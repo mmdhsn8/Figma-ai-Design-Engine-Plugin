@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "1.0.0",
+  "document": {
+    "name": "Phase 1 Test — سلام دنیا",
+    "width": 390,
+    "height": 844,
+    "background": "#F8FAFC",
+    "children": [
+      {
+        "type": "text",
+        "name": "Persian Heading",
+        "text": "سلام دنیا",
+        "x": 24,
+        "y": 40,
+        "fontSize": 28,
+        "fontFamily": "Inter",
+        "color": "#123B5D"
+      },
+      {
+        "type": "rectangle",
+        "name": "Primary Blue Card",
+        "x": 24,
+        "y": 100,
+        "width": 342,
+        "height": 120,
+        "fill": "#DBEAFE",
+        "cornerRadius": 16
+      },
+      {
+        "type": "text",
+        "name": "Secondary Label",
+        "text": "طراحی شما آماده است",
+        "x": 24,
+        "y": 246,
+        "fontSize": 16,
+        "fontFamily": "Inter",
+        "color": "#475569"
+      }
+    ]
+  }
+}

@@ -1,0 +1,359 @@
+{
+  "schemaVersion": "1.0.0",
+  "document": {
+    "name": "فروشگاه پوشاک",
+    "width": 390,
+    "height": 844,
+    "background": "#F8FAFC",
+    "layout": {
+      "mode": "vertical",
+      "gap": 14,
+      "padding": { "top": 22, "right": 22, "bottom": 18, "left": 22 },
+      "primaryAxisAlign": "start",
+      "counterAxisAlign": "stretch"
+    },
+    "components": [
+      {
+        "type": "component",
+        "id": "button.primary",
+        "name": "Button / Primary",
+        "width": 318,
+        "height": 48,
+        "background": "#2563EB",
+        "cornerRadius": 14,
+        "layout": {
+          "mode": "horizontal",
+          "padding": { "top": 12, "right": 16, "bottom": 12, "left": 16 },
+          "primaryAxisAlign": "center",
+          "counterAxisAlign": "center"
+        },
+        "children": [
+          {
+            "type": "text",
+            "name": "Button Label",
+            "text": "افزودن به سبد خرید",
+            "fontFamily": "Arial",
+            "fontStyle": "Bold",
+            "fontSize": 14,
+            "color": "#FFFFFF",
+            "textAlign": "center"
+          }
+        ]
+      },
+      {
+        "type": "component",
+        "id": "product-card.basic",
+        "name": "Product Card / Basic",
+        "width": 346,
+        "height": 340,
+        "background": "#FFFFFF",
+        "stroke": { "color": "#E2E8F0", "width": 1 },
+        "cornerRadius": 18,
+        "layout": {
+          "mode": "vertical",
+          "gap": 10,
+          "padding": { "top": 14, "right": 14, "bottom": 14, "left": 14 },
+          "primaryAxisAlign": "start",
+          "counterAxisAlign": "stretch"
+        },
+        "children": [
+          {
+            "type": "frame",
+            "name": "Product Image Placeholder",
+            "width": 318,
+            "height": 176,
+            "background": "#EFF6FF",
+            "cornerRadius": 14,
+            "layout": {
+              "mode": "vertical",
+              "gap": 7,
+              "padding": { "top": 8, "right": 8, "bottom": 8, "left": 8 },
+              "primaryAxisAlign": "center",
+              "counterAxisAlign": "center"
+            },
+            "children": [
+              {
+                "type": "frame",
+                "name": "Editable Product Illustration",
+                "width": 72,
+                "height": 90,
+                "children": [
+                  {
+                    "type": "rectangle",
+                    "name": "Garment Shape",
+                    "x": 9,
+                    "y": 7,
+                    "width": 54,
+                    "height": 78,
+                    "fill": "#38BDF8",
+                    "cornerRadius": 18
+                  },
+                  {
+                    "type": "rectangle",
+                    "name": "Garment Detail",
+                    "x": 24,
+                    "y": 15,
+                    "width": 24,
+                    "height": 26,
+                    "fill": "#EFF6FF",
+                    "cornerRadius": 8
+                  }
+                ]
+              },
+              {
+                "type": "text",
+                "name": "Placeholder Caption",
+                "text": "نمونه تصویر محصول",
+                "fontFamily": "Arial",
+                "fontSize": 11,
+                "color": "#64748B",
+                "textAlign": "center"
+              }
+            ]
+          },
+          {
+            "type": "text",
+            "name": "Product Name",
+            "text": "مانتو کتان روزمره",
+            "fontFamily": "Arial",
+            "fontStyle": "Bold",
+            "fontSize": 16,
+            "color": "#0F172A",
+            "textAlign": "right"
+          },
+          {
+            "type": "text",
+            "name": "Product Price",
+            "text": "۱٬۲۹۰٬۰۰۰ تومان",
+            "fontFamily": "Arial",
+            "fontStyle": "Bold",
+            "fontSize": 15,
+            "color": "#16A34A",
+            "textAlign": "right"
+          },
+          {
+            "type": "instance",
+            "componentId": "button.primary",
+            "name": "افزودن به سبد خرید",
+            "sizing": { "width": "fill", "height": "fixed" }
+          }
+        ]
+      }
+    ],
+    "children": [
+      {
+        "type": "text",
+        "name": "Store Heading",
+        "text": "فروشگاه پوشاک",
+        "fontFamily": "Arial",
+        "fontStyle": "Bold",
+        "fontSize": 26,
+        "color": "#123B5D",
+        "textAlign": "right"
+      },
+      {
+        "type": "text",
+        "name": "Store Subtitle",
+        "text": "انتخابی ساده برای استایل هر روز",
+        "fontFamily": "Arial",
+        "fontSize": 13,
+        "color": "#64748B",
+        "textAlign": "right"
+      },
+      {
+        "type": "frame",
+        "name": "Product Search",
+        "width": 346,
+        "height": 50,
+        "background": "#FFFFFF",
+        "stroke": { "color": "#E2E8F0", "width": 1 },
+        "cornerRadius": 14,
+        "layout": {
+          "mode": "horizontal",
+          "padding": { "top": 10, "right": 14, "bottom": 10, "left": 14 },
+          "primaryAxisAlign": "start",
+          "counterAxisAlign": "center"
+        },
+        "sizing": { "width": "fill", "height": "fixed" },
+        "children": [
+          {
+            "type": "text",
+            "name": "Search Placeholder",
+            "text": "جستجوی محصولات...",
+            "fontFamily": "Arial",
+            "fontSize": 13,
+            "color": "#64748B",
+            "textAlign": "right",
+            "sizing": { "width": "fill", "height": "hug" }
+          }
+        ]
+      },
+      {
+        "type": "frame",
+        "name": "Product Categories",
+        "width": 346,
+        "height": 38,
+        "layout": {
+          "mode": "horizontal",
+          "gap": 8,
+          "primaryAxisAlign": "end",
+          "counterAxisAlign": "center"
+        },
+        "sizing": { "width": "fill", "height": "fixed" },
+        "children": [
+          {
+            "type": "frame",
+            "name": "Menswear Category",
+            "width": 70,
+            "height": 36,
+            "background": "#EFF6FF",
+            "cornerRadius": 12,
+            "layout": {
+              "mode": "horizontal",
+              "primaryAxisAlign": "center",
+              "counterAxisAlign": "center"
+            },
+            "children": [
+              {
+                "type": "text",
+                "name": "Menswear Label",
+                "text": "مردانه",
+                "fontFamily": "Arial",
+                "fontSize": 11,
+                "color": "#123B5D",
+                "textAlign": "center"
+              }
+            ]
+          },
+          {
+            "type": "frame",
+            "name": "Womenswear Category",
+            "width": 62,
+            "height": 36,
+            "background": "#EFF6FF",
+            "cornerRadius": 12,
+            "layout": {
+              "mode": "horizontal",
+              "primaryAxisAlign": "center",
+              "counterAxisAlign": "center"
+            },
+            "children": [
+              {
+                "type": "text",
+                "name": "Womenswear Label",
+                "text": "زنانه",
+                "fontFamily": "Arial",
+                "fontSize": 11,
+                "color": "#123B5D",
+                "textAlign": "center"
+              }
+            ]
+          },
+          {
+            "type": "frame",
+            "name": "All Category",
+            "width": 52,
+            "height": 36,
+            "background": "#2563EB",
+            "cornerRadius": 12,
+            "layout": {
+              "mode": "horizontal",
+              "primaryAxisAlign": "center",
+              "counterAxisAlign": "center"
+            },
+            "children": [
+              {
+                "type": "text",
+                "name": "All Category Label",
+                "text": "همه",
+                "fontFamily": "Arial",
+                "fontSize": 11,
+                "color": "#FFFFFF",
+                "textAlign": "center"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "name": "Featured Section Heading",
+        "text": "پیشنهاد ویژه",
+        "fontFamily": "Arial",
+        "fontStyle": "Bold",
+        "fontSize": 18,
+        "color": "#0F172A",
+        "textAlign": "right"
+      },
+      {
+        "type": "instance",
+        "componentId": "product-card.basic",
+        "name": "Featured Product Card",
+        "sizing": { "width": "fill", "height": "fixed" }
+      },
+      {
+        "type": "frame",
+        "name": "Flexible Spacer",
+        "width": 1,
+        "height": 1,
+        "sizing": { "width": "fill", "height": "fill" },
+        "children": []
+      },
+      {
+        "type": "frame",
+        "name": "Bottom Navigation",
+        "width": 346,
+        "height": 58,
+        "background": "#FFFFFF",
+        "stroke": { "color": "#E2E8F0", "width": 1 },
+        "cornerRadius": 18,
+        "layout": {
+          "mode": "horizontal",
+          "padding": { "top": 10, "right": 18, "bottom": 10, "left": 18 },
+          "primaryAxisAlign": "space-between",
+          "counterAxisAlign": "center"
+        },
+        "sizing": { "width": "fill", "height": "fixed" },
+        "children": [
+          {
+            "type": "text",
+            "name": "Account Navigation",
+            "text": "حساب",
+            "fontFamily": "Arial",
+            "fontSize": 11,
+            "color": "#64748B",
+            "textAlign": "center"
+          },
+          {
+            "type": "text",
+            "name": "Cart Navigation",
+            "text": "سبد خرید",
+            "fontFamily": "Arial",
+            "fontSize": 11,
+            "color": "#64748B",
+            "textAlign": "center"
+          },
+          {
+            "type": "text",
+            "name": "Categories Navigation",
+            "text": "دسته‌ها",
+            "fontFamily": "Arial",
+            "fontSize": 11,
+            "color": "#64748B",
+            "textAlign": "center"
+          },
+          {
+            "type": "text",
+            "name": "Home Navigation",
+            "text": "خانه",
+            "fontFamily": "Arial",
+            "fontStyle": "Bold",
+            "fontSize": 11,
+            "color": "#2563EB",
+            "textAlign": "center"
+          }
+        ]
+      }
+    ]
+  }
+}
