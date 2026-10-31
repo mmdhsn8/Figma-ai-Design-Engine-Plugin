@@ -12,6 +12,12 @@ import type {
 } from "../shared/schema";
 import { orderComponentDefinitions, parseDesignValue } from "../shared/schema";
 import type { FontSelection } from "../shared/messages";
+import { planCanvasPlacements, type CanvasBounds, type PlacementItem } from "./canvas-placement";
+import {
+  getCanvasNodeBounds,
+  placeTopLevelNode,
+  readTopLevelCanvasObstacles,
+} from "./figma-canvas-adapter";
 import { hexToRgb } from "./figma-utils";
 
 export type RendererFigmaApi = Pick<
@@ -23,8 +29,8 @@ export type RendererFigmaApi = Pick<
   | "listAvailableFontsAsync"
   | "loadFontAsync"
 > & {
-  currentPage: Pick<PluginAPI["currentPage"], "selection" | "findAll">;
-  viewport: Pick<PluginAPI["viewport"], "center" | "scrollAndZoomIntoView">;
+  currentPage: Pick<PluginAPI["currentPage"], "children" | "selection" | "findAll">;
+  viewport: Pick<PluginAPI["viewport"], "scrollAndZoomIntoView">;
 };
 
 export interface RenderResult {
@@ -40,6 +46,11 @@ export class DesignRenderError extends Error {
     this.name = "DesignRenderError";
   }
 }
+
+const COMPONENT_AREA_WIDTH = 390;
+const COMPONENT_AREA_GAP = 18;
+const COMPONENT_AREA_VERTICAL_PADDING = 36;
+const COMPONENT_AREA_OFFSET = 56;
 
 interface LayoutMapping {
   mode: "HORIZONTAL" | "VERTICAL";
@@ -456,11 +467,14 @@ function createDocumentFrame(
   name: string,
   context: BuildContext,
   parent?: FrameNode,
+  position?: Pick<CanvasBounds, "x" | "y">,
 ): FrameNode {
   const frame = api.createFrame();
   context.tracker.track(frame, "frames");
   frame.name = name;
   frame.resize(spec.document.width, spec.document.height);
+  frame.x = position?.x ?? 0;
+  frame.y = position?.y ?? 0;
   setSolidFill(frame, spec.document.background);
   if (spec.document.layout)
     applyLayout(frame, spec.document.layout, spec.document.width, spec.document.height);
@@ -471,35 +485,68 @@ function createDocumentFrame(
   return frame;
 }
 
-function createComponentArea(api: RendererFigmaApi, tracker: Tracker, name: string): FrameNode {
+function createComponentArea(
+  api: RendererFigmaApi,
+  tracker: Tracker,
+  name: string,
+  width: number,
+): FrameNode {
   const area = api.createFrame();
   tracker.track(area, "frames");
   area.name = name;
-  area.resize(390, 160);
+  area.resize(width, 160);
   setSolidFill(area, "#EFF6FF");
   applyLayout(
     area,
     {
       mode: "vertical",
-      gap: 18,
+      gap: COMPONENT_AREA_GAP,
       padding: { top: 18, right: 16, bottom: 18, left: 16 },
       primaryAxisAlign: "start",
       counterAxisAlign: "center",
     },
-    390,
+    width,
     160,
   );
   area.primaryAxisSizingMode = "AUTO";
   return area;
 }
 
-function createWrapper(api: RendererFigmaApi, tracker: Tracker, name: string): FrameNode {
+function createWrapper(
+  api: RendererFigmaApi,
+  tracker: Tracker,
+  name: string,
+  width: number,
+  height: number,
+  position: Pick<CanvasBounds, "x" | "y">,
+): FrameNode {
   const wrapper = api.createFrame();
   tracker.track(wrapper, "frames");
   wrapper.name = name;
-  wrapper.resize(600, 844);
+  wrapper.resize(width, height);
+  wrapper.x = position.x;
+  wrapper.y = position.y;
   wrapper.fills = [];
   return wrapper;
+}
+
+function intendedClusterSize(
+  spec: DesignSpec,
+  componentAreaWidth: number,
+): Pick<PlacementItem, "width" | "height"> {
+  const definitions = spec.document.components ?? [];
+  if (definitions.length === 0) {
+    return { width: spec.document.width, height: spec.document.height };
+  }
+
+  const componentAreaHeight =
+    COMPONENT_AREA_VERTICAL_PADDING +
+    definitions.reduce((height, definition) => height + definition.height, 0) +
+    (definitions.length - 1) * COMPONENT_AREA_GAP;
+  return {
+    width: spec.document.width + COMPONENT_AREA_OFFSET + componentAreaWidth,
+    height: Math.max(spec.document.height, componentAreaHeight),
+  };
 }
 
 export async function renderDesign(api: RendererFigmaApi, input: unknown): Promise<RenderResult> {
@@ -519,24 +566,49 @@ export async function renderDesign(api: RendererFigmaApi, input: unknown): Promi
   const components = spec.document.components ?? [];
 
   try {
+    const existingCanvasBounds = readTopLevelCanvasObstacles(api.currentPage);
+    const documentFrameName = uniqueName(api, spec.document.name, reservedNames);
+    const componentAreaWidth = Math.max(
+      COMPONENT_AREA_WIDTH,
+      ...components.map((definition) => definition.width),
+    );
+    const intendedSize = intendedClusterSize(spec, componentAreaWidth);
+    const [initialPlacement] = planCanvasPlacements(
+      [{ id: documentFrameName, ...intendedSize }],
+      existingCanvasBounds,
+    );
+    if (!initialPlacement)
+      throw new DesignRenderError(
+        "Canvas placement did not return a position for the generated design.",
+      );
+
     let root: FrameNode;
-    let documentFrameName: string;
     if (components.length === 0) {
-      documentFrameName = uniqueName(api, spec.document.name, reservedNames);
-      root = createDocumentFrame(api, spec, documentFrameName, context);
+      root = createDocumentFrame(
+        api,
+        spec,
+        documentFrameName,
+        context,
+        undefined,
+        initialPlacement,
+      );
     } else {
       const wrapper = createWrapper(
         api,
         tracker,
         uniqueName(api, `Generated — ${spec.document.name}`, reservedNames),
+        intendedSize.width,
+        intendedSize.height,
+        initialPlacement,
       );
       const componentArea = createComponentArea(
         api,
         tracker,
         uniqueName(api, `Components — ${spec.document.name}`, reservedNames),
+        componentAreaWidth,
       );
       wrapper.appendChild(componentArea);
-      componentArea.x = spec.document.width + 56;
+      componentArea.x = spec.document.width + COMPONENT_AREA_OFFSET;
       componentArea.y = 0;
 
       for (const definition of orderComponentDefinitions(components)) {
@@ -548,19 +620,26 @@ export async function renderDesign(api: RendererFigmaApi, input: unknown): Promi
         );
       }
 
-      documentFrameName = uniqueName(api, spec.document.name, reservedNames);
       root = createDocumentFrame(api, spec, documentFrameName, context, wrapper);
       root.x = 0;
       root.y = 0;
       wrapper.resize(
-        spec.document.width + 56 + componentArea.width,
+        spec.document.width + COMPONENT_AREA_OFFSET + componentArea.width,
         Math.max(spec.document.height, componentArea.height),
       );
       root = wrapper;
     }
 
-    root.x = Math.round(api.viewport.center.x - root.width / 2);
-    root.y = Math.round(api.viewport.center.y - root.height / 2);
+    const stagedBounds = getCanvasNodeBounds(root);
+    const [placement] = planCanvasPlacements(
+      [{ id: documentFrameName, width: stagedBounds.width, height: stagedBounds.height }],
+      existingCanvasBounds,
+    );
+    if (!placement)
+      throw new DesignRenderError(
+        "Canvas placement did not return a position for the generated design.",
+      );
+    placeTopLevelNode(root, stagedBounds, placement);
     api.currentPage.selection = [root];
     api.viewport.scrollAndZoomIntoView([root]);
     return {

@@ -18,6 +18,9 @@ interface MockNode {
   height: number;
   fills: readonly Paint[];
   strokes: readonly Paint[];
+  readonly absoluteRenderBounds: Rect | null;
+  readonly absoluteBoundingBox: Rect | null;
+  readonly absoluteTransform: Transform;
   children: MockNode[];
   parent: MockNode | null;
   removed: boolean;
@@ -51,6 +54,18 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
       height: 100,
       fills: [],
       strokes: [],
+      get absoluteRenderBounds() {
+        return { x: node.x, y: node.y, width: node.width, height: node.height };
+      },
+      get absoluteBoundingBox() {
+        return { x: node.x, y: node.y, width: node.width, height: node.height };
+      },
+      get absoluteTransform() {
+        return [
+          [1, 0, node.x],
+          [0, 1, node.y],
+        ] as Transform;
+      },
       children: [],
       parent: null,
       removed: false,
@@ -116,6 +131,7 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
       loadedFonts.push(font);
     }),
     currentPage: {
+      children: roots as unknown as SceneNode[],
       selection: [] as SceneNode[],
       findAll: vi.fn((predicate: (node: MockNode) => boolean) => walk(roots, predicate)),
     },
@@ -185,6 +201,8 @@ describe("renderDesign", () => {
     });
     expect(frame.width).toBe(390);
     expect(frame.height).toBe(844);
+    expect(frame.x).toBe(220);
+    expect(frame.y).toBe(0);
     expect(frame.children[0].x).toBe(24);
     expect(frame.children[0].y).toBe(40);
     expect(frame.fills).toEqual([
@@ -344,6 +362,42 @@ describe("renderDesign", () => {
       characters: "فروشگاه پوشاک",
       textAlignHorizontal: "RIGHT",
     });
+  });
+
+  it("places the screen and component masters as a horizontal, non-overlapping cluster", async () => {
+    const firstResult = await renderDesign(mock.api, storefront);
+    const firstWrapper = mock.raw.currentPage.selection[0] as unknown as MockNode;
+    const firstPosition = { x: firstWrapper.x, y: firstWrapper.y };
+    expect(firstWrapper.x).toBe(220);
+    expect(firstWrapper.y).toBe(0);
+    expect(firstWrapper.children.map((node) => node.name)).toEqual([
+      "Components — فروشگاه پوشاک",
+      "فروشگاه پوشاک",
+    ]);
+    expect(firstWrapper.children[0].x).toBe(446);
+    expect(firstWrapper.children[1].x).toBe(0);
+
+    const secondResult = await renderDesign(mock.api, storefront);
+    const secondWrapper = mock.raw.currentPage.selection[0] as unknown as MockNode;
+    expect(secondResult.frameName).toBe(`${firstResult.frameName} (2)`);
+    expect(secondWrapper.x - (firstWrapper.x + firstWrapper.width)).toBe(120);
+    expect(secondWrapper.y).toBe(firstWrapper.y);
+    expect(firstWrapper).toMatchObject(firstPosition);
+    expect(mock.unrelated).toMatchObject({ x: 0, y: 0, removed: false });
+    expect(mock.roots).toContain(mock.unrelated);
+  });
+
+  it("reserves enough cluster width for component masters wider than the screen", async () => {
+    const wideComponents = structuredClone(storefront);
+    for (const component of wideComponents.document.components ?? []) component.width = 700;
+
+    await renderDesign(mock.api, wideComponents);
+
+    const wrapper = mock.raw.currentPage.selection[0] as unknown as MockNode;
+    const componentArea = wrapper.children[0];
+    expect(componentArea.width).toBe(700);
+    expect(componentArea.x).toBe(390 + 56);
+    expect(wrapper.width).toBe(390 + 56 + 700);
   });
 
   it("validates before creating content and preserves unrelated layers on invalid input", async () => {
