@@ -1,21 +1,31 @@
 # Figma AI Design Engine
 
-Figma AI Design Engine is a local plugin for Figma Desktop that turns a JSON design description into editable Figma layers. It can create frames, text, rectangles, Auto Layout, components, and component instances. Use the built-in examples to see what it can make, or import and edit your own JSON design.
+Figma AI Design Engine is a local plugin for Figma Desktop. It reads a structured JSON design and creates editable native Figma layers from it. You can start with one of the included examples or write/import your own JSON, validate it, generate the design, and keep editing it in Figma.
 
-The plugin validates your JSON before creating anything. Generated content stays in your Figma file, where you can continue editing it like any other design. The plugin does not require an AI prompt, API key, cloud account, backend, or internet connection at runtime.
+The plugin name includes “AI,” but this version does not generate designs from text prompts. It uses the JSON design you provide and does not need an API key, cloud account, backend, or internet connection at runtime.
 
-## Quick start
+## What the plugin can do
 
-### Requirements
+- Create frames, text layers, and rectangles, including nested frames.
+- Place children at explicit `x`/`y` coordinates or arrange them with Figma Auto Layout.
+- Set colors, strokes, corner radii, text alignment, font family/style, and text sizing.
+- Define reusable components and create linked instances of them.
+- Validate the JSON and report errors before adding layers to the Figma document.
+- Preserve existing page content and place each new design in a clear canvas area.
+- Keep Persian and other Unicode text editable in Figma text layers. Font availability and complex right-to-left shaping depend on the local Figma environment.
+
+The **Phase 1 sample** and **Phase 2 demo** buttons are examples in the same plugin, not separate programs. The Phase 1 sample demonstrates a simple, coordinate-based design and remains supported. The Phase 2 demo shows a larger storefront using nested frames, Auto Layout, components, and component instances.
+
+## Requirements
 
 - Windows 10 or 11
 - Node.js 22.12 or newer and npm
 - Figma Desktop
 
-### Install the plugin in Figma
+## Install the plugin in Figma
 
-1. Download or clone this repository, then open PowerShell in the project folder.
-2. Install the project dependencies and build the plugin:
+1. Download or clone this repository.
+2. Open PowerShell in the project folder and install the dependencies/build the plugin:
 
    ```powershell
    npm install
@@ -23,24 +33,22 @@ The plugin validates your JSON before creating anything. Generated content stays
    ```
 
 3. Open a Figma Design file in Figma Desktop.
-4. In Figma, choose **Plugins → Development → Import plugin from manifest…** and select this project's `manifest.json` file.
+4. Choose **Plugins → Development → Import plugin from manifest…** and select this project's `manifest.json`.
 5. Run **Figma AI Design Engine** from **Plugins → Development**.
 
-### Generate your first design
+The plugin is set up for local development and is not configured for publishing to the Figma Community.
 
-1. In the plugin, click **Phase 2 demo** to load a sample storefront. **Phase 1 sample** loads a smaller example.
-2. Click **Validate JSON**. If there are errors, read the messages and fix the JSON in the editor.
-3. Click **Generate in Figma**. The plugin creates editable layers on the current page and moves the viewport to the new design.
-4. Select the generated frames, text, or components on the canvas and edit them in Figma. You can generate again; each run adds a new cluster without replacing earlier results.
+## Use the plugin
 
-### Use your own design JSON
+1. Load **Phase 1 sample** for a small, positioned example, or **Phase 2 demo** for the storefront example.
+2. To use your own design, click **Import JSON** to select a `.json` file, or paste/edit JSON in the editor. The import/editor limit is 1 MB.
+3. Click **Validate JSON**. Fix any errors shown in the status area before continuing.
+4. Click **Generate in Figma**. The plugin creates native editable layers on the current page and focuses the new design in the viewport.
+5. Edit the generated layers as usual in Figma. Running Generate again adds another design; it does not replace earlier results.
 
-1. Prepare a JSON design that follows [schema version 1.0.0](#json-schema-100).
-2. Click **Import JSON** to load a `.json` file, or paste the JSON into the editor. You can also start with a sample and edit its contents.
-3. Click **Validate JSON** and correct any reported issues.
-4. Click **Generate in Figma** to add the design to the current page.
+## JSON format
 
-At a minimum, a design JSON has a `schemaVersion` of `1.0.0` and a `document` containing a name, width, height, and children. For example:
+The plugin supports schema version `1.0.0`. A design has a `document` with a name, width, height, background color, and child layers. This example positions a card on the canvas and uses Auto Layout to arrange its contents:
 
 ```json
 {
@@ -49,28 +57,105 @@ At a minimum, a design JSON has a `schemaVersion` of `1.0.0` and a `document` co
     "name": "My first design",
     "width": 390,
     "height": 844,
+    "background": "#F8FAFC",
     "children": [
       {
-        "type": "text",
-        "name": "Greeting",
-        "text": "Hello, Figma!",
+        "type": "frame",
+        "name": "Content Card",
         "x": 24,
         "y": 40,
-        "fontSize": 28,
-        "color": "#123B5D"
+        "width": 342,
+        "height": 180,
+        "background": "#FFFFFF",
+        "cornerRadius": 16,
+        "layout": {
+          "mode": "vertical",
+          "gap": 12,
+          "padding": { "top": 16, "right": 16, "bottom": 16, "left": 16 }
+        },
+        "children": [
+          {
+            "type": "text",
+            "name": "Greeting",
+            "text": "Hello, Figma!",
+            "fontSize": 24,
+            "color": "#123B5D"
+          },
+          {
+            "type": "rectangle",
+            "name": "Accent",
+            "width": 80,
+            "height": 8,
+            "fill": "#2563EB",
+            "cornerRadius": 4
+          }
+        ]
       }
     ]
   }
 }
 ```
 
-The full list of supported node types, layout fields, sizing rules, limits, and component behavior is described in the [JSON schema](#json-schema-100) section below.
+### Layer types and positioning
+
+Supported child layer types are `frame`, `text`, `rectangle`, and `instance`. Frames can contain other layers. A frame or document can use an optional `layout` object to arrange its children horizontally or vertically using Auto Layout. Layout supports gap, padding, alignment, and child sizing (`fixed`, `hug`, or `fill`).
+
+When a parent has no Auto Layout, each child needs both `x` and `y` coordinates. When a parent uses Auto Layout, omit child coordinates; their order and layout settings control placement. Colors use six-digit hex notation, such as `#123ABC`.
+
+Text supports font family/style, font size, color, alignment, line height, resizing, and optional dimensions. The plugin asks Figma for the requested font and falls back to Inter Regular if that font is unavailable; the result reports font choices. Persian Unicode text is preserved, but full bidirectional text shaping is controlled by Figma and the selected font.
+
+### Components and instances
+
+Reusable component definitions go in `document.components` and each needs a unique `id`. Add an `instance` layer with the matching `componentId` wherever the design should use that component. Generated component masters appear in a Components area beside the screen. Instances stay linked to their master. Component variants and instance property overrides are not supported yet.
+
+### Validation limits
+
+- Document, frame, and component dimensions: 1–10,000 px.
+- Coordinates: −10,000–10,000 px.
+- Maximum 500 total nodes, 50 component definitions, and 8 nested node levels.
+- Text: up to 5,000 characters per text layer.
+- Layout gap/padding: 0–1,000 px; corner radii: 0–5,000 px; stroke width: 0.25–100 px.
+- JSON objects reject unsupported fields; the editor/import limit is 1 MB.
+
+## Canvas organization
+
+Each generation is placed as a cluster. If the design has components, its screen and component masters are kept together. New clusters are placed from left to right and wrap onto another row as needed, with at least 120 px of spacing. The default target row width is 6,000 px. These settings are centralized in `src/plugin/canvas-placement.ts`; an individual cluster wider than the target gets a row of its own. Row height uses the tallest actual cluster in that row, plus the gap.
+
+Before rendering, the plugin reads document-space bounds for all direct children of the current page, including unrelated frames and other scene nodes. Bounds prefer Figma's `absoluteRenderBounds`, then `absoluteBoundingBox`, and use the transformed-corner AABB fallback if needed. Rotated objects reserve their conservative axis-aligned bounds. Descendants are covered by their top-level parent, so they are not counted twice. The planner finds the first row-major slot that clears those obstacles and all previous generated clusters. It plans from intended dimensions before creating nodes, then measures and corrects the full generated cluster if its actual bounds differ. Only the new cluster root can move; existing content and internal child coordinates remain unchanged.
+
+The plugin adds generated screens to the current Figma Page; it does not create a page per screen. Each single-cluster placement uses O(n log n) time and O(n) temporary memory for n top-level obstacles. Batch planning repeats the bounded row query per item. Old vertically stacked Phase 2.1 clusters are left in place; horizontal placement applies to new generations only.
+
+### Windows / Figma Desktop acceptance
+
+Automated tests use a mocked Figma API and do not verify the real canvas. After `npm run build`, reload the development plugin in Figma Desktop and confirm:
+
+1. Generate the Phase 2 demo six times; verify the clusters appear horizontally and wrap at the configured row width.
+2. Confirm at least 120 px of clearance between cluster bounds, including component masters.
+3. Put a large unrelated frame in the next available slot and generate again; confirm the new cluster avoids it.
+4. Generate valid mobile and desktop designs with different heights; check wrapped-row height.
+5. Confirm old content is unchanged, Auto Layout remains editable, component instances stay linked, and the viewport focuses the newest design.
+6. If practical, repeat with 100+ frames and check responsiveness.
+
+Phase 2.2 remains pending until these checks pass in Figma Desktop and the user confirms them.
+
+## Limitations
+
+- The plugin creates designs from JSON; it does not create a design from a natural-language prompt.
+- Full right-to-left/bidirectional shaping, component variants, configurable component properties, and instance overrides are not implemented.
+- Rotated nodes reserve their full axis-aligned envelope, which may leave extra space. Figma render bounds may omit editor-only effects; geometric bounds are used when render bounds are unavailable.
+- The 6,000 px row width is a layout target rather than a hard canvas limit. Existing Phase 2.1 clusters are not rearranged automatically.
+- Responsive breakpoints, multi-screen generation, design tokens/variables, prototyping, and publishing workflows are outside the current scope.
+- Font appearance and some text shaping depend on fonts installed and available to Figma Desktop.
 
 ## Build and development
 
-The production build writes `dist\plugin.js` and `dist\ui.html`, which are referenced by `manifest.json`. No development server is needed to use the production build. For local development, run `npm run dev`; after rebuilding, reload or rerun the development plugin in Figma Desktop.
+The production build writes `dist\plugin.js` and `dist\ui.html`, which are referenced by `manifest.json`. No development server is needed to use the production build. To run the local development workflow, use:
 
-Useful project checks are:
+```powershell
+npm run dev
+```
+
+After a rebuild, reload or rerun the development plugin in Figma Desktop. Project checks are available with:
 
 ```powershell
 npm run typecheck
@@ -79,77 +164,4 @@ npm run test
 npm run format:check
 ```
 
-The manifest ID is a local-development placeholder. The plugin is not configured for publishing.
-
-## JSON schema 1.0.0
-
-Phase 2 extends the existing `1.0.0` payload. Legacy documents with positioned root children remain valid. The root `document` has a name, width, height, background, children, and optional `layout` and `components`. Node types are `frame`, `text`, `rectangle`, and `instance`. Component definitions live in `document.components`, keyed by stable `id`; instances refer to those IDs with `componentId`. Objects reject unknown fields.
-
-All colors use six-digit hex such as `#123ABC`; `#RGB` is not supported. Dimensions must be from 1 to 10,000 px. Coordinates may be from −10,000 to 10,000 px. Layout gaps and padding must be from 0 to 1,000 px. Strokes must be from 0.25 to 100 px. Corner radii must be from 0 to 5,000 px. Text is limited to 5,000 characters. A document may contain at most 500 nodes, 50 component definitions, and 8 nested node levels. The JSON editor/import limit is 1 MB.
-
-### Layout and sizing rules
-
-| JSON field                      | Accepted values                                 | Figma mapping                                           |
-| ------------------------------- | ----------------------------------------------- | ------------------------------------------------------- |
-| `layout.mode`                   | `horizontal`, `vertical`                        | `layoutMode: HORIZONTAL`, `VERTICAL`                    |
-| `primaryAxisAlign`              | `start`, `center`, `end`, `space-between`       | `MIN`, `CENTER`, `MAX`, `SPACE_BETWEEN`                 |
-| `counterAxisAlign`              | `start`, `center`, `end`, `baseline`, `stretch` | `MIN`, `CENTER`, `MAX`, `BASELINE`; see stretch below   |
-| `gap`                           | nonnegative number                              | `itemSpacing`                                           |
-| `padding.top/right/bottom/left` | nonnegative numbers                             | Matching Figma padding properties                       |
-| `sizing.width/height`           | `fixed`, `hug`, `fill`                          | `layoutSizingHorizontal/Vertical: FIXED`, `HUG`, `FILL` |
-
-`counterAxisAlign: "stretch"` uses Figma's supported child `layoutAlign: "STRETCH"` and `FILL` sizing on the counter axis. Figma has no `STRETCH` value for `counterAxisAlignItems`; the container uses `MIN` for that property. FILL requires an Auto Layout parent and cannot fill an axis the parent sizes as HUG. HUG is supported for text, Auto Layout frames, and instances whose master uses Auto Layout. Baseline alignment is limited to horizontal layouts. Optional sizing defaults to HUG/HUG for text and FIXED/FIXED for other children; a parent's `stretch` behavior fills the child's counter axis unless an incompatible explicit sizing is supplied.
-
-If a parent has no `layout`, its children need both `x` and `y`. Children of Auto Layout parents omit `x` and `y`; Figma's Auto Layout controls their placement. Frames and component definitions keep explicit width and height as their initial/fixed dimensions. Text with explicit `fixed` sizing needs the corresponding width or height.
-
-### Fonts and Persian text
-
-The renderer asks Figma for available fonts, loads each requested family/style before creating nodes, and uses the exact font when available. If Figma cannot resolve or load it, the renderer falls back to Inter Regular and reports both the requested and chosen font in its result. The demo requests Arial for Persian text; availability depends on the local Figma/Windows font list.
-
-Persian Unicode, punctuation, and numerals are kept in editable text nodes. Right alignment and child order support practical RTL-oriented layouts. The Figma Plugin API does not expose full bidirectional text-engine controls, so mixed-script shaping and complex RTL behavior depend on Figma and the selected font.
-
-### Components
-
-The demo includes native `Button / Primary` and `Product Card / Basic` components. The product-card master contains a button instance, and the storefront contains a product-card instance. Generated masters appear in a named Components area in the same generated canvas cluster as the screen. Component dependencies are created before their consumers. Repeated runs create separately named results and do not replace existing layers. Instance property overrides and variants are outside this MVP; edit a master to update linked instances.
-
-## Canvas placement
-
-Each run is rendered as one cluster, including the root screen and its generated component area. The planner places clusters left-to-right, then wraps to the next row when the next cluster would exceed the configured maximum row width. Defaults are a 120 Figma-pixel gap and a 6,000 px row width, centralized in `src/plugin/canvas-placement.ts`. A cluster wider than the row limit is allowed on its own row so valid large designs remain placeable. Row height comes from the tallest actual cluster in that row, plus the configured gap.
-
-Before rendering, the plugin snapshots the current page's direct children and their document-space visual bounds. It finds the first row-major slot that clears all existing bounds, including unrelated top-level objects. The screen and component area are one measured collision region. If that component area needs more width than its default, it expands to contain its widest master. Old vertically stacked Phase 2.1 clusters remain where they are; the horizontal policy applies only to newly generated clusters.
-
-Bounds prefer Figma's `absoluteRenderBounds`, then `absoluteBoundingBox`, with a transformed-corner AABB fallback. Rotated objects use conservative axis-aligned page-space boxes. Only direct page children are obstacles; descendants are covered by their top-level parent's bounds and are not double-counted. Placement is planned from intended dimensions before rendering, then checked against the full measured cluster. Only the new cluster root can move during correction, preserving child coordinates and Auto Layout. Existing content is never repositioned. The viewport focuses the completed cluster. The planner is pure TypeScript and has no Figma document side effects.
-
-The plugin keeps one Figma Page and adds generated screen frames and component masters as ordinary canvas nodes. It does not create a page per screen. Each single-cluster placement expands obstacles once and sorts relevant horizontal intervals, taking O(n log n) time and O(n) temporary memory for n top-level obstacles. Batch planning repeats that bounded row query for each requested cluster. The search advances through at most a number of rows proportional to the blocking bounds and reports an actionable error for invalid, overflowing, or unrepresentable geometry.
-
-## Verification
-
-Automated tests use a mocked Figma API. They cover Phase 1 parsing/rendering compatibility, recursive schema and limits, Auto Layout mapping and constraints, font loading/fallback, native component/instance creation, error cleanup, repeated generation names, Persian/mixed-script text, visual properties, UI/controller message shapes, and canvas placement geometry. Placement coverage includes repeated and batch generations, 500 mixed-size clusters, negative coordinates, irregular and rotated obstacles, boundary spacing, and 100, 250, and 500 page obstacles. They do not launch Figma Desktop or verify its actual font rendering and canvas appearance.
-
-### Manual Figma Desktop acceptance steps
-
-1. In PowerShell at the project folder, run `npm install` and `npm run build`.
-2. In Figma Desktop, open **Plugins → Development → Manage plugins**, then reload the imported plugin (or import `manifest.json` again if it is not listed). Run **Figma AI Design Engine** from **Plugins → Development**.
-3. Generate the **Phase 2 demo** six times. Confirm new clusters appear side-by-side and wrap when the configured row width is reached.
-4. Verify at least 120 px clearance between neighboring cluster bounds, including component masters.
-5. Place a large unrelated frame in the next available slot and generate again; confirm collision avoidance.
-6. Generate a mix of desktop and mobile JSON and check that wrapped rows use the tallest cluster's height.
-7. Confirm old screens and unrelated nodes have not moved or changed, Auto Layout remains editable, instances remain linked, and the viewport focuses the latest generation.
-8. If practical, repeat in a test file with 100+ frames and check overlap avoidance and responsiveness.
-9. Import invalid JSON and confirm validation blocks generation without adding partial layers.
-
-Phase 2.2 is not accepted until these checks pass in Figma Desktop and the user confirms the manual results. Automated tests do not replace desktop verification.
-
-## Known limitations
-
-- No full RTL/bidirectional shaping control; font coverage and mixed-script rendering vary with the local Figma font environment.
-- Unavailable requested fonts fall back to Inter Regular. If Figma cannot load Inter either, generation stops before document changes.
-- Component variants, configurable component properties, and instance overrides are not implemented.
-- Rotated nodes use conservative axis-aligned bounds, so a rotated object's free corners can reserve extra canvas space. Figma render bounds do not include every possible editor-only effect; geometric bounds are used when render bounds are unavailable.
-- The row width is a configurable target, not a hard canvas boundary: a single cluster wider than the configured width occupies a row by itself. Existing Phase 2.1 rows are not automatically rearranged.
-- Responsive breakpoint generation, multiple-screen generation, tokens/variables, prototyping, AI prompts, publishing, and remote services are out of scope.
-- Manual Figma Desktop import, generation, and visual verification are still required; mocked API tests do not prove desktop behavior.
-
-## Dependencies
-
-Runtime dependencies are React, React DOM, and Zod. Vite, TypeScript, Vitest, ESLint, Prettier, Figma typings, and their transitive packages are development-only. There are no paid dependencies, external services, or runtime network calls.
+Runtime dependencies are React, React DOM, and Zod. Other project dependencies are used for development and building. The manifest disables network access, so the plugin has no runtime network calls or paid service dependencies.
