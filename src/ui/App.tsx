@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import phase1Sample from "../samples/sample-design.json?raw";
 import phase2Sample from "../samples/phase-2-storefront.json?raw";
+import phase3Sample from "../samples/phase-3-design-system.json?raw";
 import { parseDesignText } from "../shared/schema";
 import { PluginToUISchema, type UIToPluginMessage } from "../shared/messages";
+import { planDesignSystemApply } from "../plugin/design-system/apply-design-system";
 
 type Notice = {
   tone: "neutral" | "success" | "error";
@@ -31,8 +33,10 @@ export default function App() {
     title: "Ready to validate",
   });
   const [busy, setBusy] = useState(false);
+  const [updateOwned, setUpdateOwned] = useState(false);
   const currentRequest = useRef<string | null>(null);
   const parsed = useMemo(() => parseDesignText(json), [json]);
+  const dryRun = parsed.success ? planDesignSystemApply(parsed.data) : undefined;
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent<unknown>) => {
@@ -82,6 +86,14 @@ export default function App() {
           details: [
             `${counts.frames} frames · ${counts.texts} texts · ${counts.rectangles} rectangles · ${counts.components} components · ${counts.instances} instances.`,
             `Fonts: ${fontSummary}.`,
+            ...(message.designSystem
+              ? [
+                  `Design system ${message.designSystem.namespace}: created ${message.designSystem.created.length} · reused ${message.designSystem.reused.length} · updated ${message.designSystem.updated.length} · skipped ${message.designSystem.skipped.length}.`,
+                  ...(message.designSystem.fallbacks.length
+                    ? [`Fallbacks: ${message.designSystem.fallbacks.join("; ")}`]
+                    : []),
+                ]
+              : []),
             ...message.warnings,
           ],
         });
@@ -116,6 +128,22 @@ export default function App() {
     setBusy(true);
     setNotice({ tone: "neutral", title: "Creating native Figma layers…" });
     postToPlugin({ type: "generate", requestId, json });
+  };
+
+  const applyDesignSystem = () => {
+    if (!parsed.success || !dryRun) {
+      setNotice({
+        tone: "error",
+        title: "Fix the design-system JSON before creating assets",
+        details: parsed.success ? ["No designSystem section was found."] : parsed.errors,
+      });
+      return;
+    }
+    const requestId = nextRequestId();
+    currentRequest.current = requestId;
+    setBusy(true);
+    setNotice({ tone: "neutral", title: "Creating the design system and editable preview…" });
+    postToPlugin({ type: "apply-design-system", requestId, json, updateOwned });
   };
 
   const loadSample = (content: string, label: string) => {
@@ -177,7 +205,7 @@ export default function App() {
       </header>
 
       <section className="intro-row" aria-label="Import instructions">
-        <span className="step-indicator">PHASE 02</span>
+        <span className="step-indicator">PHASE 01–03</span>
         <span className="intro-copy">Paste a design spec or import a .json file</span>
       </section>
 
@@ -245,6 +273,14 @@ export default function App() {
           Phase 2 demo
         </button>
         <button
+          className="text-button"
+          type="button"
+          onClick={() => loadSample(phase3Sample, "Phase 3 design-system demo")}
+          disabled={busy}
+        >
+          Phase 3 demo
+        </button>
+        <button
           className="text-button muted"
           type="button"
           onClick={reset}
@@ -285,6 +321,72 @@ export default function App() {
         </div>
       </section>
 
+      <section className="design-system-panel" aria-labelledby="design-system-title">
+        <div className="design-system-heading">
+          <div>
+            <span className="section-kicker">PHASE 03</span>
+            <h2 id="design-system-title">Design System</h2>
+          </div>
+          <span className={`system-status ${dryRun ? "is-ready" : ""}`}>
+            {dryRun ? "Ready to preview" : "No valid system"}
+          </span>
+        </div>
+        {dryRun ? (
+          <>
+            <p className="system-namespace">
+              <strong>{dryRun.namespace}</strong> · {dryRun.name}
+            </p>
+            <div className="system-counts">
+              <span>{dryRun.colors} colors</span>
+              <span>{dryRun.typography} type</span>
+              <span>{dryRun.spacing} spacing</span>
+              <span>{dryRun.radii} radii</span>
+              <span>{dryRun.borders} borders</span>
+              <span>{dryRun.components} components</span>
+            </div>
+            <div className="dry-run-summary">
+              <strong>Dry run</strong>
+              <p>{dryRun.message}</p>
+              {dryRun.fallbacks.map((fallback) => (
+                <p className="system-fallback" key={fallback}>
+                  {fallback}
+                </p>
+              ))}
+            </div>
+            <label className="update-owned-option">
+              <input
+                type="checkbox"
+                checked={updateOwned}
+                onChange={(event) => setUpdateOwned(event.target.checked)}
+                disabled={busy}
+              />
+              <span>
+                Update plugin-owned styles only if their saved fingerprint shows they were not
+                manually edited.
+              </span>
+            </label>
+            <button
+              className="system-action"
+              type="button"
+              onClick={applyDesignSystem}
+              disabled={busy || !parsed.success}
+            >
+              {busy ? "Working…" : "Create / Update Design System"}
+            </button>
+          </>
+        ) : parsed.success ? (
+          <p className="system-empty">
+            Add a valid optional designSystem section to preview assets.
+          </p>
+        ) : (
+          <div className="system-validation">
+            <strong>Validation issues, including unresolved token references</strong>
+            <ErrorList errors={parsed.errors.slice(0, 5)} />
+            {parsed.errors.length > 5 && <p>+{parsed.errors.length - 5} more errors</p>}
+          </div>
+        )}
+      </section>
+
       <div className="actions">
         <button className="secondary-action" type="button" onClick={validate} disabled={busy}>
           Validate JSON
@@ -293,7 +395,9 @@ export default function App() {
           className="primary-action"
           type="button"
           onClick={generate}
-          disabled={busy || !parsed.success}
+          disabled={
+            busy || !parsed.success || (parsed.success && Boolean(parsed.data.designSystem))
+          }
         >
           {busy ? (
             <span className="button-spinner" />
@@ -302,7 +406,11 @@ export default function App() {
               <path d="M8 1.5v13m-6.5-6.5h13M3.75 3.75l8.5 8.5m0-8.5-8.5 8.5" />
             </svg>
           )}
-          {busy ? "Working…" : "Generate in Figma"}
+          {busy
+            ? "Working…"
+            : parsed.success && parsed.data.designSystem
+              ? "Use design-system action"
+              : "Generate in Figma"}
         </button>
       </div>
 

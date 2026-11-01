@@ -28,7 +28,23 @@ const FontSelectionSchema = z
 export const UIToPluginSchema = z.discriminatedUnion("type", [
   RequestSchema.extend({ type: z.literal("validate") }).strict(),
   RequestSchema.extend({ type: z.literal("generate") }).strict(),
+  RequestSchema.extend({
+    type: z.literal("apply-design-system"),
+    updateOwned: z.boolean().default(false),
+  }).strict(),
 ]);
+
+const DesignSystemReportSchema = z
+  .object({
+    namespace: z.string(),
+    created: z.array(z.string()),
+    reused: z.array(z.string()),
+    updated: z.array(z.string()),
+    skipped: z.array(z.string()),
+    fallbacks: z.array(z.string()),
+    warnings: z.array(z.string()),
+  })
+  .strict();
 
 export const PluginToUISchema = z.discriminatedUnion("type", [
   z
@@ -49,6 +65,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       counts: CountsSchema,
       warnings: z.array(z.string()),
       fontSelections: z.array(FontSelectionSchema),
+      designSystem: DesignSystemReportSchema.optional(),
     })
     .strict(),
   z

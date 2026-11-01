@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import phase1Sample from "../src/samples/sample-design.json";
 import storefront from "../src/samples/phase-2-storefront.json";
+import phase3Sample from "../src/samples/phase-3-design-system.json";
 import {
   mapLayoutSpec,
   mapSizingMode,
@@ -24,16 +25,26 @@ interface MockNode {
   children: MockNode[];
   parent: MockNode | null;
   removed: boolean;
+  pluginData: Map<string, string>;
   resize(width: number, height: number): void;
   appendChild(node: MockNode): void;
   remove(): void;
   createInstance(): MockNode;
+  getPluginData(key: string): string;
+  setPluginData(key: string, value: string): void;
+  setFillStyleIdAsync(id: string): Promise<void>;
+  setRangeFillStyleIdAsync(start: number, end: number, id: string): Promise<void>;
+  setStrokeStyleIdAsync(id: string): Promise<void>;
+  setTextStyleIdAsync(id: string): Promise<void>;
   mainComponent?: MockNode;
 }
 
 function createMockFigma(options: { failLoadFamily?: string } = {}) {
   const roots: MockNode[] = [];
   const allCreated: MockNode[] = [];
+  const paintStyles: PaintStyle[] = [];
+  const textStyles: TextStyle[] = [];
+  let nextStyleId = 1;
   const loadedFonts: FontName[] = [];
   const detach = (node: MockNode) => {
     if (node.parent) {
@@ -69,6 +80,37 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
       children: [],
       parent: null,
       removed: false,
+      pluginData: new Map(),
+      getPluginData(key) {
+        return node.pluginData.get(key) ?? "";
+      },
+      setPluginData(key, value) {
+        node.pluginData.set(key, value);
+      },
+      async setFillStyleIdAsync(id) {
+        Object.assign(node, { fillStyleId: id });
+      },
+      async setRangeFillStyleIdAsync(start, end, id) {
+        Object.assign(node, { rangeFillStyleId: id, rangeFillStart: start, rangeFillEnd: end });
+      },
+      async setStrokeStyleIdAsync(id) {
+        Object.assign(node, { strokeStyleId: id });
+      },
+      async setTextStyleIdAsync(id) {
+        const style = textStyles.find((candidate) => candidate.id === id);
+        Object.assign(node, {
+          textStyleId: id,
+          ...(style?.type === "TEXT"
+            ? {
+                fontName: style.fontName,
+                fontSize: style.fontSize,
+                lineHeight: style.lineHeight,
+                letterSpacing: style.letterSpacing,
+                textDecoration: style.textDecoration,
+              }
+            : {}),
+        });
+      },
       resize(width, height) {
         node.width = width;
         node.height = height;
@@ -103,6 +145,39 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
     ]);
   const unrelated = makeNode("RECTANGLE");
   unrelated.name = "Unrelated user layer";
+  const createStyle = (type: "PAINT" | "TEXT") => {
+    const plugins = new Map<string, string>();
+    const style = {
+      id: `style:${nextStyleId++}`,
+      type,
+      name: "",
+      getPluginData(key: string) {
+        return plugins.get(key) ?? "";
+      },
+      setPluginData(key: string, value: string) {
+        plugins.set(key, value);
+      },
+      remove() {
+        if (type === "PAINT") {
+          const index = paintStyles.indexOf(style as unknown as PaintStyle);
+          if (index >= 0) paintStyles.splice(index, 1);
+        } else {
+          const index = textStyles.indexOf(style as unknown as TextStyle);
+          if (index >= 0) textStyles.splice(index, 1);
+        }
+      },
+      ...(type === "PAINT"
+        ? { paints: [] as readonly Paint[] }
+        : {
+            fontName: { family: "Inter", style: "Regular" },
+            fontSize: 12,
+            lineHeight: { unit: "AUTO" },
+            letterSpacing: { unit: "PIXELS", value: 0 },
+            textDecoration: "NONE",
+          }),
+    } as unknown as PaintStyle | TextStyle;
+    return style;
+  };
   const raw = {
     createFrame: vi.fn(() => makeNode("FRAME")),
     createText: vi.fn(() => {
@@ -120,6 +195,10 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
       node.type = "COMPONENT";
       return node;
     }),
+    createPaintStyle: vi.fn(() => createStyle("PAINT") as PaintStyle),
+    createTextStyle: vi.fn(() => createStyle("TEXT") as TextStyle),
+    getLocalPaintStylesAsync: vi.fn(async () => paintStyles),
+    getLocalTextStylesAsync: vi.fn(async () => textStyles),
     listAvailableFontsAsync: vi.fn(async () =>
       ["Regular", "Bold"].flatMap((style) => [
         { fontName: { family: "Inter", style } },
@@ -139,6 +218,7 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
       center: { x: 500, y: 500 },
       scrollAndZoomIntoView: vi.fn(),
     },
+    variables: { createVariableCollection: vi.fn() },
   };
   return {
     api: raw as unknown as RendererFigmaApi,
@@ -146,6 +226,8 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
     roots,
     allCreated,
     loadedFonts,
+    paintStyles,
+    textStyles,
     unrelated,
     find: (name: string) => walk(roots, (node) => node.name === name)[0],
   };
@@ -451,5 +533,96 @@ describe("renderDesign", () => {
     expect(firstFrame.removed).toBe(false);
     expect(secondFrame.removed).toBe(false);
     expect(mock.roots).toContain(mock.unrelated);
+  });
+
+  it("creates native style bindings, owned reusable masters, and linked Persian preview instances", async () => {
+    const result = await renderDesign(mock.api, phase3Sample);
+    const components = mock.allCreated.filter((node) => node.type === "COMPONENT");
+    const wrapper = mock.raw.currentPage.selection[0] as unknown as MockNode;
+    const primary = components.find((node) => node.name.includes("button.primary"))!;
+    const productCard = components.find((node) => node.name.includes("product-card.basic"))!;
+    const buttonInstance = mock.find("Purchase Action")!;
+    const cardInstance = mock.find("Persian Product Card Preview")!;
+    expect(components).toHaveLength(4);
+    expect(buttonInstance.type).toBe("INSTANCE");
+    expect(buttonInstance.mainComponent).toBe(primary);
+    expect(cardInstance.type).toBe("INSTANCE");
+    expect(cardInstance.mainComponent).toBe(productCard);
+    expect(mock.paintStyles).toHaveLength(11);
+    expect(mock.textStyles).toHaveLength(4);
+    expect(mock.find("Preview Heading")).toMatchObject({
+      characters: "محصولات منتخب",
+      textStyleId: expect.any(String),
+      rangeFillStyleId: expect.any(String),
+      rangeFillStart: 0,
+      rangeFillEnd: "محصولات منتخب".length,
+      textAlignHorizontal: "RIGHT",
+    });
+    expect(result.designSystem).toMatchObject({
+      namespace: "apparel-core",
+      created: expect.arrayContaining(["component:button.primary", "style:color.brand.deepNavy"]),
+      fallbacks: expect.arrayContaining([
+        expect.stringContaining("Resolved numeric values"),
+        expect.stringContaining("Starter variable creation has not been verified"),
+      ]),
+    });
+    expect(wrapper.type).toBe("FRAME");
+    expect(mock.raw.currentPage.selection).toEqual([wrapper]);
+  });
+
+  it("reuses owned design-system styles and masters on repeated imports", async () => {
+    const first = await renderDesign(mock.api, phase3Sample);
+    const createdMasters = mock.allCreated.filter((node) => node.type === "COMPONENT");
+    const second = await renderDesign(mock.api, phase3Sample);
+    expect(mock.raw.createComponentFromNode).toHaveBeenCalledTimes(4);
+    expect(mock.allCreated.filter((node) => node.type === "COMPONENT")).toHaveLength(4);
+    expect(mock.paintStyles).toHaveLength(11);
+    expect(mock.textStyles).toHaveLength(4);
+    expect(second.designSystem?.reused).toHaveLength(19);
+    expect(second.designSystem?.created).toEqual([]);
+    expect(first.frameName).not.toBe(second.frameName);
+    expect(createdMasters.every((node) => !node.removed)).toBe(true);
+  });
+
+  it("keeps explicit text overrides and binds token colors after native Text Styles", async () => {
+    const design = structuredClone(phase3Sample) as unknown as DesignSpec;
+    const heading = design.document.children.find(
+      (child) => child.type === "text" && child.name === "Preview Heading",
+    );
+    expect(heading?.type).toBe("text");
+    if (heading?.type === "text") {
+      heading.fontSize = 19;
+      heading.lineHeight = 27;
+      heading.textDecoration = "underline";
+      heading.fontFamily = "Unavailable Font";
+      heading.fontStyle = "Regular";
+    }
+
+    await renderDesign(mock.api, design);
+
+    const renderedHeading = mock.find("Preview Heading")!;
+    expect(renderedHeading).toMatchObject({
+      textStyleId: expect.any(String),
+      fontName: { family: "Inter", style: "Regular" },
+      fontSize: 19,
+      lineHeight: { unit: "PIXELS", value: 27 },
+      textDecoration: "UNDERLINE",
+      rangeFillStyleId: expect.any(String),
+      rangeFillStart: 0,
+      rangeFillEnd: "محصولات منتخب".length,
+    });
+  });
+
+  it("rolls back styles and newly created nodes if design-system rendering fails", async () => {
+    mock.raw.createText.mockImplementation(() => {
+      throw new Error("Text layer creation failed");
+    });
+    await expect(renderDesign(mock.api, phase3Sample)).rejects.toThrow(
+      /Text layer creation failed/,
+    );
+    expect(mock.roots).toEqual([mock.unrelated]);
+    expect(mock.paintStyles).toEqual([]);
+    expect(mock.textStyles).toEqual([]);
+    expect(mock.unrelated.removed).toBe(false);
   });
 });

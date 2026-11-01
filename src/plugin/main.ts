@@ -49,8 +49,30 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     return;
   }
 
+  if (message.data.type === "generate" && parsed.data.designSystem) {
+    send({
+      type: "render-error",
+      requestId: message.data.requestId,
+      message:
+        "This JSON contains a design system. Use the explicit Create / Update Design System action.",
+    });
+    return;
+  }
+  if (message.data.type === "apply-design-system" && !parsed.data.designSystem) {
+    send({
+      type: "render-error",
+      requestId: message.data.requestId,
+      message: "No designSystem section was found in this JSON.",
+    });
+    return;
+  }
+
   try {
-    const result = await renderDesign(figma, parsed.data);
+    const result = await renderDesign(
+      figma,
+      parsed.data,
+      message.data.type === "apply-design-system" ? { updateOwned: message.data.updateOwned } : {},
+    );
     send({
       type: "render-result",
       requestId: message.data.requestId,
@@ -59,6 +81,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       counts: result.counts,
       warnings: result.warnings,
       fontSelections: result.fontSelections,
+      designSystem: result.designSystem,
     });
   } catch (error) {
     send({

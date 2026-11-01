@@ -1,4 +1,12 @@
 import { z } from "zod";
+import {
+  DesignSystemTokensSchema,
+  TokenColorValueSchema,
+  TokenReferenceSchema,
+  isTokenReference,
+  type DesignSystemTokens,
+  type TokenReference,
+} from "./design-system-schema";
 
 export const DESIGN_SCHEMA_VERSION = "1.0.0";
 export const MAX_JSON_LENGTH = 1_000_000;
@@ -11,8 +19,13 @@ export type AxisSizing = { width: SizingMode; height: SizingMode };
 
 export interface LayoutSpec {
   mode: "horizontal" | "vertical";
-  gap?: number;
-  padding?: { top?: number; right?: number; bottom?: number; left?: number };
+  gap?: number | TokenReference;
+  padding?: {
+    top?: number | TokenReference;
+    right?: number | TokenReference;
+    bottom?: number | TokenReference;
+    left?: number | TokenReference;
+  };
   primaryAxisAlign?: "start" | "center" | "end" | "space-between";
   counterAxisAlign?: "start" | "center" | "end" | "baseline" | "stretch";
 }
@@ -21,13 +34,16 @@ export interface TextNodeSpec {
   type: "text";
   name: string;
   text: string;
-  fontSize: number;
-  color: string;
+  fontSize?: number | TokenReference;
+  color: string | TokenReference;
+  textStyle?: TokenReference;
   x?: number;
   y?: number;
   fontFamily?: string;
   fontStyle?: string;
-  lineHeight?: number;
+  lineHeight?: number | TokenReference;
+  letterSpacing?: number | TokenReference;
+  textDecoration?: "none" | "underline" | "strikethrough";
   textAlign?: "left" | "center" | "right" | "justified";
   textAutoResize?: "width-and-height" | "height" | "truncate";
   width?: number;
@@ -42,9 +58,9 @@ export interface RectangleNodeSpec {
   y?: number;
   width: number;
   height: number;
-  fill: string;
-  stroke?: { color: string; width?: number };
-  cornerRadius?: number;
+  fill: string | TokenReference;
+  stroke?: { color: string | TokenReference; width?: number | TokenReference } | TokenReference;
+  cornerRadius?: number | TokenReference;
   cornerRadii?: { topLeft: number; topRight: number; bottomRight: number; bottomLeft: number };
   sizing?: AxisSizing;
 }
@@ -56,9 +72,9 @@ export interface FrameNodeSpec {
   y?: number;
   width: number;
   height: number;
-  background?: string;
-  stroke?: { color: string; width?: number };
-  cornerRadius?: number;
+  background?: string | TokenReference;
+  stroke?: { color: string | TokenReference; width?: number | TokenReference } | TokenReference;
+  cornerRadius?: number | TokenReference;
   cornerRadii?: { topLeft: number; topRight: number; bottomRight: number; bottomLeft: number };
   children: DesignNode[];
   layout?: LayoutSpec;
@@ -80,11 +96,13 @@ export interface ComponentDefinitionSpec {
   type: "component";
   id: string;
   name: string;
+  key?: string;
+  variant?: Record<string, string>;
   width: number;
   height: number;
-  background?: string;
-  stroke?: { color: string; width?: number };
-  cornerRadius?: number;
+  background?: string | TokenReference;
+  stroke?: { color: string | TokenReference; width?: number | TokenReference } | TokenReference;
+  cornerRadius?: number | TokenReference;
   cornerRadii?: { topLeft: number; topRight: number; bottomRight: number; bottomLeft: number };
   children: DesignNode[];
   layout?: LayoutSpec;
@@ -95,7 +113,7 @@ export interface DesignDocumentSpec {
   name: string;
   width: number;
   height: number;
-  background: string;
+  background: string | TokenReference;
   children: DesignNode[];
   layout?: LayoutSpec;
   components?: ComponentDefinitionSpec[];
@@ -103,6 +121,7 @@ export interface DesignDocumentSpec {
 
 export interface DesignSpec {
   schemaVersion: typeof DESIGN_SCHEMA_VERSION;
+  designSystem?: DesignSystemTokens & { components?: ComponentDefinitionSpec[] };
   document: DesignDocumentSpec;
 }
 
@@ -110,16 +129,26 @@ const nameSchema = z.string().trim().min(1).max(200);
 const coordinateSchema = z.number().finite().min(-10_000).max(10_000);
 const dimensionSchema = z.number().finite().min(1).max(10_000);
 const radiusSchema = z.number().finite().min(0).max(5_000);
-const colorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/);
+const nodeColorSchema = TokenColorValueSchema;
+const layoutNumberSchema = z.union([z.number().finite().min(0).max(1_000), TokenReferenceSchema]);
+const radiusValueSchema = z.union([radiusSchema, TokenReferenceSchema]);
+const strokeWidthSchema = z.union([z.number().finite().min(0.25).max(100), TokenReferenceSchema]);
+const textSizeSchema = z.union([z.number().finite().min(1).max(512), TokenReferenceSchema]);
+const lineHeightSchema = z.union([z.number().finite().min(1).max(1_000), TokenReferenceSchema]);
+const letterSpacingSchema = z.union([
+  z.number().finite().min(-1_000).max(1_000),
+  TokenReferenceSchema,
+]);
 const sizingSchema = z
   .object({
     width: z.enum(["fixed", "hug", "fill"]),
     height: z.enum(["fixed", "hug", "fill"]),
   })
   .strict();
-const strokeSchema = z
-  .object({ color: colorSchema, width: z.number().finite().min(0.25).max(100).optional() })
-  .strict();
+const strokeSchema = z.union([
+  z.object({ color: nodeColorSchema, width: strokeWidthSchema.optional() }).strict(),
+  TokenReferenceSchema,
+]);
 const cornerRadiiSchema = z
   .object({
     topLeft: radiusSchema,
@@ -132,13 +161,13 @@ const cornerRadiiSchema = z
 export const LayoutSchema: z.ZodType<LayoutSpec> = z
   .object({
     mode: z.enum(["horizontal", "vertical"]),
-    gap: z.number().finite().min(0).max(1_000).optional(),
+    gap: layoutNumberSchema.optional(),
     padding: z
       .object({
-        top: z.number().finite().min(0).max(1_000).optional(),
-        right: z.number().finite().min(0).max(1_000).optional(),
-        bottom: z.number().finite().min(0).max(1_000).optional(),
-        left: z.number().finite().min(0).max(1_000).optional(),
+        top: layoutNumberSchema.optional(),
+        right: layoutNumberSchema.optional(),
+        bottom: layoutNumberSchema.optional(),
+        left: layoutNumberSchema.optional(),
       })
       .strict()
       .optional(),
@@ -154,18 +183,30 @@ const TextNodeSchema = z
     text: z.string().max(5_000),
     x: coordinateSchema.optional(),
     y: coordinateSchema.optional(),
-    fontSize: z.number().finite().min(1).max(512),
-    color: colorSchema,
+    fontSize: textSizeSchema.optional(),
+    color: nodeColorSchema,
+    textStyle: TokenReferenceSchema.optional(),
     fontFamily: z.string().trim().min(1).max(100).optional(),
     fontStyle: z.string().trim().min(1).max(100).optional(),
-    lineHeight: z.number().finite().min(1).max(1_000).optional(),
+    lineHeight: lineHeightSchema.optional(),
+    letterSpacing: letterSpacingSchema.optional(),
+    textDecoration: z.enum(["none", "underline", "strikethrough"]).optional(),
     textAlign: z.enum(["left", "center", "right", "justified"]).optional(),
     textAutoResize: z.enum(["width-and-height", "height", "truncate"]).optional(),
     width: dimensionSchema.optional(),
     height: dimensionSchema.optional(),
     sizing: sizingSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((node, context) => {
+    if (node.fontSize === undefined && node.textStyle === undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "fontSize is required unless textStyle references a typography token.",
+        path: ["fontSize"],
+      });
+    }
+  });
 
 const RectangleNodeSchema = z
   .object({
@@ -175,9 +216,9 @@ const RectangleNodeSchema = z
     y: coordinateSchema.optional(),
     width: dimensionSchema,
     height: dimensionSchema,
-    fill: colorSchema,
+    fill: nodeColorSchema,
     stroke: strokeSchema.optional(),
-    cornerRadius: radiusSchema.optional(),
+    cornerRadius: radiusValueSchema.optional(),
     cornerRadii: cornerRadiiSchema.optional(),
     sizing: sizingSchema.optional(),
   })
@@ -212,9 +253,9 @@ const FrameNodeSchema = z
     y: coordinateSchema.optional(),
     width: dimensionSchema,
     height: dimensionSchema,
-    background: colorSchema.optional(),
+    background: nodeColorSchema.optional(),
     stroke: strokeSchema.optional(),
-    cornerRadius: radiusSchema.optional(),
+    cornerRadius: radiusValueSchema.optional(),
     cornerRadii: cornerRadiiSchema.optional(),
     children: z.array(DesignNodeSchema).max(250),
     layout: LayoutSchema.optional(),
@@ -227,11 +268,18 @@ const ComponentDefinitionSchema: z.ZodType<ComponentDefinitionSpec> = z
     type: z.literal("component"),
     id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,99}$/),
     name: nameSchema,
+    key: z
+      .string()
+      .regex(/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,99}$/)
+      .optional(),
+    variant: z
+      .record(z.string().trim().min(1).max(100), z.string().trim().min(1).max(100))
+      .optional(),
     width: dimensionSchema,
     height: dimensionSchema,
-    background: colorSchema.optional(),
+    background: nodeColorSchema.optional(),
     stroke: strokeSchema.optional(),
-    cornerRadius: radiusSchema.optional(),
+    cornerRadius: radiusValueSchema.optional(),
     cornerRadii: cornerRadiiSchema.optional(),
     children: z.array(DesignNodeSchema).max(250),
     layout: LayoutSchema.optional(),
@@ -239,15 +287,20 @@ const ComponentDefinitionSchema: z.ZodType<ComponentDefinitionSpec> = z
   })
   .strict();
 
+const DesignSystemSchema = DesignSystemTokensSchema.extend({
+  components: z.array(ComponentDefinitionSchema).max(MAX_COMPONENT_COUNT).optional(),
+});
+
 export const DesignSchema: z.ZodType<DesignSpec> = z
   .object({
     schemaVersion: z.literal(DESIGN_SCHEMA_VERSION),
+    designSystem: DesignSystemSchema.optional(),
     document: z
       .object({
         name: nameSchema,
         width: dimensionSchema,
         height: dimensionSchema,
-        background: colorSchema,
+        background: nodeColorSchema,
         children: z.array(DesignNodeSchema).max(250),
         layout: LayoutSchema.optional(),
         components: z.array(ComponentDefinitionSchema).max(MAX_COMPONENT_COUNT).optional(),
@@ -328,6 +381,218 @@ function componentDependencies(component: ComponentDefinitionSpec): string[] {
   return refs;
 }
 
+type TokenCategory = "color" | "typography" | "spacing" | "radius" | "border";
+
+function expectedTokenCategory(key: string): TokenCategory | undefined {
+  const prefix = key.split(".")[0];
+  if (prefix === "color") return "color";
+  if (prefix === "typography") return "typography";
+  if (prefix === "spacing") return "spacing";
+  if (prefix === "radius") return "radius";
+  if (prefix === "border") return "border";
+  return undefined;
+}
+
+function validateDesignSystemReferences(spec: DesignSpec): string[] {
+  const system = spec.designSystem;
+  if (!system) return [];
+
+  const errors: string[] = [];
+  const categories = new Map<string, TokenCategory>();
+  const numericTokenValues = new Map<string, number | TokenReference>();
+  const addTokens = (entries: Record<string, unknown>, category: TokenCategory, path: string) => {
+    for (const key of Object.keys(entries)) {
+      if (expectedTokenCategory(key) !== category) {
+        errors.push(`${path}.${key} must use the “${category}.” token prefix.`);
+      }
+      if (categories.has(key)) {
+        errors.push(`Design system token “${key}” is declared more than once.`);
+      } else {
+        categories.set(key, category);
+      }
+    }
+  };
+
+  addTokens(system.colors, "color", "designSystem.colors");
+  addTokens(system.typography, "typography", "designSystem.typography");
+  addTokens(system.spacing?.aliases ?? {}, "spacing", "designSystem.spacing.aliases");
+  for (const [key, value] of Object.entries(system.spacing?.aliases ?? {})) {
+    numericTokenValues.set(key, value);
+  }
+  system.spacing?.scale.forEach((value, index) => {
+    const key = `spacing.scale.${index}`;
+    if (categories.has(key))
+      errors.push(`Design system token “${key}” is declared more than once.`);
+    else categories.set(key, "spacing");
+    numericTokenValues.set(key, value);
+  });
+  addTokens(system.radii?.aliases ?? {}, "radius", "designSystem.radii.aliases");
+  for (const [key, value] of Object.entries(system.radii?.aliases ?? {})) {
+    numericTokenValues.set(key, value);
+  }
+  system.radii?.scale.forEach((value, index) => {
+    const key = `radius.scale.${index}`;
+    if (categories.has(key))
+      errors.push(`Design system token “${key}” is declared more than once.`);
+    else categories.set(key, "radius");
+    numericTokenValues.set(key, value);
+  });
+  addTokens(system.borders, "border", "designSystem.borders");
+
+  const checkReference = (value: unknown, expected: TokenCategory, path: string) => {
+    if (!isTokenReference(value)) return;
+    const actual = categories.get(value.token);
+    if (!actual) {
+      errors.push(`${path} references missing token “${value.token}”.`);
+    } else if (actual !== expected) {
+      errors.push(
+        `${path} expects a ${expected} token, but “${value.token}” is a ${actual} token.`,
+      );
+    }
+  };
+
+  const resolveNumericToken = (
+    key: string,
+    category: "spacing" | "radius",
+    trail: string[] = [],
+  ): number | undefined => {
+    if (trail.includes(key)) return undefined;
+    const value = numericTokenValues.get(key);
+    if (typeof value === "number") return value;
+    if (!value || !isTokenReference(value) || expectedTokenCategory(value.token) !== category) {
+      return undefined;
+    }
+    return resolveNumericToken(value.token, category, [...trail, key]);
+  };
+  const checkNumericRange = (
+    value: unknown,
+    category: "spacing" | "radius",
+    min: number,
+    max: number,
+    path: string,
+  ) => {
+    if (!isTokenReference(value)) return;
+    const resolved = resolveNumericToken(value.token, category);
+    if (resolved !== undefined && (resolved < min || resolved > max)) {
+      errors.push(
+        `${path} token “${value.token}” resolves to ${resolved}, outside the supported range ${min}–${max}.`,
+      );
+    }
+  };
+
+  const aliases = new Map<string, string>();
+  for (const [key, value] of Object.entries(system.colors)) {
+    if (isTokenReference(value)) aliases.set(key, value.token);
+    checkReference(value, "color", `designSystem.colors.${key}`);
+  }
+  for (const [key, value] of Object.entries(system.spacing?.aliases ?? {})) {
+    if (isTokenReference(value)) aliases.set(key, value.token);
+    checkReference(value, "spacing", `designSystem.spacing.aliases.${key}`);
+  }
+  for (const [key, value] of Object.entries(system.radii?.aliases ?? {})) {
+    if (isTokenReference(value)) aliases.set(key, value.token);
+    checkReference(value, "radius", `designSystem.radii.aliases.${key}`);
+  }
+  for (const [key, style] of Object.entries(system.typography)) {
+    const path = `designSystem.typography.${key}`;
+    checkReference(style.fontSize, "spacing", `${path}.fontSize`);
+    checkNumericRange(style.fontSize, "spacing", 1, 512, `${path}.fontSize`);
+    checkReference(style.lineHeight, "spacing", `${path}.lineHeight`);
+    checkNumericRange(style.lineHeight, "spacing", 1, 1_000, `${path}.lineHeight`);
+    checkReference(style.letterSpacing, "spacing", `${path}.letterSpacing`);
+    checkNumericRange(style.letterSpacing, "spacing", -1_000, 1_000, `${path}.letterSpacing`);
+  }
+  for (const [key, border] of Object.entries(system.borders)) {
+    checkReference(border.color, "color", `designSystem.borders.${key}.color`);
+    checkReference(border.width, "spacing", `designSystem.borders.${key}.width`);
+    checkNumericRange(border.width, "spacing", 0.25, 100, `designSystem.borders.${key}.width`);
+  }
+
+  const state = new Map<string, "visiting" | "visited">();
+  const visitAlias = (key: string, trail: string[]) => {
+    if (state.get(key) === "visited") return;
+    if (state.get(key) === "visiting") {
+      errors.push(`Token alias cycle detected: ${[...trail, key].join(" → ")}.`);
+      return;
+    }
+    state.set(key, "visiting");
+    const target = aliases.get(key);
+    if (target && aliases.has(target)) visitAlias(target, [...trail, key]);
+    state.set(key, "visited");
+  };
+  for (const key of aliases.keys()) visitAlias(key, []);
+
+  const checkColor = (value: unknown, path: string) => checkReference(value, "color", path);
+  const checkNumber = (value: unknown, category: "spacing" | "radius", path: string) =>
+    checkReference(value, category, path);
+  const checkStroke = (value: unknown, path: string) => {
+    if (isTokenReference(value)) {
+      checkReference(value, "border", path);
+    } else if (typeof value === "object" && value !== null) {
+      const stroke = value as { color?: unknown; width?: unknown };
+      checkColor(stroke.color, `${path}.color`);
+      checkNumber(stroke.width, "spacing", `${path}.width`);
+      checkNumericRange(stroke.width, "spacing", 0.25, 100, `${path}.width`);
+    }
+  };
+  const checkLayoutRefs = (layout: LayoutSpec | undefined, path: string) => {
+    if (!layout) return;
+    checkNumber(layout.gap, "spacing", `${path}.gap`);
+    for (const [side, value] of Object.entries(layout.padding ?? {})) {
+      checkNumber(value, "spacing", `${path}.padding.${side}`);
+    }
+  };
+  const checkNodes = (nodes: DesignNode[], path: string) => {
+    nodes.forEach((node, index) => {
+      const nodePath = `${path}[${index}]`;
+      if (node.type === "text") {
+        checkColor(node.color, `${nodePath}.color`);
+        checkNumber(node.fontSize, "spacing", `${nodePath}.fontSize`);
+        checkNumericRange(node.fontSize, "spacing", 1, 512, `${nodePath}.fontSize`);
+        checkNumber(node.lineHeight, "spacing", `${nodePath}.lineHeight`);
+        checkNumericRange(node.lineHeight, "spacing", 1, 1_000, `${nodePath}.lineHeight`);
+        checkNumber(node.letterSpacing, "spacing", `${nodePath}.letterSpacing`);
+        checkReference(node.textStyle, "typography", `${nodePath}.textStyle`);
+      } else if (node.type === "rectangle") {
+        checkColor(node.fill, `${nodePath}.fill`);
+        checkStroke(node.stroke, `${nodePath}.stroke`);
+        checkNumber(node.cornerRadius, "radius", `${nodePath}.cornerRadius`);
+        checkNumericRange(node.cornerRadius, "radius", 0, 5_000, `${nodePath}.cornerRadius`);
+      } else if (node.type === "frame") {
+        checkColor(node.background, `${nodePath}.background`);
+        checkStroke(node.stroke, `${nodePath}.stroke`);
+        checkNumber(node.cornerRadius, "radius", `${nodePath}.cornerRadius`);
+        checkNumericRange(node.cornerRadius, "radius", 0, 5_000, `${nodePath}.cornerRadius`);
+        checkLayoutRefs(node.layout, `${nodePath}.layout`);
+        checkNodes(node.children, `${nodePath}.children`);
+      }
+    });
+  };
+
+  checkColor(spec.document.background, "document.background");
+  checkLayoutRefs(spec.document.layout, "document.layout");
+  checkNodes(spec.document.children, "document.children");
+  for (const [index, component] of [
+    ...(spec.document.components ?? []),
+    ...(system.components ?? []),
+  ].entries()) {
+    checkColor(component.background, `components[${index}].background`);
+    checkStroke(component.stroke, `components[${index}].stroke`);
+    checkNumber(component.cornerRadius, "radius", `components[${index}].cornerRadius`);
+    checkNumericRange(
+      component.cornerRadius,
+      "radius",
+      0,
+      5_000,
+      `components[${index}].cornerRadius`,
+    );
+    checkLayoutRefs(component.layout, `components[${index}].layout`);
+    checkNodes(component.children, `components[${index}].children`);
+  }
+
+  return [...new Set(errors)].slice(0, 100);
+}
+
 export function orderComponentDefinitions(
   components: ComponentDefinitionSpec[],
 ): ComponentDefinitionSpec[] {
@@ -348,7 +613,10 @@ export function orderComponentDefinitions(
 
 function validateSemantics(spec: DesignSpec): string[] {
   const errors: string[] = [];
-  const components = spec.document.components ?? [];
+  const components = [
+    ...(spec.document.components ?? []),
+    ...(spec.designSystem?.components ?? []),
+  ];
   const componentById = new Map(components.map((component) => [component.id, component]));
   const ids = new Set<string>();
   let nodeCount = 1;
@@ -460,7 +728,11 @@ function validateSemantics(spec: DesignSpec): string[] {
   for (let index = 0; index < components.length; index++) {
     const component = components[index];
     nodeCount++;
-    const path = `document.components[${index}]`;
+    const legacyComponentCount = spec.document.components?.length ?? 0;
+    const path =
+      index < legacyComponentCount
+        ? `document.components[${index}]`
+        : `designSystem.components[${index - legacyComponentCount}]`;
     if (ids.has(component.id)) errors.push(`${path}.id “${component.id}” is duplicated.`);
     ids.add(component.id);
     checkLayout(component.layout, `${path}.layout`);
@@ -486,6 +758,17 @@ function validateSemantics(spec: DesignSpec): string[] {
       1,
       `${path}.children`,
     );
+  }
+
+  const componentKeys = new Set<string>();
+  for (const [index, component] of (spec.designSystem?.components ?? []).entries()) {
+    if (!component.key) {
+      errors.push(`designSystem.components[${index}].key is required for stable ownership.`);
+    } else if (componentKeys.has(component.key)) {
+      errors.push(`Design system component key “${component.key}” is duplicated.`);
+    } else {
+      componentKeys.add(component.key);
+    }
   }
 
   const refs: string[] = [];
@@ -516,6 +799,7 @@ function validateSemantics(spec: DesignSpec): string[] {
       `The design contains ${nodeCount} nodes; Phase 2 allows at most ${MAX_NODE_COUNT}.`,
     );
   }
+  errors.push(...validateDesignSystemReferences(spec));
   return [...new Set(errors)].slice(0, 100);
 }
 
@@ -533,7 +817,10 @@ export function countDesignNodes(spec: DesignSpec): DesignCounts {
     }
   };
   visit(spec.document.children);
-  for (const component of spec.document.components ?? []) {
+  for (const component of [
+    ...(spec.document.components ?? []),
+    ...(spec.designSystem?.components ?? []),
+  ]) {
     counts.components++;
     visit(component.children);
   }
@@ -558,7 +845,15 @@ function checkRawTreeLimits(value: unknown): string[] {
   if (typeof document !== "object" || document === null || Array.isArray(document)) return [];
   const record = document as Record<string, unknown>;
   const stack: Array<{ node: unknown; depth: number; path: string }> = [];
-  const components = Array.isArray(record.components) ? record.components : [];
+  const rawDesignSystem = (value as Record<string, unknown>).designSystem;
+  const systemComponents =
+    typeof rawDesignSystem === "object" && rawDesignSystem !== null
+      ? (rawDesignSystem as Record<string, unknown>).components
+      : undefined;
+  const components = [
+    ...(Array.isArray(record.components) ? record.components : []),
+    ...(Array.isArray(systemComponents) ? systemComponents : []),
+  ];
   let count = 1;
   const seen = new WeakSet<object>();
   const errors: string[] = [];
@@ -575,7 +870,11 @@ function checkRawTreeLimits(value: unknown): string[] {
     count++;
     if (typeof component === "object" && component !== null && !Array.isArray(component)) {
       const componentRecord = component as Record<string, unknown>;
-      addChildren(componentRecord.children, 1, `document.components[${index}].children`);
+      const source =
+        index < (Array.isArray(record.components) ? record.components.length : 0)
+          ? "document.components"
+          : "designSystem.components";
+      addChildren(componentRecord.children, 1, `${source}[${index}].children`);
     }
   }
 
@@ -621,5 +920,95 @@ export function parseDesignText(source: string): DesignParseResult {
     const message = error instanceof Error ? error.message : "The JSON could not be parsed.";
     return { success: false, errors: [`Invalid JSON syntax: ${message}`] };
   }
+  const duplicateKeyErrors = findDuplicateJsonKeys(source);
+  if (duplicateKeyErrors.length) return { success: false, errors: duplicateKeyErrors };
   return parseDesignValue(value);
+}
+
+function findDuplicateJsonKeys(source: string): string[] {
+  let cursor = 0;
+  const errors: string[] = [];
+  const skipWhitespace = () => {
+    while (/\s/.test(source[cursor] ?? "")) cursor++;
+  };
+  const readString = (): string => {
+    const start = cursor;
+    cursor++;
+    while (cursor < source.length) {
+      if (source[cursor] === "\\") {
+        cursor += 2;
+      } else if (source[cursor] === '"') {
+        cursor++;
+        break;
+      } else {
+        cursor++;
+      }
+    }
+    return JSON.parse(source.slice(start, cursor)) as string;
+  };
+  const parseValue = (path: string): void => {
+    skipWhitespace();
+    const next = source[cursor];
+    if (next === "{") {
+      cursor++;
+      skipWhitespace();
+      const keys = new Set<string>();
+      if (source[cursor] === "}") {
+        cursor++;
+        return;
+      }
+      while (cursor < source.length) {
+        skipWhitespace();
+        const key = readString();
+        const keyPath = path ? `${path}.${key}` : key;
+        if (keys.has(key)) errors.push(`Duplicate JSON key at “${keyPath}”.`);
+        else keys.add(key);
+        skipWhitespace();
+        cursor++;
+        parseValue(keyPath);
+        skipWhitespace();
+        if (source[cursor] === "}") {
+          cursor++;
+          break;
+        }
+        cursor++;
+      }
+      return;
+    }
+    if (next === "[") {
+      cursor++;
+      skipWhitespace();
+      if (source[cursor] === "]") {
+        cursor++;
+        return;
+      }
+      let index = 0;
+      while (cursor < source.length) {
+        parseValue(`${path}[${index++}]`);
+        skipWhitespace();
+        if (source[cursor] === "]") {
+          cursor++;
+          break;
+        }
+        cursor++;
+      }
+      return;
+    }
+    if (next === '"') {
+      readString();
+      return;
+    }
+    while (
+      cursor < source.length &&
+      source[cursor] !== "," &&
+      source[cursor] !== "]" &&
+      source[cursor] !== "}" &&
+      !/\s/.test(source[cursor])
+    ) {
+      cursor++;
+    }
+  };
+
+  parseValue("");
+  return [...new Set(errors)].slice(0, 100);
 }

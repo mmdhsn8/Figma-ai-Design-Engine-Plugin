@@ -9,6 +9,21 @@ describe("plugin message contract", () => {
     expect(
       UIToPluginSchema.safeParse({ type: "generate", requestId: "r2", json: "{}" }).success,
     ).toBe(true);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "apply-design-system",
+        requestId: "r3",
+        json: "{}",
+      }).success,
+    ).toBe(true);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "apply-design-system",
+        requestId: "r4",
+        json: "{}",
+        updateOwned: true,
+      }).success,
+    ).toBe(true);
   });
 
   it("rejects unknown request types and extra request properties", () => {
@@ -39,6 +54,15 @@ describe("plugin message contract", () => {
             fellBack: false,
           },
         ],
+        designSystem: {
+          namespace: "apparel-core",
+          created: ["style:color.brand.primary"],
+          reused: [],
+          updated: [],
+          skipped: [],
+          fallbacks: [],
+          warnings: [],
+        },
       }).success,
     ).toBe(true);
   });

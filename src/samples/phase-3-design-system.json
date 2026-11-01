@@ -1,0 +1,284 @@
+{
+  "schemaVersion": "1.0.0",
+  "designSystem": {
+    "id": "apparel-core",
+    "namespace": "apparel-core",
+    "name": "Persian Apparel Storefront",
+    "version": "1.0.0",
+    "colors": {
+      "color.brand.deepNavy": "#123B5D",
+      "color.action.primary": "#2563EB",
+      "color.action.highlight": "#38BDF8",
+      "color.surface.pale": "#EFF6FF",
+      "color.page.background": "#F8FAFC",
+      "color.surface.default": "#FFFFFF",
+      "color.text.primary": "#0F172A",
+      "color.text.muted": "#64748B",
+      "color.border.default": "#E2E8F0",
+      "color.status.success": "#16A34A",
+      "color.status.error": "#DC2626"
+    },
+    "typography": {
+      "typography.heading": {
+        "fontFamily": "Arial",
+        "fontStyle": "Bold",
+        "fontSize": 24,
+        "lineHeight": 32,
+        "textAlign": "right"
+      },
+      "typography.body": {
+        "fontFamily": "Arial",
+        "fontStyle": "Regular",
+        "fontSize": 14,
+        "lineHeight": 22,
+        "textAlign": "right"
+      },
+      "typography.price": {
+        "fontFamily": "Arial",
+        "fontStyle": "Bold",
+        "fontSize": 16,
+        "lineHeight": 24,
+        "textAlign": "right"
+      },
+      "typography.button": {
+        "fontFamily": "Arial",
+        "fontStyle": "Bold",
+        "fontSize": 14,
+        "lineHeight": 20,
+        "textAlign": "center"
+      }
+    },
+    "spacing": {
+      "scale": [4, 8, 12, 16, 24, 32],
+      "aliases": {
+        "spacing.xs": { "token": "spacing.scale.0" },
+        "spacing.sm": { "token": "spacing.scale.1" },
+        "spacing.md": { "token": "spacing.scale.2" },
+        "spacing.lg": { "token": "spacing.scale.3" },
+        "spacing.xl": { "token": "spacing.scale.4" },
+        "spacing.cardPadding": { "token": "spacing.scale.4" }
+      }
+    },
+    "radii": {
+      "scale": [4, 8, 12, 16],
+      "aliases": {
+        "radius.control": { "token": "radius.scale.1" },
+        "radius.card": { "token": "radius.scale.2" }
+      }
+    },
+    "borders": {
+      "border.default": {
+        "width": 1,
+        "color": { "token": "color.border.default" }
+      },
+      "border.error": {
+        "width": 1,
+        "color": { "token": "color.status.error" }
+      }
+    },
+    "components": [
+      {
+        "type": "component",
+        "id": "button.primary",
+        "key": "button.primary",
+        "variant": { "state": "primary" },
+        "name": "Button — Primary",
+        "width": 184,
+        "height": 44,
+        "background": { "token": "color.action.primary" },
+        "cornerRadius": { "token": "radius.control" },
+        "layout": {
+          "mode": "horizontal",
+          "padding": {
+            "top": { "token": "spacing.sm" },
+            "right": { "token": "spacing.lg" },
+            "bottom": { "token": "spacing.sm" },
+            "left": { "token": "spacing.lg" }
+          },
+          "primaryAxisAlign": "center",
+          "counterAxisAlign": "center"
+        },
+        "children": [
+          {
+            "type": "text",
+            "name": "Button Label",
+            "text": "افزودن به سبد خرید",
+            "textStyle": { "token": "typography.button" },
+            "color": "#FFFFFF"
+          }
+        ]
+      },
+      {
+        "type": "component",
+        "id": "button.secondary",
+        "key": "button.secondary",
+        "variant": { "state": "secondary" },
+        "name": "Button — Secondary",
+        "width": 184,
+        "height": 44,
+        "background": { "token": "color.surface.pale" },
+        "stroke": { "token": "border.default" },
+        "cornerRadius": { "token": "radius.control" },
+        "layout": {
+          "mode": "horizontal",
+          "padding": {
+            "top": { "token": "spacing.sm" },
+            "right": { "token": "spacing.lg" },
+            "bottom": { "token": "spacing.sm" },
+            "left": { "token": "spacing.lg" }
+          },
+          "primaryAxisAlign": "center",
+          "counterAxisAlign": "center"
+        },
+        "children": [
+          {
+            "type": "text",
+            "name": "Button Label",
+            "text": "مشاهده جزئیات",
+            "textStyle": { "token": "typography.button" },
+            "color": { "token": "color.brand.deepNavy" }
+          }
+        ]
+      },
+      {
+        "type": "component",
+        "id": "button.disabled",
+        "key": "button.disabled",
+        "variant": { "state": "disabled" },
+        "name": "Button — Disabled",
+        "width": 184,
+        "height": 44,
+        "background": { "token": "color.border.default" },
+        "cornerRadius": { "token": "radius.control" },
+        "layout": {
+          "mode": "horizontal",
+          "padding": {
+            "top": { "token": "spacing.sm" },
+            "right": { "token": "spacing.lg" },
+            "bottom": { "token": "spacing.sm" },
+            "left": { "token": "spacing.lg" }
+          },
+          "primaryAxisAlign": "center",
+          "counterAxisAlign": "center"
+        },
+        "children": [
+          {
+            "type": "text",
+            "name": "Button Label",
+            "text": "ناموجود",
+            "textStyle": { "token": "typography.button" },
+            "color": { "token": "color.text.muted" }
+          }
+        ]
+      },
+      {
+        "type": "component",
+        "id": "product-card.basic",
+        "key": "product-card.basic",
+        "name": "Product Card",
+        "width": 346,
+        "height": 374,
+        "background": { "token": "color.surface.default" },
+        "stroke": { "token": "border.default" },
+        "cornerRadius": { "token": "radius.card" },
+        "layout": {
+          "mode": "vertical",
+          "gap": { "token": "spacing.md" },
+          "padding": {
+            "top": { "token": "spacing.md" },
+            "right": { "token": "spacing.md" },
+            "bottom": { "token": "spacing.md" },
+            "left": { "token": "spacing.md" }
+          },
+          "primaryAxisAlign": "start",
+          "counterAxisAlign": "stretch"
+        },
+        "children": [
+          {
+            "type": "frame",
+            "name": "Image Placeholder",
+            "width": 314,
+            "height": 196,
+            "background": { "token": "color.action.highlight" },
+            "cornerRadius": { "token": "radius.control" },
+            "layout": {
+              "mode": "horizontal",
+              "primaryAxisAlign": "center",
+              "counterAxisAlign": "center"
+            },
+            "children": [
+              {
+                "type": "text",
+                "name": "Image Placeholder Label",
+                "text": "جایگاه تصویر محصول",
+                "textStyle": { "token": "typography.body" },
+                "color": { "token": "color.brand.deepNavy" },
+                "textAlign": "center"
+              }
+            ]
+          },
+          {
+            "type": "text",
+            "name": "Product Title",
+            "text": "مانتو کتان روزمره",
+            "textStyle": { "token": "typography.body" },
+            "color": { "token": "color.text.primary" }
+          },
+          {
+            "type": "text",
+            "name": "Product Price",
+            "text": "۱٬۲۹۰٬۰۰۰ تومان",
+            "textStyle": { "token": "typography.price" },
+            "color": { "token": "color.status.success" }
+          },
+          {
+            "type": "instance",
+            "componentId": "button.primary",
+            "name": "Purchase Action",
+            "sizing": { "width": "fill", "height": "fixed" }
+          }
+        ]
+      }
+    ]
+  },
+  "document": {
+    "name": "Persian Storefront Preview",
+    "width": 390,
+    "height": 610,
+    "background": { "token": "color.page.background" },
+    "layout": {
+      "mode": "vertical",
+      "gap": { "token": "spacing.md" },
+      "padding": {
+        "top": { "token": "spacing.lg" },
+        "right": { "token": "spacing.lg" },
+        "bottom": { "token": "spacing.lg" },
+        "left": { "token": "spacing.lg" }
+      },
+      "primaryAxisAlign": "start",
+      "counterAxisAlign": "stretch"
+    },
+    "children": [
+      {
+        "type": "text",
+        "name": "Preview Heading",
+        "text": "محصولات منتخب",
+        "textStyle": { "token": "typography.heading" },
+        "color": { "token": "color.brand.deepNavy" }
+      },
+      {
+        "type": "text",
+        "name": "Preview Subtitle",
+        "text": "انتخابی ساده برای استایل هر روز",
+        "textStyle": { "token": "typography.body" },
+        "color": { "token": "color.text.muted" }
+      },
+      {
+        "type": "instance",
+        "componentId": "product-card.basic",
+        "name": "Persian Product Card Preview",
+        "sizing": { "width": "fill", "height": "fixed" }
+      }
+    ]
+  }
+}

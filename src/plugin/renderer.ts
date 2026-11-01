@@ -2,13 +2,7 @@ import type {
   AxisSizing,
   ComponentDefinitionSpec,
   DesignCounts,
-  DesignNode,
-  DesignSpec,
-  FrameNodeSpec,
-  LayoutSpec,
-  RectangleNodeSpec,
   SizingMode,
-  TextNodeSpec,
 } from "../shared/schema";
 import { orderComponentDefinitions, parseDesignValue } from "../shared/schema";
 import type { FontSelection } from "../shared/messages";
@@ -19,6 +13,28 @@ import {
   readTopLevelCanvasObstacles,
 } from "./figma-canvas-adapter";
 import { hexToRgb } from "./figma-utils";
+import {
+  resolveDesignSystemTokens,
+  type ResolvedComponentDefinition,
+  type ResolvedDesignNode,
+  type ResolvedDesignSpec,
+  type ResolvedFrameNodeSpec,
+  type ResolvedLayoutSpec,
+  type ResolvedRectangleNodeSpec,
+  type ResolvedTextNodeSpec,
+} from "./design-system/token-resolver";
+import {
+  createOrReuseNativeStyles,
+  type StyleBindings,
+  type StyleRegistryReport,
+} from "./design-system/style-registry";
+import {
+  COMPONENT_FINGERPRINT_KEY,
+  componentDefinitionFingerprint,
+  markOwnedComponent,
+  readOwnedComponents,
+} from "./design-system/component-registry";
+import { inspectVariableCapability } from "./design-system/variable-adapter";
 
 export type RendererFigmaApi = Pick<
   PluginAPI,
@@ -26,11 +42,16 @@ export type RendererFigmaApi = Pick<
   | "createText"
   | "createRectangle"
   | "createComponentFromNode"
+  | "createPaintStyle"
+  | "createTextStyle"
+  | "getLocalPaintStylesAsync"
+  | "getLocalTextStylesAsync"
   | "listAvailableFontsAsync"
   | "loadFontAsync"
 > & {
   currentPage: Pick<PluginAPI["currentPage"], "children" | "selection" | "findAll">;
   viewport: Pick<PluginAPI["viewport"], "scrollAndZoomIntoView">;
+  variables?: Pick<PluginAPI["variables"], "createVariableCollection">;
 };
 
 export interface RenderResult {
@@ -38,6 +59,15 @@ export interface RenderResult {
   counts: DesignCounts;
   warnings: string[];
   fontSelections: FontSelection[];
+  designSystem?: {
+    namespace: string;
+    created: string[];
+    reused: string[];
+    updated: string[];
+    skipped: string[];
+    fallbacks: string[];
+    warnings: string[];
+  };
 }
 
 export class DesignRenderError extends Error {
@@ -51,6 +81,9 @@ const COMPONENT_AREA_WIDTH = 390;
 const COMPONENT_AREA_GAP = 18;
 const COMPONENT_AREA_VERTICAL_PADDING = 36;
 const COMPONENT_AREA_OFFSET = 56;
+const TYPOGRAPHY_TOKEN_KEY = "fad.design-system.typography-token";
+const TYPOGRAPHY_OVERRIDES_KEY = "fad.design-system.typography-overrides";
+const TEXT_COLOR_KEY = "fad.design-system.text-color";
 
 interface LayoutMapping {
   mode: "HORIZONTAL" | "VERTICAL";
@@ -68,6 +101,7 @@ type LayoutChildNode = TextNode | RectangleNode | FrameNode | InstanceNode | Com
 
 interface FontResolution {
   fonts: Map<string, FontName>;
+  typographyFonts: Map<string, FontName>;
   selections: FontSelection[];
   warnings: string[];
 }
@@ -117,20 +151,28 @@ function fontKey(family: string, style: string): string {
   return `${family}\u0000${style}`;
 }
 
-function collectTextNodes(spec: DesignSpec): TextNodeSpec[] {
-  const texts: TextNodeSpec[] = [];
-  const visit = (nodes: DesignNode[]) => {
+function collectTextNodes(spec: ResolvedDesignSpec): ResolvedTextNodeSpec[] {
+  const texts: ResolvedTextNodeSpec[] = [];
+  const visit = (nodes: ResolvedDesignNode[]) => {
     for (const node of nodes) {
       if (node.type === "text") texts.push(node);
       else if (node.type === "frame") visit(node.children);
     }
   };
   visit(spec.document.children);
-  for (const component of spec.document.components ?? []) visit(component.children);
+  for (const component of [
+    ...(spec.document.components ?? []),
+    ...(spec.designSystem?.components ?? []),
+  ])
+    visit(component.children);
   return texts;
 }
 
-async function resolveFonts(api: RendererFigmaApi, spec: DesignSpec): Promise<FontResolution> {
+async function resolveFonts(
+  api: RendererFigmaApi,
+  spec: ResolvedDesignSpec,
+  typography: ReadonlyMap<string, { fontFamily: string; fontStyle: string }>,
+): Promise<FontResolution> {
   const available = await api.listAvailableFontsAsync();
   const availableByKey = new Map(
     available.map((font) => [fontKey(font.fontName.family, font.fontName.style), font.fontName]),
@@ -141,8 +183,15 @@ async function resolveFonts(api: RendererFigmaApi, spec: DesignSpec): Promise<Fo
     const style = node.fontStyle ?? "Regular";
     requested.set(fontKey(family, style), { family, style });
   }
+  for (const token of typography.values()) {
+    requested.set(fontKey(token.fontFamily, token.fontStyle), {
+      family: token.fontFamily,
+      style: token.fontStyle,
+    });
+  }
 
   const fonts = new Map<string, FontName>();
+  const typographyFonts = new Map<string, FontName>();
   const selections: FontSelection[] = [];
   const warnings: string[] = [];
   const fallback = availableByKey.get(fontKey("Inter", "Regular")) ?? {
@@ -175,6 +224,11 @@ async function resolveFonts(api: RendererFigmaApi, spec: DesignSpec): Promise<Fo
       }
     }
     fonts.set(key, chosen);
+    for (const [token, typographyToken] of typography) {
+      if (fontKey(typographyToken.fontFamily, typographyToken.fontStyle) === key) {
+        typographyFonts.set(token, chosen);
+      }
+    }
     selections.push({
       requestedFamily: request.family,
       requestedStyle: request.style,
@@ -188,16 +242,16 @@ async function resolveFonts(api: RendererFigmaApi, spec: DesignSpec): Promise<Fo
       );
     }
   }
-  return { fonts, selections, warnings };
+  return { fonts, typographyFonts, selections, warnings };
 }
 
 export function mapSizingMode(mode: SizingMode): "FIXED" | "HUG" | "FILL" {
   return mode.toUpperCase() as "FIXED" | "HUG" | "FILL";
 }
 
-export function mapLayoutSpec(layout: LayoutSpec): LayoutMapping {
+export function mapLayoutSpec(layout: ResolvedLayoutSpec): LayoutMapping {
   const primary: Record<
-    NonNullable<LayoutSpec["primaryAxisAlign"]>,
+    NonNullable<ResolvedLayoutSpec["primaryAxisAlign"]>,
     LayoutMapping["primaryAxisAlignItems"]
   > = {
     start: "MIN",
@@ -206,7 +260,7 @@ export function mapLayoutSpec(layout: LayoutSpec): LayoutMapping {
     "space-between": "SPACE_BETWEEN",
   };
   const counter: Record<
-    Exclude<NonNullable<LayoutSpec["counterAxisAlign"]>, "stretch">,
+    Exclude<NonNullable<ResolvedLayoutSpec["counterAxisAlign"]>, "stretch">,
     LayoutMapping["counterAxisAlignItems"]
   > = {
     start: "MIN",
@@ -241,7 +295,7 @@ function setOptionalFill(
 
 function applyLayout(
   frame: FrameNode | ComponentNode,
-  layout: LayoutSpec,
+  layout: ResolvedLayoutSpec,
   width: number,
   height: number,
 ): LayoutMapping {
@@ -261,7 +315,7 @@ function applyLayout(
   return mapping;
 }
 
-function effectiveSizing(node: DesignNode, parentLayout: LayoutSpec): AxisSizing {
+function effectiveSizing(node: ResolvedDesignNode, parentLayout: ResolvedLayoutSpec): AxisSizing {
   if (node.sizing) return node.sizing;
   const isText = node.type === "text";
   const width: SizingMode = isText && node.width === undefined ? "hug" : "fixed";
@@ -270,17 +324,21 @@ function effectiveSizing(node: DesignNode, parentLayout: LayoutSpec): AxisSizing
   return parentLayout.mode === "vertical" ? { width: "fill", height } : { width, height: "fill" };
 }
 
-function applyChildSizing(node: LayoutChildNode, sizing: AxisSizing, layout: LayoutSpec): void {
+function applyChildSizing(
+  node: LayoutChildNode,
+  sizing: AxisSizing,
+  layout: ResolvedLayoutSpec,
+): void {
   node.layoutSizingHorizontal = mapSizingMode(sizing.width);
   node.layoutSizingVertical = mapSizingMode(sizing.height);
   if (layout.counterAxisAlign === "stretch") node.layoutAlign = "STRETCH";
 }
 
 function setTextTypography(
-  node: TextNodeSpec,
+  node: ResolvedTextNodeSpec,
   text: TextNode,
   fonts: Map<string, FontName>,
-  parentLayout?: LayoutSpec,
+  parentLayout?: ResolvedLayoutSpec,
 ): void {
   const family = node.fontFamily ?? "Inter";
   const style = node.fontStyle ?? "Regular";
@@ -291,6 +349,10 @@ function setTextTypography(
   text.fontSize = node.fontSize;
   text.characters = node.text;
   if (node.lineHeight !== undefined) text.lineHeight = { unit: "PIXELS", value: node.lineHeight };
+  if (node.letterSpacing !== undefined)
+    text.letterSpacing = { unit: "PIXELS", value: node.letterSpacing };
+  if (node.textDecoration)
+    text.textDecoration = node.textDecoration.toUpperCase() as TextNode["textDecoration"];
   if (node.textAlign)
     text.textAlignHorizontal = node.textAlign.toUpperCase() as TextNode["textAlignHorizontal"];
 
@@ -315,9 +377,25 @@ function setTextTypography(
     text.resize(node.width ?? text.width, node.height ?? text.height);
   }
   setSolidFill(text, node.color);
+  if (node.textStyle) {
+    text.setPluginData(TYPOGRAPHY_TOKEN_KEY, node.textStyle.token);
+    text.setPluginData(TEXT_COLOR_KEY, node.color);
+    if (
+      node.styleOverrides &&
+      Object.values(node.styleOverrides).some((value) => value !== undefined)
+    ) {
+      const styleOverrides = {
+        ...node.styleOverrides,
+        fontName: node.styleOverrides.fontName
+          ? { family: font.family, style: font.style }
+          : undefined,
+      };
+      text.setPluginData(TYPOGRAPHY_OVERRIDES_KEY, JSON.stringify(styleOverrides));
+    }
+  }
 }
 
-function setRectangleProperties(rectangle: RectangleNode, node: RectangleNodeSpec): void {
+function setRectangleProperties(rectangle: RectangleNode, node: ResolvedRectangleNodeSpec): void {
   rectangle.resize(node.width, node.height);
   setSolidFill(rectangle, node.fill);
   if (node.stroke) {
@@ -338,7 +416,7 @@ function setRectangleProperties(rectangle: RectangleNode, node: RectangleNodeSpe
 
 function setFrameProperties(
   frame: FrameNode | ComponentNode,
-  properties: Pick<FrameNodeSpec, "background" | "stroke" | "cornerRadius" | "cornerRadii">,
+  properties: Pick<ResolvedFrameNodeSpec, "background" | "stroke" | "cornerRadius" | "cornerRadii">,
 ): void {
   setOptionalFill(frame, properties.background);
   if (properties.stroke) {
@@ -362,16 +440,22 @@ interface BuildContext {
   tracker: Tracker;
   fonts: Map<string, FontName>;
   components: Map<string, ComponentNode>;
+  designSystemId?: string;
+  designSystemNamespace?: string;
 }
 
-function buildFrameChildren(frame: FrameNode, spec: FrameNodeSpec, context: BuildContext): void {
+function buildFrameChildren(
+  frame: FrameNode,
+  spec: ResolvedFrameNodeSpec,
+  context: BuildContext,
+): void {
   for (const child of spec.children) appendDesignNode(frame, child, spec.layout, context);
 }
 
 function appendDesignNode(
   parent: FrameNode | ComponentNode,
-  spec: DesignNode,
-  parentLayout: LayoutSpec | undefined,
+  spec: ResolvedDesignNode,
+  parentLayout: ResolvedLayoutSpec | undefined,
   context: BuildContext,
 ): LayoutChildNode {
   const { api, tracker } = context;
@@ -418,15 +502,16 @@ function appendDesignNode(
     node.x = spec.x as number;
     node.y = spec.y as number;
   }
-  if (frameToPopulate) buildFrameChildren(frameToPopulate, spec as FrameNodeSpec, context);
+  if (frameToPopulate) buildFrameChildren(frameToPopulate, spec as ResolvedFrameNodeSpec, context);
   return node;
 }
 
 function createComponentDefinition(
   area: FrameNode,
-  definition: ComponentDefinitionSpec,
+  definition: ResolvedComponentDefinition,
   name: string,
   context: BuildContext,
+  ownedByDesignSystem = false,
 ): ComponentNode {
   const frame = context.api.createFrame();
   context.tracker.track(frame, "frames");
@@ -445,6 +530,9 @@ function createComponentDefinition(
     counterAxisAlign: "center",
   });
   context.components.set(definition.id, component);
+  if (ownedByDesignSystem && context.designSystemId) {
+    markOwnedComponent(component, context.designSystemId, definition);
+  }
   return component;
 }
 
@@ -463,7 +551,7 @@ function uniqueName(api: RendererFigmaApi, base: string, reserved: Set<string>):
 
 function createDocumentFrame(
   api: RendererFigmaApi,
-  spec: DesignSpec,
+  spec: ResolvedDesignSpec,
   name: string,
   context: BuildContext,
   parent?: FrameNode,
@@ -530,11 +618,115 @@ function createWrapper(
   return wrapper;
 }
 
+function toHex(color: RGB): string {
+  const byte = (channel: number) =>
+    Math.round(channel * 255)
+      .toString(16)
+      .padStart(2, "0");
+  return `#${byte(color.r)}${byte(color.g)}${byte(color.b)}`.toUpperCase();
+}
+
+async function applyNativeStyleBindings(root: FrameNode, bindings: StyleBindings): Promise<void> {
+  const walk = async (node: SceneNode): Promise<void> => {
+    if (node.type === "INSTANCE") return;
+
+    const bindFill = async (hex: string, bind: (styleId: string) => Promise<void>) => {
+      const styleId = bindings.paintStyleIdByHex.get(hex.toUpperCase());
+      if (!styleId) return;
+      try {
+        await bind(styleId);
+      } catch (error) {
+        bindings.report.warnings.push(
+          `A fill could not bind to its native color style and remains a resolved color: ${error instanceof Error ? error.message : "Figma rejected the style binding."}`,
+        );
+      }
+    };
+
+    if (node.type === "TEXT") {
+      const token = node.getPluginData(TYPOGRAPHY_TOKEN_KEY);
+      const styleId = bindings.textStyleIdByToken.get(token);
+      if (styleId) {
+        try {
+          await node.setTextStyleIdAsync(styleId);
+          const overrideText = node.getPluginData(TYPOGRAPHY_OVERRIDES_KEY);
+          if (overrideText) {
+            const overrides = JSON.parse(overrideText) as NonNullable<
+              ResolvedTextNodeSpec["styleOverrides"]
+            >;
+            if (overrides.fontName) node.fontName = overrides.fontName;
+            if (overrides.fontSize !== undefined) node.fontSize = overrides.fontSize;
+            if (overrides.lineHeight !== undefined) {
+              node.lineHeight = { unit: "PIXELS", value: overrides.lineHeight };
+            }
+            if (overrides.letterSpacing !== undefined) {
+              node.letterSpacing = { unit: "PIXELS", value: overrides.letterSpacing };
+            }
+            if (overrides.textDecoration) {
+              node.textDecoration =
+                overrides.textDecoration.toUpperCase() as TextNode["textDecoration"];
+            }
+          }
+        } catch (error) {
+          bindings.report.warnings.push(
+            `Text style “${token}” could not be bound and remains resolved text: ${error instanceof Error ? error.message : "Figma rejected the style binding."}`,
+          );
+        }
+      }
+
+      const textColor = node.getPluginData(TEXT_COLOR_KEY);
+      if (textColor && node.characters.length > 0) {
+        await bindFill(textColor, (id) =>
+          node.setRangeFillStyleIdAsync(0, node.characters.length, id),
+        );
+      }
+    } else {
+      const fillTarget = node as SceneNode & {
+        fills?: readonly Paint[] | PluginAPI["mixed"];
+        setFillStyleIdAsync?: (id: string) => Promise<void>;
+      };
+      if (Array.isArray(fillTarget.fills) && typeof fillTarget.setFillStyleIdAsync === "function") {
+        const fill = fillTarget.fills.find((paint) => paint.type === "SOLID");
+        if (fill?.type === "SOLID") {
+          await bindFill(toHex(fill.color), (id) => fillTarget.setFillStyleIdAsync!(id));
+        }
+      }
+    }
+
+    const strokeTarget = node as SceneNode & {
+      strokes?: readonly Paint[] | PluginAPI["mixed"];
+      setStrokeStyleIdAsync?: (id: string) => Promise<void>;
+    };
+    if (
+      Array.isArray(strokeTarget.strokes) &&
+      typeof strokeTarget.setStrokeStyleIdAsync === "function"
+    ) {
+      const stroke = strokeTarget.strokes.find((paint) => paint.type === "SOLID");
+      if (stroke?.type === "SOLID") {
+        const styleId = bindings.paintStyleIdByHex.get(toHex(stroke.color));
+        if (styleId) {
+          try {
+            await strokeTarget.setStrokeStyleIdAsync(styleId);
+          } catch (error) {
+            bindings.report.warnings.push(
+              `A stroke could not bind to its native color style and remains a resolved color: ${error instanceof Error ? error.message : "Figma rejected the style binding."}`,
+            );
+          }
+        }
+      }
+    }
+
+    if ("children" in node) {
+      for (const child of node.children) await walk(child);
+    }
+  };
+  await walk(root);
+}
+
 function intendedClusterSize(
-  spec: DesignSpec,
+  spec: ResolvedDesignSpec,
+  definitions: ResolvedComponentDefinition[],
   componentAreaWidth: number,
 ): Pick<PlacementItem, "width" | "height"> {
-  const definitions = spec.document.components ?? [];
   if (definitions.length === 0) {
     return { width: spec.document.width, height: spec.document.height };
   }
@@ -549,30 +741,51 @@ function intendedClusterSize(
   };
 }
 
-export async function renderDesign(api: RendererFigmaApi, input: unknown): Promise<RenderResult> {
+export async function renderDesign(
+  api: RendererFigmaApi,
+  input: unknown,
+  options: { updateOwned?: boolean } = {},
+): Promise<RenderResult> {
   const parsed = parseDesignValue(input);
   if (!parsed.success) throw new DesignRenderError(parsed.errors.join(" "));
-  const spec = parsed.data;
-  const fontResolution = await resolveFonts(api, spec);
+  const { spec, tables } = resolveDesignSystemTokens(parsed.data);
+  const fontResolution = await resolveFonts(api, spec, tables.typography);
   const tracker = createTracker();
   const previousSelection = [...api.currentPage.selection];
+  const designSystemId = spec.designSystem?.id;
+  const designSystemNamespace = spec.designSystem?.namespace;
+  const systemComponents = spec.designSystem?.components ?? [];
+  const existingRegistry = designSystemId
+    ? readOwnedComponents(api.currentPage, designSystemId, systemComponents)
+    : { byComponentId: new Map<string, ComponentNode>(), byStableKey: new Map(), warnings: [] };
+  const newDefinitions = [
+    ...(spec.document.components ?? []),
+    ...systemComponents.filter((definition) => !existingRegistry.byComponentId.has(definition.id)),
+  ];
+  const dsComponentsById = new Map(systemComponents.map((component) => [component.id, component]));
   const context: BuildContext = {
     api,
     tracker,
     fonts: fontResolution.fonts,
-    components: new Map(),
+    components: new Map(existingRegistry.byComponentId),
+    designSystemId,
+    designSystemNamespace,
   };
   const reservedNames = new Set<string>();
-  const components = spec.document.components ?? [];
+  let styleBindings: StyleBindings | undefined;
+  const componentCreated: string[] = [];
+  const componentReused: string[] = [];
+  const componentSkipped: string[] = [];
+  const componentWarnings = [...existingRegistry.warnings];
 
   try {
     const existingCanvasBounds = readTopLevelCanvasObstacles(api.currentPage);
     const documentFrameName = uniqueName(api, spec.document.name, reservedNames);
     const componentAreaWidth = Math.max(
       COMPONENT_AREA_WIDTH,
-      ...components.map((definition) => definition.width),
+      ...newDefinitions.map((definition) => definition.width),
     );
-    const intendedSize = intendedClusterSize(spec, componentAreaWidth);
+    const intendedSize = intendedClusterSize(spec, newDefinitions, componentAreaWidth);
     const [initialPlacement] = planCanvasPlacements(
       [{ id: documentFrameName, ...intendedSize }],
       existingCanvasBounds,
@@ -582,8 +795,25 @@ export async function renderDesign(api: RendererFigmaApi, input: unknown): Promi
         "Canvas placement did not return a position for the generated design.",
       );
 
+    if (spec.designSystem && designSystemNamespace) {
+      styleBindings = await createOrReuseNativeStyles(
+        api,
+        designSystemNamespace,
+        tables,
+        { byToken: fontResolution.typographyFonts },
+        options.updateOwned ?? false,
+      );
+      const variableCapability = inspectVariableCapability(api.variables);
+      if ((tables.spacing.size > 0 || tables.radii.size > 0) && variableCapability.fallback) {
+        styleBindings.report.fallbacks.push(variableCapability.fallback);
+      }
+      if ((tables.spacing.size > 0 || tables.radii.size > 0) && !variableCapability.enabled) {
+        styleBindings.report.warnings.push(variableCapability.fallback);
+      }
+    }
+
     let root: FrameNode;
-    if (components.length === 0) {
+    if (newDefinitions.length === 0) {
       root = createDocumentFrame(
         api,
         spec,
@@ -604,20 +834,35 @@ export async function renderDesign(api: RendererFigmaApi, input: unknown): Promi
       const componentArea = createComponentArea(
         api,
         tracker,
-        uniqueName(api, `Components — ${spec.document.name}`, reservedNames),
+        uniqueName(
+          api,
+          designSystemNamespace
+            ? `Generated Components — ${designSystemNamespace}`
+            : `Components — ${spec.document.name}`,
+          reservedNames,
+        ),
         componentAreaWidth,
       );
       wrapper.appendChild(componentArea);
       componentArea.x = spec.document.width + COMPONENT_AREA_OFFSET;
       componentArea.y = 0;
 
-      for (const definition of orderComponentDefinitions(components)) {
+      for (const definition of orderComponentDefinitions(
+        newDefinitions as ComponentDefinitionSpec[],
+      ) as ResolvedComponentDefinition[]) {
+        const systemDefinition = dsComponentsById.get(definition.id);
+        const isSystemOwned = systemDefinition !== undefined;
+        const masterName = isSystemOwned
+          ? `${designSystemNamespace}/${definition.key ?? definition.id}`
+          : `${definition.name} — Generated`;
         createComponentDefinition(
           componentArea,
           definition,
-          uniqueName(api, `${definition.name} — Generated`, reservedNames),
+          uniqueName(api, masterName, reservedNames),
           context,
+          isSystemOwned,
         );
+        if (isSystemOwned) componentCreated.push(definition.key ?? definition.id);
       }
 
       root = createDocumentFrame(api, spec, documentFrameName, context, wrapper);
@@ -629,6 +874,25 @@ export async function renderDesign(api: RendererFigmaApi, input: unknown): Promi
       );
       root = wrapper;
     }
+
+    for (const definition of systemComponents) {
+      const existing = existingRegistry.byComponentId.get(definition.id);
+      if (existing) {
+        const key = definition.key ?? definition.id;
+        const stored = existing.getPluginData(COMPONENT_FINGERPRINT_KEY);
+        const requested = componentDefinitionFingerprint(definition);
+        if (stored === requested) {
+          componentReused.push(key);
+        } else {
+          componentSkipped.push(key);
+          componentWarnings.push(
+            `Component master “${key}” already exists with a different definition and was reused unchanged to preserve its native instances and manual edits. Create a new component key to add the changed definition.`,
+          );
+        }
+      }
+    }
+
+    if (styleBindings) await applyNativeStyleBindings(root, styleBindings);
 
     const stagedBounds = getCanvasNodeBounds(root);
     const [placement] = planCanvasPlacements(
@@ -642,14 +906,41 @@ export async function renderDesign(api: RendererFigmaApi, input: unknown): Promi
     placeTopLevelNode(root, stagedBounds, placement);
     api.currentPage.selection = [root];
     api.viewport.scrollAndZoomIntoView([root]);
+    const designSystemReport: StyleRegistryReport | undefined = styleBindings?.report;
     return {
       frameName: documentFrameName,
       counts: tracker.counts,
-      warnings: fontResolution.warnings,
+      warnings: [
+        ...fontResolution.warnings,
+        ...componentWarnings,
+        ...(designSystemReport?.warnings ?? []),
+      ],
       fontSelections: fontResolution.selections,
+      designSystem:
+        spec.designSystem && designSystemReport
+          ? {
+              namespace: spec.designSystem.namespace,
+              created: [
+                ...designSystemReport.created.map((key) => `style:${key}`),
+                ...componentCreated.map((key) => `component:${key}`),
+              ],
+              reused: [
+                ...designSystemReport.reused.map((key) => `style:${key}`),
+                ...componentReused.map((key) => `component:${key}`),
+              ],
+              updated: designSystemReport.updated.map((key) => `style:${key}`),
+              skipped: [
+                ...designSystemReport.skipped.map((key) => `style:${key}`),
+                ...componentSkipped.map((key) => `component:${key}`),
+              ],
+              fallbacks: designSystemReport.fallbacks,
+              warnings: [...componentWarnings, ...designSystemReport.warnings],
+            }
+          : undefined,
     };
   } catch (error) {
     tracker.cleanup();
+    styleBindings?.rollback();
     try {
       api.currentPage.selection = previousSelection;
     } catch {

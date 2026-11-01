@@ -367,6 +367,127 @@ textarea:disabled {
   font-size: 10px;
   line-height: 14px;
 }
+.design-system-panel {
+  padding: 13px;
+  border: 1px solid #333541;
+  border-radius: 9px;
+  background: linear-gradient(145deg, rgba(154, 140, 255, 0.075), rgba(28, 30, 37, 0.96));
+}
+.design-system-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.design-system-heading h2 {
+  margin: 2px 0 0;
+  color: #e3e2ed;
+  font-size: 12px;
+  line-height: 16px;
+}
+.section-kicker {
+  color: #8f84de;
+  font: 8px var(--mono);
+  letter-spacing: 0.09em;
+}
+.system-status {
+  padding: 4px 6px;
+  border: 1px solid #3b3d48;
+  border-radius: 999px;
+  color: #858896;
+  font-size: 8px;
+}
+.system-status.is-ready {
+  border-color: rgba(105, 217, 174, 0.28);
+  color: #82d8b6;
+  background: rgba(105, 217, 174, 0.07);
+}
+.system-namespace {
+  margin: 9px 0 7px;
+  color: #9b9eaa;
+  font-size: 9px;
+}
+.system-namespace strong {
+  color: #d0caff;
+  font-family: var(--mono);
+  font-weight: 500;
+}
+.system-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.system-counts span {
+  padding: 4px 6px;
+  border: 1px solid #343641;
+  border-radius: 5px;
+  color: #b8bac5;
+  background: rgba(14, 15, 19, 0.35);
+  font-size: 8px;
+}
+.dry-run-summary {
+  margin-top: 9px;
+  padding: 8px 9px;
+  border-left: 2px solid #8b7ef0;
+  border-radius: 4px;
+  background: rgba(13, 14, 18, 0.36);
+}
+.dry-run-summary strong,
+.system-validation strong {
+  color: #d0caff;
+  font-size: 9px;
+}
+.dry-run-summary p,
+.system-empty,
+.system-validation p {
+  margin: 4px 0 0;
+  color: #9699a7;
+  font-size: 8px;
+  line-height: 13px;
+}
+.dry-run-summary .system-fallback {
+  color: #d0b981;
+}
+.update-owned-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 10px;
+  color: #a7a9b4;
+  font-size: 8px;
+  line-height: 13px;
+  cursor: pointer;
+}
+.update-owned-option input {
+  margin: 1px 0 0;
+  accent-color: #9a8cff;
+}
+.system-action {
+  width: 100%;
+  min-height: 34px;
+  margin-top: 9px;
+  border: 1px solid #6057a9;
+  border-radius: 6px;
+  color: #e7e3ff;
+  background: #393450;
+  font-size: 9px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.system-action:hover:not(:disabled) {
+  background: #494168;
+}
+.system-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.system-validation {
+  margin-top: 9px;
+}
+.system-validation .notice-list {
+  max-height: 88px;
+  overflow: auto;
+}
 .spinner,
 .button-spinner {
   width: 13px;
