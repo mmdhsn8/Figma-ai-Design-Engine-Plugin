@@ -498,6 +498,15 @@ export function createCompanionServer(options: CompanionServerOptions) {
       sendApprovalHtml(response, 410, approvalMessagePage(approvalAttemptStatusMessage(attempt)));
       return;
     }
+    const rejection = approvalRequestRejection(request, actualPort);
+    if (rejection) {
+      sendApprovalHtml(
+        response,
+        403,
+        approvalMessagePage(`${rejection} ${approvalHeaderDiagnostics(request, actualPort)}`),
+      );
+      return;
+    }
     sendApprovalHtml(response, 200, approvalFormPage(attempt.id, attempt.csrfToken));
   }
 
@@ -509,7 +518,11 @@ export function createCompanionServer(options: CompanionServerOptions) {
     const rejection = approvalRequestRejection(request, actualPort);
     if (rejection) {
       request.resume();
-      sendApprovalHtml(response, 403, approvalMessagePage(rejection));
+      sendApprovalHtml(
+        response,
+        403,
+        approvalMessagePage(`${rejection} ${approvalHeaderDiagnostics(request, actualPort)}`),
+      );
       return;
     }
     const attempt = getAttempt(url.pathname.slice("/local-approval/".length));
@@ -1357,13 +1370,42 @@ function approvalRequestRejection(request: IncomingMessage, port: number): strin
     return "This approval used an unexpected local address. No connection was approved.";
   }
 
-  // Origin and Fetch Metadata are defense in depth. Some system browsers omit
-  // them for shell-opened local pages; the handler still requires the one-use
-  // CSRF value from the same-origin form before recording any user decision.
+  // Fetch Metadata is checked whenever present, but the one-use form CSRF
+  // remains the authorization proof because some system browsers omit metadata.
+  const fetchSite = request.headers["sec-fetch-site"];
+  if (fetchSite !== undefined && fetchSite !== "same-origin" && fetchSite !== "none") {
+    return "The browser marked this approval as cross-origin. No connection was approved.";
+  }
+  const fetchMode = request.headers["sec-fetch-mode"];
+  if (fetchMode !== undefined && fetchMode !== "navigate") {
+    return "The browser did not submit a page navigation. No connection was approved.";
+  }
+  const fetchDest = request.headers["sec-fetch-dest"];
+  if (fetchDest !== undefined && fetchDest !== "document") {
+    return "The approval request was not a top-level document navigation. No connection was approved.";
+  }
+  const fetchUser = request.headers["sec-fetch-user"];
+  if (fetchUser !== undefined && fetchUser !== "?1") {
+    return "The browser did not report a user-initiated approval action. No connection was approved.";
+  }
+
+  // A literal opaque Origin is not accepted by itself. It is allowed only for
+  // a loopback-hosted top-level navigation with corroborating Fetch Metadata;
+  // the POST still needs the one-use CSRF value from the approval form.
   const origin = request.headers.origin;
   if (origin !== undefined) {
     if (Array.isArray(origin)) {
       return "The browser origin could not be verified. No connection was approved.";
+    }
+    if (origin === "null") {
+      if (
+        (fetchSite !== "same-origin" && fetchSite !== "none") ||
+        fetchMode !== "navigate" ||
+        fetchDest !== "document"
+      ) {
+        return "An opaque browser origin is allowed only for a top-level loopback navigation. No connection was approved.";
+      }
+      return undefined;
     }
     try {
       const parsed = new URL(origin);
@@ -1381,16 +1423,72 @@ function approvalRequestRejection(request: IncomingMessage, port: number): strin
       return "The browser origin could not be verified. No connection was approved.";
     }
   }
-
-  const fetchSite = request.headers["sec-fetch-site"];
-  if (fetchSite !== undefined && fetchSite !== "same-origin" && fetchSite !== "none") {
-    return "The browser marked this approval as cross-origin. No connection was approved.";
-  }
-  const fetchMode = request.headers["sec-fetch-mode"];
-  if (fetchMode !== undefined && fetchMode !== "navigate") {
-    return "The browser did not submit a page navigation. No connection was approved.";
-  }
   return undefined;
+}
+
+function approvalHeaderDiagnostics(request: IncomingMessage, port: number): string {
+  const host = request.headers.host?.toLowerCase();
+  const hostClass = !host
+    ? "missing"
+    : host === `localhost:${port}`
+      ? "localhost"
+      : host === `127.0.0.1:${port}`
+        ? "ipv4-loopback"
+        : host === `[::1]:${port}`
+          ? "ipv6-loopback"
+          : "other";
+  const originClass = classifyApprovalOrigin(request.headers.origin, host, port);
+  const site = classifyHeader(request.headers["sec-fetch-site"], [
+    "none",
+    "same-origin",
+    "same-site",
+    "cross-site",
+  ]);
+  const mode = classifyHeader(request.headers["sec-fetch-mode"], ["navigate", "cors", "no-cors"]);
+  const destination = classifyHeader(request.headers["sec-fetch-dest"], [
+    "document",
+    "iframe",
+    "empty",
+  ]);
+  const user = classifyHeader(request.headers["sec-fetch-user"], ["?1", "?0"]);
+  return `Safe diagnostic: Host=${hostClass}; Origin=${originClass}; Sec-Fetch-Site=${site}; Sec-Fetch-Mode=${mode}; Sec-Fetch-Dest=${destination}; Sec-Fetch-User=${user}.`;
+}
+
+function classifyApprovalOrigin(
+  origin: string | string[] | undefined,
+  host: string | undefined,
+  port: number,
+): string {
+  if (origin === undefined) return "missing";
+  if (Array.isArray(origin)) return "multiple";
+  if (origin === "null") return "opaque-null";
+  try {
+    const parsed = new URL(origin);
+    if (
+      parsed.origin === `http://${host}` &&
+      parsed.pathname === "/" &&
+      parsed.search === "" &&
+      parsed.hash === "" &&
+      parsed.username === "" &&
+      parsed.password === ""
+    ) {
+      return "matching-loopback";
+    }
+    const loopbackOrigins = [
+      `http://localhost:${port}`,
+      `http://127.0.0.1:${port}`,
+      `http://[::1]:${port}`,
+    ];
+    return loopbackOrigins.includes(parsed.origin) ? "different-loopback" : "other";
+  } catch {
+    return "malformed";
+  }
+}
+
+function classifyHeader(value: string | string[] | undefined, allowed: string[]): string {
+  if (value === undefined) return "missing";
+  if (Array.isArray(value)) return "multiple";
+  return allowed.includes(value) ? value : "other";
 }
 
 function hashSecret(value: string): string {
