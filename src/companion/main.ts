@@ -16,8 +16,7 @@ console.log(
   handle.port,
 );
 console.log(
-  "One-time Figma pairing code (enter it in the plugin; do not share it):\n%s",
-  handle.pairingCode,
+  "Open the Figma AI Design Engine plugin and choose Continue with ChatGPT. The first connection opens a local approval page in your system browser.",
 );
 console.log("Press Ctrl+C to stop. OAuth tokens are held in memory only and cleared on exit.");
 

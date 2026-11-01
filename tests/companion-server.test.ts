@@ -1,4 +1,4 @@
-import { generateKeyPairSync, sign } from "node:crypto";
+import { generateKeyPairSync, randomBytes, sign } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMPANION_BIND_ADDRESSES } from "../src/companion/config.js";
@@ -42,9 +42,9 @@ describe("loopback companion", () => {
     }
   });
 
-  it("binds only to loopback and requires null-origin pairing with a one-time code", async () => {
+  it("serves safe health and requires browser approval plus verifier proof for local pairing", async () => {
     const harness = await createHarness();
-    const preflight = await fetch(`http://localhost:${harness.handle.port}/v1/pair`, {
+    const preflight = await fetch(`http://localhost:${harness.handle.port}/v1/pairing/attempt`, {
       method: "OPTIONS",
       headers: {
         Origin: "null",
@@ -57,32 +57,245 @@ describe("loopback companion", () => {
     expect(preflight.headers.get("access-control-allow-origin")).toBe("*");
     expect(preflight.headers.get("access-control-allow-private-network")).toBe("true");
 
-    const originDenied = await request(harness.handle, "/v1/pair", {
-      body: { code: harness.handle.pairingCode },
+    const health = await request(harness.handle, "/v1/health", {});
+    expect(await health.json()).toEqual({ companion: "running" });
+    const originDenied = await request(harness.handle, "/v1/pairing/attempt", {
+      body: { verifier: "A".repeat(43) },
       origin: "https://untrusted.example",
     });
     expect(originDenied.status).toBe(403);
 
     const unauthenticated = await request(harness.handle, "/v1/status", {});
     expect(unauthenticated.status).toBe(401);
-    const failedPair = await request(harness.handle, "/v1/pair", { body: { code: "wrong" } });
-    expect(failedPair.status).toBe(403);
-    const paired = await request(harness.handle, "/v1/pair", {
-      body: { code: harness.handle.pairingCode },
+    const verifier = randomBytes(32).toString("base64url");
+    const pairing = await beginPairing(harness.handle, verifier);
+    const stillPending = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: pairing.attemptId, verifier },
+    });
+    expect(await stillPending.json()).toEqual({ status: "pending" });
+    const approvalPage = await fetch(
+      `http://localhost:${harness.handle.port}/local-approval/${pairing.attemptId}`,
+    );
+    expect(approvalPage.status).toBe(200);
+    const html = await approvalPage.text();
+    expect(html).toContain("cannot verify whether the request came from Figma AI Design Engine");
+    expect(html).not.toContain("sessionToken");
+    const csrf = html.match(/name="csrf" value="([A-Za-z0-9_-]{43})"/u)?.[1];
+    expect(csrf).toBeDefined();
+
+    const crossSiteApproval = await submitApproval(
+      harness.handle,
+      pairing.attemptId,
+      csrf!,
+      "approve",
+      {
+        origin: "null",
+      },
+    );
+    expect(crossSiteApproval.status).toBe(403);
+    const missingCsrf = await submitApproval(harness.handle, pairing.attemptId, "wrong", "approve");
+    expect(missingCsrf.status).toBe(403);
+    const approved = await submitApproval(harness.handle, pairing.attemptId, csrf!, "approve");
+    expect(approved.status).toBe(200);
+    const approvalReplay = await submitApproval(
+      harness.handle,
+      pairing.attemptId,
+      csrf!,
+      "approve",
+    );
+    expect(approvalReplay.status).toBe(403);
+
+    const wrongProof = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: pairing.attemptId, verifier: "B".repeat(43) },
+    });
+    expect(wrongProof.status).toBe(403);
+    const paired = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: pairing.attemptId, verifier },
     });
     expect(paired.status).toBe(200);
-    const pairing = (await paired.json()) as { sessionToken: string };
-    expect(pairing.sessionToken).toHaveLength(43);
+    const pairingResult = (await paired.json()) as { status: string; sessionToken: string };
+    expect(pairingResult.status).toBe("approved");
+    expect(pairingResult.sessionToken).toHaveLength(43);
 
-    const reusedPair = await request(harness.handle, "/v1/pair", {
-      body: { code: harness.handle.pairingCode },
+    const replay = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: pairing.attemptId, verifier },
     });
-    expect(reusedPair.status).toBe(403);
-    const connected = await request(harness.handle, "/v1/status", { token: pairing.sessionToken });
+    expect(replay.status).toBe(409);
+    const connected = await request(harness.handle, "/v1/status", {
+      token: pairingResult.sessionToken,
+    });
     expect(connected.status).toBe(200);
     const body = (await connected.json()) as Record<string, unknown>;
     expect(body).toMatchObject({ companion: "connected", auth: "signed_out" });
-    expect(JSON.stringify(body)).not.toContain(pairing.sessionToken);
+    expect(JSON.stringify(body)).not.toContain(pairingResult.sessionToken);
+
+    const disconnected = await request(harness.handle, "/v1/pairing/disconnect", {
+      token: pairingResult.sessionToken,
+      body: {},
+    });
+    expect(await disconnected.json()).toEqual({ disconnected: true });
+    expect(
+      (await request(harness.handle, "/v1/status", { token: pairingResult.sessionToken })).status,
+    ).toBe(401);
+  });
+
+  it("rejects concurrent approval attempts and reports explicit denial and expiration", async () => {
+    const harness = await createHarness();
+    const firstVerifier = randomBytes(32).toString("base64url");
+    const first = await beginPairing(harness.handle, firstVerifier);
+    const second = await request(harness.handle, "/v1/pairing/attempt", {
+      body: { verifier: randomBytes(32).toString("base64url") },
+    });
+    expect(second.status).toBe(409);
+    expect(await second.json()).toMatchObject({ error: "pairing_busy" });
+
+    const firstHtml = await (
+      await fetch(`http://localhost:${harness.handle.port}/local-approval/${first.attemptId}`)
+    ).text();
+    const firstCsrf = firstHtml.match(/name="csrf" value="([A-Za-z0-9_-]{43})"/u)?.[1] ?? "";
+    await submitApproval(harness.handle, first.attemptId, firstCsrf, "deny");
+    const deniedPoll = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: first.attemptId, verifier: firstVerifier },
+    });
+    expect(deniedPoll.status).toBe(403);
+    expect(await deniedPoll.json()).toMatchObject({ error: "pairing_denied" });
+
+    const expiringVerifier = randomBytes(32).toString("base64url");
+    const expiring = await beginPairing(harness.handle, expiringVerifier);
+    harness.advanceTime(91_000);
+    const expiredPoll = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: expiring.attemptId, verifier: expiringVerifier },
+    });
+    expect(expiredPoll.status).toBe(410);
+    expect(await expiredPoll.json()).toMatchObject({ error: "pairing_expired" });
+  });
+
+  it("cancels pairing only with the matching verifier and invalidates sessions on companion restart", async () => {
+    const harness = await createHarness();
+    const verifier = randomBytes(32).toString("base64url");
+    const attempt = await beginPairing(harness.handle, verifier);
+    const wrongCancel = await request(harness.handle, "/v1/pairing/cancel", {
+      body: { attemptId: attempt.attemptId, verifier: randomBytes(32).toString("base64url") },
+    });
+    expect(wrongCancel.status).toBe(403);
+    const cancel = await request(harness.handle, "/v1/pairing/cancel", {
+      body: { attemptId: attempt.attemptId, verifier },
+    });
+    expect(cancel.status).toBe(200);
+    const cancelledPoll = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: attempt.attemptId, verifier },
+    });
+    expect(cancelledPoll.status).toBe(403);
+    expect(await cancelledPoll.json()).toMatchObject({ error: "pairing_cancelled" });
+
+    const token = await harness.pair();
+    await harness.handle.close();
+    const restarted = createCompanionServer({
+      port: 0,
+      installationStore: harness.store,
+    });
+    const restartedHandle = await restarted.start();
+    openHandles.push(restartedHandle);
+    const oldTokenResponse = await request(restartedHandle, "/v1/status", { token });
+    expect(oldTokenResponse.status).toBe(401);
+  });
+
+  it("rate limits approval attempts and rejects extra request properties", async () => {
+    const harness = await createHarness();
+    const extraProperty = await request(harness.handle, "/v1/pairing/attempt", {
+      body: { verifier: randomBytes(32).toString("base64url"), clientName: "untrusted" },
+    });
+    expect(extraProperty.status).toBe(400);
+
+    for (let index = 0; index < 5; index += 1) {
+      const verifier = randomBytes(32).toString("base64url");
+      const attempt = await beginPairing(harness.handle, verifier);
+      await request(harness.handle, "/v1/pairing/cancel", {
+        body: { attemptId: attempt.attemptId, verifier },
+      });
+    }
+    const limited = await request(harness.handle, "/v1/pairing/attempt", {
+      body: { verifier: randomBytes(32).toString("base64url") },
+    });
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toMatchObject({ error: "pairing_rate_limited" });
+  });
+
+  it("reopens the local approval page only for the originating proof", async () => {
+    const harness = await createHarness();
+    const verifier = randomBytes(32).toString("base64url");
+    const attempt = await beginPairing(harness.handle, verifier);
+    const openedAfterStart = harness.openedUrl;
+    const wrongProof = await request(harness.handle, "/v1/pairing/open", {
+      body: { attemptId: attempt.attemptId, verifier: randomBytes(32).toString("base64url") },
+    });
+    expect(wrongProof.status).toBe(403);
+    const opened = await request(harness.handle, "/v1/pairing/open", {
+      body: { attemptId: attempt.attemptId, verifier },
+    });
+    expect(opened.status).toBe(200);
+    expect(await opened.json()).toEqual({ opened: true });
+    expect(harness.openedUrl).toBe(openedAfterStart);
+  });
+
+  it("reports a failed system-browser launch and allows a user-triggered retry", async () => {
+    let openCount = 0;
+    const companion = createCompanionServer({
+      port: 0,
+      installationStore: {
+        load: async () => ({ extAgentHostId: TEST_HOST_ID }),
+        saveClientId: async () => undefined,
+        clearRegistration: async () => undefined,
+      },
+      openBrowser: async () => {
+        openCount += 1;
+        if (openCount === 1) throw new Error("browser_unavailable");
+      },
+    });
+    const handle = await companion.start();
+    openHandles.push(handle);
+    const verifier = randomBytes(32).toString("base64url");
+    const started = await request(handle, "/v1/pairing/attempt", { body: { verifier } });
+    expect(started.status).toBe(200);
+    const attempt = (await started.json()) as { attemptId: string; approvalOpened: boolean };
+    expect(attempt.approvalOpened).toBe(false);
+    const retried = await request(handle, "/v1/pairing/open", {
+      body: { attemptId: attempt.attemptId, verifier },
+    });
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual({ opened: true });
+    expect(openCount).toBe(2);
+  });
+
+  it("keeps OAuth pending after a browser-launch failure and retries only on user request", async () => {
+    const harness = await createHarness({ oauthBrowserFailures: 1 });
+    const token = await harness.pair();
+    const start = await request(harness.handle, "/v1/auth/start", { token, body: {} });
+    expect(start.status).toBe(200);
+    expect(await start.json()).toMatchObject({
+      status: {
+        auth: "signing_in",
+        safeMessage: "system_browser_unavailable",
+      },
+    });
+
+    const retry = await request(harness.handle, "/v1/auth/open", { token, body: {} });
+    expect(retry.status).toBe(200);
+    const retryStatus = (await retry.json()) as { status: Record<string, unknown> };
+    expect(retryStatus.status).toMatchObject({ auth: "signing_in" });
+    expect(retryStatus.status).not.toHaveProperty("safeMessage");
+    expect(new URL(harness.openedUrl as string).pathname).toBe("/api/accounts/authorize");
+  });
+
+  it("expires idle local bearers and extends them only while authenticated use continues", async () => {
+    const harness = await createHarness();
+    const token = await harness.pair();
+    harness.advanceTime(14 * 60 * 1_000);
+    expect((await request(harness.handle, "/v1/status", { token })).status).toBe(200);
+    harness.advanceTime(14 * 60 * 1_000);
+    expect((await request(harness.handle, "/v1/status", { token })).status).toBe(200);
+    harness.advanceTime(16 * 60 * 1_000);
+    expect((await request(harness.handle, "/v1/status", { token })).status).toBe(401);
   });
 
   it("runs mocked PKCE authorization, checks granted plan scope, discovers models and streams a smoke response", async () => {
@@ -254,12 +467,14 @@ describe("loopback companion", () => {
     expect(harness.responsesRequest).toBeUndefined();
   });
 
-  it("rejects oversized pairing input and does not expose an unauthenticated endpoint", async () => {
+  it("rejects oversized pairing input and keeps account endpoints authenticated", async () => {
     const harness = await createHarness();
-    const tooLarge = await request(harness.handle, "/v1/pair", {
-      body: { code: "x".repeat(20_000) },
+    const tooLarge = await request(harness.handle, "/v1/pairing/attempt", {
+      body: { verifier: "x".repeat(20_000) },
     });
-    expect(tooLarge.status).toBe(403);
+    expect(tooLarge.status).toBe(400);
+    const models = await request(harness.handle, "/v1/models", { body: {} });
+    expect(models.status).toBe(401);
     const unknown = await request(harness.handle, "/private", {});
     expect(unknown.status).toBe(401);
   });
@@ -321,7 +536,7 @@ describe("loopback companion", () => {
     await first.handle.close();
     const restarted = await second.start();
     expect(restarted.port).toBe(first.handle.port);
-    expect(restarted.pairingCode).not.toBe(first.handle.pairingCode);
+    expect("pairingCode" in restarted).toBe(false);
     await restarted.close();
   });
 
@@ -351,6 +566,7 @@ async function createHarness(
     refreshFailure?: boolean;
     usageFailure?: boolean;
     stalledStream?: boolean;
+    oauthBrowserFailures?: number;
   } = {},
 ) {
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -479,8 +695,15 @@ async function createHarness(
     now: () => currentTime,
     openBrowser: async (url) => {
       openedUrl = url;
-      authTransactionUrl = new URL(url);
-      authNonce = authTransactionUrl.searchParams.get("nonce") ?? "";
+      const parsedUrl = new URL(url);
+      if (parsedUrl.pathname.includes("/api/accounts/authorize")) {
+        if ((options.oauthBrowserFailures ?? 0) > 0) {
+          options.oauthBrowserFailures = (options.oauthBrowserFailures ?? 0) - 1;
+          throw new Error("system_browser_unavailable");
+        }
+        authTransactionUrl = parsedUrl;
+        authNonce = parsedUrl.searchParams.get("nonce") ?? "";
+      }
     },
   });
   const handle = await companion.start();
@@ -502,7 +725,17 @@ async function createHarness(
       return codeExchange;
     },
     async pair() {
-      const result = await request(handle, "/v1/pair", { body: { code: handle.pairingCode } });
+      const verifier = randomBytes(32).toString("base64url");
+      const attempt = await beginPairing(handle, verifier);
+      const approvalPage = await fetch(
+        `http://localhost:${handle.port}/local-approval/${attempt.attemptId}`,
+      );
+      const html = await approvalPage.text();
+      const csrf = html.match(/name="csrf" value="([A-Za-z0-9_-]{43})"/u)?.[1] ?? "";
+      await submitApproval(handle, attempt.attemptId, csrf, "approve");
+      const result = await request(handle, "/v1/pairing/poll", {
+        body: { attemptId: attempt.attemptId, verifier },
+      });
       return ((await result.json()) as { sessionToken: string }).sessionToken;
     },
     advanceTime(milliseconds: number) {
@@ -544,10 +777,61 @@ async function request(
   if (options.body !== undefined) headers.set("Content-Type", "application/json");
   if (options.token) headers.set("Authorization", `Bearer ${options.token}`);
   return fetch(`http://localhost:${handle.port}${path}`, {
-    method: options.body !== undefined || path === "/v1/pair" ? "POST" : "GET",
+    method: options.body !== undefined ? "POST" : "GET",
     headers,
     ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
     ...(options.signal ? { signal: options.signal } : {}),
+  });
+}
+
+async function beginPairing(
+  handle: CompanionServerHandle,
+  verifier: string,
+): Promise<{ attemptId: string; expiresInMs: number }> {
+  const response = await request(handle, "/v1/pairing/attempt", { body: { verifier } });
+  expect(response.status).toBe(200);
+  return (await response.json()) as { attemptId: string; expiresInMs: number };
+}
+
+async function submitApproval(
+  handle: CompanionServerHandle,
+  attemptId: string,
+  csrf: string,
+  decision: "approve" | "deny",
+  options: { origin?: string; csrfHeader?: string } = {},
+): Promise<Response> {
+  const body = new URLSearchParams({ csrf: options.csrfHeader ?? csrf, decision }).toString();
+  return new Promise((resolve, reject) => {
+    const outgoing = httpRequest(
+      {
+        host: "localhost",
+        port: handle.port,
+        path: `/local-approval/${attemptId}`,
+        method: "POST",
+        headers: {
+          Host: `localhost:${handle.port}`,
+          Origin: options.origin ?? `http://localhost:${handle.port}`,
+          "Sec-Fetch-Site": "same-origin",
+          "Sec-Fetch-Mode": "navigate",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Length": Buffer.byteLength(body),
+        },
+      },
+      (incoming) => {
+        const chunks: Buffer[] = [];
+        incoming.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        incoming.on("end", () => {
+          resolve(
+            new Response(Buffer.concat(chunks), {
+              status: incoming.statusCode,
+              headers: incoming.headers as HeadersInit,
+            }),
+          );
+        });
+      },
+    );
+    outgoing.once("error", reject);
+    outgoing.end(body);
   });
 }
 

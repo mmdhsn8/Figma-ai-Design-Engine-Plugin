@@ -1,35 +1,117 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CompanionClientError,
+  disconnectLocalSession,
   discoverAuthorizedModels,
+  getCompanionHealth,
   getCompanionStatus,
-  pairWithCompanion,
+  pollLocalPairing,
+  reopenChatGPTSignIn,
+  reopenLocalApproval,
+  requestLocalPairing,
   runSmokeRequest,
 } from "../src/ui/companion-client";
 
 describe("Figma UI companion client", () => {
-  it("pairs with a valid one-time code and uses an explicit loopback endpoint", async () => {
-    const fetcher = vi.fn<typeof fetch>(async () =>
-      Response.json({ sessionToken: "x".repeat(43) }),
+  it("discovers the local companion and starts approval without exposing a terminal code", async () => {
+    const healthFetcher = vi.fn<typeof fetch>(async () => Response.json({ companion: "running" }));
+    expect(await getCompanionHealth(healthFetcher)).toBe(true);
+    expect(healthFetcher).toHaveBeenCalledWith(
+      "http://localhost:1455/v1/health",
+      expect.objectContaining({ method: "GET", mode: "cors", credentials: "omit" }),
     );
-    const token = await pairWithCompanion("A".repeat(32), fetcher);
-    expect(token).toBe("x".repeat(43));
+    const fetcher = vi.fn<typeof fetch>(async () =>
+      Response.json({ attemptId: "a".repeat(43), expiresInMs: 90_000, approvalOpened: true }),
+    );
+    const attempt = await requestLocalPairing("v".repeat(43), fetcher);
+    expect(attempt).toEqual({
+      attemptId: "a".repeat(43),
+      expiresInMs: 90_000,
+      approvalOpened: true,
+    });
     expect(fetcher).toHaveBeenCalledWith(
-      "http://localhost:1455/v1/pair",
+      "http://localhost:1455/v1/pairing/attempt",
       expect.objectContaining({
         mode: "cors",
         credentials: "omit",
         referrerPolicy: "no-referrer",
+        body: JSON.stringify({ verifier: "v".repeat(43) }),
       }),
     );
   });
 
-  it("rejects malformed pairing codes before issuing a network request", async () => {
+  it("rejects malformed local pairing proofs before issuing a network request", async () => {
     const fetcher = vi.fn<typeof fetch>();
-    await expect(pairWithCompanion("too-short", fetcher)).rejects.toMatchObject({
+    await expect(requestLocalPairing("too-short", fetcher)).rejects.toMatchObject({
       category: "pairing_failed",
     } satisfies Partial<CompanionClientError>);
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("polls an attempt with its verifier and validates approved session credentials", async () => {
+    const pendingFetch = vi.fn<typeof fetch>(async () => Response.json({ status: "pending" }));
+    expect(await pollLocalPairing("a".repeat(43), "v".repeat(43), pendingFetch)).toEqual({
+      status: "pending",
+    });
+    const approvedFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({ status: "approved", sessionToken: "s".repeat(43) }),
+    );
+    expect(await pollLocalPairing("a".repeat(43), "v".repeat(43), approvedFetch)).toEqual({
+      status: "approved",
+      sessionToken: "s".repeat(43),
+    });
+  });
+
+  it("reopens the system approval page only for a pending local proof", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ opened: true }));
+    await expect(
+      reopenLocalApproval("a".repeat(43), "v".repeat(43), fetcher),
+    ).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledWith(
+      "http://localhost:1455/v1/pairing/open",
+      expect.objectContaining({
+        body: JSON.stringify({ attemptId: "a".repeat(43), verifier: "v".repeat(43) }),
+      }),
+    );
+  });
+
+  it("offers a separate user-triggered retry for a pending ChatGPT browser flow", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () =>
+      Response.json({
+        status: {
+          companion: "connected",
+          auth: "signing_in",
+          authLabel: "Signing in",
+          planUseAuthorized: false,
+          modelCount: 0,
+        },
+      }),
+    );
+    expect(await reopenChatGPTSignIn("s".repeat(43), fetcher)).toMatchObject({
+      auth: "signing_in",
+    });
+    expect(fetcher).toHaveBeenCalledWith(
+      "http://localhost:1455/v1/auth/open",
+      expect.objectContaining({ body: "{}" }),
+    );
+  });
+
+  it("treats the health probe as offline when loopback is unavailable", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("fetch failed");
+    });
+    await expect(getCompanionHealth(offline)).rejects.toMatchObject({
+      category: "connection_failed",
+    });
+  });
+
+  it("can clear only the local pairing session", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ disconnected: true }));
+    await expect(disconnectLocalSession("s".repeat(43), fetcher)).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledWith(
+      "http://localhost:1455/v1/pairing/disconnect",
+      expect.objectContaining({ body: "{}" }),
+    );
   });
 
   it("validates status payloads and maps server errors to safe categories", async () => {

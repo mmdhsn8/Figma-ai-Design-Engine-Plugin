@@ -22,7 +22,20 @@ const StatusSchema = z
   })
   .strict();
 
-const PairSchema = z.object({ sessionToken: z.string().min(32).max(128) }).strict();
+const HealthSchema = z.object({ companion: z.literal("running") }).strict();
+const PairingAttemptSchema = z
+  .object({
+    attemptId: z.string().regex(/^[A-Za-z0-9_-]{43}$/u),
+    expiresInMs: z.number().int().positive(),
+    approvalOpened: z.boolean(),
+  })
+  .strict();
+const PairingPollSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("pending") }).strict(),
+  z.object({ status: z.literal("approved"), sessionToken: z.string().min(32).max(128) }).strict(),
+]);
+const PairingActionSchema = z.object({ disconnected: z.literal(true) }).strict();
+const PairingCancelSchema = z.object({ cancelled: z.literal(true) }).strict();
 const ModelSchema = z
   .object({ slug: z.string().min(1).max(200), displayName: z.string().min(1).max(200) })
   .strict();
@@ -40,10 +53,20 @@ const DisconnectSchema = z
 export type CompanionStatus = z.infer<typeof StatusSchema>;
 export type CompanionModel = z.infer<typeof ModelSchema>;
 export type CompanionErrorCategory =
+  | "pairing_busy"
+  | "pairing_rate_limited"
+  | "pairing_approval_unavailable"
+  | "pairing_denied"
+  | "pairing_expired"
+  | "pairing_cancelled"
+  | "pairing_replayed"
+  | "system_browser_unavailable"
+  | "browser_open_rate_limited"
   | "pairing_unavailable"
   | "pairing_failed"
   | "pairing_required"
   | "sign_in_already_pending"
+  | "sign_in_timed_out"
   | "consent_denied"
   | "callback_invalid"
   | "client_id_mismatch"
@@ -75,15 +98,77 @@ export class CompanionClientError extends Error {
 
 type Fetcher = typeof fetch;
 
-export async function pairWithCompanion(code: string, fetcher: Fetcher = fetch): Promise<string> {
-  const normalized = code.trim();
-  if (!/^[A-Za-z0-9_-]{32,128}$/u.test(normalized)) {
+export async function getCompanionHealth(fetcher: Fetcher = fetch): Promise<boolean> {
+  const parsed = HealthSchema.safeParse(await request("/v1/health", undefined, undefined, fetcher));
+  if (!parsed.success) throw new CompanionClientError("unknown");
+  return true;
+}
+
+export async function requestLocalPairing(
+  verifier: string,
+  fetcher: Fetcher = fetch,
+): Promise<{ attemptId: string; expiresInMs: number; approvalOpened: boolean }> {
+  if (!/^[A-Za-z0-9_-]{43}$/u.test(verifier)) {
     throw new CompanionClientError("pairing_failed");
   }
-  const body = await request("/v1/pair", undefined, { code: normalized }, fetcher);
-  const parsed = PairSchema.safeParse(body);
+  const body = await request("/v1/pairing/attempt", undefined, { verifier }, fetcher);
+  const parsed = PairingAttemptSchema.safeParse(body);
   if (!parsed.success) throw new CompanionClientError("unknown");
-  return parsed.data.sessionToken;
+  return parsed.data;
+}
+
+export async function pollLocalPairing(
+  attemptId: string,
+  verifier: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<{ status: "pending" } | { status: "approved"; sessionToken: string }> {
+  if (!/^[A-Za-z0-9_-]{43}$/u.test(attemptId) || !/^[A-Za-z0-9_-]{43}$/u.test(verifier)) {
+    throw new CompanionClientError("pairing_failed");
+  }
+  const body = await request(
+    "/v1/pairing/poll",
+    undefined,
+    { attemptId, verifier },
+    fetcher,
+    signal,
+  );
+  const parsed = PairingPollSchema.safeParse(body);
+  if (!parsed.success) throw new CompanionClientError("unknown");
+  return parsed.data;
+}
+
+export async function reopenLocalApproval(
+  attemptId: string,
+  verifier: string,
+  fetcher: Fetcher = fetch,
+): Promise<void> {
+  const body = await request("/v1/pairing/open", undefined, { attemptId, verifier }, fetcher);
+  if (
+    !z
+      .object({ opened: z.literal(true) })
+      .strict()
+      .safeParse(body).success
+  ) {
+    throw new CompanionClientError("unknown");
+  }
+}
+
+export async function cancelLocalPairing(
+  attemptId: string,
+  verifier: string,
+  fetcher: Fetcher = fetch,
+): Promise<void> {
+  const body = await request("/v1/pairing/cancel", undefined, { attemptId, verifier }, fetcher);
+  if (!PairingCancelSchema.safeParse(body).success) throw new CompanionClientError("unknown");
+}
+
+export async function disconnectLocalSession(
+  token: string,
+  fetcher: Fetcher = fetch,
+): Promise<void> {
+  const body = await request("/v1/pairing/disconnect", token, {}, fetcher);
+  if (!PairingActionSchema.safeParse(body).success) throw new CompanionClientError("unknown");
 }
 
 export async function getCompanionStatus(
@@ -101,6 +186,14 @@ export async function startChatGPTSignIn(
   fetcher: Fetcher = fetch,
 ): Promise<CompanionStatus> {
   const body = await request("/v1/auth/start", token, {}, fetcher);
+  return parseStatus((body as { status?: unknown }).status);
+}
+
+export async function reopenChatGPTSignIn(
+  token: string,
+  fetcher: Fetcher = fetch,
+): Promise<CompanionStatus> {
+  const body = await request("/v1/auth/open", token, {}, fetcher);
   return parseStatus((body as { status?: unknown }).status);
 }
 
@@ -157,7 +250,8 @@ async function request(
   let response: Response;
   try {
     response = await fetcher(`${COMPANION_URL}${path}`, {
-      method: body === undefined && path === "/v1/status" ? "GET" : "POST",
+      method:
+        body === undefined && (path === "/v1/status" || path === "/v1/health") ? "GET" : "POST",
       mode: "cors",
       credentials: "omit",
       cache: "no-store",
@@ -193,10 +287,20 @@ async function request(
 
 function mapError(value: string): CompanionErrorCategory {
   const known: CompanionErrorCategory[] = [
+    "pairing_busy",
+    "pairing_rate_limited",
+    "pairing_approval_unavailable",
+    "pairing_denied",
+    "pairing_expired",
+    "pairing_cancelled",
+    "pairing_replayed",
+    "system_browser_unavailable",
+    "browser_open_rate_limited",
     "pairing_unavailable",
     "pairing_failed",
     "pairing_required",
     "sign_in_already_pending",
+    "sign_in_timed_out",
     "consent_denied",
     "callback_invalid",
     "client_id_mismatch",

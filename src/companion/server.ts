@@ -28,7 +28,12 @@ import {
 } from "./oauth.js";
 
 const MAX_BODY_BYTES = 16 * 1_024;
+const MAX_APPROVAL_BODY_BYTES = 2 * 1_024;
 const NETWORK_TIMEOUT_MS = 45_000;
+const PAIRING_ATTEMPT_TTL_MS = 90_000;
+const PAIRING_SESSION_TTL_MS = 15 * 60 * 1_000;
+const MAX_PAIRING_ATTEMPTS_PER_MINUTE = 5;
+const MAX_PAIRING_POLL_REQUESTS = 180;
 const STATUS_TEXT: Record<string, string> = {
   signed_out: "Signed out",
   signing_in: "Signing in",
@@ -61,7 +66,6 @@ export interface CompanionServerOptions {
 
 export interface CompanionServerHandle {
   port: number;
-  pairingCode: string;
   close(): Promise<void>;
 }
 
@@ -84,6 +88,18 @@ interface PendingAuthorization {
   transaction: AuthorizationTransaction;
   discovery: OidcDiscovery;
   timer: ReturnType<typeof setNodeTimeout>;
+  authorizationUrl: string;
+  browserOpenAttempts: number;
+}
+
+interface PairingAttempt {
+  id: string;
+  verifierHash: string;
+  csrfToken: string;
+  status: "pending" | "approved" | "denied" | "cancelled" | "expired" | "completed";
+  expiresAt: number;
+  pollCount: number;
+  openCount: number;
 }
 
 interface TokenResponse {
@@ -100,10 +116,9 @@ export function createCompanionServer(options: CompanionServerOptions) {
   const now = options.now ?? Date.now;
   const timeoutMs = options.requestTimeoutMs ?? NETWORK_TIMEOUT_MS;
   const port = options.port ?? COMPANION_PORT;
-  const pairingCode = randomBytes(24).toString("base64url");
-  const sessionToken = randomBytes(32).toString("base64url");
-  let pairingUsed = false;
-  let pairingAttempts = 0;
+  const pairingAttempts = new Map<string, PairingAttempt>();
+  const sessionTokenHashes = new Map<string, number>();
+  const pairingStartTimes: number[] = [];
   let authStatus: AuthStatus = "signed_out";
   let safeMessage: string | undefined;
   let liveSession: LiveSession | undefined;
@@ -147,13 +162,15 @@ export function createCompanionServer(options: CompanionServerOptions) {
     }
     return {
       port: actualPort,
-      pairingCode,
       close: async () => close(),
     };
   }
 
   async function close(): Promise<void> {
     clearPendingAuthorization();
+    pairingAttempts.clear();
+    sessionTokenHashes.clear();
+    pairingStartTimes.length = 0;
     liveSession = undefined;
     authStatus = "signed_out";
     const running = servers;
@@ -177,6 +194,15 @@ export function createCompanionServer(options: CompanionServerOptions) {
       return;
     }
 
+    if (url.pathname.startsWith("/local-approval/") && request.method === "GET") {
+      await handleApprovalPage(request, response, url);
+      return;
+    }
+    if (url.pathname.startsWith("/local-approval/") && request.method === "POST") {
+      await handleApprovalDecision(request, response, url);
+      return;
+    }
+
     if (request.headers.host !== `${COMPANION_HOSTNAME}:${actualPort}`) {
       sendJson(response, 400, { error: "invalid_host" });
       return;
@@ -195,8 +221,24 @@ export function createCompanionServer(options: CompanionServerOptions) {
       return;
     }
 
-    if (url.pathname === "/v1/pair" && request.method === "POST") {
-      await handlePair(request, response);
+    if (url.pathname === "/v1/health" && request.method === "GET") {
+      sendJson(response, 200, { companion: "running" });
+      return;
+    }
+    if (url.pathname === "/v1/pairing/attempt" && request.method === "POST") {
+      await handlePairingAttempt(request, response);
+      return;
+    }
+    if (url.pathname === "/v1/pairing/poll" && request.method === "POST") {
+      await handlePairingPoll(request, response);
+      return;
+    }
+    if (url.pathname === "/v1/pairing/open" && request.method === "POST") {
+      await handlePairingOpen(request, response);
+      return;
+    }
+    if (url.pathname === "/v1/pairing/cancel" && request.method === "POST") {
+      await handlePairingCancel(request, response);
       return;
     }
     if (!authorized(request)) {
@@ -207,6 +249,19 @@ export function createCompanionServer(options: CompanionServerOptions) {
       sendJson(response, 200, status());
       return;
     }
+    if (url.pathname === "/v1/pairing/disconnect" && request.method === "POST") {
+      const body = await readJsonBody(request);
+      if (!body.ok || !hasExactKeys(body.value, [])) {
+        sendJson(response, 400, { error: "invalid_json" });
+        return;
+      }
+      const header = request.headers.authorization;
+      if (header?.startsWith("Bearer ")) {
+        sessionTokenHashes.delete(hashSecret(header.slice(7)));
+      }
+      sendJson(response, 200, { disconnected: true });
+      return;
+    }
     if (url.pathname === "/v1/auth/start" && request.method === "POST") {
       const body = await readJsonBody(request);
       if (!body.ok) {
@@ -214,6 +269,15 @@ export function createCompanionServer(options: CompanionServerOptions) {
         return;
       }
       await handleAuthStart(response);
+      return;
+    }
+    if (url.pathname === "/v1/auth/open" && request.method === "POST") {
+      const body = await readJsonBody(request);
+      if (!body.ok || !hasExactKeys(body.value, [])) {
+        sendJson(response, 400, { error: "invalid_json" });
+        return;
+      }
+      await handleAuthBrowserOpen(response);
       return;
     }
     if (url.pathname === "/v1/models" && request.method === "POST") {
@@ -251,29 +315,279 @@ export function createCompanionServer(options: CompanionServerOptions) {
     sendJson(response, 404, { error: "not_found" });
   }
 
-  async function handlePair(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    if (pairingUsed || pairingAttempts >= 5) {
-      sendJson(response, 403, { error: "pairing_unavailable" });
+  async function handlePairingAttempt(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const body = await readJsonBody(request);
+    const verifier =
+      body.ok && hasExactKeys(body.value, ["verifier"]) ? body.value.verifier : undefined;
+    if (typeof verifier !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(verifier)) {
+      sendJson(response, 400, { error: "pairing_failed" });
       return;
     }
-    pairingAttempts += 1;
-    const body = await readJsonBody(request);
+
+    prunePairingState();
     if (
-      !body.ok ||
-      typeof body.value.code !== "string" ||
-      !safeStringEqual(body.value.code, pairingCode)
+      [...pairingAttempts.values()].some(
+        (attempt) => attempt.status === "pending" || attempt.status === "approved",
+      )
+    ) {
+      sendJson(response, 409, { error: "pairing_busy" });
+      return;
+    }
+
+    const currentTime = now();
+    while (pairingStartTimes.length && currentTime - pairingStartTimes[0]! >= 60_000) {
+      pairingStartTimes.shift();
+    }
+    if (pairingStartTimes.length >= MAX_PAIRING_ATTEMPTS_PER_MINUTE) {
+      sendJson(response, 429, { error: "pairing_rate_limited" });
+      return;
+    }
+    pairingStartTimes.push(currentTime);
+
+    const attempt: PairingAttempt = {
+      id: randomBytes(32).toString("base64url"),
+      verifierHash: hashSecret(verifier),
+      csrfToken: randomBytes(32).toString("base64url"),
+      status: "pending",
+      expiresAt: currentTime + PAIRING_ATTEMPT_TTL_MS,
+      pollCount: 0,
+      openCount: 0,
+    };
+    pairingAttempts.set(attempt.id, attempt);
+    const opened = await openApprovalPage(attempt);
+    sendJson(response, 200, {
+      attemptId: attempt.id,
+      expiresInMs: PAIRING_ATTEMPT_TTL_MS,
+      approvalOpened: opened,
+    });
+  }
+
+  async function openApprovalPage(attempt: PairingAttempt): Promise<boolean> {
+    attempt.openCount += 1;
+    if (!options.openBrowser) return false;
+    const approvalUrl = `http://${COMPANION_HOSTNAME}:${actualPort}/local-approval/${attempt.id}`;
+    try {
+      await options.openBrowser(approvalUrl);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function handlePairingPoll(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const body = await readJsonBody(request);
+    const validBody = body.ok && hasExactKeys(body.value, ["attemptId", "verifier"]);
+    const attempt = validBody ? getAttempt(body.value.attemptId) : undefined;
+    const verifier = validBody ? body.value.verifier : undefined;
+    if (
+      !attempt ||
+      typeof verifier !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/u.test(verifier) ||
+      !safeStringEqual(attempt.verifierHash, hashSecret(verifier))
     ) {
       sendJson(response, 403, { error: "pairing_failed" });
       return;
     }
-    pairingUsed = true;
-    sendJson(response, 200, { sessionToken });
+    attempt.pollCount += 1;
+    if (attempt.pollCount > MAX_PAIRING_POLL_REQUESTS) {
+      attempt.status = "cancelled";
+      sendJson(response, 429, { error: "pairing_rate_limited" });
+      return;
+    }
+    if (attempt.status === "pending") {
+      sendJson(response, 200, { status: "pending" });
+      return;
+    }
+    if (attempt.status === "approved") {
+      const sessionToken = randomBytes(32).toString("base64url");
+      sessionTokenHashes.set(hashSecret(sessionToken), now() + PAIRING_SESSION_TTL_MS);
+      attempt.status = "completed";
+      attempt.csrfToken = "";
+      sendJson(response, 200, { status: "approved", sessionToken });
+      return;
+    }
+    if (attempt.status === "denied") {
+      sendJson(response, 403, { error: "pairing_denied" });
+      return;
+    }
+    if (attempt.status === "cancelled") {
+      sendJson(response, 403, { error: "pairing_cancelled" });
+      return;
+    }
+    if (attempt.status === "expired") {
+      sendJson(response, 410, { error: "pairing_expired" });
+      return;
+    }
+    sendJson(response, 409, { error: "pairing_replayed" });
+  }
+
+  async function handlePairingCancel(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const body = await readJsonBody(request);
+    const validBody = body.ok && hasExactKeys(body.value, ["attemptId", "verifier"]);
+    const attempt = validBody ? getAttempt(body.value.attemptId) : undefined;
+    const verifier = validBody ? body.value.verifier : undefined;
+    if (
+      !attempt ||
+      typeof verifier !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/u.test(verifier) ||
+      !safeStringEqual(attempt.verifierHash, hashSecret(verifier)) ||
+      attempt.status !== "pending"
+    ) {
+      sendJson(response, 403, { error: "pairing_failed" });
+      return;
+    }
+    attempt.status = "cancelled";
+    attempt.csrfToken = "";
+    sendJson(response, 200, { cancelled: true });
+  }
+
+  async function handlePairingOpen(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const body = await readJsonBody(request);
+    const validBody = body.ok && hasExactKeys(body.value, ["attemptId", "verifier"]);
+    const attempt = validBody ? getAttempt(body.value.attemptId) : undefined;
+    const verifier = validBody ? body.value.verifier : undefined;
+    if (
+      !attempt ||
+      attempt.status !== "pending" ||
+      typeof verifier !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/u.test(verifier) ||
+      !safeStringEqual(attempt.verifierHash, hashSecret(verifier))
+    ) {
+      sendJson(response, 403, { error: "pairing_failed" });
+      return;
+    }
+    if (attempt.openCount >= 3) {
+      sendJson(response, 429, { error: "pairing_rate_limited" });
+      return;
+    }
+    const opened = await openApprovalPage(attempt);
+    if (!opened) {
+      sendJson(response, 503, { error: "pairing_approval_unavailable" });
+      return;
+    }
+    sendJson(response, 200, { opened: true });
+  }
+
+  async function handleApprovalPage(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    if (request.headers.host !== `${COMPANION_HOSTNAME}:${actualPort}`) {
+      sendApprovalHtml(response, 400, approvalMessagePage("This local approval link is invalid."));
+      return;
+    }
+    const attempt = getAttempt(url.pathname.slice("/local-approval/".length));
+    if (!attempt || attempt.status !== "pending") {
+      sendApprovalHtml(
+        response,
+        410,
+        approvalMessagePage("This approval request expired or was already handled."),
+      );
+      return;
+    }
+    sendApprovalHtml(response, 200, approvalFormPage(attempt.id, attempt.csrfToken));
+  }
+
+  async function handleApprovalDecision(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    if (
+      request.headers.host !== `${COMPANION_HOSTNAME}:${actualPort}` ||
+      request.headers.origin !== `http://${COMPANION_HOSTNAME}:${actualPort}` ||
+      request.headers["sec-fetch-site"] !== "same-origin" ||
+      request.headers["sec-fetch-mode"] !== "navigate"
+    ) {
+      request.resume();
+      sendApprovalHtml(
+        response,
+        403,
+        approvalMessagePage("The local approval request was rejected."),
+      );
+      return;
+    }
+    const attempt = getAttempt(url.pathname.slice("/local-approval/".length));
+    const form = await readFormBody(request, MAX_APPROVAL_BODY_BYTES);
+    if (
+      !attempt ||
+      attempt.status !== "pending" ||
+      !form ||
+      typeof form.get("csrf") !== "string" ||
+      !safeStringEqual(attempt.csrfToken, form.get("csrf") ?? "")
+    ) {
+      sendApprovalHtml(
+        response,
+        403,
+        approvalMessagePage("The local approval request was invalid or expired."),
+      );
+      return;
+    }
+    const decision = form.get("decision");
+    if (decision !== "approve" && decision !== "deny") {
+      sendApprovalHtml(response, 400, approvalMessagePage("Choose approve or deny to continue."));
+      return;
+    }
+    attempt.status = decision === "approve" ? "approved" : "denied";
+    attempt.csrfToken = "";
+    sendApprovalHtml(
+      response,
+      200,
+      approvalMessagePage(
+        decision === "approve"
+          ? "Local companion access was approved. Return to Figma; this did not sign you in to ChatGPT."
+          : "Local companion access was denied. Return to Figma to retry if you initiated this request.",
+      ),
+    );
+  }
+
+  function getAttempt(value: unknown): PairingAttempt | undefined {
+    if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(value)) return undefined;
+    const attempt = pairingAttempts.get(value);
+    if (attempt && attempt.status === "pending" && now() >= attempt.expiresAt) {
+      attempt.status = "expired";
+      attempt.csrfToken = "";
+    }
+    return attempt;
+  }
+
+  function prunePairingState(): void {
+    const currentTime = now();
+    for (const [id, attempt] of pairingAttempts) {
+      if (attempt.status === "pending" && currentTime >= attempt.expiresAt) {
+        attempt.status = "expired";
+        attempt.csrfToken = "";
+      }
+      if (currentTime >= attempt.expiresAt + PAIRING_ATTEMPT_TTL_MS) pairingAttempts.delete(id);
+    }
+    for (const [tokenHash, expiresAt] of sessionTokenHashes) {
+      if (currentTime >= expiresAt) sessionTokenHashes.delete(tokenHash);
+    }
   }
 
   function authorized(request: IncomingMessage): boolean {
     const header = request.headers.authorization;
     if (!header?.startsWith("Bearer ")) return false;
-    return safeStringEqual(header.slice(7), sessionToken);
+    const token = header.slice(7);
+    if (!/^[A-Za-z0-9_-]{43}$/u.test(token)) return false;
+    prunePairingState();
+    const tokenHash = hashSecret(token);
+    if (!sessionTokenHashes.has(tokenHash)) return false;
+    sessionTokenHashes.set(tokenHash, now() + PAIRING_SESSION_TTL_MS);
+    return true;
   }
 
   async function handleAuthStart(response: ServerResponse): Promise<void> {
@@ -299,16 +613,53 @@ export function createCompanionServer(options: CompanionServerOptions) {
         },
         Math.max(0, transaction.expiresAt - now()),
       );
-      pendingAuthorization = { transaction, discovery, timer };
+      pendingAuthorization = {
+        transaction,
+        discovery,
+        timer,
+        authorizationUrl: url.toString(),
+        browserOpenAttempts: 0,
+      };
       liveSession = undefined;
       authStatus = "signing_in";
       safeMessage = undefined;
-      await options.openBrowser?.(url.toString());
+      try {
+        if (!options.openBrowser) throw new Error("system_browser_unavailable");
+        pendingAuthorization.browserOpenAttempts += 1;
+        await options.openBrowser(pendingAuthorization.authorizationUrl);
+      } catch {
+        safeMessage = "system_browser_unavailable";
+      }
       sendJson(response, 200, { status: status() });
     } catch (error) {
       clearPendingAuthorization();
       authStatus = "blocked";
       safeMessage = classifyError(error);
+      sendJson(response, 503, { error: safeMessage, status: status() });
+    }
+  }
+
+  async function handleAuthBrowserOpen(response: ServerResponse): Promise<void> {
+    const pending = pendingAuthorization;
+    if (!pending || now() >= pending.transaction.expiresAt) {
+      clearPendingAuthorization();
+      authStatus = "blocked";
+      safeMessage = "sign_in_timed_out";
+      sendJson(response, 410, { error: "sign_in_timed_out", status: status() });
+      return;
+    }
+    if (pending.browserOpenAttempts >= 3) {
+      sendJson(response, 429, { error: "browser_open_rate_limited", status: status() });
+      return;
+    }
+    pending.browserOpenAttempts += 1;
+    try {
+      if (!options.openBrowser) throw new Error("system_browser_unavailable");
+      await options.openBrowser(pending.authorizationUrl);
+      safeMessage = undefined;
+      sendJson(response, 200, { status: status() });
+    } catch {
+      safeMessage = "system_browser_unavailable";
       sendJson(response, 503, { error: safeMessage, status: status() });
     }
   }
@@ -682,7 +1033,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
     if (request.headers.origin !== COMPANION_UI_ORIGIN) return false;
     // Figma plugin UI iframes have an opaque "null" origin. Figma's docs require
     // an API reachable from the plugin iframe to permit wildcard ACAO. Cookies
-    // are disabled; the one-time pairing bearer authorizes subsequent requests.
+    // are disabled; explicit local approval and per-session bearers authorize
+    // privileged requests. Origin:null is not an identity assertion.
     response.setHeader("Access-Control-Allow-Origin", "*");
     response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
@@ -866,9 +1218,115 @@ async function readJsonBody(
   }
 }
 
+function hasExactKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
 function sendJson(response: ServerResponse, statusCode: number, body: unknown): void {
   response.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body));
+}
+
+async function readFormBody(
+  request: IncomingMessage,
+  maxBytes: number,
+): Promise<URLSearchParams | undefined> {
+  if (
+    !request.headers["content-type"]?.toLowerCase().startsWith("application/x-www-form-urlencoded")
+  ) {
+    request.resume();
+    return undefined;
+  }
+  const declaredLength = Number(request.headers["content-length"]);
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    request.resume();
+    return undefined;
+  }
+  const chunks: Buffer[] = [];
+  let length = 0;
+  try {
+    for await (const chunk of request) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      length += buffer.length;
+      if (length > maxBytes) {
+        request.resume();
+        return undefined;
+      }
+      chunks.push(buffer);
+    }
+    const form = new URLSearchParams(Buffer.concat(chunks).toString("utf8"));
+    return Array.from(form.keys()).length <= 2 ? form : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function approvalFormPage(attemptId: string, csrfToken: string): string {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Local companion approval</title>
+    <style>
+      body{font:16px system-ui,sans-serif;max-width:34rem;margin:12vh auto;padding:0 1.25rem;color:#172033}
+      h1{font-size:1.5rem}
+      p{line-height:1.55}
+      .notice{padding:1rem;background:#eff6ff;border-radius:.75rem}
+      form{display:flex;gap:.75rem;margin-top:1.5rem}
+      button{font:inherit;padding:.75rem 1rem;border:0;border-radius:.5rem;cursor:pointer}
+      button[name=decision][value=approve]{background:#2563eb;color:white}
+      button[name=decision][value=deny]{background:#e2e8f0;color:#172033}
+    </style>
+  </head>
+  <body>
+    <h1>Approve local companion access?</h1>
+    <p class="notice">A local client is waiting to connect to this companion. This page cannot verify whether the request came from Figma AI Design Engine, another plugin, or another local program. Approve only if you just clicked <strong>Continue with ChatGPT</strong> in the Figma AI Design Engine plugin.</p>
+    <p>This approval connects the plugin UI to the local companion only. It does not sign you in to ChatGPT or grant plan-use permission.</p>
+    <form method="post" action="/local-approval/${attemptId}">
+      <input type="hidden" name="csrf" value="${csrfToken}">
+      <button type="submit" name="decision" value="approve">Approve local connection</button>
+      <button type="submit" name="decision" value="deny">Deny</button>
+    </form>
+  </body>
+</html>`;
+}
+
+function approvalMessagePage(message: string): string {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Local companion</title>
+    <style>body{font:16px system-ui,sans-serif;max-width:34rem;margin:12vh auto;padding:0 1.25rem;color:#172033}p{line-height:1.55}</style>
+  </head>
+  <body>
+    <h1>Figma AI Design Engine local companion</h1>
+    <p>${message}</p>
+    <p>You may close this tab and return to Figma.</p>
+  </body>
+</html>`;
+}
+
+function sendApprovalHtml(response: ServerResponse, statusCode: number, html: string): void {
+  response.writeHead(statusCode, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store, max-age=0",
+    Pragma: "no-cache",
+    "Content-Security-Policy":
+      "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+  });
+  response.end(html);
+}
+
+function hashSecret(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function sendCallbackPage(response: ServerResponse, result: string): void {

@@ -24,10 +24,16 @@ import { auditVisualQuality, type VisualQualityAudit } from "../shared/visual-qu
 import { inspectEmbeddedImage, parseSafeSvg } from "../shared/visual-assets";
 import {
   CompanionClientError,
+  cancelLocalPairing,
   disconnectChatGPT,
+  disconnectLocalSession,
   discoverAuthorizedModels,
+  getCompanionHealth,
   getCompanionStatus,
-  pairWithCompanion,
+  pollLocalPairing,
+  reopenLocalApproval,
+  reopenChatGPTSignIn,
+  requestLocalPairing,
   runSmokeRequest,
   startChatGPTSignIn,
   switchChatGPTAccount,
@@ -40,6 +46,9 @@ type Notice = {
   title: string;
   details?: string[];
 };
+
+type CompanionConnectionState =
+  "discovering" | "offline" | "available" | "approval_required" | "pairing" | "connected";
 
 function postToPlugin(message: UIToPluginMessage): void {
   parent.postMessage({ pluginMessage: message }, "*");
@@ -78,6 +87,14 @@ function rawAssetInventory(source: string): Array<Record<string, unknown>> {
   }
 }
 
+function createPairingVerifier(): string {
+  const bytes = new Uint8Array(32);
+  window.crypto.getRandomValues(bytes);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+}
+
 export default function App() {
   const [json, setJson] = useState(phase1Sample.trim());
   const [notice, setNotice] = useState<Notice>({
@@ -90,16 +107,21 @@ export default function App() {
   const [rowWidth, setRowWidth] = useState(DEFAULT_MAX_ROW_WIDTH);
   const [assetLicense, setAssetLicense] = useState("");
   const [assetAttribution, setAssetAttribution] = useState("");
-  const [pairingCode, setPairingCode] = useState("");
   const [companionToken, setCompanionToken] = useState<string | null>(null);
+  const [companionConnectionState, setCompanionConnectionState] =
+    useState<CompanionConnectionState>("discovering");
+  const [pairingAttemptId, setPairingAttemptId] = useState<string | null>(null);
   const [companionStatus, setCompanionStatus] = useState<CompanionStatus | null>(null);
   const [companionError, setCompanionError] = useState<string | null>(null);
   const [companionBusy, setCompanionBusy] = useState(false);
+  const [approvalPageBusy, setApprovalPageBusy] = useState(false);
   const [companionModels, setCompanionModels] = useState<CompanionModel[]>([]);
   const [selectedCompanionModel, setSelectedCompanionModel] = useState("");
   const [smokeResult, setSmokeResult] = useState<string | null>(null);
   const [smokeInFlight, setSmokeInFlight] = useState(false);
   const smokeAbort = useRef<AbortController | null>(null);
+  const pairingAbort = useRef<AbortController | null>(null);
+  const pairingAttempt = useRef<{ attemptId: string; verifier: string } | null>(null);
   const [multiProgress, setMultiProgress] = useState<MultiScreenProgressMessage | null>(null);
   const [multiReport, setMultiReport] = useState<MultiScreenRenderResultMessage | null>(null);
   const currentRequest = useRef<string | null>(null);
@@ -252,7 +274,63 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!companionToken || companionStatus?.auth !== "signing_in") return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const checkConnection = async () => {
+      if (
+        companionConnectionState === "approval_required" ||
+        companionConnectionState === "pairing"
+      ) {
+        timer = window.setTimeout(() => void checkConnection(), 2_000);
+        return;
+      }
+      try {
+        await getCompanionHealth();
+        if (cancelled) return;
+        if (companionToken) {
+          try {
+            const status = await getCompanionStatus(companionToken);
+            if (cancelled) return;
+            setCompanionStatus(status);
+            setCompanionConnectionState("connected");
+          } catch {
+            if (cancelled) return;
+            setCompanionToken(null);
+            setCompanionStatus(null);
+            setCompanionModels([]);
+            setSelectedCompanionModel("");
+            setCompanionConnectionState("available");
+          }
+        } else {
+          setCompanionConnectionState("available");
+        }
+      } catch {
+        if (cancelled) return;
+        setCompanionConnectionState("offline");
+        if (companionToken) {
+          setCompanionToken(null);
+          setCompanionStatus(null);
+          setCompanionModels([]);
+          setSelectedCompanionModel("");
+        }
+      }
+      if (!cancelled) timer = window.setTimeout(() => void checkConnection(), 5_000);
+    };
+    void checkConnection();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [companionConnectionState, companionToken]);
+
+  useEffect(() => {
+    if (
+      !companionToken ||
+      companionStatus?.auth !== "signing_in" ||
+      companionStatus.safeMessage === "system_browser_unavailable"
+    ) {
+      return;
+    }
     let cancelled = false;
     let timer: number | undefined;
     let attempts = 0;
@@ -279,7 +357,7 @@ export default function App() {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [companionStatus?.auth, companionToken]);
+  }, [companionStatus?.auth, companionStatus?.safeMessage, companionToken]);
 
   const nextRequestId = () => `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -369,20 +447,99 @@ export default function App() {
     postToPlugin({ type: "apply-design-system", requestId, json, updateOwned });
   };
 
-  const pairCompanion = async () => {
+  const continueWithChatGPT = async () => {
     setCompanionBusy(true);
     setCompanionError(null);
     setSmokeResult(null);
     try {
-      const token = await pairWithCompanion(pairingCode);
-      setCompanionToken(token);
-      setPairingCode("");
-      const status = await getCompanionStatus(token);
+      let token = companionToken;
+      if (!token) {
+        setCompanionConnectionState("pairing");
+        const verifier = createPairingVerifier();
+        const attempt = await requestLocalPairing(verifier);
+        pairingAttempt.current = { attemptId: attempt.attemptId, verifier };
+        setPairingAttemptId(attempt.attemptId);
+        setCompanionConnectionState("approval_required");
+        if (!attempt.approvalOpened) {
+          setCompanionError(companionErrorText("pairing_approval_unavailable"));
+        }
+        const controller = new AbortController();
+        pairingAbort.current = controller;
+        const deadline = Date.now() + attempt.expiresInMs;
+        while (Date.now() < deadline) {
+          if (controller.signal.aborted) throw new CompanionClientError("pairing_cancelled");
+          const result = await pollLocalPairing(
+            attempt.attemptId,
+            verifier,
+            fetch,
+            controller.signal,
+          );
+          if (result.status === "approved") {
+            token = result.sessionToken;
+            break;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+        }
+        if (!token) throw new CompanionClientError("pairing_expired");
+        pairingAttempt.current = null;
+        setPairingAttemptId(null);
+        pairingAbort.current = null;
+        setCompanionToken(token);
+        setCompanionConnectionState("connected");
+      }
+      let status = await getCompanionStatus(token);
+      if (["signed_out", "signed_in_no_plan", "session_expired"].includes(status.auth)) {
+        status = await startChatGPTSignIn(token);
+      }
       setCompanionStatus(status);
+      setCompanionConnectionState("connected");
+      setCompanionError(status.safeMessage ? companionErrorText(status.safeMessage) : null);
+    } catch (error) {
+      pairingAttempt.current = null;
+      setPairingAttemptId(null);
+      setCompanionConnectionState("available");
+      if (
+        pairingAbort.current?.signal.aborted ||
+        (error instanceof CompanionClientError && error.category === "request_cancelled")
+      ) {
+        setCompanionError("Local connection cancelled. No ChatGPT sign-in was started.");
+      } else {
+        setCompanionError(companionErrorText(error));
+      }
+      pairingAbort.current = null;
+    } finally {
+      setCompanionBusy(false);
+    }
+  };
+
+  const cancelLocalConnection = async () => {
+    const attempt = pairingAttempt.current;
+    if (attempt) {
+      try {
+        await cancelLocalPairing(attempt.attemptId, attempt.verifier);
+      } catch {
+        // The short-lived attempt expires automatically if the companion is unavailable.
+      }
+    }
+    pairingAbort.current?.abort();
+    pairingAttempt.current = null;
+    pairingAbort.current = null;
+    setPairingAttemptId(null);
+    setCompanionConnectionState("available");
+    setCompanionError("Local connection cancelled. No ChatGPT sign-in was started.");
+  };
+
+  const reopenApprovalPage = async () => {
+    const attempt = pairingAttempt.current;
+    if (!attempt) return;
+    setApprovalPageBusy(true);
+    setCompanionError(null);
+    try {
+      await reopenLocalApproval(attempt.attemptId, attempt.verifier);
     } catch (error) {
       setCompanionError(companionErrorText(error));
     } finally {
-      setCompanionBusy(false);
+      setApprovalPageBusy(false);
     }
   };
 
@@ -394,7 +551,22 @@ export default function App() {
     try {
       const status = await startChatGPTSignIn(companionToken);
       setCompanionStatus(status);
-      setCompanionError(null);
+      setCompanionError(status.safeMessage ? companionErrorText(status.safeMessage) : null);
+    } catch (error) {
+      setCompanionError(companionErrorText(error));
+    } finally {
+      setCompanionBusy(false);
+    }
+  };
+
+  const reopenChatGPTBrowser = async () => {
+    if (!companionToken) return;
+    setCompanionBusy(true);
+    setCompanionError(null);
+    try {
+      const status = await reopenChatGPTSignIn(companionToken);
+      setCompanionStatus(status);
+      setCompanionError(status.safeMessage ? companionErrorText(status.safeMessage) : null);
     } catch (error) {
       setCompanionError(companionErrorText(error));
     } finally {
@@ -454,6 +626,23 @@ export default function App() {
     setCompanionModels([]);
     setSelectedCompanionModel("");
     setSmokeResult(null);
+  };
+
+  const disconnectLocalCompanion = async () => {
+    if (!companionToken) return;
+    setCompanionBusy(true);
+    try {
+      await disconnectLocalSession(companionToken);
+      setCompanionError(null);
+    } catch (error) {
+      setCompanionError(companionErrorText(error));
+    } finally {
+      setCompanionToken(null);
+      setCompanionStatus(null);
+      clearConnectedAccountDetails();
+      setCompanionConnectionState("available");
+      setCompanionBusy(false);
+    }
   };
 
   const disconnectCompanion = async (switchAccount = false) => {
@@ -791,35 +980,85 @@ export default function App() {
             <h2 id="ai-gate-title">ChatGPT connection proof of concept</h2>
           </div>
           <span className={`system-status ${companionStatus?.auth === "ready" ? "is-ready" : ""}`}>
-            {companionStatus?.authLabel ?? "Companion not paired"}
+            {companionStatus?.authLabel ??
+              (
+                {
+                  discovering: "Checking local companion…",
+                  offline: "Companion offline",
+                  available: "Companion available · sign-in not checked",
+                  approval_required: "Local approval required",
+                  pairing: "Pairing with local companion",
+                  connected: "Locally connected",
+                } satisfies Record<CompanionConnectionState, string>
+              )[companionConnectionState]}
           </span>
         </div>
         {!companionToken ? (
           <>
-            <p className="ai-gate-note">
-              Start <code>npm run companion</code> in PowerShell, then enter its one-time pairing
-              code here. The code connects this plugin window to your local process.
-            </p>
-            <label className="ai-gate-field">
-              <span>One-time local pairing code</span>
-              <input
-                type="password"
-                autoComplete="off"
-                value={pairingCode}
-                maxLength={128}
-                onChange={(event) => setPairingCode(event.target.value)}
-                aria-label="Local companion pairing code"
-                placeholder="Paste code from the companion terminal"
-              />
-            </label>
-            <button
-              className="system-action"
-              type="button"
-              onClick={() => void pairCompanion()}
-              disabled={companionBusy || pairingCode.trim().length < 32}
-            >
-              {companionBusy ? "Connecting…" : "Connect local companion"}
-            </button>
+            {companionConnectionState === "offline" ||
+            companionConnectionState === "discovering" ? (
+              <>
+                <p className="ai-gate-note">
+                  The local companion is not available. In PowerShell, run{" "}
+                  <code>npm run companion</code>
+                  from the project folder, then retry here. The plugin cannot launch local
+                  executables.
+                </p>
+                <button
+                  className="system-action"
+                  type="button"
+                  onClick={() => setCompanionConnectionState("discovering")}
+                  disabled={companionConnectionState === "discovering"}
+                >
+                  {companionConnectionState === "discovering"
+                    ? "Checking companion…"
+                    : "Retry connection"}
+                </button>
+              </>
+            ) : companionConnectionState === "approval_required" ||
+              companionConnectionState === "pairing" ? (
+              <>
+                <p className="ai-gate-note">
+                  The companion is waiting for local approval. It normally opens the page in your
+                  system browser; use the button below if it did not. Approve only if you just
+                  started this connection here. The separate official ChatGPT sign-in opens after
+                  local approval.
+                </p>
+                <button
+                  className="secondary-action"
+                  type="button"
+                  onClick={() => void reopenApprovalPage()}
+                  disabled={approvalPageBusy || !pairingAttemptId}
+                >
+                  {approvalPageBusy ? "Opening approval page…" : "Open approval page again"}
+                </button>
+                <button
+                  className="text-button ai-disconnect"
+                  type="button"
+                  onClick={() => void cancelLocalConnection()}
+                  disabled={!pairingAttemptId}
+                >
+                  Cancel local approval
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="ai-gate-note">
+                  Continue opens a local approval page the first time this plugin connects to the
+                  companion. The browser page cannot identify a specific plugin, so approve only
+                  after initiating this action here. ChatGPT sign-in and plan-use consent remain
+                  separate.
+                </p>
+                <button
+                  className="system-action"
+                  type="button"
+                  onClick={() => void continueWithChatGPT()}
+                  disabled={companionBusy}
+                >
+                  {companionBusy ? "Connecting…" : "Continue with ChatGPT"}
+                </button>
+              </>
+            )}
           </>
         ) : (
           <>
@@ -828,16 +1067,29 @@ export default function App() {
               are separate; the granted scope is checked after return.
             </p>
             {!companionStatus?.planUseAuthorized ? (
-              <button
-                className="system-action"
-                type="button"
-                onClick={() => void signInWithChatGPT()}
-                disabled={companionBusy || companionStatus?.auth === "signing_in"}
-              >
-                {companionStatus?.auth === "signing_in"
-                  ? "Waiting for browser sign-in…"
-                  : "Continue with ChatGPT"}
-              </button>
+              <>
+                <button
+                  className="system-action"
+                  type="button"
+                  onClick={() => void signInWithChatGPT()}
+                  disabled={companionBusy || companionStatus?.auth === "signing_in"}
+                >
+                  {companionStatus?.auth === "signing_in"
+                    ? "Waiting for browser sign-in…"
+                    : "Continue with ChatGPT"}
+                </button>
+                {(companionStatus?.auth === "signing_in" ||
+                  companionStatus?.safeMessage === "system_browser_unavailable") && (
+                  <button
+                    className="secondary-action"
+                    type="button"
+                    onClick={() => void reopenChatGPTBrowser()}
+                    disabled={companionBusy}
+                  >
+                    Open sign-in page in system browser again
+                  </button>
+                )}
+              </>
             ) : (
               <>
                 <p className="ai-gate-note ai-gate-ready">
@@ -893,10 +1145,18 @@ export default function App() {
             <button
               className="text-button ai-disconnect"
               type="button"
+              onClick={() => void disconnectLocalCompanion()}
+              disabled={companionBusy}
+            >
+              Disconnect this plugin from the local companion
+            </button>
+            <button
+              className="text-button ai-disconnect"
+              type="button"
               onClick={() => void disconnectCompanion()}
               disabled={companionBusy}
             >
-              Disconnect and clear local session
+              Disconnect ChatGPT account
             </button>
             <button
               className="text-button ai-disconnect"
@@ -1349,12 +1609,27 @@ function companionErrorText(error: unknown): string {
         ? error
         : "connection_failed";
   const messages: Record<string, string> = {
+    pairing_busy:
+      "Another local approval is already pending. Finish or cancel it in the first Figma plugin, then retry.",
+    pairing_rate_limited:
+      "Too many local connection attempts were made. Wait a minute before trying again.",
+    pairing_approval_unavailable:
+      "The companion could not open the local approval page. Check that Windows has a default browser, then retry.",
+    pairing_denied: "Local companion access was denied. No ChatGPT sign-in was started.",
+    pairing_expired: "The local approval expired. Start a new connection from the Figma plugin.",
+    pairing_cancelled: "Local companion connection was cancelled.",
+    pairing_replayed: "This local approval was already used. Start a new connection from Figma.",
+    system_browser_unavailable:
+      "Windows could not open the system browser. Use the button to retry sign-in, or check your default browser.",
+    browser_open_rate_limited:
+      "Too many browser launch attempts were made. Wait briefly, then try again or restart the sign-in flow.",
     pairing_unavailable:
-      "Pairing code is no longer available. Restart the companion for a new code.",
-    pairing_failed: "Pairing failed. Check the code in the companion terminal and try again.",
-    pairing_required: "Reconnect the local companion from its current one-time code.",
+      "The local companion cannot accept another connection right now. Restart it and retry.",
+    pairing_failed: "Local connection could not be verified. Start a new approval from Figma.",
+    pairing_required: "Reconnect the local companion from the Figma plugin.",
     sign_in_already_pending:
       "A browser sign-in is already pending. Finish or cancel that attempt first.",
+    sign_in_timed_out: "The browser sign-in attempt expired. Start a new sign-in from Figma.",
     consent_denied: "ChatGPT sign-in or permission was declined.",
     callback_invalid: "The sign-in callback did not match this attempt. Start sign-in again.",
     client_id_mismatch:
