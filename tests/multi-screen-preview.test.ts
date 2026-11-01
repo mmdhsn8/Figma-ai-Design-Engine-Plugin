@@ -89,6 +89,7 @@ describe("multi-screen UI preview and reporting", () => {
       expect(multiScreenResultLines(report)).toEqual(
         expect.arrayContaining([
           expect.stringContaining("40 native nodes created"),
+          expect.stringContaining("text"),
           "cart: Mock failure",
           "One screen failed.",
         ]),

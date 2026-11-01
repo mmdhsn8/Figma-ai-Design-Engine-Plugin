@@ -90,6 +90,7 @@ describe("plugin message contract", () => {
         requestId: "r4",
         success: true,
         counts: { frames: 1, texts: 2, rectangles: 1, components: 0, instances: 0 },
+        fontWarnings: ["Font missing during preflight."],
       }).success,
     ).toBe(true);
     expect(

@@ -221,9 +221,112 @@ textarea:disabled {
 
 .utility-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   min-height: 30px;
+}
+.visual-quality-panel {
+  padding: 13px;
+  border: 1px solid #39404b;
+  border-radius: 9px;
+  background: linear-gradient(145deg, rgba(56, 189, 248, 0.07), rgba(28, 30, 37, 0.96));
+}
+.visual-quality-panel h2 {
+  margin: 2px 0 0;
+  color: #e3e2ed;
+  font-size: 12px;
+  line-height: 16px;
+}
+.visual-quality-summary,
+.visual-quality-note,
+.quality-clear {
+  margin: 8px 0 0;
+  color: #b3bdc9;
+  font-size: 9px;
+  line-height: 14px;
+}
+.visual-quality-note {
+  color: #828b99;
+}
+.quality-clear {
+  color: #81d2ad;
+}
+.quality-diagnostics,
+.asset-inventory {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 176px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.quality-diagnostics li,
+.asset-inventory li {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 8px;
+  border: 1px solid #383b46;
+  border-radius: 6px;
+  background: rgba(14, 15, 20, 0.35);
+}
+.quality-diagnostics strong,
+.asset-inventory strong {
+  color: #d1d9e4;
+  font-size: 9px;
+  text-transform: capitalize;
+}
+.quality-diagnostics span,
+.asset-inventory span {
+  color: #7da9c9;
+  font: 8px var(--mono);
+  overflow-wrap: anywhere;
+}
+.quality-diagnostics p,
+.asset-inventory small,
+.quality-diagnostics small {
+  margin: 0;
+  color: #b1b3bd;
+  font-size: 8px;
+  line-height: 12px;
+  overflow-wrap: anywhere;
+}
+.quality-diagnostics small {
+  color: #d3b989;
+}
+.asset-provenance-fields {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+.asset-provenance-fields > label:not(.file-button) {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #a5a8b5;
+  font-size: 8px;
+}
+.asset-provenance-fields input[type="text"] {
+  width: 100%;
+  min-height: 30px;
+  padding: 0 7px;
+  border: 1px solid #393c47;
+  border-radius: 5px;
+  outline: none;
+  color: #e0e1e8;
+  background: #1d1f26;
+  font-size: 9px;
+}
+.asset-provenance-fields input[type="text"]:focus-visible {
+  border-color: #72b1e5;
+  outline: 2px solid rgba(114, 177, 229, 0.25);
+}
+.asset-provenance-fields .file-button {
+  width: fit-content;
+  max-width: 100%;
 }
 .file-button {
   height: 29px;

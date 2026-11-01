@@ -168,6 +168,32 @@ describe("design schema", () => {
     expect(parseDesignValue(badBaseline).success).toBe(false);
   });
 
+  it("accepts native constraints only on absolutely positioned, non-Auto-Layout children", () => {
+    const absolute = emptyDesign();
+    absolute.document.children = [
+      {
+        type: "rectangle",
+        name: "Anchored decoration",
+        x: 12,
+        y: 12,
+        width: 40,
+        height: 40,
+        fill: "#2563EB",
+        constraints: { horizontal: "left-right", vertical: "bottom" },
+      },
+    ];
+    expect(parseDesignValue(absolute).success).toBe(true);
+
+    const invalid = structuredClone(absolute);
+    invalid.document.layout = { mode: "horizontal" };
+    const invalidResult = parseDesignValue(invalid);
+    expect(invalidResult.success).toBe(false);
+    if (!invalidResult.success) {
+      expect(invalidResult.errors.join(" ")).toContain("constraints can only be used");
+      expect(invalidResult.errors.join(" ")).toContain("uses x/y inside an Auto Layout parent");
+    }
+  });
+
   it("rejects unsupported HUG nodes and conflicting stretch sizing", () => {
     const hugRectangle = emptyDesign();
     hugRectangle.document.layout = { mode: "vertical", counterAxisAlign: "center" };

@@ -1,6 +1,7 @@
 import type {
   AxisSizing,
   ComponentDefinitionSpec,
+  DesignNode,
   DesignCounts,
   SizingMode,
 } from "../shared/schema";
@@ -20,6 +21,9 @@ import {
   readTopLevelCanvasObstacles,
 } from "./figma-canvas-adapter";
 import { hexToRgb } from "./figma-utils";
+import { applyFigmaVisualStyle, normalizeImageFit, resolvedFillPaints } from "./visual-rendering";
+import { embeddedImageBytes, scaleFigmaPathData } from "../shared/visual-assets";
+import type { VisualAsset } from "../shared/visual-schema";
 import {
   resolveDesignSystemTokens,
   resolveDesignSpecWithTables,
@@ -30,6 +34,7 @@ import {
   type ResolvedLayoutSpec,
   type ResolvedRectangleNodeSpec,
   type ResolvedTextNodeSpec,
+  type ResolvedVisualStyle,
 } from "./design-system/token-resolver";
 import {
   designSpecForScreen,
@@ -55,6 +60,9 @@ export type RendererFigmaApi = Pick<
   | "createFrame"
   | "createText"
   | "createRectangle"
+  | "createEllipse"
+  | "createVector"
+  | "createImage"
   | "createComponentFromNode"
   | "createPaintStyle"
   | "createTextStyle"
@@ -144,6 +152,8 @@ const COMPONENT_AREA_OFFSET = 56;
 const TYPOGRAPHY_TOKEN_KEY = "fad.design-system.typography-token";
 const TYPOGRAPHY_OVERRIDES_KEY = "fad.design-system.typography-overrides";
 const TEXT_COLOR_KEY = "fad.design-system.text-color";
+const VISUAL_OVERRIDE_KEY = "fad.visual.style";
+const VISUAL_FILL_EXPLICIT_KEY = "fad.visual.fills-explicit";
 const MULTI_SCREEN_BATCH_KEY = "fad.multi-screen.batch-id";
 const MULTI_SCREEN_ID_KEY = "fad.multi-screen.screen-id";
 const MULTI_SCREEN_META_KEY = "fad.multi-screen.metadata";
@@ -161,7 +171,8 @@ interface LayoutMapping {
   paddingLeft: number;
 }
 
-type LayoutChildNode = TextNode | RectangleNode | FrameNode | InstanceNode | ComponentNode;
+type LayoutChildNode =
+  TextNode | RectangleNode | EllipseNode | VectorNode | FrameNode | InstanceNode | ComponentNode;
 
 interface FontResolution {
   fonts: Map<string, FontName>;
@@ -191,13 +202,13 @@ function createTracker(): Tracker {
     counts,
     track(node, kind) {
       nodes.push(node);
-      counts[kind]++;
+      counts[kind] = (counts[kind] ?? 0) + 1;
     },
     replace(oldNode, newNode, oldKind, newKind) {
       if (!nodes.includes(oldNode)) nodes.push(oldNode);
       nodes.push(newNode);
-      counts[oldKind]--;
-      counts[newKind]++;
+      counts[oldKind] = (counts[oldKind] ?? 0) - 1;
+      counts[newKind] = (counts[newKind] ?? 0) + 1;
     },
     cleanup() {
       for (const node of [...nodes].reverse()) {
@@ -209,6 +220,43 @@ function createTracker(): Tracker {
       }
     },
   };
+}
+
+function collectImageReferences(nodes: DesignNode[], references: Set<string>): void {
+  for (const node of nodes) {
+    if (node.type === "image") references.add(node.assetId);
+    else if (node.type === "frame") collectImageReferences(node.children, references);
+  }
+}
+
+function prepareVisualAssets(
+  api: RendererFigmaApi,
+  assets: VisualAsset[] | undefined,
+  nodeTrees: DesignNode[][],
+): { assets: Map<string, VisualAsset>; imageHashes: Map<string, string> } {
+  const assetMap = new Map((assets ?? []).map((asset) => [asset.id, asset]));
+  const references = new Set<string>();
+  nodeTrees.forEach((nodes) => collectImageReferences(nodes, references));
+  const hashesByBytes = new Map<string, string>();
+  const imageHashes = new Map<string, string>();
+  for (const assetId of references) {
+    const asset = assetMap.get(assetId);
+    if (!asset || asset.kind !== "raster") continue;
+    let hash = hashesByBytes.get(asset.base64);
+    if (!hash) {
+      try {
+        hash = api.createImage(embeddedImageBytes(asset.base64)).hash;
+      } catch (error) {
+        throw new DesignRenderError(
+          `Image asset “${asset.name}” could not be imported locally. ${error instanceof Error ? error.message : "Check the file bytes and format."}`,
+          { cause: error },
+        );
+      }
+      hashesByBytes.set(asset.base64, hash);
+    }
+    imageHashes.set(assetId, hash);
+  }
+  return { assets: assetMap, imageHashes };
 }
 
 function fontKey(family: string, style: string): string {
@@ -312,6 +360,27 @@ async function resolveFonts(
 export function mapSizingMode(mode: SizingMode): "FIXED" | "HUG" | "FILL" {
   return mode.toUpperCase() as "FIXED" | "HUG" | "FILL";
 }
+
+const horizontalConstraint: Record<
+  NonNullable<Extract<DesignNode, { constraints?: unknown }>["constraints"]>["horizontal"],
+  ConstraintType
+> = {
+  left: "MIN",
+  right: "MAX",
+  center: "CENTER",
+  "left-right": "STRETCH",
+  scale: "SCALE",
+};
+const verticalConstraint: Record<
+  NonNullable<Extract<DesignNode, { constraints?: unknown }>["constraints"]>["vertical"],
+  ConstraintType
+> = {
+  top: "MIN",
+  bottom: "MAX",
+  center: "CENTER",
+  "top-bottom": "STRETCH",
+  scale: "SCALE",
+};
 
 export function mapLayoutSpec(layout: ResolvedLayoutSpec): LayoutMapping {
   const primary: Record<
@@ -441,6 +510,11 @@ function setTextTypography(
     text.resize(node.width ?? text.width, node.height ?? text.height);
   }
   setSolidFill(text, node.color);
+  if (node.visual) {
+    text.setPluginData(VISUAL_OVERRIDE_KEY, JSON.stringify(node.visual));
+    if (node.visual.fills !== undefined) text.setPluginData(VISUAL_FILL_EXPLICIT_KEY, "1");
+    applyFigmaVisualStyle(text, node.visual);
+  }
   if (node.textStyle) {
     text.setPluginData(TYPOGRAPHY_TOKEN_KEY, node.textStyle.token);
     text.setPluginData(TEXT_COLOR_KEY, node.color);
@@ -476,11 +550,19 @@ function setRectangleProperties(rectangle: RectangleNode, node: ResolvedRectangl
   } else if (node.cornerRadius !== undefined) {
     rectangle.cornerRadius = node.cornerRadius;
   }
+  if (node.visual) {
+    rectangle.setPluginData(VISUAL_OVERRIDE_KEY, JSON.stringify(node.visual));
+    if (node.visual.fills !== undefined) rectangle.setPluginData(VISUAL_FILL_EXPLICIT_KEY, "1");
+    applyFigmaVisualStyle(rectangle, node.visual);
+  }
 }
 
 function setFrameProperties(
   frame: FrameNode | ComponentNode,
-  properties: Pick<ResolvedFrameNodeSpec, "background" | "stroke" | "cornerRadius" | "cornerRadii">,
+  properties: Pick<
+    ResolvedFrameNodeSpec,
+    "background" | "stroke" | "cornerRadius" | "cornerRadii" | "visual"
+  >,
 ): void {
   setOptionalFill(frame, properties.background);
   if (properties.stroke) {
@@ -497,6 +579,11 @@ function setFrameProperties(
   } else if (properties.cornerRadius !== undefined) {
     frame.cornerRadius = properties.cornerRadius;
   }
+  if (properties.visual) {
+    frame.setPluginData(VISUAL_OVERRIDE_KEY, JSON.stringify(properties.visual));
+    if (properties.visual.fills !== undefined) frame.setPluginData(VISUAL_FILL_EXPLICIT_KEY, "1");
+    applyFigmaVisualStyle(frame, properties.visual);
+  }
 }
 
 interface BuildContext {
@@ -506,6 +593,9 @@ interface BuildContext {
   components: Map<string, ComponentNode>;
   designSystemId?: string;
   designSystemNamespace?: string;
+  assets: Map<string, VisualAsset>;
+  imageHashes: Map<string, string>;
+  warnings: string[];
 }
 
 function buildFrameChildren(
@@ -514,6 +604,44 @@ function buildFrameChildren(
   context: BuildContext,
 ): void {
   for (const child of spec.children) appendDesignNode(frame, child, spec.layout, context);
+}
+
+function populateSvgAsset(
+  frame: FrameNode,
+  asset: Extract<VisualAsset, { kind: "svg-paths" }>,
+  width: number,
+  height: number,
+  fit: "fill" | "fit" | "crop" | "tile" | undefined,
+  context: BuildContext,
+): void {
+  const mode = fit ?? "fit";
+  if (mode === "tile") {
+    context.warnings.push(
+      `SVG asset “${asset.name}” does not support tiled vectors; it was fit proportionally.`,
+    );
+  }
+  const scale =
+    mode === "fit" || mode === "tile"
+      ? Math.min(width / asset.width, height / asset.height)
+      : Math.max(width / asset.width, height / asset.height);
+  const scaledWidth = asset.width * scale;
+  const scaledHeight = asset.height * scale;
+  const offsetX = (width - scaledWidth) / 2;
+  const offsetY = (height - scaledHeight) / 2;
+  for (let index = 0; index < asset.paths.length; index++) {
+    const path = asset.paths[index];
+    const vector = context.api.createVector();
+    context.tracker.track(vector, "vectors");
+    vector.name = path.name ?? `${asset.name} path ${index + 1}`;
+    vector.vectorPaths = [
+      { windingRule: "NONZERO", data: scaleFigmaPathData(path.data, scale, scale) },
+    ];
+    vector.resize(scaledWidth, scaledHeight);
+    vector.fills = [{ type: "SOLID", color: hexToRgb(path.fill) }];
+    frame.appendChild(vector);
+    vector.x = offsetX;
+    vector.y = offsetY;
+  }
 }
 
 function appendDesignNode(
@@ -525,6 +653,8 @@ function appendDesignNode(
   const { api, tracker } = context;
   let node: LayoutChildNode;
   let frameToPopulate: FrameNode | undefined;
+  let svgToPopulate: Extract<VisualAsset, { kind: "svg-paths" }> | undefined;
+  let svgFit: "fill" | "fit" | "crop" | "tile" | undefined;
 
   if (spec.type === "text") {
     const text = api.createText();
@@ -538,6 +668,71 @@ function appendDesignNode(
     rectangle.name = spec.name;
     setRectangleProperties(rectangle, spec);
     node = rectangle;
+  } else if (spec.type === "ellipse") {
+    const ellipse = api.createEllipse();
+    tracker.track(ellipse, "ellipses");
+    ellipse.name = spec.name;
+    ellipse.resize(spec.width, spec.height);
+    setSolidFill(ellipse, spec.fill);
+    if (spec.visual) {
+      ellipse.setPluginData(VISUAL_OVERRIDE_KEY, JSON.stringify(spec.visual));
+      if (spec.visual.fills !== undefined) ellipse.setPluginData(VISUAL_FILL_EXPLICIT_KEY, "1");
+      applyFigmaVisualStyle(ellipse, spec.visual);
+    }
+    node = ellipse;
+  } else if (spec.type === "vector") {
+    const vector = api.createVector();
+    tracker.track(vector, "vectors");
+    vector.name = spec.name;
+    vector.vectorPaths = [{ windingRule: "NONZERO", data: spec.pathData }];
+    vector.resize(spec.width, spec.height);
+    setSolidFill(vector, spec.fill);
+    if (spec.visual) {
+      vector.setPluginData(VISUAL_OVERRIDE_KEY, JSON.stringify(spec.visual));
+      if (spec.visual.fills !== undefined) vector.setPluginData(VISUAL_FILL_EXPLICIT_KEY, "1");
+      applyFigmaVisualStyle(vector, spec.visual);
+    }
+    node = vector;
+  } else if (spec.type === "image") {
+    const asset = context.assets.get(spec.assetId);
+    if (!asset)
+      throw new DesignRenderError(
+        `Image node “${spec.name}” references missing asset “${spec.assetId}”.`,
+      );
+    if (asset.kind === "raster") {
+      const rectangle = api.createRectangle();
+      tracker.track(rectangle, "images");
+      rectangle.name = spec.name;
+      rectangle.resize(spec.width, spec.height);
+      const imageHash = context.imageHashes.get(spec.assetId);
+      if (!imageHash)
+        throw new DesignRenderError(`Image asset “${spec.assetId}” could not be prepared.`);
+      rectangle.fills = [{ type: "IMAGE", imageHash, scaleMode: normalizeImageFit(spec.fit) }];
+      if (spec.cornerRadius !== undefined) rectangle.cornerRadius = spec.cornerRadius;
+      if (spec.visual) {
+        rectangle.setPluginData(VISUAL_OVERRIDE_KEY, JSON.stringify(spec.visual));
+        if (spec.visual.fills !== undefined) rectangle.setPluginData(VISUAL_FILL_EXPLICIT_KEY, "1");
+        applyFigmaVisualStyle(rectangle, spec.visual, imageHash, normalizeImageFit(spec.fit));
+      }
+      node = rectangle;
+    } else {
+      const frame = api.createFrame();
+      tracker.track(frame, "frames");
+      frame.name = spec.name;
+      frame.resize(spec.width, spec.height);
+      frame.fills = [];
+      frame.clipsContent = true;
+      if (spec.cornerRadius !== undefined) frame.cornerRadius = spec.cornerRadius;
+      if (spec.visual) {
+        frame.setPluginData(VISUAL_OVERRIDE_KEY, JSON.stringify(spec.visual));
+        if (spec.visual.fills !== undefined) frame.setPluginData(VISUAL_FILL_EXPLICIT_KEY, "1");
+        applyFigmaVisualStyle(frame, spec.visual);
+      }
+      svgToPopulate = asset;
+      svgFit = spec.fit;
+      frameToPopulate = frame;
+      node = frame;
+    }
   } else if (spec.type === "frame") {
     const frame = api.createFrame();
     tracker.track(frame, "frames");
@@ -566,7 +761,18 @@ function appendDesignNode(
     node.x = spec.x as number;
     node.y = spec.y as number;
   }
-  if (frameToPopulate) buildFrameChildren(frameToPopulate, spec as ResolvedFrameNodeSpec, context);
+  if ("constraints" in spec && spec.constraints) {
+    node.constraints = {
+      horizontal: horizontalConstraint[spec.constraints.horizontal],
+      vertical: verticalConstraint[spec.constraints.vertical],
+    };
+  }
+  if (frameToPopulate && spec.type === "frame") {
+    buildFrameChildren(frameToPopulate, spec as ResolvedFrameNodeSpec, context);
+  }
+  if (svgToPopulate && frameToPopulate && spec.type === "image") {
+    populateSvgAsset(frameToPopulate, svgToPopulate, spec.width, spec.height, svgFit, context);
+  }
   return node;
 }
 
@@ -714,6 +920,7 @@ async function applyNativeStyleBindings(root: FrameNode, bindings: StyleBindings
     };
 
     if (node.type === "TEXT") {
+      const hasExplicitVisualFills = node.getPluginData(VISUAL_FILL_EXPLICIT_KEY) === "1";
       const token = node.getPluginData(TYPOGRAPHY_TOKEN_KEY);
       const styleId = bindings.textStyleIdByToken.get(token);
       if (styleId) {
@@ -745,17 +952,29 @@ async function applyNativeStyleBindings(root: FrameNode, bindings: StyleBindings
       }
 
       const textColor = node.getPluginData(TEXT_COLOR_KEY);
-      if (textColor && node.characters.length > 0) {
+      if (!hasExplicitVisualFills && textColor && node.characters.length > 0) {
         await bindFill(textColor, (id) =>
           node.setRangeFillStyleIdAsync(0, node.characters.length, id),
         );
+      }
+      if (hasExplicitVisualFills) {
+        const encodedVisual = node.getPluginData(VISUAL_OVERRIDE_KEY);
+        if (encodedVisual) {
+          const visual = JSON.parse(encodedVisual) as ResolvedVisualStyle;
+          const paints = resolvedFillPaints(visual);
+          if (paints) node.fills = paints;
+        }
       }
     } else {
       const fillTarget = node as SceneNode & {
         fills?: readonly Paint[] | PluginAPI["mixed"];
         setFillStyleIdAsync?: (id: string) => Promise<void>;
       };
-      if (Array.isArray(fillTarget.fills) && typeof fillTarget.setFillStyleIdAsync === "function") {
+      if (
+        node.getPluginData(VISUAL_FILL_EXPLICIT_KEY) !== "1" &&
+        Array.isArray(fillTarget.fills) &&
+        typeof fillTarget.setFillStyleIdAsync === "function"
+      ) {
         const fill = fillTarget.fills.find((paint) => paint.type === "SOLID");
         if (fill?.type === "SOLID") {
           await bindFill(toHex(fill.color), (id) => fillTarget.setFillStyleIdAsync!(id));
@@ -841,6 +1060,9 @@ export async function renderDesign(
     components: new Map(existingRegistry.byComponentId),
     designSystemId,
     designSystemNamespace,
+    assets: new Map(),
+    imageHashes: new Map(),
+    warnings: [],
   };
   const reservedNames = new Set<string>();
   let styleBindings: StyleBindings | undefined;
@@ -865,6 +1087,14 @@ export async function renderDesign(
       throw new DesignRenderError(
         "Canvas placement did not return a position for the generated design.",
       );
+
+    const assetPreparation = prepareVisualAssets(api, spec.assets, [
+      spec.document.children,
+      ...(spec.document.components ?? []).map((component) => component.children),
+      ...(spec.designSystem?.components ?? []).map((component) => component.children),
+    ]);
+    context.assets = assetPreparation.assets;
+    context.imageHashes = assetPreparation.imageHashes;
 
     if (spec.designSystem && designSystemNamespace) {
       styleBindings = await createOrReuseNativeStyles(
@@ -983,6 +1213,7 @@ export async function renderDesign(
       counts: tracker.counts,
       warnings: [
         ...fontResolution.warnings,
+        ...context.warnings,
         ...componentWarnings,
         ...(designSystemReport?.warnings ?? []),
       ],
@@ -1034,10 +1265,23 @@ function addDesignCounts(target: DesignCounts, source: DesignCounts): void {
   target.rectangles += source.rectangles;
   target.components += source.components;
   target.instances += source.instances;
+  for (const key of ["ellipses", "vectors", "images"] as const) {
+    const total = (target[key] ?? 0) + (source[key] ?? 0);
+    if (total > 0) target[key] = total;
+  }
 }
 
 function sumDesignCounts(counts: DesignCounts): number {
-  return counts.frames + counts.texts + counts.rectangles + counts.components + counts.instances;
+  return (
+    counts.frames +
+    counts.texts +
+    counts.rectangles +
+    counts.components +
+    counts.instances +
+    (counts.ellipses ?? 0) +
+    (counts.vectors ?? 0) +
+    (counts.images ?? 0)
+  );
 }
 
 function screenPlacementId(screenId: string): string {
@@ -1132,6 +1376,7 @@ export async function renderMultiScreenDesign(
   const componentReused: string[] = [];
   const componentSkipped: string[] = [];
   const componentWarnings: string[] = [];
+  const visualWarnings: string[] = [];
 
   const markRemainingScreensFailed = (startIndex: number, error: string) => {
     for (let index = startIndex; index < orderedScreens.length; index++) {
@@ -1232,6 +1477,10 @@ export async function renderMultiScreenDesign(
     const existingBounds = readTopLevelCanvasObstacles(api.currentPage);
     let planned = planCanvasPlacements(placementItems, existingBounds, placementSettings);
     const placementById = new Map(planned.map((placement) => [placement.id, placement]));
+    const assetPreparation = prepareVisualAssets(api, batch.assets, [
+      ...orderedScreens.map((screen) => screen.children),
+      ...definitions.map((definition) => definition.children),
+    ]);
 
     if (batch.designSystem) {
       styleBindings = await createOrReuseNativeStyles(
@@ -1258,6 +1507,8 @@ export async function renderMultiScreenDesign(
       components,
       designSystemId,
       designSystemNamespace,
+      ...assetPreparation,
+      warnings: visualWarnings,
     };
     if (newDefinitions.length && componentAreaItem) {
       componentArea = createComponentArea(
@@ -1507,7 +1758,7 @@ export async function renderMultiScreenDesign(
       maxRowWidth: placementSettings.maxRowWidth,
       counts,
       screens: screenResults,
-      warnings: [...fontResolution.warnings, ...warnings],
+      warnings: [...fontResolution.warnings, ...visualWarnings, ...warnings],
       fontSelections: fontResolution.selections,
       designSystem:
         batch.designSystem && styleReport
@@ -1577,7 +1828,7 @@ export async function renderMultiScreenDesign(
       maxRowWidth: placementSettings.maxRowWidth,
       counts,
       screens: screenResults,
-      warnings: [...(fontResolution?.warnings ?? []), ...warnings],
+      warnings: [...(fontResolution?.warnings ?? []), ...visualWarnings, ...warnings],
       fontSelections: fontResolution?.selections ?? [],
       designSystem:
         batch.designSystem && styleBindings

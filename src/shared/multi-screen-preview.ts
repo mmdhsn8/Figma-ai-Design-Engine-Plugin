@@ -52,6 +52,7 @@ export function multiScreenProgressText(progress: MultiScreenProgressMessage): s
 export function multiScreenResultLines(result: MultiScreenRenderResultMessage): string[] {
   return [
     `${result.createdNodeCount} native nodes created · ${result.estimatedNodeCount} nodes estimated · ${result.gap} px gap · ${result.maxRowWidth} px row width.`,
+    `${result.counts.frames} frames · ${result.counts.texts} text · ${result.counts.rectangles} rectangles · ${(result.counts.ellipses ?? 0) + (result.counts.vectors ?? 0)} editable vector/ellipse shapes · ${result.counts.images ?? 0} image fills · ${result.counts.instances} instances.`,
     ...result.screens
       .filter((screen) => screen.status === "failed")
       .map((screen) => `${screen.id}: ${screen.error ?? "Generation failed."}`),

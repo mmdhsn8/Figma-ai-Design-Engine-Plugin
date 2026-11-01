@@ -3,6 +3,8 @@ import phase1Sample from "../samples/sample-design.json?raw";
 import phase2Sample from "../samples/phase-2-storefront.json?raw";
 import phase3Sample from "../samples/phase-3-design-system.json?raw";
 import phase4Sample from "../samples/phase-4-multi-screen.json?raw";
+import phase45Sample from "../samples/phase-4.5-visual-design.json?raw";
+import visualLtrFixture from "../samples/visual-ltr-fixture.json?raw";
 import { parseDesignText } from "../shared/schema";
 import {
   PluginToUISchema,
@@ -18,6 +20,8 @@ import {
 } from "../shared/multi-screen-preview";
 import { planDesignSystemApply } from "../plugin/design-system/apply-design-system";
 import { DEFAULT_MAX_ROW_WIDTH, DEFAULT_MIN_CANVAS_GAP } from "../plugin/canvas-placement";
+import { auditVisualQuality, type VisualQualityAudit } from "../shared/visual-quality";
+import { inspectEmbeddedImage, parseSafeSvg } from "../shared/visual-assets";
 
 type Notice = {
   tone: "neutral" | "success" | "error";
@@ -39,6 +43,29 @@ function ErrorList({ errors }: { errors: string[] }) {
   );
 }
 
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)),
+    );
+  }
+  return btoa(binary);
+}
+
+function rawAssetInventory(source: string): Array<Record<string, unknown>> {
+  try {
+    const value = JSON.parse(source) as { assets?: unknown };
+    return Array.isArray(value.assets)
+      ? value.assets.filter(
+          (asset): asset is Record<string, unknown> => typeof asset === "object" && asset !== null,
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 export default function App() {
   const [json, setJson] = useState(phase1Sample.trim());
   const [notice, setNotice] = useState<Notice>({
@@ -49,6 +76,8 @@ export default function App() {
   const [updateOwned, setUpdateOwned] = useState(false);
   const [canvasGap, setCanvasGap] = useState(DEFAULT_MIN_CANVAS_GAP);
   const [rowWidth, setRowWidth] = useState(DEFAULT_MAX_ROW_WIDTH);
+  const [assetLicense, setAssetLicense] = useState("");
+  const [assetAttribution, setAssetAttribution] = useState("");
   const [multiProgress, setMultiProgress] = useState<MultiScreenProgressMessage | null>(null);
   const [multiReport, setMultiReport] = useState<MultiScreenRenderResultMessage | null>(null);
   const currentRequest = useRef<string | null>(null);
@@ -65,6 +94,12 @@ export default function App() {
         : undefined,
     [batchParsed],
   );
+  const visualAudit = useMemo<VisualQualityAudit | undefined>(() => {
+    if (batchParsed?.success) return auditVisualQuality(batchParsed.data);
+    if (parsed.success) return auditVisualQuality(parsed.data);
+    return undefined;
+  }, [batchParsed, parsed]);
+  const assetInventory = useMemo(() => rawAssetInventory(json), [json]);
   const dryRun = parsed.success ? planDesignSystemApply(parsed.data) : undefined;
   const inputValid = batchMode ? Boolean(batchParsed?.success) : parsed.success;
   const placementOptionsValid =
@@ -115,6 +150,7 @@ export default function App() {
                 " screens · " +
                 message.multiScreen.nodeCount +
                 " estimated nodes.",
+              ...(message.fontWarnings ?? []),
               ...message.multiScreen.screens.map(
                 (screen) =>
                   screen.name +
@@ -135,7 +171,8 @@ export default function App() {
                 tone: "success",
                 title: "JSON is valid",
                 details: [
-                  `Schema 1.0.0 · ${counts?.frames ?? 0} frames, ${counts?.texts ?? 0} texts, ${counts?.rectangles ?? 0} rectangles, ${counts?.components ?? 0} components, ${counts?.instances ?? 0} instances.`,
+                  `Schema 1.0.0 · ${counts?.frames ?? 0} frames, ${counts?.texts ?? 0} texts, ${counts?.rectangles ?? 0} rectangles, ${(counts?.ellipses ?? 0) + (counts?.vectors ?? 0)} editable vector/ellipse shapes, ${counts?.images ?? 0} image fills, ${counts?.components ?? 0} components, ${counts?.instances ?? 0} instances.`,
+                  ...(message.fontWarnings ?? []),
                 ],
               }
             : { tone: "error", title: "Validation failed", details: message.errors },
@@ -172,7 +209,7 @@ export default function App() {
           tone: "success",
           title: `Created “${message.frameName}”`,
           details: [
-            `${counts.frames} frames · ${counts.texts} texts · ${counts.rectangles} rectangles · ${counts.components} components · ${counts.instances} instances.`,
+            `${counts.frames} frames · ${counts.texts} texts · ${counts.rectangles} rectangles · ${(counts.ellipses ?? 0) + (counts.vectors ?? 0)} editable vector/ellipse shapes · ${counts.images ?? 0} image fills · ${counts.components} components · ${counts.instances} instances.`,
             `Fonts: ${fontSummary}.`,
             ...(message.designSystem
               ? [
@@ -326,6 +363,134 @@ export default function App() {
     }
   };
 
+  const importVisualAsset = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    const isSvg = extension === "svg";
+    const limit = isSvg ? 50 * 1_024 : 256 * 1_024;
+    if (file.size > limit) {
+      setNotice({
+        tone: "error",
+        title: "Asset is too large",
+        details: [
+          isSvg
+            ? "SVG markup is limited to 50 KB."
+            : "PNG, JPEG, and GIF files are limited to 256 KiB each.",
+        ],
+      });
+      return;
+    }
+    if (!assetLicense.trim()) {
+      setNotice({
+        tone: "error",
+        title: "Add provenance before importing",
+        details: ["Enter the asset's source/license or a note that you own its rights."],
+      });
+      return;
+    }
+    let root: Record<string, unknown>;
+    try {
+      const parsedJson = JSON.parse(json) as unknown;
+      if (typeof parsedJson !== "object" || parsedJson === null || Array.isArray(parsedJson)) {
+        throw new Error("The design JSON root must be an object.");
+      }
+      root = parsedJson as Record<string, unknown>;
+      if (!("document" in root) && !("screens" in root)) {
+        throw new Error("Load a single-design or multi-screen JSON document first.");
+      }
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        title: "Could not attach the local asset",
+        details: [error instanceof Error ? error.message : "Fix the JSON syntax and try again."],
+      });
+      return;
+    }
+    const assets = Array.isArray(root.assets) ? [...root.assets] : [];
+    if (root.assets !== undefined && !Array.isArray(root.assets)) {
+      setNotice({
+        tone: "error",
+        title: "Invalid assets field",
+        details: ["Top-level assets must be an array."],
+      });
+      return;
+    }
+    const stem = file.name.replace(/\.[^.]+$/, "").trim() || "local-asset";
+    const baseId = `visual-${
+      stem
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, "-")
+        .replace(/^-+|-+$/g, "") || "local-asset"
+    }`.slice(0, 90);
+    let id = baseId;
+    let suffix = 2;
+    while (
+      assets.some(
+        (asset) =>
+          typeof asset === "object" && asset !== null && (asset as { id?: unknown }).id === id,
+      )
+    ) {
+      id = `${baseId.slice(0, 85)}-${suffix++}`;
+    }
+    const common = {
+      id,
+      name: stem.slice(0, 160),
+      license: assetLicense.trim(),
+      ...(assetAttribution.trim() ? { attribution: assetAttribution.trim() } : {}),
+    };
+
+    try {
+      if (isSvg) {
+        const imported = parseSafeSvg(await file.text());
+        if (!imported.success) throw new Error(imported.error);
+        assets.push({ kind: "svg-paths", ...common, ...imported.data });
+      } else {
+        const mimeType =
+          extension === "png"
+            ? "image/png"
+            : extension === "jpg" || extension === "jpeg"
+              ? "image/jpeg"
+              : extension === "gif"
+                ? "image/gif"
+                : undefined;
+        if (!mimeType) throw new Error("Choose an SVG, PNG, JPEG, or GIF file.");
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const base64 = bytesToBase64(bytes);
+        const dimensions = inspectEmbeddedImage(base64, mimeType);
+        if (!dimensions.valid)
+          throw new Error(dimensions.error ?? "Image bytes could not be validated.");
+        assets.push({
+          kind: "raster",
+          ...common,
+          width: dimensions.width,
+          height: dimensions.height,
+          mimeType,
+          base64,
+        });
+      }
+      const next = { ...root, assets };
+      const serialized = JSON.stringify(next, null, 2);
+      if (serialized.length > 1_000_000)
+        throw new Error("Combined JSON and embedded assets exceed the 1 MB document limit.");
+      setJson(serialized);
+      setNotice({
+        tone: "success",
+        title: `${isSvg ? "Editable SVG paths" : "Replaceable image fill"} attached`,
+        details: [
+          `Asset id: ${id}. Add an image node that references this id. No network request was made.`,
+        ],
+      });
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        title: "Asset was not added",
+        details: [error instanceof Error ? error.message : "Check the local file and try again."],
+      });
+    }
+  };
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -427,6 +592,22 @@ export default function App() {
           Phase 4 demo
         </button>
         <button
+          className="text-button"
+          type="button"
+          onClick={() => loadSample(phase45Sample, "Phase 4.5 visual design demo")}
+          disabled={busy}
+        >
+          Visual demo
+        </button>
+        <button
+          className="text-button muted"
+          type="button"
+          onClick={() => loadSample(visualLtrFixture, "LTR visual regression fixture")}
+          disabled={busy}
+        >
+          LTR fixture
+        </button>
+        <button
           className="text-button muted"
           type="button"
           onClick={reset}
@@ -465,6 +646,116 @@ export default function App() {
               <p>{notice.details.join(" ")}</p>
             ))}
         </div>
+      </section>
+
+      <section className="visual-quality-panel" aria-labelledby="visual-quality-title">
+        <div className="design-system-heading">
+          <div>
+            <span className="section-kicker">VISUAL PREFLIGHT</span>
+            <h2 id="visual-quality-title">Quality & Local Assets</h2>
+          </div>
+          <span className={`system-status ${visualAudit ? "is-ready" : ""}`}>
+            {visualAudit ? `${visualAudit.diagnostics.length} findings` : "Validate JSON"}
+          </span>
+        </div>
+        {visualAudit ? (
+          <>
+            <p className="visual-quality-summary">
+              {visualAudit.screenCount} screen{visualAudit.screenCount === 1 ? "" : "s"} ·{" "}
+              {batchPreview?.estimatedNodeCount ?? visualAudit.estimatedNativeNodes} estimated nodes
+              · {visualAudit.componentCount} shared masters · {visualAudit.instanceCount} instances
+              · {visualAudit.assetCount} assets
+            </p>
+            <p className="visual-quality-note">
+              Measured JSON checks only. Font availability, visual balance, and Persian shaping
+              still need a Figma Desktop review.
+            </p>
+            {visualAudit.diagnostics.length ? (
+              <ul className="quality-diagnostics" aria-label="Visual quality findings">
+                {visualAudit.diagnostics.slice(0, 8).map((item, index) => (
+                  <li key={`${item.code}-${item.path}-${index}`}>
+                    <strong>{item.code.replaceAll("-", " ")}</strong>
+                    <span>{item.path}</span>
+                    <p>{item.message}</p>
+                    <small>{item.action}</small>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="quality-clear" role="status">
+                No configured preflight warnings. This is not a visual-quality score.
+              </p>
+            )}
+          </>
+        ) : (
+          <div className="system-validation">
+            <strong>Fix validation errors before preview</strong>
+            <ErrorList
+              errors={(batchMode
+                ? batchParsed?.success === false
+                  ? batchParsed.errors
+                  : []
+                : !parsed.success
+                  ? parsed.errors
+                  : []
+              ).slice(0, 4)}
+            />
+          </div>
+        )}
+        <div className="asset-provenance-fields">
+          <label>
+            <span>Asset source / license (required)</span>
+            <input
+              type="text"
+              maxLength={500}
+              value={assetLicense}
+              onChange={(event) => setAssetLicense(event.target.value)}
+              disabled={busy}
+              placeholder="Owned by me, CC0, or source and license"
+            />
+          </label>
+          <label>
+            <span>Attribution (optional)</span>
+            <input
+              type="text"
+              maxLength={500}
+              value={assetAttribution}
+              onChange={(event) => setAssetAttribution(event.target.value)}
+              disabled={busy}
+              placeholder="Creator or source credit"
+            />
+          </label>
+          <label className={`file-button ${busy ? "is-disabled" : ""}`}>
+            <span>Import local PNG / JPEG / GIF / safe SVG</span>
+            <input
+              type="file"
+              accept="image/png,image/jpeg,image/gif,image/svg+xml,.png,.jpg,.jpeg,.gif,.svg"
+              onChange={importVisualAsset}
+              disabled={busy}
+            />
+          </label>
+        </div>
+        {assetInventory.length > 0 && (
+          <ul className="asset-inventory" aria-label="Embedded local assets">
+            {assetInventory.slice(0, 8).map((asset, index) => (
+              <li key={String(asset.id ?? index)}>
+                <strong>{String(asset.name ?? asset.id ?? "Local asset")}</strong>
+                <span>
+                  {String(asset.kind ?? "unknown")} · {String(asset.width ?? "?")} ×{" "}
+                  {String(asset.height ?? "?")}
+                </span>
+                <small>{String(asset.license ?? "Missing provenance note")}</small>
+                {typeof asset.attribution === "string" && (
+                  <small>Credit: {asset.attribution}</small>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="visual-quality-note">
+          Local raster bytes are embedded in JSON (256 KiB each, 4,096 px maximum); safe SVG imports
+          become editable path layers (50 KB, 32 paths max).
+        </p>
       </section>
 
       {batchMode ? (

@@ -7,6 +7,15 @@ import {
   type DesignSystemTokens,
   type TokenReference,
 } from "./design-system-schema";
+import {
+  VisualAssetSchema,
+  VisualStyleSchema,
+  type VisualAsset,
+  type VisualStyle,
+  type QualityRule,
+  visualAssetSize,
+} from "./visual-schema";
+import { isFigmaPathData } from "./visual-assets";
 
 export const DESIGN_SCHEMA_VERSION = "1.0.0";
 export const MAX_JSON_LENGTH = 1_000_000;
@@ -16,6 +25,10 @@ export const MAX_COMPONENT_COUNT = 50;
 
 export type SizingMode = "fixed" | "hug" | "fill";
 export type AxisSizing = { width: SizingMode; height: SizingMode };
+export interface LayoutConstraints {
+  horizontal: "left" | "right" | "center" | "left-right" | "scale";
+  vertical: "top" | "bottom" | "center" | "top-bottom" | "scale";
+}
 
 export interface LayoutSpec {
   mode: "horizontal" | "vertical";
@@ -49,6 +62,10 @@ export interface TextNodeSpec {
   width?: number;
   height?: number;
   sizing?: AxisSizing;
+  constraints?: LayoutConstraints;
+  visual?: VisualStyle;
+  qualityRole?: "button" | "input" | "image" | "heading" | "body" | "decorative";
+  qualityExceptions?: QualityRule[];
 }
 
 export interface RectangleNodeSpec {
@@ -63,6 +80,10 @@ export interface RectangleNodeSpec {
   cornerRadius?: number | TokenReference;
   cornerRadii?: { topLeft: number; topRight: number; bottomRight: number; bottomLeft: number };
   sizing?: AxisSizing;
+  constraints?: LayoutConstraints;
+  visual?: VisualStyle;
+  qualityRole?: "button" | "input" | "image" | "heading" | "body" | "decorative";
+  qualityExceptions?: QualityRule[];
 }
 
 export interface FrameNodeSpec {
@@ -79,6 +100,60 @@ export interface FrameNodeSpec {
   children: DesignNode[];
   layout?: LayoutSpec;
   sizing?: AxisSizing;
+  constraints?: LayoutConstraints;
+  visual?: VisualStyle;
+  qualityRole?: "button" | "input" | "image" | "heading" | "body" | "decorative";
+  qualityExceptions?: QualityRule[];
+}
+
+export interface EllipseNodeSpec {
+  type: "ellipse";
+  name: string;
+  x?: number;
+  y?: number;
+  width: number;
+  height: number;
+  fill: string | TokenReference;
+  sizing?: AxisSizing;
+  constraints?: LayoutConstraints;
+  visual?: VisualStyle;
+  qualityRole?: "button" | "input" | "image" | "heading" | "body" | "decorative";
+  qualityExceptions?: QualityRule[];
+}
+
+export interface VectorNodeSpec {
+  type: "vector";
+  name: string;
+  x?: number;
+  y?: number;
+  width: number;
+  height: number;
+  pathData: string;
+  fill: string | TokenReference;
+  sizing?: AxisSizing;
+  constraints?: LayoutConstraints;
+  visual?: VisualStyle;
+  qualityRole?: "button" | "input" | "image" | "heading" | "body" | "decorative";
+  qualityExceptions?: QualityRule[];
+}
+
+export interface ImageNodeSpec {
+  type: "image";
+  name: string;
+  x?: number;
+  y?: number;
+  width: number;
+  height: number;
+  assetId: string;
+  fit?: "fill" | "fit" | "crop" | "tile";
+  cornerRadius?: number;
+  alt?: string;
+  placeholder?: boolean;
+  sizing?: AxisSizing;
+  constraints?: LayoutConstraints;
+  visual?: VisualStyle;
+  qualityRole?: "button" | "input" | "image" | "heading" | "body" | "decorative";
+  qualityExceptions?: QualityRule[];
 }
 
 export interface InstanceNodeSpec {
@@ -88,9 +163,17 @@ export interface InstanceNodeSpec {
   x?: number;
   y?: number;
   sizing?: AxisSizing;
+  constraints?: LayoutConstraints;
 }
 
-export type DesignNode = TextNodeSpec | RectangleNodeSpec | FrameNodeSpec | InstanceNodeSpec;
+export type DesignNode =
+  | TextNodeSpec
+  | RectangleNodeSpec
+  | EllipseNodeSpec
+  | VectorNodeSpec
+  | ImageNodeSpec
+  | FrameNodeSpec
+  | InstanceNodeSpec;
 
 export interface ComponentDefinitionSpec {
   type: "component";
@@ -107,6 +190,7 @@ export interface ComponentDefinitionSpec {
   children: DesignNode[];
   layout?: LayoutSpec;
   sizing?: AxisSizing;
+  visual?: VisualStyle;
 }
 
 export interface DesignDocumentSpec {
@@ -123,6 +207,7 @@ export interface DesignSpec {
   schemaVersion: typeof DESIGN_SCHEMA_VERSION;
   designSystem?: DesignSystemTokens & { components?: ComponentDefinitionSpec[] };
   document: DesignDocumentSpec;
+  assets?: VisualAsset[];
 }
 
 const nameSchema = z.string().trim().min(1).max(200);
@@ -130,6 +215,35 @@ const coordinateSchema = z.number().finite().min(-10_000).max(10_000);
 const dimensionSchema = z.number().finite().min(1).max(10_000);
 const radiusSchema = z.number().finite().min(0).max(5_000);
 const nodeColorSchema = TokenColorValueSchema;
+const nodeQualityMeta = {
+  visual: VisualStyleSchema.optional(),
+  qualityRole: z.enum(["button", "input", "image", "heading", "body", "decorative"]).optional(),
+  qualityExceptions: z
+    .array(
+      z.enum([
+        "tiny-text",
+        "low-contrast",
+        "small-touch-target",
+        "overflow-risk",
+        "duplicated-pattern",
+        "missing-alt",
+        "missing-asset-license",
+        "spacing-variety",
+        "style-variety",
+        "weak-hierarchy",
+        "repeated-placeholders",
+      ]),
+    )
+    .max(10)
+    .optional(),
+  constraints: z
+    .object({
+      horizontal: z.enum(["left", "right", "center", "left-right", "scale"]),
+      vertical: z.enum(["top", "bottom", "center", "top-bottom", "scale"]),
+    })
+    .strict()
+    .optional(),
+};
 const layoutNumberSchema = z.union([z.number().finite().min(0).max(1_000), TokenReferenceSchema]);
 const radiusValueSchema = z.union([radiusSchema, TokenReferenceSchema]);
 const strokeWidthSchema = z.union([z.number().finite().min(0.25).max(100), TokenReferenceSchema]);
@@ -178,6 +292,7 @@ export const LayoutSchema: z.ZodType<LayoutSpec> = z
 
 const TextNodeSchema = z
   .object({
+    ...nodeQualityMeta,
     type: z.literal("text"),
     name: nameSchema,
     text: z.string().max(5_000),
@@ -210,6 +325,7 @@ const TextNodeSchema = z
 
 const RectangleNodeSchema = z
   .object({
+    ...nodeQualityMeta,
     type: z.literal("rectangle"),
     name: nameSchema,
     x: coordinateSchema.optional(),
@@ -224,6 +340,59 @@ const RectangleNodeSchema = z
   })
   .strict();
 
+const EllipseNodeSchema = z
+  .object({
+    ...nodeQualityMeta,
+    type: z.literal("ellipse"),
+    name: nameSchema,
+    x: coordinateSchema.optional(),
+    y: coordinateSchema.optional(),
+    width: dimensionSchema,
+    height: dimensionSchema,
+    fill: nodeColorSchema,
+    sizing: sizingSchema.optional(),
+  })
+  .strict();
+
+const vectorPathDataSchema = z
+  .string()
+  .min(3)
+  .max(8_192)
+  .refine(isFigmaPathData, "Use only bounded absolute M/L/Q/C/Z path data supported by Figma.");
+
+const VectorNodeSchema = z
+  .object({
+    ...nodeQualityMeta,
+    type: z.literal("vector"),
+    name: nameSchema,
+    x: coordinateSchema.optional(),
+    y: coordinateSchema.optional(),
+    width: dimensionSchema,
+    height: dimensionSchema,
+    pathData: vectorPathDataSchema,
+    fill: nodeColorSchema,
+    sizing: sizingSchema.optional(),
+  })
+  .strict();
+
+const ImageNodeSchema = z
+  .object({
+    ...nodeQualityMeta,
+    type: z.literal("image"),
+    name: nameSchema,
+    x: coordinateSchema.optional(),
+    y: coordinateSchema.optional(),
+    width: dimensionSchema,
+    height: dimensionSchema,
+    assetId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,99}$/),
+    fit: z.enum(["fill", "fit", "crop", "tile"]).optional(),
+    cornerRadius: radiusSchema.optional(),
+    alt: z.string().trim().max(300).optional(),
+    placeholder: z.boolean().optional(),
+    sizing: sizingSchema.optional(),
+  })
+  .strict();
+
 const InstanceNodeSchema = z
   .object({
     type: z.literal("instance"),
@@ -232,6 +401,13 @@ const InstanceNodeSchema = z
     x: coordinateSchema.optional(),
     y: coordinateSchema.optional(),
     sizing: sizingSchema.optional(),
+    constraints: z
+      .object({
+        horizontal: z.enum(["left", "right", "center", "left-right", "scale"]),
+        vertical: z.enum(["top", "bottom", "center", "top-bottom", "scale"]),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -240,6 +416,9 @@ export const DesignNodeSchema: z.ZodType<DesignNode> = z.lazy(
     z.discriminatedUnion("type", [
       TextNodeSchema,
       RectangleNodeSchema,
+      EllipseNodeSchema,
+      VectorNodeSchema,
+      ImageNodeSchema,
       FrameNodeSchema,
       InstanceNodeSchema,
     ]) as z.ZodType<DesignNode>,
@@ -247,6 +426,7 @@ export const DesignNodeSchema: z.ZodType<DesignNode> = z.lazy(
 
 const FrameNodeSchema = z
   .object({
+    ...nodeQualityMeta,
     type: z.literal("frame"),
     name: nameSchema,
     x: coordinateSchema.optional(),
@@ -265,6 +445,7 @@ const FrameNodeSchema = z
 
 export const ComponentDefinitionSchema: z.ZodType<ComponentDefinitionSpec> = z
   .object({
+    visual: VisualStyleSchema.optional(),
     type: z.literal("component"),
     id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,99}$/),
     name: nameSchema,
@@ -294,6 +475,7 @@ export const DesignSystemSchema = DesignSystemTokensSchema.extend({
 export const DesignSchema: z.ZodType<DesignSpec> = z
   .object({
     schemaVersion: z.literal(DESIGN_SCHEMA_VERSION),
+    assets: z.array(VisualAssetSchema).max(20).optional(),
     designSystem: DesignSystemSchema.optional(),
     document: z
       .object({
@@ -318,6 +500,9 @@ export interface DesignCounts {
   rectangles: number;
   components: number;
   instances: number;
+  ellipses?: number;
+  vectors?: number;
+  images?: number;
 }
 
 function pathLabel(path: PropertyKey[]): string {
@@ -334,13 +519,13 @@ function issueMessage(issue: z.ZodIssue): string {
   const path = pathLabel(issue.path);
   if (issue.code === "unrecognized_keys") {
     const keys = issue.keys.map((key) => `“${key}”`).join(", ");
-    return `${path} has unsupported propert${issue.keys.length === 1 ? "y" : "ies"}: ${keys}. Remove them and use only documented Phase 2 fields.`;
+    return `${path} has unsupported node type field(s) or unsupported property/properties: ${keys}. Use a supported node type (frame, text, rectangle, ellipse, vector, image, instance) and documented properties.`;
   }
   if (
     (issue.code === "invalid_value" || issue.code === "invalid_union") &&
     issue.path.at(-1) === "type"
   ) {
-    return `${path} uses an unsupported node type. Use frame, text, rectangle, or instance.`;
+    return `${path} uses an unsupported node type. Use frame, text, rectangle, ellipse, vector, image, or instance.`;
   }
   if (issue.code === "invalid_type" && issue.input === undefined) return `${path} is required.`;
   if (
@@ -542,9 +727,29 @@ function validateDesignSystemReferences(spec: DesignSpec): string[] {
       checkNumber(value, "spacing", `${path}.padding.${side}`);
     }
   };
+  const checkVisual = (visual: VisualStyle | undefined, path: string) => {
+    if (!visual) return;
+    visual.fills?.forEach((fill, index) => {
+      const fillPath = `${path}.fills[${index}]`;
+      if (fill.type === "solid") checkColor(fill.color, `${fillPath}.color`);
+      else
+        fill.stops.forEach((stop, stopIndex) =>
+          checkColor(stop.color, `${fillPath}.stops[${stopIndex}].color`),
+        );
+    });
+    visual.strokes?.forEach((stroke, index) =>
+      checkColor(stroke.color, `${path}.strokes[${index}].color`),
+    );
+    visual.effects?.forEach((effect, index) => {
+      if (effect.type === "drop-shadow" || effect.type === "inner-shadow") {
+        checkColor(effect.color, `${path}.effects[${index}].color`);
+      }
+    });
+  };
   const checkNodes = (nodes: DesignNode[], path: string) => {
     nodes.forEach((node, index) => {
       const nodePath = `${path}[${index}]`;
+      checkVisual("visual" in node ? node.visual : undefined, `${nodePath}.visual`);
       if (node.type === "text") {
         checkColor(node.color, `${nodePath}.color`);
         checkNumber(node.fontSize, "spacing", `${nodePath}.fontSize`);
@@ -558,6 +763,10 @@ function validateDesignSystemReferences(spec: DesignSpec): string[] {
         checkStroke(node.stroke, `${nodePath}.stroke`);
         checkNumber(node.cornerRadius, "radius", `${nodePath}.cornerRadius`);
         checkNumericRange(node.cornerRadius, "radius", 0, 5_000, `${nodePath}.cornerRadius`);
+      } else if (node.type === "ellipse" || node.type === "vector") {
+        checkColor(node.fill, `${nodePath}.fill`);
+      } else if (node.type === "image") {
+        // Asset id existence is validated after all trees have been visited.
       } else if (node.type === "frame") {
         checkColor(node.background, `${nodePath}.background`);
         checkStroke(node.stroke, `${nodePath}.stroke`);
@@ -576,6 +785,7 @@ function validateDesignSystemReferences(spec: DesignSpec): string[] {
     ...(spec.document.components ?? []),
     ...(system.components ?? []),
   ].entries()) {
+    checkVisual(component.visual, `components[${index}].visual`);
     checkColor(component.background, `components[${index}].background`);
     checkStroke(component.stroke, `components[${index}].stroke`);
     checkNumber(component.cornerRadius, "radius", `components[${index}].cornerRadius`);
@@ -650,6 +860,15 @@ function validateSemantics(spec: DesignSpec): string[] {
           `${nodePath} uses x/y inside an Auto Layout parent. Remove positions; child order and layout control placement.`,
         );
       }
+      const sizing = node.sizing;
+      if ("constraints" in node && node.constraints && parentLayout) {
+        errors.push(
+          `${nodePath}.constraints can only be used with absolute positioning inside a non-auto-layout frame.`,
+        );
+      }
+      if ("constraints" in node && node.constraints && sizing) {
+        errors.push(`${nodePath}.constraints cannot be combined with Auto Layout sizing.`);
+      }
       if (!parentLayout && (node.x === undefined || node.y === undefined)) {
         errors.push(`${nodePath} requires x and y because its parent does not use Auto Layout.`);
       }
@@ -662,7 +881,6 @@ function validateSemantics(spec: DesignSpec): string[] {
         errors.push(`${nodePath} cannot set both cornerRadius and cornerRadii.`);
       }
 
-      const sizing = node.sizing;
       if (sizing && !parentLayout)
         errors.push(`${nodePath}.sizing requires an Auto Layout parent.`);
       if (sizing) {
@@ -676,6 +894,9 @@ function validateSemantics(spec: DesignSpec): string[] {
           if (
             mode === "hug" &&
             (node.type === "rectangle" ||
+              node.type === "ellipse" ||
+              node.type === "vector" ||
+              node.type === "image" ||
               (node.type === "instance" && !componentById.get(node.componentId)?.layout) ||
               (node.type === "frame" && !node.layout))
           ) {
@@ -794,6 +1015,47 @@ function validateSemantics(spec: DesignSpec): string[] {
   };
   for (const component of components) visit(component.id, []);
 
+  const assetById = new Map<string, VisualAsset>();
+  let assetBytes = 0;
+  for (const [index, asset] of (spec.assets ?? []).entries()) {
+    const assetPath = `assets[${index}]`;
+    if (assetById.has(asset.id)) errors.push(`${assetPath}.id “${asset.id}” is duplicated.`);
+    else assetById.set(asset.id, asset);
+    assetBytes += visualAssetSize(asset);
+    if (
+      asset.kind === "svg-paths" &&
+      asset.paths.reduce((total, path) => total + path.data.length, 0) > 40_000
+    ) {
+      errors.push(`${assetPath}.paths exceeds the 40 KB total vector path limit.`);
+    }
+  }
+  if (assetBytes > 700 * 1_024) {
+    errors.push(
+      "Embedded visual assets exceed the total 700 KiB limit. Import fewer or smaller files.",
+    );
+  }
+  const checkAssetRefs = (nodes: DesignNode[], path: string) => {
+    nodes.forEach((node, index) => {
+      const nodePath = `${path}[${index}]`;
+      if (node.type === "image" && !assetById.has(node.assetId)) {
+        errors.push(`${nodePath}.assetId references missing asset “${node.assetId}”.`);
+      } else if (node.type === "image" && assetById.get(node.assetId)?.kind === "svg-paths") {
+        nodeCount += (assetById.get(node.assetId) as Extract<VisualAsset, { kind: "svg-paths" }>)
+          .paths.length;
+      }
+      if (node.type === "frame") checkAssetRefs(node.children, `${nodePath}.children`);
+    });
+  };
+  checkAssetRefs(spec.document.children, "document.children");
+  for (const [index, component] of components.entries()) {
+    const documentComponentCount = spec.document.components?.length ?? 0;
+    const path =
+      index < documentComponentCount
+        ? `document.components[${index}].children`
+        : `designSystem.components[${index - documentComponentCount}].children`;
+    checkAssetRefs(component.children, path);
+  }
+
   if (nodeCount > MAX_NODE_COUNT) {
     errors.push(
       `The design contains ${nodeCount} nodes; Phase 2 allows at most ${MAX_NODE_COUNT}.`,
@@ -805,11 +1067,24 @@ function validateSemantics(spec: DesignSpec): string[] {
 
 export function countDesignNodes(spec: DesignSpec): DesignCounts {
   const counts: DesignCounts = { frames: 1, texts: 0, rectangles: 0, components: 0, instances: 0 };
+  const increment = (kind: keyof DesignCounts) => {
+    counts[kind] = (counts[kind] ?? 0) + 1;
+  };
+  const assets = new Map((spec.assets ?? []).map((asset) => [asset.id, asset]));
   const visit = (nodes: DesignNode[]) => {
     for (const node of nodes) {
       if (node.type === "text") counts.texts++;
       else if (node.type === "rectangle") counts.rectangles++;
-      else if (node.type === "instance") counts.instances++;
+      else if (node.type === "ellipse") increment("ellipses");
+      else if (node.type === "vector") increment("vectors");
+      else if (node.type === "image") {
+        const asset = assets.get(node.assetId);
+        if (asset?.kind === "svg-paths") {
+          counts.frames++;
+          increment("vectors");
+          for (let index = 1; index < asset.paths.length; index++) increment("vectors");
+        } else increment("images");
+      } else if (node.type === "instance") counts.instances++;
       else if (node.type === "frame") {
         counts.frames++;
         visit(node.children);

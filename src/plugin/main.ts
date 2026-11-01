@@ -1,12 +1,29 @@
 import { countDesignNodes, parseDesignText } from "../shared/schema";
 import { isMultiScreenInput, parseMultiScreenText } from "../shared/multi-screen-schema";
 import { UIToPluginSchema, type PluginToUIMessage } from "../shared/messages";
+import type { DesignSpec } from "../shared/schema";
+import type { MultiScreenSpec } from "../shared/multi-screen-schema";
 import { renderDesign, renderMultiScreenDesign } from "./renderer";
+import { collectFontRequirements, unavailableFontWarnings } from "./font-preflight";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
 
 function send(message: PluginToUIMessage): void {
   figma.ui.postMessage(message);
+}
+
+async function fontWarnings(input: DesignSpec | MultiScreenSpec): Promise<string[]> {
+  try {
+    const fonts = await figma.listAvailableFontsAsync();
+    return unavailableFontWarnings(
+      collectFontRequirements(input),
+      fonts.map(({ fontName }) => fontName),
+    );
+  } catch {
+    return [
+      "Figma could not list available fonts during validation; generation will still report actual font fallbacks.",
+    ];
+  }
 }
 
 figma.ui.onmessage = async (rawMessage: unknown) => {
@@ -22,6 +39,9 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
   if (message.data.type === "validate") {
     if (isMultiScreenInput(message.data.json)) {
       const multiResult = parseMultiScreenText(message.data.json);
+      const fontWarningsForInput = multiResult.success
+        ? await fontWarnings(multiResult.data)
+        : undefined;
       send(
         multiResult.success
           ? {
@@ -40,6 +60,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
                   height: screen.height,
                 })),
               },
+              fontWarnings: fontWarningsForInput,
             }
           : {
               type: "validation-result",
@@ -51,6 +72,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       return;
     }
     const result = parseDesignText(message.data.json);
+    const fontWarningsForInput = result.success ? await fontWarnings(result.data) : undefined;
     send(
       result.success
         ? {
@@ -58,6 +80,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
             requestId: message.data.requestId,
             success: true,
             counts: countDesignNodes(result.data),
+            fontWarnings: fontWarningsForInput,
           }
         : {
             type: "validation-result",

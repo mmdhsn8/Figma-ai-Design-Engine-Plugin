@@ -7,6 +7,7 @@ The plugin name includes “AI,” but this version does not generate designs fr
 ## What the plugin can do
 
 - Create frames, text layers, and rectangles, including nested frames.
+- Create ellipses, editable vector paths, gradients, strokes, shadows/blur, clipping, opacity and native image fills.
 - Place children at explicit `x`/`y` coordinates or arrange them with Figma Auto Layout.
 - Set colors, strokes, corner radii, text alignment, font family/style, and text sizing.
 - Define reusable components and create linked instances of them.
@@ -40,7 +41,7 @@ The plugin is set up for local development and is not configured for publishing 
 
 ## Use the plugin
 
-1. Load **Phase 1 sample** for a small, positioned example, **Phase 2 demo** for the storefront, or **Phase 3 demo** for native styles, components, and token references.
+1. Load **Phase 1 sample** for a small, positioned example, **Phase 2 demo** for the storefront, **Phase 3 demo** for native styles/components, or **Visual demo** for native editorial visuals and the 10-screen Persian storefront.
 2. To use your own design, click **Import JSON** to select a `.json` file, or paste/edit JSON in the editor. The import/editor limit is 1 MB.
 3. Click **Validate JSON**. Fix any errors shown in the status area before continuing.
 4. Click **Generate in Figma** for Phase 1/2 documents. For JSON containing `designSystem`, inspect its dry-run summary and click **Create / Update Design System**. The plugin creates native editable layers on the current page and focuses the new design in the viewport.
@@ -232,10 +233,133 @@ Automated tests use a mocked Figma API and do not verify the real canvas. After 
 
 Phase 2.2 remains pending until these checks pass in Figma Desktop and the user confirms them.
 
+## Phase 4.5 visual design and quality preflight
+
+Phase 4.5 adds optional, schema 1.0.0 visual properties and local assets. Existing Phase 1–4 JSON remains valid and keeps the same default rendering. The **Visual Quality / Local Assets** panel shows a dry-run summary, measured JSON diagnostics with paths, embedded asset provenance, and a read-only font availability check from the active Figma editor. It does not produce a numerical quality score. Contrast is measured only for a single fully opaque solid text paint against a single fully opaque solid inherited surface; gradients, alpha, stacked paints and overlays are skipped because a reliable contrast ratio cannot be inferred from the JSON alone. Touch-size thresholds are automated checks; composition, typography, Persian shaping, and platform appearance still require visual review.
+
+The visual palette uses explicit six-digit colors; alpha is set through fill or layer opacity. New visual styling is additive and can be token-bound through the existing Phase 3 color tokens:
+
+```json
+{
+  "type": "rectangle",
+  "name": "Editorial card",
+  "x": 16,
+  "y": 16,
+  "width": 320,
+  "height": 180,
+  "fill": "#FFFFFF",
+  "cornerRadii": { "topLeft": 20, "topRight": 20, "bottomRight": 12, "bottomLeft": 12 },
+  "visual": {
+    "fills": [
+      {
+        "type": "linear",
+        "angle": -24,
+        "opacity": 0.95,
+        "stops": [
+          { "position": 0, "color": { "token": "color.brand.deepNavy" } },
+          { "position": 1, "color": { "token": "color.action.primary" } }
+        ]
+      }
+    ],
+    "strokes": [{ "color": { "token": "color.border.default" }, "width": 1, "align": "inside" }],
+    "effects": [
+      {
+        "type": "drop-shadow",
+        "color": "#123B5D",
+        "opacity": 0.16,
+        "offsetX": 0,
+        "offsetY": 8,
+        "radius": 20,
+        "spread": 0
+      }
+    ],
+    "clipsContent": true
+  }
+}
+```
+
+Absolute-positioned nodes can also opt into Figma's native `constraints` on a non-Auto-Layout parent, for example `{"horizontal":"left-right","vertical":"top"}`. These are Figma resize constraints on that frame; they do not create breakpoint variants or guarantee responsive composition. Constraints are rejected inside Auto Layout, where Auto Layout sizing and child order remain authoritative. Child array order controls layer z-order. Multiple native fills support layered backgrounds; frame clipping is explicit.
+
+### Local raster and SVG assets
+
+Use **Import local PNG / JPEG / GIF / safe SVG** in the panel after entering a source/license note. The UI embeds file bytes into JSON and makes no network request. The `assets` list is shared by single-design and multi-screen documents. A raster image node refers to an asset id:
+
+```json
+{
+  "assets": [
+    {
+      "id": "product-photo",
+      "name": "Product photo",
+      "kind": "raster",
+      "mimeType": "image/png",
+      "width": 800,
+      "height": 1000,
+      "license": "Owned by me",
+      "alt": "Blue linen coat on a neutral background",
+      "base64": "<canonical base64 PNG bytes>"
+    }
+  ],
+  "document": {
+    "children": [
+      {
+        "type": "image",
+        "name": "Product photo",
+        "assetId": "product-photo",
+        "x": 16,
+        "y": 16,
+        "width": 160,
+        "height": 200,
+        "fit": "crop",
+        "alt": "Blue linen coat on a neutral background"
+      }
+    ]
+  }
+}
+```
+
+The example fragment omits the required document fields for brevity. Import a real file through the UI to populate bytes and dimensions. Figma receives the bytes through `figma.createImage` and renders them as a native, replaceable image fill on an editable rectangle. Identical local bytes are converted once per generation, then reused by their Figma image hash. No external URL is accepted.
+
+Limits: 20 assets per document, 256 KiB per raster file, 4,096 px per dimension, 700 KiB total decoded asset bytes, and the existing 1 MB JSON/editor limit. PNG chunk lengths/checksums and JPEG/GIF container headers are checked locally; Figma's image importer remains the final decoder. Invalid bytes stop before visible nodes are created and the error suggests re-exporting or using an editable vector placeholder. Figma image resources created before a later render error may remain as invisible file resources because the Plugin API has no image-resource delete operation; no image rectangle or unrelated node is left behind by the tested failure path.
+
+SVG imports are intentionally narrow and offline: one root `viewBox` beginning at `0 0`, with 1–32 direct self-closing paths. The parser accepts solid six-digit fills and bounded absolute `M`, `L`, `Q`, `C`, and `Z` path commands. Markup is limited to 50 KB, combined path data to 40 KB, and path coordinates/complexity are bounded. Scripts, entities, images, groups, CSS, transforms, URLs, gradients, relative commands, and other SVG features are rejected with an error. Accepted paths become separate editable Vector nodes inside a clipped frame; raster asset fills remain pixels in a replaceable image fill. SVG tiling is not supported and is fit proportionally with a warning.
+
+### Native feature matrix
+
+| JSON feature                                             | Figma output                                                          | Behavior / fallback                                                                         |
+| -------------------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Solid and linear/radial fills, opacity, layered fills    | Native Paint arrays on text, rectangles, ellipses, vectors and frames | Literal values or resolved Phase 3 color tokens                                             |
+| Stroke color, width, alignment and dash pattern          | Native strokes on supported shapes/frames                             | Multiple paints share the node's stroke weight/alignment                                    |
+| Per-corner radii, clipping, layer opacity and blend mode | Native frame/shape properties                                         | Bounds and supported values are validated                                                   |
+| Drop/inner shadow and normal layer/background blur       | Native Figma effects                                                  | Unsupported effects are rejected; no experimental effect types are emitted                  |
+| Safe SVG path art                                        | Native editable Vector nodes                                          | Limited SVG subset; unsupported markup is rejected                                          |
+| Local PNG/JPEG/GIF                                       | Native image fill on an editable rectangle                            | Pixels are not vectorized; invalid bytes fail preflight                                     |
+| Design-system paint/text styles and component masters    | Phase 3 native styles, components and linked instances                | Existing ownership and safe reuse rules remain in force                                     |
+| Spacing/radius numeric tokens                            | Resolved numeric values in layout/radius properties                   | Not a live Figma Variable binding                                                           |
+| Figma font availability                                  | Read-only validation warning and runtime load/fallback report         | Text remains editable; Figma's font and bidirectional shaping behavior needs Desktop review |
+| Absolute layout constraints                              | Native Figma constraints for non-Auto-Layout parents                  | No generated responsive breakpoints or automatic reflow                                     |
+
+The button **Visual demo** loads `src/samples/phase-4.5-visual-design.json`, which has 10 distinct Persian storefront screens and native vector fashion illustrations; it includes no product photos, external fonts, remote icons or permanent brand logo. The separate `src/samples/visual-ltr-fixture.json` checks that visual styling also works in an LTR document. The included art is authored as editable path/shape geometry, not presented as photography.
+
+### Phase 4.5 Windows / Figma Desktop acceptance
+
+**Pending:** no Figma Desktop run was performed for this implementation. After building, close and reload the development plugin from this repository's `manifest.json`, then:
+
+1. Load the Phase 4.5 demo, validate, inspect the estimated frame/node/component/instance counts and quality diagnostics, then generate all 10 screens.
+2. Compare the 10 compositions at 100% zoom. Check hierarchy, whitespace, shadows, gradients, corner radii, row alignment, and overflow.
+3. Inspect Persian/Latin mixed text, numerals, punctuation, font fallback, and editability. Do not treat the native text API as a manual RTL shaping control.
+4. Edit vector paths, frames, shapes, gradients, strokes, effects, Auto Layout and linked Button/Product Card instances. Edit a master and verify normal Figma instance propagation.
+5. Import a licensed local PNG, generate it, replace its native image fill, then import an SVG with several paths and edit the resulting Vector nodes.
+6. Try a malformed PNG, unsafe SVG, missing asset id, invalid token and unavailable font. Confirm validation is actionable and no visible partial tree is left.
+7. Re-import the visual demo twice; check for duplicate masters/styles and unchanged prior screen positions or manual edits.
+8. Run the Phase 1–4 examples, confirm horizontal-first placement with the 120 px gap and 6,000 px default row width, and verify unrelated content stays in place.
+9. Confirm the local Starter/Desktop environment can create and edit these native shapes, image fills and effects. Plugin API mocks are not proof of account-specific Figma behavior.
+
+The prior Phase 2.2, Phase 3 and Phase 4 Desktop acceptance gates also remain pending unless the user reports their results. Phase 4.5 is implemented in code; product acceptance is pending this manual review. Phase 5 has not started.
+
 ## Limitations
 
 - The plugin creates designs from JSON; it does not create a design from a natural-language prompt.
-- Full right-to-left/bidirectional shaping, component variants, configurable component properties, and instance overrides are not implemented.
+- Full right-to-left/bidirectional shaping, component variants, configurable component properties, and instance overrides are not implemented. Native absolute constraints do not provide responsive breakpoints or automatic reflow.
 - Rotated nodes reserve their full axis-aligned envelope, which may leave extra space. Figma render bounds may omit editor-only effects; geometric bounds are used when render bounds are unavailable.
 - The 6,000 px row width is a layout target rather than a hard canvas limit. Existing Phase 2.1 clusters are not rearranged automatically.
 - Numeric design-system tokens are resolved values and do not update through Figma Variables. Shadow/effect tokens, native component sets, variant properties, instance text overrides, advanced responsive rules, prototyping links, and publishing workflows are outside the current scope.

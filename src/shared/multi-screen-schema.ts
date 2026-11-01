@@ -14,7 +14,9 @@ import {
   type DesignCounts,
   type DesignNode,
   type DesignSpec,
+  countDesignNodes,
 } from "./schema";
+import { VisualAssetSchema, type VisualAsset } from "./visual-schema";
 
 export const MAX_MULTI_SCREEN_COUNT = 100;
 export const MAX_MULTI_SCREEN_NODE_COUNT = 5_000;
@@ -73,6 +75,7 @@ export const MultiScreenSpecSchema = z
     name: nameSchema,
     designSystem: DesignSystemSchema.optional(),
     components: z.array(ComponentDefinitionSchema).max(MAX_COMPONENT_COUNT).optional(),
+    assets: z.array(VisualAssetSchema).max(20).optional(),
     screens: z.array(MultiScreenItemSchema).min(1).max(MAX_MULTI_SCREEN_COUNT),
   })
   .strict();
@@ -84,6 +87,7 @@ export interface MultiScreenSpec {
   name: string;
   designSystem?: DesignSpec["designSystem"];
   components?: ComponentDefinitionSpec[];
+  assets?: VisualAsset[];
   screens: MultiScreenItem[];
 }
 
@@ -106,6 +110,7 @@ function screenAsDesignSpec(batch: MultiScreenSpec, screen: MultiScreenItem): De
   return {
     schemaVersion: DESIGN_SCHEMA_VERSION,
     designSystem: batch.designSystem,
+    assets: batch.assets,
     document: {
       name: `${screen.name} — ${screen.id}`,
       width: screen.width,
@@ -119,15 +124,32 @@ function screenAsDesignSpec(batch: MultiScreenSpec, screen: MultiScreenItem): De
 }
 
 function totalNodes(counts: DesignCounts): number {
-  return counts.frames + counts.texts + counts.rectangles + counts.components + counts.instances;
+  return (
+    counts.frames +
+    counts.texts +
+    counts.rectangles +
+    counts.components +
+    counts.instances +
+    (counts.ellipses ?? 0) +
+    (counts.vectors ?? 0) +
+    (counts.images ?? 0)
+  );
 }
 
-function componentTreeNodeCount(components: ComponentDefinitionSpec[]): number {
+function componentTreeNodeCount(
+  components: ComponentDefinitionSpec[],
+  assets: VisualAsset[] = [],
+): number {
+  const assetById = new Map(assets.map((asset) => [asset.id, asset]));
   let count = components.length;
   const visit = (nodes: DesignNode[]) => {
     for (const node of nodes) {
       count++;
       if (node.type === "frame") visit(node.children);
+      else if (node.type === "image" && assetById.get(node.assetId)?.kind === "svg-paths") {
+        count += (assetById.get(node.assetId) as Extract<VisualAsset, { kind: "svg-paths" }>).paths
+          .length;
+      }
     }
   };
   for (const component of components) visit(component.children);
@@ -178,14 +200,23 @@ export function parseMultiScreenValue(value: unknown): MultiScreenParseResult {
 
   const sharedComponents = [...(batch.components ?? []), ...(batch.designSystem?.components ?? [])];
   // One generated component-area frame contains the shared masters when any are new.
-  const sharedNodes = componentTreeNodeCount(sharedComponents) + (sharedComponents.length ? 1 : 0);
+  const sharedNodes =
+    componentTreeNodeCount(sharedComponents, batch.assets) + (sharedComponents.length ? 1 : 0);
   let nodeCount = 0;
   for (const screen of batch.screens) {
     const checked = parseDesignValue(screenAsDesignSpec(batch, screen));
     if (!checked.success) {
       errors.push(...referencePrefix(screen.id, checked.errors));
     } else {
-      nodeCount += totalNodes(countScreenTree(screen));
+      const screenSpec = designSpecForScreen(batch, screen);
+      const screenOnlySpec: DesignSpec = {
+        ...screenSpec,
+        designSystem: screenSpec.designSystem
+          ? { ...screenSpec.designSystem, components: undefined }
+          : undefined,
+        document: { ...screenSpec.document, components: undefined },
+      };
+      nodeCount += totalNodes(countDesignNodes(screenOnlySpec));
     }
   }
 
@@ -204,23 +235,6 @@ export function parseMultiScreenValue(value: unknown): MultiScreenParseResult {
     data: { ...batch, screens: orderMultiScreenItems(batch.screens) },
     nodeCount,
   };
-}
-
-function countScreenTree(screen: MultiScreenItem): DesignCounts {
-  const counts: DesignCounts = { frames: 1, texts: 0, rectangles: 0, components: 0, instances: 0 };
-  const visit = (nodes: MultiScreenItem["children"]) => {
-    for (const node of nodes) {
-      if (node.type === "text") counts.texts++;
-      else if (node.type === "rectangle") counts.rectangles++;
-      else if (node.type === "instance") counts.instances++;
-      else if (node.type === "frame") {
-        counts.frames++;
-        visit(node.children);
-      }
-    }
-  };
-  visit(screen.children);
-  return counts;
 }
 
 export function parseMultiScreenText(source: string): MultiScreenParseResult {

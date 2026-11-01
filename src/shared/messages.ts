@@ -12,6 +12,9 @@ const CountsSchema = z
     rectangles: z.number().int().nonnegative(),
     components: z.number().int().nonnegative(),
     instances: z.number().int().nonnegative(),
+    ellipses: z.number().int().nonnegative().optional(),
+    vectors: z.number().int().nonnegative().optional(),
+    images: z.number().int().nonnegative().optional(),
   })
   .strict();
 
@@ -120,6 +123,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       success: z.boolean(),
       counts: CountsSchema.optional(),
       multiScreen: MultiScreenCountsSchema.optional(),
+      fontWarnings: z.array(z.string()).max(100).optional(),
       errors: z.array(z.string()).optional(),
     })
     .strict(),

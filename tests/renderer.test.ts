@@ -3,6 +3,8 @@ import phase1Sample from "../src/samples/sample-design.json";
 import storefront from "../src/samples/phase-2-storefront.json";
 import phase3Sample from "../src/samples/phase-3-design-system.json";
 import phase4Sample from "../src/samples/phase-4-multi-screen.json";
+import phase45VisualSample from "../src/samples/phase-4.5-visual-design.json";
+import { ONE_PIXEL_PNG } from "./visual-fixtures";
 import {
   mapLayoutSpec,
   mapSizingMode,
@@ -194,6 +196,9 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
       return text;
     }),
     createRectangle: vi.fn(() => makeNode("RECTANGLE")),
+    createEllipse: vi.fn(() => makeNode("ELLIPSE")),
+    createVector: vi.fn(() => makeNode("VECTOR")),
+    createImage: vi.fn(() => ({ hash: "mock-image-hash" })),
     createComponentFromNode: vi.fn((node: MockNode) => {
       node.type = "COMPONENT";
       return node;
@@ -745,7 +750,7 @@ describe("renderDesign", () => {
     expect(first.generatedScreens).toBe(10);
   });
 
-  it("renders 100 empty roots from one batch without overlap", async () => {
+  it("renders 100 visual roots from one batch without overlap", async () => {
     const batch = {
       schemaVersion: "1.0.0",
       id: "stress-batch",
@@ -758,19 +763,78 @@ describe("renderDesign", () => {
         width: index % 2 === 0 ? 390 : 834,
         height: 844 + (index % 3) * 100,
         background: "#FFFFFF",
-        children: [],
+        children: [
+          {
+            type: "rectangle" as const,
+            name: `Surface ${index}`,
+            x: 12,
+            y: 12,
+            width: Math.min(220, (index % 7) * 18 + 120),
+            height: 72,
+            fill: "#FFFFFF",
+            constraints: { horizontal: "left-right", vertical: "bottom" },
+            visual: {
+              fills: [
+                {
+                  type: "linear" as const,
+                  angle: -18,
+                  stops: [
+                    { position: 0, color: "#EFF6FF" },
+                    { position: 1, color: "#D7EDFF" },
+                  ],
+                },
+              ],
+              effects: [
+                {
+                  type: "drop-shadow" as const,
+                  color: "#123B5D",
+                  opacity: 0.12,
+                  offsetX: 0,
+                  offsetY: 4,
+                  radius: 12,
+                  spread: 0,
+                },
+              ],
+            },
+          },
+          {
+            type: "vector" as const,
+            name: `Icon ${index}`,
+            x: 24,
+            y: 28,
+            width: 24,
+            height: 24,
+            pathData: "M 2 12 L 9 19 L 22 4 Z",
+            fill: "#2563EB",
+          },
+        ],
       })),
     };
+    const heapBefore = process.memoryUsage().heapUsed;
+    let sampledHeapPeak = heapBefore;
     const startedAt = performance.now();
-    const result = await renderMultiScreenDesign(mock.api, batch, { maxRowWidth: 6_000 });
+    const result = await renderMultiScreenDesign(mock.api, batch, {
+      maxRowWidth: 6_000,
+      onProgress: () => {
+        sampledHeapPeak = Math.max(sampledHeapPeak, process.memoryUsage().heapUsed);
+      },
+    });
     const elapsedMs = performance.now() - startedAt;
+    const sampledHeapPeakDeltaBytes = sampledHeapPeak - heapBefore;
+    const sampledHeapPeakBytes = sampledHeapPeak;
     const roots = mock.roots.filter((node) => node.pluginData.has("fad.multi-screen.screen-id"));
 
     expect(Number.isFinite(elapsedMs)).toBe(true);
     expect(elapsedMs).toBeLessThan(5_000);
+    expect(sampledHeapPeakDeltaBytes).toBeLessThan(64 * 1_024 * 1_024);
+    console.info(
+      `VISUAL_BATCH_METRICS screens=100 generated=${result.generatedScreens} nodes=${result.createdNodeCount} elapsedMs=${elapsedMs.toFixed(1)} heapBeforeBytes=${heapBefore} sampledHeapPeakBytes=${sampledHeapPeakBytes} sampledHeapPeakDeltaBytes=${sampledHeapPeakDeltaBytes}`,
+    );
     expect(result.generatedScreens).toBe(100);
     expect(result.screens).toHaveLength(100);
     expect(roots).toHaveLength(100);
+    expect(result.counts.vectors).toBe(100);
+    expect(result.counts.rectangles).toBe(100);
     for (let first = 0; first < roots.length; first++) {
       expect(
         boundsIntersectWithGap(
@@ -809,6 +873,303 @@ describe("renderDesign", () => {
         ).toBe(false);
       }
     }
+  });
+
+  it("renders the 10-screen Phase 4.5 demo with native editable visuals", async () => {
+    const heapBefore = process.memoryUsage().heapUsed;
+    let sampledHeapPeak = heapBefore;
+    const startedAt = performance.now();
+    const result = await renderMultiScreenDesign(mock.api, phase45VisualSample, {
+      maxRowWidth: 6_000,
+      onProgress: () => {
+        sampledHeapPeak = Math.max(sampledHeapPeak, process.memoryUsage().heapUsed);
+      },
+    });
+    const elapsedMs = performance.now() - startedAt;
+    const sampledHeapPeakDeltaBytes = sampledHeapPeak - heapBefore;
+    const sampledHeapPeakBytes = sampledHeapPeak;
+    const screenRoots = mock.roots.filter((node) =>
+      node.pluginData.has("fad.multi-screen.screen-id"),
+    );
+    const gradientSurface = mock.find("Promotional hero — layered editable art");
+    const cardMaster = mock.find("apparel-core/product-card.basic");
+
+    expect(result).toMatchObject({
+      totalScreens: 10,
+      generatedScreens: 10,
+      failedScreens: 0,
+      counts: {
+        vectors: expect.any(Number),
+        ellipses: expect.any(Number),
+        instances: expect.any(Number),
+      },
+    });
+    expect(screenRoots).toHaveLength(10);
+    expect(elapsedMs).toBeLessThan(5_000);
+    expect(sampledHeapPeakDeltaBytes).toBeLessThan(64 * 1_024 * 1_024);
+    console.info(
+      `VISUAL_DEMO_METRICS screens=10 generated=${result.generatedScreens} nodes=${result.createdNodeCount} elapsedMs=${elapsedMs.toFixed(1)} heapBeforeBytes=${heapBefore} sampledHeapPeakBytes=${sampledHeapPeakBytes} sampledHeapPeakDeltaBytes=${sampledHeapPeakDeltaBytes}`,
+    );
+    expect(mock.raw.createVector).toHaveBeenCalled();
+    expect(mock.raw.createEllipse).toHaveBeenCalled();
+    expect(mock.raw.createComponentFromNode).toHaveBeenCalled();
+    expect(gradientSurface?.fills.some((paint) => paint.type === "GRADIENT_LINEAR")).toBe(true);
+    expect(cardMaster?.type).toBe("COMPONENT");
+    expect(mock.allCreated.some((node) => node.mainComponent === cardMaster)).toBe(true);
+    const firstScreenPositions = screenRoots.map(({ x, y }) => [x, y]);
+    const firstComponentCount = mock.raw.createComponentFromNode.mock.calls.length;
+    const second = await renderMultiScreenDesign(mock.api, phase45VisualSample, {
+      maxRowWidth: 6_000,
+    });
+    expect(second.generatedScreens).toBe(10);
+    expect(second.designSystem?.created).toEqual([]);
+    expect(mock.raw.createComponentFromNode).toHaveBeenCalledTimes(firstComponentCount);
+    expect(
+      mock.roots
+        .filter((node) => node.pluginData.has("fad.multi-screen.screen-id"))
+        .slice(0, 10)
+        .map(({ x, y }) => [x, y]),
+    ).toEqual(firstScreenPositions);
+  });
+
+  it("deduplicates an embedded image and renders safe SVG as editable vector layers", async () => {
+    const design: DesignSpec = {
+      schemaVersion: "1.0.0",
+      assets: [
+        {
+          id: "local-photo",
+          name: "Local photo",
+          kind: "raster",
+          mimeType: "image/png",
+          width: 1,
+          height: 1,
+          base64: ONE_PIXEL_PNG,
+          license: "User supplied, rights confirmed",
+          alt: "Test image",
+        },
+        {
+          id: "local-photo-copy",
+          name: "Duplicate local photo",
+          kind: "raster",
+          mimeType: "image/png",
+          width: 1,
+          height: 1,
+          base64: ONE_PIXEL_PNG,
+          license: "User supplied, rights confirmed",
+          alt: "Duplicate test image",
+        },
+        {
+          id: "local-icon",
+          name: "Editable check",
+          kind: "svg-paths",
+          width: 24,
+          height: 24,
+          paths: [
+            { name: "Check outline", data: "M 3 12 L 9 18 L 21 4 Z", fill: "#2563EB" },
+            { name: "Inner mark", data: "M 5 5 L 8 8 L 12 3 Z", fill: "#123B5D" },
+          ],
+          license: "User supplied, rights confirmed",
+        },
+      ],
+      document: {
+        name: "Offline assets",
+        width: 320,
+        height: 240,
+        background: "#FFFFFF",
+        children: [
+          {
+            type: "image",
+            name: "Photo one",
+            assetId: "local-photo",
+            x: 8,
+            y: 8,
+            width: 80,
+            height: 80,
+          },
+          {
+            type: "image",
+            name: "Photo two",
+            assetId: "local-photo-copy",
+            fit: "crop",
+            x: 100,
+            y: 8,
+            width: 80,
+            height: 80,
+          },
+          {
+            type: "image",
+            name: "Editable icon",
+            assetId: "local-icon",
+            x: 200,
+            y: 8,
+            width: 48,
+            height: 48,
+          },
+        ],
+      },
+    };
+
+    const result = await renderDesign(mock.api, design);
+    expect(mock.raw.createImage).toHaveBeenCalledTimes(1);
+    expect(result.counts.images).toBe(2);
+    expect(result.counts.vectors).toBe(2);
+    expect(result.counts.frames).toBe(2);
+    expect(mock.find("Photo one")?.fills).toEqual([
+      { type: "IMAGE", imageHash: "mock-image-hash", scaleMode: "FILL" },
+    ]);
+    expect(mock.find("Photo two")?.fills).toEqual([
+      { type: "IMAGE", imageHash: "mock-image-hash", scaleMode: "CROP" },
+    ]);
+    expect(mock.find("Editable icon")?.children.map((child) => child.type)).toEqual([
+      "VECTOR",
+      "VECTOR",
+    ]);
+  });
+
+  it("does not create visible layers when Figma rejects an embedded image", async () => {
+    mock.raw.createImage.mockImplementation(() => {
+      throw new Error("Figma rejected mock image bytes");
+    });
+    const design: DesignSpec = {
+      schemaVersion: "1.0.0",
+      assets: [
+        {
+          id: "local-photo",
+          name: "Local photo",
+          kind: "raster",
+          mimeType: "image/png",
+          width: 1,
+          height: 1,
+          base64: ONE_PIXEL_PNG,
+          license: "User supplied, rights confirmed",
+        },
+      ],
+      document: {
+        name: "Image failure",
+        width: 320,
+        height: 240,
+        background: "#FFFFFF",
+        children: [
+          {
+            type: "image",
+            name: "Photo",
+            assetId: "local-photo",
+            x: 8,
+            y: 8,
+            width: 80,
+            height: 80,
+          },
+        ],
+      },
+    };
+    await expect(renderDesign(mock.api, design)).rejects.toThrow("Figma rejected mock image bytes");
+    expect(mock.roots).toEqual([mock.unrelated]);
+    expect(mock.unrelated.removed).toBe(false);
+  });
+
+  it("maps gradient paint, alpha, strokes, blend mode and effects to native Figma properties", async () => {
+    const design: DesignSpec = {
+      schemaVersion: "1.0.0",
+      document: {
+        name: "Paint and effect fixture",
+        width: 200,
+        height: 160,
+        background: "#FFFFFF",
+        children: [
+          {
+            type: "rectangle",
+            name: "Styled native surface",
+            x: 10,
+            y: 10,
+            width: 100,
+            height: 80,
+            fill: "#FFFFFF",
+            constraints: { horizontal: "left-right", vertical: "bottom" },
+            visual: {
+              fills: [
+                {
+                  type: "linear",
+                  angle: 45,
+                  opacity: 0.8,
+                  stops: [
+                    { position: 0, color: "#123B5D" },
+                    { position: 1, color: "#2563EB" },
+                  ],
+                },
+              ],
+              opacity: 0.9,
+              strokes: [{ color: "#E2E8F0", width: 2, align: "inside", dashPattern: [4, 2] }],
+              effects: [
+                {
+                  type: "drop-shadow",
+                  color: "#123B5D",
+                  opacity: 0.2,
+                  offsetX: 1,
+                  offsetY: 5,
+                  radius: 12,
+                  spread: 0,
+                },
+                {
+                  type: "inner-shadow",
+                  color: "#0F172A",
+                  opacity: 0.1,
+                  offsetX: 0,
+                  offsetY: 1,
+                  radius: 2,
+                  spread: 0,
+                },
+                { type: "layer-blur", radius: 1 },
+              ],
+              blendMode: "screen",
+            },
+          },
+        ],
+      },
+    };
+    await renderDesign(mock.api, design);
+    const surface = mock.find("Styled native surface") as MockNode & {
+      opacity: number;
+      blendMode: BlendMode;
+      strokeWeight: number;
+      strokeAlign: string;
+      dashPattern: number[];
+      effects: Effect[];
+      constraints: Constraints;
+    };
+    expect(surface.fills[0]).toMatchObject({ type: "GRADIENT_LINEAR", opacity: 0.8 });
+    expect(surface.opacity).toBe(0.9);
+    expect(surface.blendMode).toBe("SCREEN");
+    expect(surface.strokeWeight).toBe(2);
+    expect(surface.strokeAlign).toBe("INSIDE");
+    expect(surface.dashPattern).toEqual([4, 2]);
+    expect(surface.effects.map((effect: Effect) => effect.type)).toEqual([
+      "DROP_SHADOW",
+      "INNER_SHADOW",
+      "LAYER_BLUR",
+    ]);
+    expect(surface.constraints).toEqual({ horizontal: "STRETCH", vertical: "MAX" });
+  });
+
+  it("preserves visual text paint after applying the linked native Text Style", async () => {
+    const design = structuredClone(phase3Sample) as unknown as DesignSpec;
+    const heading = design.document.children.find((node) => node.type === "text");
+    if (!heading || heading.type !== "text") throw new Error("Phase 3 preview heading is missing.");
+    heading.visual = {
+      fills: [
+        {
+          type: "linear",
+          angle: 0,
+          stops: [
+            { position: 0, color: "#123B5D" },
+            { position: 1, color: "#2563EB" },
+          ],
+        },
+      ],
+    };
+    await renderDesign(mock.api, design);
+    const rendered = mock.find("Preview Heading") as MockNode & { textStyleId?: string };
+    expect(rendered.textStyleId).toBeTruthy();
+    expect(rendered.fills[0]).toMatchObject({ type: "GRADIENT_LINEAR" });
   });
 
   it("cleans only a failed screen and continues the remaining batch", async () => {

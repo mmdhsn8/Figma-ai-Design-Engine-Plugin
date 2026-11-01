@@ -1,0 +1,141 @@
+{
+  "schemaVersion": "1.0.0",
+  "document": {
+    "name": "LTR Visual Regression Fixture",
+    "width": 390,
+    "height": 720,
+    "background": "#F8FAFC",
+    "layout": {
+      "mode": "vertical",
+      "gap": 16,
+      "padding": { "top": 24, "right": 24, "bottom": 24, "left": 24 },
+      "counterAxisAlign": "stretch"
+    },
+    "children": [
+      {
+        "type": "frame",
+        "name": "English visual header",
+        "width": 342,
+        "height": 172,
+        "visual": {
+          "fills": [
+            {
+              "type": "linear",
+              "angle": -18,
+              "stops": [
+                { "position": 0, "color": "#123B5D" },
+                { "position": 1, "color": "#2563EB" }
+              ]
+            }
+          ],
+          "effects": [
+            {
+              "type": "drop-shadow",
+              "color": "#123B5D",
+              "opacity": 0.14,
+              "offsetX": 0,
+              "offsetY": 8,
+              "radius": 20,
+              "spread": 0
+            }
+          ],
+          "clipsContent": true
+        },
+        "cornerRadius": 20,
+        "children": [
+          {
+            "type": "ellipse",
+            "name": "Decorative circle",
+            "x": 236,
+            "y": 18,
+            "width": 88,
+            "height": 88,
+            "fill": "#38BDF8",
+            "visual": { "opacity": 0.35 }
+          },
+          {
+            "type": "vector",
+            "name": "Native vector sparkle",
+            "x": 274,
+            "y": 38,
+            "width": 34,
+            "height": 34,
+            "pathData": "M 17 0 L 21 12 L 34 17 L 21 22 L 17 34 L 12 22 L 0 17 L 12 12 Z",
+            "fill": "#FFFFFF"
+          },
+          {
+            "type": "text",
+            "name": "English headline",
+            "text": "A thoughtful\nnew season",
+            "fontSize": 28,
+            "fontFamily": "Arial",
+            "fontStyle": "Bold",
+            "lineHeight": 34,
+            "textAlign": "left",
+            "color": "#FFFFFF",
+            "x": 20,
+            "y": 40,
+            "width": 196,
+            "height": 76,
+            "qualityRole": "heading"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "name": "English supporting copy",
+        "text": "Native text, layered fills and editable shapes remain independent of right-to-left examples.",
+        "fontSize": 14,
+        "fontFamily": "Arial",
+        "fontStyle": "Regular",
+        "lineHeight": 22,
+        "textAlign": "left",
+        "color": "#0F172A",
+        "width": 342,
+        "height": 48,
+        "qualityRole": "body"
+      },
+      {
+        "type": "frame",
+        "name": "English action control",
+        "width": 342,
+        "height": 54,
+        "layout": {
+          "mode": "horizontal",
+          "gap": 8,
+          "padding": { "top": 12, "right": 16, "bottom": 12, "left": 16 },
+          "primaryAxisAlign": "center",
+          "counterAxisAlign": "center"
+        },
+        "visual": {
+          "fills": [{ "type": "solid", "color": "#FFFFFF" }],
+          "strokes": [{ "color": "#E2E8F0", "width": 1, "align": "inside" }],
+          "effects": [
+            {
+              "type": "inner-shadow",
+              "color": "#123B5D",
+              "opacity": 0.06,
+              "offsetX": 0,
+              "offsetY": 2,
+              "radius": 4,
+              "spread": 0
+            }
+          ]
+        },
+        "cornerRadius": 14,
+        "children": [
+          {
+            "type": "text",
+            "name": "English action label",
+            "text": "Explore the collection",
+            "fontSize": 14,
+            "fontFamily": "Arial",
+            "fontStyle": "Bold",
+            "textAlign": "center",
+            "color": "#123B5D"
+          }
+        ]
+      }
+    ]
+  }
+}

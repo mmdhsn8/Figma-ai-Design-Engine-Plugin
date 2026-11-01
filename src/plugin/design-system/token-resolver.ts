@@ -2,12 +2,49 @@ import {
   type DesignSpec,
   type ComponentDefinitionSpec,
   type DesignNode,
+  type EllipseNodeSpec,
+  type ImageNodeSpec,
   type FrameNodeSpec,
   type LayoutSpec,
   type RectangleNodeSpec,
   type TextNodeSpec,
+  type VectorNodeSpec,
 } from "../../shared/schema";
 import { isTokenReference, type TokenReference } from "../../shared/design-system-schema";
+import type { VisualStyle } from "../../shared/visual-schema";
+
+export type ResolvedVisualFill =
+  | { type: "solid"; color: string; opacity?: number }
+  | {
+      type: "linear" | "radial";
+      angle?: number;
+      opacity?: number;
+      stops: Array<{ position: number; color: string }>;
+    };
+export type ResolvedVisualEffect =
+  | {
+      type: "drop-shadow" | "inner-shadow";
+      color: string;
+      opacity: number;
+      offsetX: number;
+      offsetY: number;
+      radius: number;
+      spread: number;
+    }
+  | { type: "layer-blur" | "background-blur"; radius: number };
+export type ResolvedVisualStyle = {
+  fills?: ResolvedVisualFill[];
+  opacity?: number;
+  strokes?: Array<{
+    color: string;
+    width: number;
+    align: "inside" | "center" | "outside";
+    dashPattern?: number[];
+  }>;
+  effects?: ResolvedVisualEffect[];
+  blendMode?: "normal" | "multiply" | "screen" | "overlay";
+  clipsContent?: boolean;
+};
 
 export type ResolvedLayoutSpec = Omit<LayoutSpec, "gap" | "padding"> & {
   gap?: number;
@@ -15,12 +52,13 @@ export type ResolvedLayoutSpec = Omit<LayoutSpec, "gap" | "padding"> & {
 };
 export type ResolvedTextNodeSpec = Omit<
   TextNodeSpec,
-  "fontSize" | "color" | "lineHeight" | "letterSpacing"
+  "fontSize" | "color" | "lineHeight" | "letterSpacing" | "visual"
 > & {
   fontSize: number;
   color: string;
   lineHeight?: number;
   letterSpacing?: number;
+  visual?: ResolvedVisualStyle;
   styleOverrides?: {
     fontName?: { family: string; style: string };
     fontSize?: number;
@@ -31,36 +69,53 @@ export type ResolvedTextNodeSpec = Omit<
 };
 export type ResolvedRectangleNodeSpec = Omit<
   RectangleNodeSpec,
-  "fill" | "stroke" | "cornerRadius"
+  "fill" | "stroke" | "cornerRadius" | "visual"
 > & {
   fill: string;
   stroke?: { color: string; width?: number };
   cornerRadius?: number;
+  visual?: ResolvedVisualStyle;
+};
+export type ResolvedEllipseNodeSpec = Omit<EllipseNodeSpec, "fill" | "visual"> & {
+  fill: string;
+  visual?: ResolvedVisualStyle;
+};
+export type ResolvedVectorNodeSpec = Omit<VectorNodeSpec, "fill" | "visual"> & {
+  fill: string;
+  visual?: ResolvedVisualStyle;
+};
+export type ResolvedImageNodeSpec = Omit<ImageNodeSpec, "visual"> & {
+  visual?: ResolvedVisualStyle;
 };
 export type ResolvedFrameNodeSpec = Omit<
   FrameNodeSpec,
-  "background" | "stroke" | "cornerRadius" | "children" | "layout"
+  "background" | "stroke" | "cornerRadius" | "children" | "layout" | "visual"
 > & {
   background?: string;
   stroke?: { color: string; width?: number };
   cornerRadius?: number;
   children: ResolvedDesignNode[];
   layout?: ResolvedLayoutSpec;
+  visual?: ResolvedVisualStyle;
 };
 export type ResolvedDesignNode =
   | ResolvedTextNodeSpec
   | ResolvedRectangleNodeSpec
+  | ResolvedEllipseNodeSpec
+  | ResolvedVectorNodeSpec
+  | ResolvedImageNodeSpec
   | ResolvedFrameNodeSpec
   | Extract<DesignNode, { type: "instance" }>;
 export type ResolvedComponentDefinition = Omit<
   ComponentDefinitionSpec,
-  "background" | "stroke" | "cornerRadius" | "children" | "layout"
+  "background" | "stroke" | "cornerRadius" | "children" | "layout" | "visual"
 > & {
   background?: string;
   stroke?: { color: string; width?: number };
   cornerRadius?: number;
   children: ResolvedDesignNode[];
   layout?: ResolvedLayoutSpec;
+  visual?: ResolvedVisualStyle;
 };
 export type ResolvedDesignSpec = Omit<DesignSpec, "document" | "designSystem"> & {
   document: Omit<DesignSpec["document"], "background" | "children" | "layout" | "components"> & {
@@ -209,6 +264,33 @@ function resolveColor(value: string | TokenReference, tables: ResolvedTokenTable
   return isTokenReference(value) ? requireTableValue(tables.colors, value.token, "color") : value;
 }
 
+function resolveVisual(
+  value: VisualStyle | undefined,
+  tables: ResolvedTokenTables,
+): ResolvedVisualStyle | undefined {
+  if (!value) return undefined;
+  return {
+    ...value,
+    fills: value.fills?.map((fill) =>
+      fill.type === "solid"
+        ? { ...fill, color: resolveColor(fill.color, tables) }
+        : {
+            ...fill,
+            stops: fill.stops.map((stop) => ({ ...stop, color: resolveColor(stop.color, tables) })),
+          },
+    ) as ResolvedVisualFill[] | undefined,
+    strokes: value.strokes?.map((stroke) => ({
+      ...stroke,
+      color: resolveColor(stroke.color, tables),
+    })),
+    effects: value.effects?.map((effect) =>
+      effect.type === "drop-shadow" || effect.type === "inner-shadow"
+        ? { ...effect, color: resolveColor(effect.color, tables) }
+        : effect,
+    ) as ResolvedVisualStyle["effects"],
+  };
+}
+
 function resolveNumber(
   value: number | TokenReference | undefined,
   table: Map<string, number>,
@@ -299,6 +381,7 @@ function resolveText(node: TextNodeSpec, tables: ResolvedTokenTables): ResolvedT
   const textDecoration = node.textDecoration ?? typography?.textDecoration;
   return {
     ...node,
+    visual: resolveVisual(node.visual, tables),
     fontFamily,
     fontStyle,
     fontSize,
@@ -328,13 +411,23 @@ function resolveNode(node: DesignNode, tables: ResolvedTokenTables): ResolvedDes
     return {
       ...node,
       fill: resolveColor(node.fill, tables),
+      visual: resolveVisual(node.visual, tables),
       stroke: resolveStroke(node.stroke, tables),
       cornerRadius: resolveNumber(node.cornerRadius, tables.radii, "radius"),
     };
   }
+  if (node.type === "ellipse" || node.type === "vector") {
+    return {
+      ...node,
+      fill: resolveColor(node.fill, tables),
+      visual: resolveVisual(node.visual, tables),
+    };
+  }
+  if (node.type === "image") return { ...node, visual: resolveVisual(node.visual, tables) };
   if (node.type === "frame") {
     return {
       ...node,
+      visual: resolveVisual(node.visual, tables),
       background: node.background ? resolveColor(node.background, tables) : undefined,
       stroke: resolveStroke(node.stroke, tables),
       cornerRadius: resolveNumber(node.cornerRadius, tables.radii, "radius"),
@@ -351,6 +444,7 @@ function resolveComponent(
 ): ResolvedComponentDefinition {
   return {
     ...component,
+    visual: resolveVisual(component.visual, tables),
     background: component.background ? resolveColor(component.background, tables) : undefined,
     stroke: resolveStroke(component.stroke, tables),
     cornerRadius: resolveNumber(component.cornerRadius, tables.radii, "radius"),
