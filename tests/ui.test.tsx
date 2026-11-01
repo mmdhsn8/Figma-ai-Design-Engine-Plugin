@@ -1,0 +1,127 @@
+import { readFileSync } from "node:fs";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it } from "vitest";
+import phase1Sample from "../src/samples/sample-design.json?raw";
+import { parseDesignText } from "../src/shared/schema";
+import App, {
+  getConnectionSummary,
+  getModelAvailabilityMessage,
+  navigationReducer,
+  type ModelDiscoveryState,
+  type PluginView,
+} from "../src/ui/App";
+import type { CompanionStatus } from "../src/ui/companion-client";
+
+function render(view: PluginView = "design"): string {
+  return renderToStaticMarkup(<App initialView={view} />);
+}
+
+function status(auth: CompanionStatus["auth"]): CompanionStatus {
+  return {
+    companion: "connected",
+    auth,
+    authLabel: auth,
+    planUseAuthorized: auth === "scope_granted" || auth === "ready",
+    modelCount: 0,
+  };
+}
+
+describe("plugin UI navigation and capability states", () => {
+  it("starts on Design and exposes all five keyboard reachable navigation buttons", () => {
+    const html = render();
+
+    expect(html).toContain('<nav class="primary-nav" aria-label="Plugin sections">');
+    expect(html).toContain('aria-current="page">Design</button>');
+    for (const label of ["JSON", "Assets", "System", "Quality"]) {
+      expect(html).toContain(`>${label}</button>`);
+    }
+  });
+
+  it("switches between areas and Settings without losing the selected area", () => {
+    const design = { activeView: "design", settingsOpen: false } as const;
+    const json = navigationReducer(design, { type: "navigate", view: "json" });
+    expect(json).toEqual({ activeView: "json", settingsOpen: false });
+    expect(navigationReducer(json, { type: "toggle-settings" })).toEqual({
+      activeView: "json",
+      settingsOpen: true,
+    });
+    expect(navigationReducer({ ...json, settingsOpen: true }, { type: "toggle-settings" })).toEqual(
+      json,
+    );
+    expect(navigationReducer(json, { type: "open-settings" })).toEqual({
+      activeView: "json",
+      settingsOpen: true,
+    });
+  });
+
+  it("keeps the offline JSON editor, sample controls, validation, and renderer available", () => {
+    const html = render("json");
+
+    expect(html).toContain('id="json-input"');
+    expect(html).toContain("Import JSON");
+    expect(html).toContain("Phase 1 sample");
+    expect(html).toContain("Phase 4 demo");
+    expect(html).toContain("Validate JSON");
+    expect(html).toContain("Generate in Figma");
+    expect(html).toContain("Offline JSON");
+    expect(parseDesignText(phase1Sample.trim()).success).toBe(true);
+    expect(html).not.toContain("Companion &amp; ChatGPT");
+  });
+
+  it("keeps the AI action honestly disabled and labels unsupported targets as planned", () => {
+    const html = render();
+
+    expect(html).toContain("Describe your app, website, or interface...");
+    expect(html).toContain('id="prompt-count"');
+    const generateButton = html.match(/<button class="design-generate-button"[^>]*>/)?.[0];
+    expect(generateButton).toContain('aria-describedby="generation-help"');
+    expect(generateButton).toContain('disabled=""');
+    expect(html).toContain("Natural-language generation is not implemented yet.");
+    expect(html).toContain('aria-label="Mobile, planned"');
+    expect(html).toContain('aria-label="Desktop, planned"');
+    expect(html).toContain('aria-label="Web, planned"');
+    expect(html).toContain("Recent projects aren’t saved yet");
+    expect(html).not.toContain("Screen 01");
+  });
+
+  it("shows distinct local, account, scope, and inference status labels", () => {
+    expect(getConnectionSummary("offline", null)).toBe("Companion offline");
+    expect(getConnectionSummary("connected", status("signed_in_no_plan"))).toBe(
+      "ChatGPT signed in",
+    );
+    expect(getConnectionSummary("connected", status("scope_granted"))).toBe("Plan use authorized");
+    expect(getConnectionSummary("connected", status("ready"))).toBe("Inference verified");
+    expect(getConnectionSummary("connected", status("blocked"))).toBe("Connection needs attention");
+  });
+
+  it("renders truthful loading, empty, error, and unconfigured model states", () => {
+    const cases: Array<[ModelDiscoveryState, boolean, boolean, string]> = [
+      ["loading", true, true, "Loading account-visible models"],
+      ["empty", true, true, "No account-visible models were returned"],
+      ["error", true, true, "Model discovery failed"],
+      ["idle", false, false, "Connect the optional Companion"],
+      ["idle", true, false, "Grant plan-use permission"],
+      ["idle", true, true, "Models have not been loaded"],
+    ];
+
+    for (const [state, hasToken, scope, expected] of cases) {
+      expect(getModelAvailabilityMessage(state, hasToken, scope)).toContain(expected);
+    }
+  });
+
+  it("keeps Assets, Design System, and Quality as separate reachable areas", () => {
+    expect(render("assets")).toContain("Asset library");
+    expect(render("system")).toContain("Design System");
+    expect(render("quality")).toContain("Quality preflight");
+    expect(render("quality")).not.toContain("Asset source / license");
+  });
+
+  it("defines a compact five-item navigation and removes the plugin minimum width", () => {
+    const css = readFileSync("src/ui/styles.css", "utf8");
+
+    expect(css).toContain("grid-template-columns: repeat(5, minmax(0, 1fr))");
+    expect(css).toContain("@media (max-width: 420px)");
+    expect(css).toContain("@media (max-width: 340px)");
+    expect(css).toContain("min-width: 0;");
+  });
+});

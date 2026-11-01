@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import phase1Sample from "../samples/sample-design.json?raw";
 import phase2Sample from "../samples/phase-2-storefront.json?raw";
 import phase3Sample from "../samples/phase-3-design-system.json?raw";
@@ -47,8 +47,67 @@ type Notice = {
   details?: string[];
 };
 
-type CompanionConnectionState =
+export type CompanionConnectionState =
   "discovering" | "offline" | "available" | "approval_required" | "pairing" | "connected";
+
+export type PluginView = "design" | "json" | "assets" | "system" | "quality";
+export type ModelDiscoveryState = "idle" | "loading" | "loaded" | "empty" | "error";
+
+type NavigationState = { activeView: PluginView; settingsOpen: boolean };
+type NavigationAction =
+  { type: "navigate"; view: PluginView } | { type: "toggle-settings" } | { type: "open-settings" };
+
+export function navigationReducer(
+  state: NavigationState,
+  action: NavigationAction,
+): NavigationState {
+  if (action.type === "navigate") return { activeView: action.view, settingsOpen: false };
+  if (action.type === "open-settings") return { ...state, settingsOpen: true };
+  return { ...state, settingsOpen: !state.settingsOpen };
+}
+
+export function getConnectionSummary(
+  state: CompanionConnectionState,
+  status: CompanionStatus | null,
+): string {
+  if (state !== "connected") {
+    return (
+      {
+        discovering: "Checking companion",
+        offline: "Companion offline",
+        available: "Companion available",
+        approval_required: "Approval required",
+        pairing: "Connecting…",
+        connected: "Connected",
+      } satisfies Record<CompanionConnectionState, string>
+    )[state];
+  }
+
+  return (
+    {
+      signed_out: "ChatGPT not signed in",
+      signing_in: "Signing in",
+      signed_in_no_plan: "ChatGPT signed in",
+      scope_granted: "Plan use authorized",
+      ready: "Inference verified",
+      session_expired: "Session expired",
+      blocked: "Connection needs attention",
+    } satisfies Record<CompanionStatus["auth"], string>
+  )[status?.auth ?? "signed_out"];
+}
+
+export function getModelAvailabilityMessage(
+  state: ModelDiscoveryState,
+  hasCompanionToken: boolean,
+  planUseAuthorized: boolean,
+): string {
+  if (state === "loading") return "Loading account-visible models…";
+  if (state === "empty") return "No account-visible models were returned.";
+  if (state === "error") return "Model discovery failed. Review the connection status in Settings.";
+  if (!hasCompanionToken) return "Connect the optional Companion in Settings to discover models.";
+  if (!planUseAuthorized) return "Grant plan-use permission in Settings before loading models.";
+  return "Models have not been loaded from this account yet.";
+}
 
 function postToPlugin(message: UIToPluginMessage): void {
   parent.postMessage({ pluginMessage: message }, "*");
@@ -95,7 +154,14 @@ function createPairingVerifier(): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
-export default function App() {
+export default function App({ initialView = "design" }: { initialView?: PluginView } = {}) {
+  const [navigation, dispatchNavigation] = useReducer(navigationReducer, {
+    activeView: initialView,
+    settingsOpen: false,
+  });
+  const { activeView, settingsOpen } = navigation;
+  const [prompt, setPrompt] = useState("");
+  const [modelDiscovery, setModelDiscovery] = useState<ModelDiscoveryState>("idle");
   const [json, setJson] = useState(phase1Sample.trim());
   const [notice, setNotice] = useState<Notice>({
     tone: "neutral",
@@ -299,6 +365,7 @@ export default function App() {
             setCompanionStatus(null);
             setCompanionModels([]);
             setSelectedCompanionModel("");
+            setModelDiscovery("idle");
             setCompanionConnectionState("available");
           }
         } else {
@@ -312,6 +379,7 @@ export default function App() {
           setCompanionStatus(null);
           setCompanionModels([]);
           setSelectedCompanionModel("");
+          setModelDiscovery("idle");
         }
       }
       if (!cancelled) timer = window.setTimeout(() => void checkConnection(), 5_000);
@@ -577,17 +645,20 @@ export default function App() {
   const discoverModels = async () => {
     if (!companionToken) return;
     setCompanionBusy(true);
+    setModelDiscovery("loading");
     setCompanionError(null);
     try {
       const models = await discoverAuthorizedModels(companionToken);
       setCompanionModels(models);
       setSelectedCompanionModel(models[0]?.slug ?? "");
+      setModelDiscovery(models.length ? "loaded" : "empty");
       setCompanionError(
         models.length ? null : "No account-visible model was returned for this session.",
       );
       const status = await getCompanionStatus(companionToken);
       setCompanionStatus(status);
     } catch (error) {
+      setModelDiscovery("error");
       setCompanionError(companionErrorText(error));
     } finally {
       setCompanionBusy(false);
@@ -625,6 +696,7 @@ export default function App() {
   const clearConnectedAccountDetails = () => {
     setCompanionModels([]);
     setSelectedCompanionModel("");
+    setModelDiscovery("idle");
     setSmokeResult(null);
   };
 
@@ -847,495 +919,727 @@ export default function App() {
     }
   };
 
+  const connectionSummary = getConnectionSummary(companionConnectionState, companionStatus);
+
   return (
     <main className="app-shell">
       <header className="topbar">
         <div className="brand-mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none">
-            <path d="M12 2.5 14.5 9.5 21.5 12 14.5 14.5 12 21.5 9.5 14.5 2.5 12 9.5 9.5 12 2.5Z" />
-            <path d="m19 2 .8 2.2L22 5l-2.2.8L19 8l-.8-2.2L16 5l2.2-.8L19 2Z" />
+            <path d="M5 5h14v14H5z" />
+            <path d="M9 5v14M5 9h14" />
           </svg>
         </div>
         <div className="brand-copy">
-          <div className="brand-title">Design Engine</div>
-          <div className="brand-subtitle">JSON → native Figma layers</div>
+          <div className="brand-title">Figma AI Design Engine</div>
+          <div className="brand-subtitle">Structured, editable design workflows</div>
         </div>
-        <span className="version-tag">v0.1.0</span>
+        <span
+          className={`connection-chip ${companionToken ? "is-connected" : ""}`}
+          aria-live="polite"
+          aria-label={`Connection status: ${connectionSummary}`}
+        >
+          <span className="connection-dot" aria-hidden="true" />
+          <span>{connectionSummary}</span>
+        </span>
+        <button
+          className={`settings-button ${settingsOpen ? "is-active" : ""}`}
+          type="button"
+          aria-pressed={settingsOpen}
+          onClick={() => dispatchNavigation({ type: "toggle-settings" })}
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M8.3 2.5h3.4l.5 1.8 1.6.9 1.8-.5 1.7 2.9-1.3 1.4v1.8l1.3 1.4-1.7 2.9-1.8-.5-1.6.9-.5 1.8H8.3l-.5-1.8-1.6-.9-1.8.5-1.7-2.9L4 10.8V9l-1.3-1.4 1.7-2.9 1.8.5 1.6-.9.5-1.8Z" />
+            <circle cx="10" cy="9.9" r="2.2" />
+          </svg>
+          <span>{settingsOpen ? "Close" : "Settings"}</span>
+        </button>
       </header>
 
-      <section className="intro-row" aria-label="Import instructions">
-        <span className="step-indicator">PHASE 01–04.6</span>
-        <span className="intro-copy">Paste a design spec or import a .json file</span>
-      </section>
+      {!settingsOpen && (
+        <nav className="primary-nav" aria-label="Plugin sections">
+          {(
+            [
+              ["design", "Design"],
+              ["json", "JSON"],
+              ["assets", "Assets"],
+              ["system", "System"],
+              ["quality", "Quality"],
+            ] as const
+          ).map(([view, label]) => (
+            <button
+              className={`nav-item ${activeView === view ? "is-active" : ""}`}
+              key={view}
+              type="button"
+              aria-label={view === "system" ? "Design System" : label}
+              aria-current={activeView === view ? "page" : undefined}
+              onClick={() => dispatchNavigation({ type: "navigate", view })}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+      )}
 
-      <section className="editor-section">
-        <div className="section-heading">
-          <label htmlFor="json-input">Design JSON</label>
-          <span className="format-hint">Schema 1.0.0</span>
-        </div>
-        <div className="editor-wrap">
-          <textarea
-            id="json-input"
-            spellCheck={false}
-            autoCapitalize="off"
-            autoCorrect="off"
-            aria-describedby="editor-help"
-            value={json}
-            onChange={(event) => {
-              setJson(event.target.value);
-              setMultiProgress(null);
-              setMultiReport(null);
-            }}
-            disabled={busy}
-            placeholder={'{\n  "schemaVersion": "1.0.0",\n  "document": { ... }\n}'}
-          />
-          <div className="editor-foot" id="editor-help">
-            <span
-              className={`validation-dot ${inputValid ? "is-valid" : json ? "is-invalid" : ""}`}
+      {settingsOpen ? (
+        <section className="settings-view" aria-labelledby="settings-title">
+          <div className="page-heading compact-heading">
+            <div>
+              <span className="page-eyebrow">PREFERENCES & CONNECTION</span>
+              <h1 id="settings-title">Settings</h1>
+            </div>
+            <span className="system-status">Optional companion</span>
+          </div>
+          <p className="page-description">
+            Manage local pairing, ChatGPT access, account-visible models, and developer diagnostics.
+          </p>
+        </section>
+      ) : activeView === "design" ? (
+        <section className="design-home" aria-labelledby="design-title">
+          <div className="page-heading">
+            <div>
+              <span className="page-eyebrow">AI WORKSPACE</span>
+              <h1 id="design-title">Design with AI</h1>
+              <p className="page-description">
+                Turn your ideas into structured, editable Figma designs.
+              </p>
+            </div>
+            <span className="availability-tag">Preview</span>
+          </div>
+
+          <section className="prompt-card" aria-labelledby="prompt-label">
+            <label className="prompt-label" id="prompt-label" htmlFor="design-prompt">
+              Describe what you want to make
+            </label>
+            <textarea
+              id="design-prompt"
+              className="prompt-input"
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value.slice(0, 2000))}
+              maxLength={2000}
+              placeholder="Describe your app, website, or interface..."
+              aria-describedby="prompt-status prompt-count"
             />
-            <span>
-              {inputValid ? "Structure looks good" : json ? "Needs attention" : "Waiting for JSON"}
-            </span>
-            <span className="char-count">{json.length.toLocaleString()} / 1,000,000</span>
-          </div>
-        </div>
-      </section>
+            <div className="prompt-footer">
+              <span id="prompt-status">Prompt-to-design generation is not available yet.</span>
+              <span id="prompt-count" className="char-count">
+                {prompt.length.toLocaleString()} / 2,000
+              </span>
+            </div>
+          </section>
 
-      <div className="utility-row">
-        <label className={`file-button ${busy ? "is-disabled" : ""}`}>
-          <svg viewBox="0 0 16 16" aria-hidden="true">
-            <path d="M8 10.75V2.5m0 0L4.75 5.75M8 2.5l3.25 3.25M2.5 9.5v3A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5v-3" />
-          </svg>
-          Import JSON
-          <input
-            type="file"
-            accept="application/json,.json"
-            onChange={importFile}
-            disabled={busy}
-          />
-        </label>
-        <div className="utility-spacer" />
-        <button
-          className="text-button"
-          type="button"
-          onClick={() => loadSample(phase1Sample, "Phase 1 sample")}
-          disabled={busy}
-        >
-          Phase 1 sample
-        </button>
-        <button
-          className="text-button"
-          type="button"
-          onClick={() => loadSample(phase2Sample, "Phase 2 demo")}
-          disabled={busy}
-        >
-          Phase 2 demo
-        </button>
-        <button
-          className="text-button"
-          type="button"
-          onClick={() => loadSample(phase3Sample, "Phase 3 design-system demo")}
-          disabled={busy}
-        >
-          Phase 3 demo
-        </button>
-        <button
-          className="text-button"
-          type="button"
-          onClick={() => loadSample(phase4Sample, "Phase 4 multi-screen demo")}
-          disabled={busy}
-        >
-          Phase 4 demo
-        </button>
-        <button
-          className="text-button"
-          type="button"
-          onClick={() => loadSample(phase45Sample, "Phase 4.5 visual design demo")}
-          disabled={busy}
-        >
-          Visual demo
-        </button>
-        <button
-          className="text-button muted"
-          type="button"
-          onClick={() => loadSample(visualLtrFixture, "LTR visual regression fixture")}
-          disabled={busy}
-        >
-          LTR fixture
-        </button>
-        <button
-          className="text-button muted"
-          type="button"
-          onClick={reset}
-          disabled={busy || !json}
-        >
-          Reset
-        </button>
-      </div>
-
-      <section className="ai-gate-panel" aria-labelledby="ai-gate-title">
-        <div className="design-system-heading">
-          <div>
-            <span className="section-kicker">PHASE 4.6 · LIVE GATE</span>
-            <h2 id="ai-gate-title">ChatGPT connection proof of concept</h2>
-          </div>
-          <span className={`system-status ${companionStatus?.auth === "ready" ? "is-ready" : ""}`}>
-            {companionStatus?.authLabel ??
-              (
-                {
-                  discovering: "Checking local companion…",
-                  offline: "Companion offline",
-                  available: "Companion available · sign-in not checked",
-                  approval_required: "Local approval required",
-                  pairing: "Pairing with local companion",
-                  connected: "Locally connected",
-                } satisfies Record<CompanionConnectionState, string>
-              )[companionConnectionState]}
-          </span>
-        </div>
-        {!companionToken ? (
-          <>
-            {companionConnectionState === "offline" ||
-            companionConnectionState === "discovering" ? (
-              <>
-                <p className="ai-gate-note">
-                  The local companion is not available. In PowerShell, run{" "}
-                  <code>npm run companion</code>
-                  from the project folder, then retry here. The plugin cannot launch local
-                  executables.
-                </p>
-                <button
-                  className="system-action"
-                  type="button"
-                  onClick={() => setCompanionConnectionState("discovering")}
-                  disabled={companionConnectionState === "discovering"}
-                >
-                  {companionConnectionState === "discovering"
-                    ? "Checking companion…"
-                    : "Retry connection"}
+          <section className="design-options" aria-label="Generation options">
+            <div className="option-heading">
+              <span>Target</span>
+              <span className="planned-tag">Planned</span>
+            </div>
+            <div className="target-options" aria-describedby="target-help">
+              {(["Mobile", "Desktop", "Web"] as const).map((target) => (
+                <button key={target} type="button" disabled aria-label={`${target}, planned`}>
+                  {target}
                 </button>
-              </>
-            ) : companionConnectionState === "approval_required" ||
-              companionConnectionState === "pairing" ? (
-              <>
-                <p className="ai-gate-note">
-                  The companion is waiting for local approval. It normally opens the page in your
-                  system browser; use the button below if it did not. Approve only if you just
-                  started this connection here. The separate official ChatGPT sign-in opens after
-                  local approval.
-                </p>
-                <button
-                  className="secondary-action"
-                  type="button"
-                  onClick={() => void reopenApprovalPage()}
-                  disabled={approvalPageBusy || !pairingAttemptId}
-                >
-                  {approvalPageBusy ? "Opening approval page…" : "Open approval page again"}
-                </button>
-                <button
-                  className="text-button ai-disconnect"
-                  type="button"
-                  onClick={() => void cancelLocalConnection()}
-                  disabled={!pairingAttemptId}
-                >
-                  Cancel local approval
-                </button>
-              </>
-            ) : (
-              <>
-                <p className="ai-gate-note">
-                  Continue opens a local approval page the first time this plugin connects to the
-                  companion. The browser page cannot identify a specific plugin, so approve only
-                  after initiating this action here. ChatGPT sign-in and plan-use consent remain
-                  separate.
-                </p>
-                <button
-                  className="system-action"
-                  type="button"
-                  onClick={() => void continueWithChatGPT()}
-                  disabled={companionBusy}
-                >
-                  {companionBusy ? "Connecting…" : "Continue with ChatGPT"}
-                </button>
-              </>
-            )}
-          </>
-        ) : (
-          <>
-            <p className="ai-gate-note">
-              Sign-in opens your system browser. Identity permission and direct plan-use permission
-              are separate; the granted scope is checked after return.
+              ))}
+            </div>
+            <p className="option-help" id="target-help">
+              Target presets will be enabled when prompt generation is implemented.
             </p>
-            {!companionStatus?.planUseAuthorized ? (
-              <>
-                <button
-                  className="system-action"
-                  type="button"
-                  onClick={() => void signInWithChatGPT()}
-                  disabled={companionBusy || companionStatus?.auth === "signing_in"}
-                >
-                  {companionStatus?.auth === "signing_in"
-                    ? "Waiting for browser sign-in…"
-                    : "Continue with ChatGPT"}
-                </button>
-                {(companionStatus?.auth === "signing_in" ||
-                  companionStatus?.safeMessage === "system_browser_unavailable") && (
+
+            <div className="model-option">
+              <label htmlFor="design-model">Model</label>
+              {companionModels.length > 0 ? (
+                <>
+                  <select
+                    id="design-model"
+                    value={selectedCompanionModel}
+                    onChange={(event) => setSelectedCompanionModel(event.target.value)}
+                    disabled={companionBusy}
+                  >
+                    {companionModels.map((model) => (
+                      <option key={model.slug} value={model.slug}>
+                        {model.displayName}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="option-help">Loaded from this signed-in account.</p>
+                </>
+              ) : (
+                <div className="model-empty-state" aria-live="polite">
+                  <span>
+                    {getModelAvailabilityMessage(
+                      modelDiscovery,
+                      Boolean(companionToken),
+                      Boolean(companionStatus?.planUseAuthorized),
+                    )}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => dispatchNavigation({ type: "open-settings" })}
+                  >
+                    {companionToken ? "Manage connection" : "Open Settings"}
+                  </button>
+                </div>
+              )}
+            </div>
+          </section>
+
+          <button
+            className="design-generate-button"
+            type="button"
+            disabled
+            aria-describedby="generation-help"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M8 1.5v13m-6.5-6.5h13M3.75 3.75l8.5 8.5m0-8.5-8.5 8.5" />
+            </svg>
+            Generate in Figma
+          </button>
+          <p className="generation-help" id="generation-help">
+            Natural-language generation is not implemented yet. To create editable layers now, use
+            the{" "}
+            <button
+              type="button"
+              onClick={() => dispatchNavigation({ type: "navigate", view: "json" })}
+            >
+              JSON workflow
+            </button>
+            .
+          </p>
+
+          <section className="recent-section" aria-labelledby="recent-title">
+            <div className="section-title-row">
+              <h2 id="recent-title">Recent</h2>
+              <span className="section-caption">LOCAL</span>
+            </div>
+            <div className="recent-empty-state">
+              <span className="recent-empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <rect x="5" y="3.5" width="14" height="17" rx="2" />
+                  <path d="M8.5 8h7M8.5 12h7M8.5 16h4" />
+                </svg>
+              </span>
+              <strong>Recent projects aren’t saved yet</strong>
+              <span>This plugin does not keep a project history.</span>
+            </div>
+          </section>
+        </section>
+      ) : null}
+
+      {!settingsOpen && activeView === "json" && (
+        <>
+          <section className="intro-row" aria-label="JSON workflow">
+            <span className="step-indicator">OFFLINE WORKFLOW</span>
+            <span className="intro-copy">Paste a design spec or import a .json file</span>
+          </section>
+
+          <section className="editor-section">
+            <div className="section-heading">
+              <label htmlFor="json-input">Design JSON</label>
+              <span className="format-hint">Schema 1.0.0</span>
+            </div>
+            <div className="editor-wrap">
+              <textarea
+                id="json-input"
+                spellCheck={false}
+                autoCapitalize="off"
+                autoCorrect="off"
+                aria-describedby="editor-help"
+                value={json}
+                onChange={(event) => {
+                  setJson(event.target.value);
+                  setMultiProgress(null);
+                  setMultiReport(null);
+                }}
+                disabled={busy}
+                placeholder={'{\n  "schemaVersion": "1.0.0",\n  "document": { ... }\n}'}
+              />
+              <div className="editor-foot" id="editor-help">
+                <span
+                  className={`validation-dot ${inputValid ? "is-valid" : json ? "is-invalid" : ""}`}
+                />
+                <span>
+                  {inputValid
+                    ? "Structure looks good"
+                    : json
+                      ? "Needs attention"
+                      : "Waiting for JSON"}
+                </span>
+                <span className="char-count">{json.length.toLocaleString()} / 1,000,000</span>
+              </div>
+            </div>
+          </section>
+
+          <div className="utility-row">
+            <label className={`file-button ${busy ? "is-disabled" : ""}`}>
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M8 10.75V2.5m0 0L4.75 5.75M8 2.5l3.25 3.25M2.5 9.5v3A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5v-3" />
+              </svg>
+              Import JSON
+              <input
+                type="file"
+                accept="application/json,.json"
+                onChange={importFile}
+                disabled={busy}
+              />
+            </label>
+            <div className="utility-spacer" />
+            <button
+              className="text-button"
+              type="button"
+              onClick={() => loadSample(phase1Sample, "Phase 1 sample")}
+              disabled={busy}
+            >
+              Phase 1 sample
+            </button>
+            <button
+              className="text-button"
+              type="button"
+              onClick={() => loadSample(phase2Sample, "Phase 2 demo")}
+              disabled={busy}
+            >
+              Phase 2 demo
+            </button>
+            <button
+              className="text-button"
+              type="button"
+              onClick={() => loadSample(phase3Sample, "Phase 3 design-system demo")}
+              disabled={busy}
+            >
+              Phase 3 demo
+            </button>
+            <button
+              className="text-button"
+              type="button"
+              onClick={() => loadSample(phase4Sample, "Phase 4 multi-screen demo")}
+              disabled={busy}
+            >
+              Phase 4 demo
+            </button>
+            <button
+              className="text-button"
+              type="button"
+              onClick={() => loadSample(phase45Sample, "Phase 4.5 visual design demo")}
+              disabled={busy}
+            >
+              Visual demo
+            </button>
+            <button
+              className="text-button muted"
+              type="button"
+              onClick={() => loadSample(visualLtrFixture, "LTR visual regression fixture")}
+              disabled={busy}
+            >
+              LTR fixture
+            </button>
+            <button
+              className="text-button muted"
+              type="button"
+              onClick={reset}
+              disabled={busy || !json}
+            >
+              Reset
+            </button>
+          </div>
+        </>
+      )}
+
+      {settingsOpen && (
+        <section className="ai-gate-panel" aria-labelledby="ai-gate-title">
+          <div className="design-system-heading">
+            <div>
+              <span className="section-kicker">PHASE 4.6 · CONNECTION</span>
+              <h2 id="ai-gate-title">Companion &amp; ChatGPT</h2>
+            </div>
+            <span
+              className={`system-status ${companionStatus?.auth === "ready" ? "is-ready" : ""}`}
+            >
+              {companionStatus?.authLabel ??
+                (
+                  {
+                    discovering: "Checking local companion…",
+                    offline: "Companion offline",
+                    available: "Companion available · sign-in not checked",
+                    approval_required: "Local approval required",
+                    pairing: "Pairing with local companion",
+                    connected: "Locally connected",
+                  } satisfies Record<CompanionConnectionState, string>
+                )[companionConnectionState]}
+            </span>
+          </div>
+          {!companionToken ? (
+            <>
+              {companionConnectionState === "offline" ||
+              companionConnectionState === "discovering" ? (
+                <>
+                  <p className="ai-gate-note">
+                    The local companion is not available. In PowerShell, run{" "}
+                    <code>npm run companion</code>
+                    from the project folder, then retry here. The plugin cannot launch local
+                    executables.
+                  </p>
+                  <button
+                    className="system-action"
+                    type="button"
+                    onClick={() => setCompanionConnectionState("discovering")}
+                    disabled={companionConnectionState === "discovering"}
+                  >
+                    {companionConnectionState === "discovering"
+                      ? "Checking companion…"
+                      : "Retry connection"}
+                  </button>
+                </>
+              ) : companionConnectionState === "approval_required" ||
+                companionConnectionState === "pairing" ? (
+                <>
+                  <p className="ai-gate-note">
+                    The companion is waiting for local approval. It normally opens the page in your
+                    system browser; use the button below if it did not. Approve only if you just
+                    started this connection here. The separate official ChatGPT sign-in opens after
+                    local approval.
+                  </p>
                   <button
                     className="secondary-action"
                     type="button"
-                    onClick={() => void reopenChatGPTBrowser()}
-                    disabled={companionBusy}
+                    onClick={() => void reopenApprovalPage()}
+                    disabled={approvalPageBusy || !pairingAttemptId}
                   >
-                    Open sign-in page in system browser again
+                    {approvalPageBusy ? "Opening approval page…" : "Open approval page again"}
                   </button>
-                )}
-              </>
-            ) : (
-              <>
-                <p className="ai-gate-note ai-gate-ready">
-                  {companionStatus.auth === "ready"
-                    ? "A real Responses smoke test completed in this companion session."
-                    : "The direct-use scope was granted, but live inference is not verified yet. Load models from this account and run the separate fixed smoke test."}
-                </p>
-                <button
-                  className="system-action"
-                  type="button"
-                  onClick={() => void discoverModels()}
-                  disabled={companionBusy}
-                >
-                  {companionBusy ? "Checking account models…" : "Load available models"}
-                </button>
-                {companionModels.length > 0 && (
-                  <label className="ai-gate-field">
-                    <span>Account-visible model</span>
-                    <select
-                      value={selectedCompanionModel}
-                      onChange={(event) => setSelectedCompanionModel(event.target.value)}
-                      disabled={companionBusy}
-                    >
-                      {companionModels.map((model) => (
-                        <option key={model.slug} value={model.slug}>
-                          {model.displayName}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                )}
-                <button
-                  className="secondary-action ai-smoke-action"
-                  type="button"
-                  onClick={() => void runCompanionSmoke()}
-                  disabled={
-                    companionBusy || !companionStatus.planUseAuthorized || !selectedCompanionModel
-                  }
-                >
-                  {companionBusy ? "Waiting for Responses…" : "Run fixed Responses smoke test"}
-                </button>
-                {smokeInFlight && (
                   <button
                     className="text-button ai-disconnect"
                     type="button"
-                    onClick={cancelCompanionSmoke}
+                    onClick={() => void cancelLocalConnection()}
+                    disabled={!pairingAttemptId}
                   >
-                    Cancel smoke request
+                    Cancel local approval
                   </button>
-                )}
-              </>
-            )}
-            <button
-              className="text-button ai-disconnect"
-              type="button"
-              onClick={() => void disconnectLocalCompanion()}
-              disabled={companionBusy}
-            >
-              Disconnect this plugin from the local companion
-            </button>
-            <button
-              className="text-button ai-disconnect"
-              type="button"
-              onClick={() => void disconnectCompanion()}
-              disabled={companionBusy}
-            >
-              Disconnect ChatGPT account
-            </button>
-            <button
-              className="text-button ai-disconnect"
-              type="button"
-              onClick={() => {
-                if (
-                  window.confirm(
-                    "Clear the saved local account registration and start a fresh ChatGPT account sign-in? The stable installation host ID will remain.",
-                  )
-                ) {
-                  void disconnectCompanion(true);
-                }
-              }}
-              disabled={companionBusy}
-            >
-              Forget account registration and switch account
-            </button>
-          </>
-        )}
-        {companionError && (
-          <p className="ai-gate-error" role="alert">
-            {companionError}
-          </p>
-        )}
-        {smokeResult && (
-          <p className="ai-gate-result" role="status">
-            Real Responses request completed. Output: <code>{smokeResult}</code>
-          </p>
-        )}
-        <p className="ai-gate-privacy">
-          This gate build sends no design JSON or custom prompt. The only inference input is the
-          fixed text “Reply with exactly OK.” after you activate the smoke test. Sign-in does not
-          grant access to ChatGPT conversations, files, or memory. Natural-language design
-          generation remains disabled until live authorization and inference are confirmed.
-        </p>
-      </section>
-
-      <section
-        className={`status-card status-${notice.tone}`}
-        aria-live="polite"
-        aria-atomic="true"
-      >
-        <span className={`status-icon ${busy ? "is-spinning" : ""}`} aria-hidden="true">
-          {busy ? (
-            <span className="spinner" />
-          ) : notice.tone === "success" ? (
-            <svg viewBox="0 0 16 16">
-              <path d="m3.5 8.2 2.8 2.8 6.2-6.2" />
-            </svg>
-          ) : notice.tone === "error" ? (
-            <svg viewBox="0 0 16 16">
-              <path d="M8 4.5v4m0 2.5h.01M8 1.75a6.25 6.25 0 1 0 0 12.5 6.25 6.25 0 0 0 0-12.5Z" />
-            </svg>
+                </>
+              ) : (
+                <>
+                  <p className="ai-gate-note">
+                    Continue opens a local approval page the first time this plugin connects to the
+                    companion. The browser page cannot identify a specific plugin, so approve only
+                    after initiating this action here. ChatGPT sign-in and plan-use consent remain
+                    separate.
+                  </p>
+                  <button
+                    className="system-action"
+                    type="button"
+                    onClick={() => void continueWithChatGPT()}
+                    disabled={companionBusy}
+                  >
+                    {companionBusy ? "Connecting…" : "Continue with ChatGPT"}
+                  </button>
+                </>
+              )}
+            </>
           ) : (
-            <span className="ready-dot" />
-          )}
-        </span>
-        <div className="status-copy">
-          <strong>{notice.title}</strong>
-          {notice.details &&
-            (notice.tone === "error" ? (
-              <ErrorList errors={notice.details} />
-            ) : (
-              <p>{notice.details.join(" ")}</p>
-            ))}
-        </div>
-      </section>
-
-      <section className="visual-quality-panel" aria-labelledby="visual-quality-title">
-        <div className="design-system-heading">
-          <div>
-            <span className="section-kicker">VISUAL PREFLIGHT</span>
-            <h2 id="visual-quality-title">Quality & Local Assets</h2>
-          </div>
-          <span className={`system-status ${visualAudit ? "is-ready" : ""}`}>
-            {visualAudit ? `${visualAudit.diagnostics.length} findings` : "Validate JSON"}
-          </span>
-        </div>
-        {visualAudit ? (
-          <>
-            <p className="visual-quality-summary">
-              {visualAudit.screenCount} screen{visualAudit.screenCount === 1 ? "" : "s"} ·{" "}
-              {batchPreview?.estimatedNodeCount ?? visualAudit.estimatedNativeNodes} estimated nodes
-              · {visualAudit.componentCount} shared masters · {visualAudit.instanceCount} instances
-              · {visualAudit.assetCount} assets
-            </p>
-            <p className="visual-quality-note">
-              Measured JSON checks only. Font availability, visual balance, and Persian shaping
-              still need a Figma Desktop review.
-            </p>
-            {visualAudit.diagnostics.length ? (
-              <ul className="quality-diagnostics" aria-label="Visual quality findings">
-                {visualAudit.diagnostics.slice(0, 8).map((item, index) => (
-                  <li key={`${item.code}-${item.path}-${index}`}>
-                    <strong>{item.code.replaceAll("-", " ")}</strong>
-                    <span>{item.path}</span>
-                    <p>{item.message}</p>
-                    <small>{item.action}</small>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="quality-clear" role="status">
-                No configured preflight warnings. This is not a visual-quality score.
+            <>
+              <p className="ai-gate-note">
+                Sign-in opens your system browser. Identity permission and direct plan-use
+                permission are separate; the granted scope is checked after return.
               </p>
-            )}
-          </>
-        ) : (
-          <div className="system-validation">
-            <strong>Fix validation errors before preview</strong>
-            <ErrorList
-              errors={(batchMode
-                ? batchParsed?.success === false
-                  ? batchParsed.errors
-                  : []
-                : !parsed.success
-                  ? parsed.errors
-                  : []
-              ).slice(0, 4)}
-            />
-          </div>
-        )}
-        <div className="asset-provenance-fields">
-          <label>
-            <span>Asset source / license (required)</span>
-            <input
-              type="text"
-              maxLength={500}
-              value={assetLicense}
-              onChange={(event) => setAssetLicense(event.target.value)}
-              disabled={busy}
-              placeholder="Owned by me, CC0, or source and license"
-            />
-          </label>
-          <label>
-            <span>Attribution (optional)</span>
-            <input
-              type="text"
-              maxLength={500}
-              value={assetAttribution}
-              onChange={(event) => setAssetAttribution(event.target.value)}
-              disabled={busy}
-              placeholder="Creator or source credit"
-            />
-          </label>
-          <label className={`file-button ${busy ? "is-disabled" : ""}`}>
-            <span>Import local PNG / JPEG / GIF / safe SVG</span>
-            <input
-              type="file"
-              accept="image/png,image/jpeg,image/gif,image/svg+xml,.png,.jpg,.jpeg,.gif,.svg"
-              onChange={importVisualAsset}
-              disabled={busy}
-            />
-          </label>
-        </div>
-        {assetInventory.length > 0 && (
-          <ul className="asset-inventory" aria-label="Embedded local assets">
-            {assetInventory.slice(0, 8).map((asset, index) => (
-              <li key={String(asset.id ?? index)}>
-                <strong>{String(asset.name ?? asset.id ?? "Local asset")}</strong>
-                <span>
-                  {String(asset.kind ?? "unknown")} · {String(asset.width ?? "?")} ×{" "}
-                  {String(asset.height ?? "?")}
-                </span>
-                <small>{String(asset.license ?? "Missing provenance note")}</small>
-                {typeof asset.attribution === "string" && (
-                  <small>Credit: {asset.attribution}</small>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-        <p className="visual-quality-note">
-          Local raster bytes are embedded in JSON (256 KiB each, 4,096 px maximum); safe SVG imports
-          become editable path layers (50 KB, 32 paths max).
-        </p>
-      </section>
+              {!companionStatus?.planUseAuthorized ? (
+                <>
+                  <button
+                    className="system-action"
+                    type="button"
+                    onClick={() => void signInWithChatGPT()}
+                    disabled={companionBusy || companionStatus?.auth === "signing_in"}
+                  >
+                    {companionStatus?.auth === "signing_in"
+                      ? "Waiting for browser sign-in…"
+                      : "Continue with ChatGPT"}
+                  </button>
+                  {(companionStatus?.auth === "signing_in" ||
+                    companionStatus?.safeMessage === "system_browser_unavailable") && (
+                    <button
+                      className="secondary-action"
+                      type="button"
+                      onClick={() => void reopenChatGPTBrowser()}
+                      disabled={companionBusy}
+                    >
+                      Open sign-in page in system browser again
+                    </button>
+                  )}
+                </>
+              ) : (
+                <>
+                  <p className="ai-gate-note ai-gate-ready">
+                    {companionStatus.auth === "ready"
+                      ? "A real Responses smoke test completed in this companion session."
+                      : "The direct-use scope was granted, but live inference is not verified yet. Load models from this account and run the separate fixed smoke test."}
+                  </p>
+                  <button
+                    className="system-action"
+                    type="button"
+                    onClick={() => void discoverModels()}
+                    disabled={companionBusy}
+                  >
+                    {companionBusy ? "Checking account models…" : "Load available models"}
+                  </button>
+                  {companionModels.length > 0 && (
+                    <label className="ai-gate-field">
+                      <span>Account-visible model</span>
+                      <select
+                        value={selectedCompanionModel}
+                        onChange={(event) => setSelectedCompanionModel(event.target.value)}
+                        disabled={companionBusy}
+                      >
+                        {companionModels.map((model) => (
+                          <option key={model.slug} value={model.slug}>
+                            {model.displayName}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  <details className="advanced-settings">
+                    <summary>Developer diagnostics</summary>
+                    <p>
+                      Sends the fixed text “Reply with exactly OK.” to verify live Responses access.
+                      It does not send your design prompt or JSON.
+                    </p>
+                    <button
+                      className="secondary-action ai-smoke-action"
+                      type="button"
+                      onClick={() => void runCompanionSmoke()}
+                      disabled={
+                        companionBusy ||
+                        !companionStatus.planUseAuthorized ||
+                        !selectedCompanionModel
+                      }
+                    >
+                      {companionBusy ? "Waiting for Responses…" : "Run fixed Responses smoke test"}
+                    </button>
+                    {smokeInFlight && (
+                      <button
+                        className="text-button ai-disconnect"
+                        type="button"
+                        onClick={cancelCompanionSmoke}
+                      >
+                        Cancel smoke request
+                      </button>
+                    )}
+                    {smokeResult && (
+                      <p className="ai-gate-result" role="status">
+                        Real Responses request completed. Output: <code>{smokeResult}</code>
+                      </p>
+                    )}
+                  </details>
+                </>
+              )}
+              <button
+                className="text-button ai-disconnect"
+                type="button"
+                onClick={() => void disconnectLocalCompanion()}
+                disabled={companionBusy}
+              >
+                Disconnect this plugin from the local companion
+              </button>
+              <button
+                className="text-button ai-disconnect"
+                type="button"
+                onClick={() => void disconnectCompanion()}
+                disabled={companionBusy}
+              >
+                Disconnect ChatGPT account
+              </button>
+              <button
+                className="text-button ai-disconnect"
+                type="button"
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      "Clear the saved local account registration and start a fresh ChatGPT account sign-in? The stable installation host ID will remain.",
+                    )
+                  ) {
+                    void disconnectCompanion(true);
+                  }
+                }}
+                disabled={companionBusy}
+              >
+                Forget account registration and switch account
+              </button>
+            </>
+          )}
+          {companionError && (
+            <p className="ai-gate-error" role="alert">
+              {companionError}
+            </p>
+          )}
+          <p className="ai-gate-privacy">
+            This gate build sends no design JSON or custom prompt. The only inference input is the
+            fixed text “Reply with exactly OK.” after you activate the smoke test. Sign-in does not
+            grant access to ChatGPT conversations, files, or memory. Natural-language design
+            generation remains disabled until live authorization and inference are confirmed.
+          </p>
+        </section>
+      )}
 
-      {batchMode ? (
+      {notice.title !== "Ready to validate" && (
+        <section
+          className={`status-card status-${notice.tone}`}
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          <span className={`status-icon ${busy ? "is-spinning" : ""}`} aria-hidden="true">
+            {busy ? (
+              <span className="spinner" />
+            ) : notice.tone === "success" ? (
+              <svg viewBox="0 0 16 16">
+                <path d="m3.5 8.2 2.8 2.8 6.2-6.2" />
+              </svg>
+            ) : notice.tone === "error" ? (
+              <svg viewBox="0 0 16 16">
+                <path d="M8 4.5v4m0 2.5h.01M8 1.75a6.25 6.25 0 1 0 0 12.5 6.25 6.25 0 0 0 0-12.5Z" />
+              </svg>
+            ) : (
+              <span className="ready-dot" />
+            )}
+          </span>
+          <div className="status-copy">
+            <strong>{notice.title}</strong>
+            {notice.details &&
+              (notice.tone === "error" ? (
+                <ErrorList errors={notice.details} />
+              ) : (
+                <p>{notice.details.join(" ")}</p>
+              ))}
+          </div>
+        </section>
+      )}
+
+      {!settingsOpen && activeView === "quality" && (
+        <section className="visual-quality-panel" aria-labelledby="visual-quality-title">
+          <div className="design-system-heading">
+            <div>
+              <span className="section-kicker">VISUAL PREFLIGHT</span>
+              <h2 id="visual-quality-title">Quality preflight</h2>
+            </div>
+            <span className={`system-status ${visualAudit ? "is-ready" : ""}`}>
+              {visualAudit ? `${visualAudit.diagnostics.length} findings` : "Validate JSON"}
+            </span>
+          </div>
+          {visualAudit ? (
+            <>
+              <p className="visual-quality-summary">
+                {visualAudit.screenCount} screen{visualAudit.screenCount === 1 ? "" : "s"} ·{" "}
+                {batchPreview?.estimatedNodeCount ?? visualAudit.estimatedNativeNodes} estimated
+                nodes · {visualAudit.componentCount} shared masters · {visualAudit.instanceCount}{" "}
+                instances · {visualAudit.assetCount} assets
+              </p>
+              <p className="visual-quality-note">
+                Measured JSON checks only. Font availability, visual balance, and Persian shaping
+                still need a Figma Desktop review.
+              </p>
+              {visualAudit.diagnostics.length ? (
+                <ul className="quality-diagnostics" aria-label="Visual quality findings">
+                  {visualAudit.diagnostics.slice(0, 8).map((item, index) => (
+                    <li key={`${item.code}-${item.path}-${index}`}>
+                      <strong>{item.code.replaceAll("-", " ")}</strong>
+                      <span>{item.path}</span>
+                      <p>{item.message}</p>
+                      <small>{item.action}</small>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="quality-clear" role="status">
+                  No configured preflight warnings. This is not a visual-quality score.
+                </p>
+              )}
+            </>
+          ) : (
+            <div className="system-validation">
+              <strong>Fix validation errors before preview</strong>
+              <ErrorList
+                errors={(batchMode
+                  ? batchParsed?.success === false
+                    ? batchParsed.errors
+                    : []
+                  : !parsed.success
+                    ? parsed.errors
+                    : []
+                ).slice(0, 4)}
+              />
+            </div>
+          )}
+        </section>
+      )}
+
+      {!settingsOpen && activeView === "assets" && (
+        <section className="assets-panel" aria-labelledby="assets-title">
+          <div className="design-system-heading">
+            <div>
+              <span className="section-kicker">LOCAL ASSETS</span>
+              <h2 id="assets-title">Asset library</h2>
+            </div>
+            <span className={`system-status ${assetInventory.length ? "is-ready" : ""}`}>
+              {assetInventory.length} embedded
+            </span>
+          </div>
+          <p className="page-description">
+            Add local images and safe SVG paths to the current JSON document. Asset bytes stay in
+            the offline workflow.
+          </p>
+          <div className="asset-provenance-fields">
+            <label>
+              <span>Asset source / license (required)</span>
+              <input
+                type="text"
+                maxLength={500}
+                value={assetLicense}
+                onChange={(event) => setAssetLicense(event.target.value)}
+                disabled={busy}
+                placeholder="Owned by me, CC0, or source and license"
+              />
+            </label>
+            <label>
+              <span>Attribution (optional)</span>
+              <input
+                type="text"
+                maxLength={500}
+                value={assetAttribution}
+                onChange={(event) => setAssetAttribution(event.target.value)}
+                disabled={busy}
+                placeholder="Creator or source credit"
+              />
+            </label>
+            <label className={`file-button ${busy ? "is-disabled" : ""}`}>
+              <span>Import local PNG / JPEG / GIF / safe SVG</span>
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/gif,image/svg+xml,.png,.jpg,.jpeg,.gif,.svg"
+                onChange={importVisualAsset}
+                disabled={busy}
+              />
+            </label>
+          </div>
+          {assetInventory.length > 0 && (
+            <ul className="asset-inventory" aria-label="Embedded local assets">
+              {assetInventory.slice(0, 8).map((asset, index) => (
+                <li key={String(asset.id ?? index)}>
+                  <strong>{String(asset.name ?? asset.id ?? "Local asset")}</strong>
+                  <span>
+                    {String(asset.kind ?? "unknown")} · {String(asset.width ?? "?")} ×{" "}
+                    {String(asset.height ?? "?")}
+                  </span>
+                  <small>{String(asset.license ?? "Missing provenance note")}</small>
+                  {typeof asset.attribution === "string" && (
+                    <small>Credit: {asset.attribution}</small>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="visual-quality-note">
+            Local raster bytes are embedded in JSON (256 KiB each, 4,096 px maximum); safe SVG
+            imports become editable path layers (50 KB, 32 paths max).
+          </p>
+        </section>
+      )}
+
+      {!settingsOpen && activeView === "json" && batchMode ? (
         <section className="multi-screen-panel" aria-labelledby="multi-screen-title">
           <div className="design-system-heading">
             <div>
@@ -1489,7 +1793,7 @@ export default function App() {
             </div>
           )}
         </section>
-      ) : (
+      ) : !settingsOpen && activeView === "system" ? (
         <section className="design-system-panel" aria-labelledby="design-system-title">
           <div className="design-system-heading">
             <div>
@@ -1555,39 +1859,43 @@ export default function App() {
             </div>
           )}
         </section>
-      )}
+      ) : null}
 
-      <div className="actions">
-        <button className="secondary-action" type="button" onClick={validate} disabled={busy}>
-          Validate JSON
-        </button>
-        <button
-          className="primary-action"
-          type="button"
-          onClick={generate}
-          disabled={
-            busy ||
-            batchMode ||
-            !parsed.success ||
-            (parsed.success && Boolean(parsed.data.designSystem))
-          }
-        >
-          {busy ? (
-            <span className="button-spinner" />
-          ) : (
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <path d="M8 1.5v13m-6.5-6.5h13M3.75 3.75l8.5 8.5m0-8.5-8.5 8.5" />
-            </svg>
-          )}
-          {busy
-            ? "Working…"
-            : batchMode
-              ? "Use multi-screen panel"
-              : parsed.success && parsed.data.designSystem
-                ? "Use design-system action"
-                : "Generate in Figma"}
-        </button>
-      </div>
+      {!settingsOpen && activeView === "json" && (
+        <>
+          <div className="actions">
+            <button className="secondary-action" type="button" onClick={validate} disabled={busy}>
+              Validate JSON
+            </button>
+            <button
+              className="primary-action"
+              type="button"
+              onClick={generate}
+              disabled={
+                busy ||
+                batchMode ||
+                !parsed.success ||
+                (parsed.success && Boolean(parsed.data.designSystem))
+              }
+            >
+              {busy ? (
+                <span className="button-spinner" />
+              ) : (
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M8 1.5v13m-6.5-6.5h13M3.75 3.75l8.5 8.5m0-8.5-8.5 8.5" />
+                </svg>
+              )}
+              {busy
+                ? "Working…"
+                : batchMode
+                  ? "Use multi-screen panel"
+                  : parsed.success && parsed.data.designSystem
+                    ? "Use design-system action"
+                    : "Generate in Figma"}
+            </button>
+          </div>
+        </>
+      )}
 
       <footer className="footer-note">
         <span className="local-icon" aria-hidden="true">
