@@ -1,6 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from "node:timers";
+import {
+  COMPANION_BIND_ADDRESSES,
+  COMPANION_CALLBACK_PATH,
+  COMPANION_HOSTNAME,
+  COMPANION_OAUTH_HOST,
+  COMPANION_PORT,
+  COMPANION_UI_ORIGIN,
+} from "./config.js";
 import type { InstallationStore } from "./installation-store.js";
 import {
   assertTrustedHttpsUrl,
@@ -19,7 +27,6 @@ import {
   type OidcDiscovery,
 } from "./oauth.js";
 
-const ALLOWED_ORIGIN = "null";
 const MAX_BODY_BYTES = 16 * 1_024;
 const NETWORK_TIMEOUT_MS = 45_000;
 const STATUS_TEXT: Record<string, string> = {
@@ -92,7 +99,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
   const fetchImpl = options.fetchImpl ?? fetch;
   const now = options.now ?? Date.now;
   const timeoutMs = options.requestTimeoutMs ?? NETWORK_TIMEOUT_MS;
-  const port = options.port ?? 1_455;
+  const port = options.port ?? COMPANION_PORT;
   const pairingCode = randomBytes(24).toString("base64url");
   const sessionToken = randomBytes(32).toString("base64url");
   let pairingUsed = false;
@@ -101,7 +108,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
   let safeMessage: string | undefined;
   let liveSession: LiveSession | undefined;
   let pendingAuthorization: PendingAuthorization | undefined;
-  let server: Server | undefined;
+  let servers: Server[] = [];
   let actualPort = port;
 
   const status = (): CompanionStatus => ({
@@ -113,34 +120,29 @@ export function createCompanionServer(options: CompanionServerOptions) {
     ...(safeMessage ? { safeMessage } : {}),
   });
 
-  const apiBase = () => `http://127.0.0.1:${actualPort}`;
-  const redirectUri = () => `${apiBase()}/auth/callback`;
+  const apiBase = () => `http://${COMPANION_HOSTNAME}:${actualPort}`;
+  const redirectUri = () =>
+    `http://${COMPANION_OAUTH_HOST}:${actualPort}${COMPANION_CALLBACK_PATH}`;
 
   async function start(): Promise<CompanionServerHandle> {
-    if (server) throw new Error("companion_already_started");
-    server = createServer((request, response) => {
-      void route(request, response).catch(() => {
-        if (!response.headersSent) sendJson(response, 500, { error: "connection_failed" });
-        else response.destroy();
-      });
-    });
+    if (servers.length > 0) throw new Error("companion_already_started");
+    const started: Server[] = [];
     try {
-      await new Promise<void>((resolve, reject) => {
-        const instance = server;
-        if (!instance) return reject(new Error("companion_server_missing"));
-        const onError = (error: Error) => reject(error);
-        instance.once("error", onError);
-        instance.listen(port, "127.0.0.1", () => {
-          instance.off("error", onError);
-          const address = instance.address();
-          if (!address || typeof address === "string")
-            return reject(new Error("companion_bind_failed"));
-          actualPort = address.port;
-          resolve();
-        });
-      });
+      for (const address of COMPANION_BIND_ADDRESSES) {
+        const instance = createRouteServer();
+        const isFirstListener = started.length === 0;
+        await listenOnLoopback(instance, address, started.length === 0 ? port : actualPort);
+        started.push(instance);
+        const listeningAddress = instance.address();
+        if (!listeningAddress || typeof listeningAddress === "string") {
+          throw new Error("companion_bind_failed");
+        }
+        if (isFirstListener) actualPort = listeningAddress.port;
+        else if (listeningAddress.port !== actualPort) throw new Error("companion_bind_failed");
+      }
+      servers = started;
     } catch (error) {
-      server = undefined;
+      await Promise.all(started.map(closeServer));
       throw error;
     }
     return {
@@ -154,11 +156,17 @@ export function createCompanionServer(options: CompanionServerOptions) {
     clearPendingAuthorization();
     liveSession = undefined;
     authStatus = "signed_out";
-    if (!server) return;
-    const instance = server;
-    server = undefined;
-    await new Promise<void>((resolve, reject) => {
-      instance.close((error) => (error ? reject(error) : resolve()));
+    const running = servers;
+    servers = [];
+    await Promise.all(running.map(closeServer));
+  }
+
+  function createRouteServer(): Server {
+    return createServer((request, response) => {
+      void route(request, response).catch(() => {
+        if (!response.headersSent) sendJson(response, 500, { error: "connection_failed" });
+        else response.destroy();
+      });
     });
   }
 
@@ -169,7 +177,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       return;
     }
 
-    if (request.headers.host !== `127.0.0.1:${actualPort}`) {
+    if (request.headers.host !== `${COMPANION_HOSTNAME}:${actualPort}`) {
       sendJson(response, 400, { error: "invalid_host" });
       return;
     }
@@ -310,7 +318,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
     response: ServerResponse,
     url: URL,
   ): Promise<void> {
-    if (request.headers.host !== `127.0.0.1:${actualPort}`) {
+    if (request.headers.host !== `${COMPANION_OAUTH_HOST}:${actualPort}`) {
       sendCallbackPage(response, "blocked");
       return;
     }
@@ -671,16 +679,43 @@ export function createCompanionServer(options: CompanionServerOptions) {
   }
 
   function setCorsHeaders(request: IncomingMessage, response: ServerResponse): boolean {
-    if (request.headers.origin !== ALLOWED_ORIGIN) return false;
-    response.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-    response.setHeader("Vary", "Origin");
+    if (request.headers.origin !== COMPANION_UI_ORIGIN) return false;
+    // Figma plugin UI iframes have an opaque "null" origin. Figma's docs require
+    // an API reachable from the plugin iframe to permit wildcard ACAO. Cookies
+    // are disabled; the one-time pairing bearer authorizes subsequent requests.
+    response.setHeader("Access-Control-Allow-Origin", "*");
     response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    if (request.headers["access-control-request-private-network"] === "true") {
+      response.setHeader("Access-Control-Allow-Private-Network", "true");
+    }
     response.setHeader("Cache-Control", "no-store");
     return true;
   }
 
   return { start, close, getStatus: status };
+}
+
+function listenOnLoopback(server: Server, address: string, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, address);
+  });
+}
+
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
 }
 
 function validateDiscovery(discovery: OidcDiscovery): void {

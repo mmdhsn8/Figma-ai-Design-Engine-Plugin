@@ -372,10 +372,20 @@ The Phase 4.6 interface adds no natural-language prompt editor and never sends t
    npm run build
    ```
 
-2. In Figma Desktop, import or reload the development plugin using this repository's `manifest.json`.
-3. In a separate PowerShell window at the repository root, run `npm run companion`. Keep that terminal open. It binds to `127.0.0.1:1455`, prints a random one-time pairing code, and opens no browser until sign-in is explicitly started from the plugin.
+2. In Figma Desktop, close any running copy of the plugin. Import or reload the development plugin using the repository-root `manifest.json` (the built UI/controller files are under `dist/`).
+3. Because an earlier one-time pairing code was visible in a screenshot, stop any old companion with Ctrl+C and restart it to rotate that code; never reuse or share the old code. In a separate PowerShell window at the repository root, check the listener and then start the companion:
+
+   ```powershell
+   [System.Net.Dns]::GetHostAddresses("localhost") | ForEach-Object IPAddressToString
+   Get-NetTCPConnection -LocalPort 1455 -State Listen -ErrorAction SilentlyContinue |
+     Select-Object LocalAddress, LocalPort, OwningProcess
+   npm run companion
+   ```
+
+   The listener should show only `127.0.0.1` and `::1`, both on port `1455`; it binds the two addresses explicitly and does not listen on LAN interfaces. `localhost` may resolve to IPv6 first on Windows, so both loopback families are served. The companion prints a random one-time pairing code and opens no browser until sign-in is explicitly started from the plugin.
+
 4. Paste the one-time code into **ChatGPT connection proof of concept → Connect local companion**. If the plugin UI is reloaded after pairing, restart the companion to print a fresh code and pair again; the session bearer is intentionally held only in UI memory.
-5. Click **Continue with ChatGPT**. Complete the official flow in the system browser and return to the plugin. The callback is accepted only for the exact loopback URI, one-time state, PKCE transaction, expected nonce, validated ID-token signature/issuer/audience/expiry, and the callback's issued public client ID.
+5. Click **Continue with ChatGPT**. Complete the official flow in the system browser and return to the plugin. The official SIWC OAuth callback stays `http://127.0.0.1:1455/auth/callback` (OpenAI's OSS flow explicitly requires `127.0.0.1`; do not replace this callback host with `localhost`). It is accepted only for the exact URI, one-time state, PKCE transaction, expected nonce, validated ID-token signature/issuer/audience/expiry, and callback's issued public client ID.
 6. Check the displayed authorization state. `Signed in; plan use not authorized` is not AI-ready. When ready, click **Load available models**, choose a listed model, then separately click **Run fixed Responses smoke test**. Capture only the sanitized status and success/failure category; never paste credentials or callback URLs into issues/logs.
 7. Click **Disconnect and clear local session**, then press Ctrl+C in the companion terminal. Disconnect attempts token revocation if a refresh token is present; local token memory is cleared even if remote revocation fails.
 
@@ -383,10 +393,10 @@ The companion stores a stable `ext_agent_host_id`, the issued public `client_id`
 
 ### Loopback security and current gate limits
 
-- The companion binds only to `127.0.0.1`, checks the Figma iframe's opaque `Origin: null`, has no cookies, and requires a random one-time pairing code followed by an in-memory bearer for every companion action. CORS is an additional browser boundary, not the authentication mechanism.
+- The UI makes companion calls from the Figma UI iframe; the Figma document controller does not make browser/network requests. The UI endpoint is `http://localhost:1455`; the system-browser OAuth callback is separately fixed at `http://127.0.0.1:1455/auth/callback` per OpenAI's documented OSS flow. The companion binds separately to `127.0.0.1:1455` and `[::1]:1455`, and validates the expected Host for each route. It checks the Figma iframe's opaque `Origin: null`, answers CORS with `Access-Control-Allow-Origin: *` as Figma's network-request guide requires for plugin iframes, disables credentialed cookies, and requires a random one-time pairing code followed by an in-memory bearer for every privileged companion action. CORS is an additional browser boundary, not the authentication mechanism.
 - Request bodies and remote response bodies have explicit size limits; OAuth state expires after five minutes and is consumed once. Callback/token/JWKS/HTTP failures are exposed only as sanitized categories. There is no general proxy endpoint.
 - **Threat model:** protect OAuth code/verifier/state/nonce, access/refresh tokens, and the pairing/session bearers from the Figma document, plugin messages, logs, disk, other web origins, and unrelated local callers. Mitigations are loopback-only binding, a one-use high-entropy terminal pairing code, bearer authorization on every bridge action, strict `Origin: null` and `Host` checks, exact redirect matching, PKCE, state replay prevention, nonce/signature/issuer/audience/expiry checks, body/time limits, no cookies, and in-memory-only credential lifetimes. Process inspection or code executing inside the paired Figma iframe/user account remains in the local user security boundary; loopback/CORS do not defend against a compromised same-user process.
-- The manifest keeps production `allowedDomains` at `none` and adds only the local development host in `devAllowedDomains`. This Figma Desktop network exception and Chromium local-network behavior still need actual Desktop verification.
+- The manifest keeps production `allowedDomains` at `none` and uses the documented development entry `http://localhost:1455`. It does not allow external OpenAI hosts in the Figma plugin manifest; OAuth and provider traffic originates from the companion process. Figma Desktop validation and Chromium local-network/private-network behavior still need actual Desktop verification.
 - Access, refresh and ID tokens are not persisted in this gate build. A single account registration is supported; an explicit switch action clears it. Protected Windows token storage, multi-account session profiles, automatic design planning, schema generation, bounded repair, and design prompt transfer are **not implemented** until the live authorization and inference gate is passed.
 - No Figma Desktop connection, ChatGPT account authorization, granted scope, model-list access, or live Responses call has been performed by the coding agent. Automated tests below use mocked OAuth/provider responses and do not pass the live gate.
 
@@ -400,6 +410,19 @@ The companion stores a stable `ext_agent_host_id`, the issued public `client_id`
 4. **Gate D — offline regression:** Stop the companion, reload the plugin, and confirm Phase 1–4.5 JSON validation, samples, rendering and placement still work without sign-in or network access.
 
 The earlier Phase 2.2, Phase 3, Phase 4 and Phase 4.5 manual Figma acceptance gates remain pending unless the user has separately reported passing them.
+
+### Phase 4.6 loopback troubleshooting
+
+| Symptom                                                                 | Check / action                                                                                                                                                                                                                                                                                                                                                                                     |
+| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Plugin refuses to open and reports an invalid `devAllowedDomains` value | Confirm Figma imported this repository's root `manifest.json`, which uses the documented `http://localhost:1455` development entry. Rebuild, close the running plugin, then reload/import the local development plugin from this manifest.                                                                                                                                                         |
+| Companion will not start / address is already in use                    | Run `Get-NetTCPConnection -LocalPort 1455 -State Listen` and inspect the owner with `Get-Process -Id <PID>`. Stop only the old companion process you started, then run `npm run companion` again.                                                                                                                                                                                                  |
+| Pairing says the code is unavailable or rejected                        | The code is one-use and expires when the companion exits. Restart `npm run companion` and use the fresh terminal code. Never share a code from a screenshot.                                                                                                                                                                                                                                       |
+| UI cannot reach companion                                               | Check both `127.0.0.1:1455` and `[::1]:1455` are listening. Inspect the Figma plugin console: a refused connection usually means the companion is stopped/busy; a CSP message points to a stale/wrong manifest; CORS or Private Network Access errors indicate the browser blocked the iframe request. Report the sanitized error category and console message, with secrets/query values removed. |
+| Pairing works but an action says pairing is required                    | The UI session bearer is memory-only. Reloading the plugin UI clears it; restart the companion and pair again with its current code.                                                                                                                                                                                                                                                               |
+| OAuth or model/inference request fails                                  | Local bridge connectivity is separate from ChatGPT authorization. Use the displayed sanitized sign-in/scope/model/quota category. Do not retry with API keys or browser session data.                                                                                                                                                                                                              |
+
+The loopback repair regression tests compare the UI endpoint, both listener addresses, and the manifest development entry, and reject the previously failing IPv4-literal manifest value. They also exercise requests against both loopback families. These tests cannot establish Figma Desktop's own manifest or iframe policy; perform the manual checklist above.
 
 ## Limitations
 

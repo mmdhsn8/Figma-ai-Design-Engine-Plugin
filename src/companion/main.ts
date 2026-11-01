@@ -1,15 +1,20 @@
 import { spawn } from "node:child_process";
+import { COMPANION_HOSTNAME, COMPANION_PORT } from "./config.js";
 import { createInstallationStore } from "./installation-store.js";
 import { createCompanionServer } from "./server.js";
 
 const companion = createCompanionServer({
-  port: 1_455,
+  port: COMPANION_PORT,
   installationStore: createInstallationStore(),
   openBrowser: openSystemBrowser,
 });
 
 const handle = await companion.start();
-console.log("Figma AI Design Engine local companion is listening on 127.0.0.1:%d", handle.port);
+console.log(
+  "Figma AI Design Engine local companion is listening on %s:%d",
+  COMPANION_HOSTNAME,
+  handle.port,
+);
 console.log(
   "One-time Figma pairing code (enter it in the plugin; do not share it):\n%s",
   handle.pairingCode,

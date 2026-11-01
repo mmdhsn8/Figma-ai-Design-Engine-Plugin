@@ -1,6 +1,7 @@
 import { z } from "zod";
+import { COMPANION_BASE_URL } from "../companion/config";
 
-export const COMPANION_URL = "http://127.0.0.1:1455";
+export const COMPANION_URL = COMPANION_BASE_URL;
 
 const StatusSchema = z
   .object({

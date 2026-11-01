@@ -15,7 +15,7 @@ describe("Figma UI companion client", () => {
     const token = await pairWithCompanion("A".repeat(32), fetcher);
     expect(token).toBe("x".repeat(43));
     expect(fetcher).toHaveBeenCalledWith(
-      "http://127.0.0.1:1455/v1/pair",
+      "http://localhost:1455/v1/pair",
       expect.objectContaining({
         mode: "cors",
         credentials: "omit",

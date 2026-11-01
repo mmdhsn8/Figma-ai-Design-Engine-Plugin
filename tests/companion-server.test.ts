@@ -1,5 +1,7 @@
 import { generateKeyPairSync, sign } from "node:crypto";
+import { request as httpRequest } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { COMPANION_BIND_ADDRESSES } from "../src/companion/config.js";
 import {
   OIDC_ISSUER,
   PLAN_USE_SCOPE,
@@ -28,18 +30,31 @@ afterEach(async () => {
 });
 
 describe("loopback companion", () => {
+  it("serves localhost on both resolved loopback address families", async () => {
+    const harness = await createHarness();
+    expect(COMPANION_BIND_ADDRESSES).toEqual(["127.0.0.1", "::1"]);
+
+    for (const address of COMPANION_BIND_ADDRESSES) {
+      const response = await requestLoopbackAddress(address, harness.handle.port);
+      expect(response.statusCode).toBe(401);
+      expect(response.allowOrigin).toBe("*");
+    }
+  });
+
   it("binds only to loopback and requires null-origin pairing with a one-time code", async () => {
     const harness = await createHarness();
-    const preflight = await fetch(`http://127.0.0.1:${harness.handle.port}/v1/pair`, {
+    const preflight = await fetch(`http://localhost:${harness.handle.port}/v1/pair`, {
       method: "OPTIONS",
       headers: {
         Origin: "null",
+        "Access-Control-Request-Private-Network": "true",
         "Access-Control-Request-Method": "POST",
         "Access-Control-Request-Headers": "content-type",
       },
     });
     expect(preflight.status).toBe(204);
-    expect(preflight.headers.get("access-control-allow-origin")).toBe("null");
+    expect(preflight.headers.get("access-control-allow-origin")).toBe("*");
+    expect(preflight.headers.get("access-control-allow-private-network")).toBe("true");
 
     const originDenied = await request(harness.handle, "/v1/pair", {
       body: { code: harness.handle.pairingCode },
@@ -527,11 +542,38 @@ async function request(
   const headers = new Headers({ Origin: options.origin ?? "null" });
   if (options.body !== undefined) headers.set("Content-Type", "application/json");
   if (options.token) headers.set("Authorization", `Bearer ${options.token}`);
-  return fetch(`http://127.0.0.1:${handle.port}${path}`, {
+  return fetch(`http://localhost:${handle.port}${path}`, {
     method: options.body !== undefined || path === "/v1/pair" ? "POST" : "GET",
     headers,
     ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
     ...(options.signal ? { signal: options.signal } : {}),
+  });
+}
+
+function requestLoopbackAddress(
+  host: string,
+  port: number,
+): Promise<{ statusCode: number | undefined; allowOrigin: string | undefined }> {
+  return new Promise((resolve, reject) => {
+    const outgoing = httpRequest(
+      {
+        host,
+        port,
+        path: "/v1/status",
+        headers: { Host: `localhost:${port}`, Origin: "null" },
+      },
+      (response) => {
+        response.resume();
+        response.once("end", () => {
+          resolve({
+            statusCode: response.statusCode,
+            allowOrigin: response.headers["access-control-allow-origin"],
+          });
+        });
+      },
+    );
+    outgoing.once("error", reject);
+    outgoing.end();
   });
 }
 

@@ -1382,7 +1382,8 @@ function companionErrorText(error: unknown): string {
     request_rejected:
       "The request was rejected. Check the account's authorization and availability.",
     unknown: "The companion returned an invalid response. Restart it and reconnect.",
-    connection_failed: "Could not reach the local companion. Confirm it is running on port 1455.",
+    connection_failed:
+      "Cannot reach the local companion. If it is running, Figma or the browser may have blocked localhost (manifest CSP, CORS, or private-network access); reload the development plugin and inspect its console.",
   };
   return messages[category] ?? "The companion could not complete that step.";
 }
