@@ -8,6 +8,8 @@ import {
   pollLocalPairing,
   reopenChatGPTSignIn,
   reopenLocalApproval,
+  restoreLocalCompanionSession,
+  restoreLocalSession,
   requestLocalPairing,
   runSmokeRequest,
 } from "../src/ui/companion-client";
@@ -54,12 +56,56 @@ describe("Figma UI companion client", () => {
       status: "pending",
     });
     const approvedFetch = vi.fn<typeof fetch>(async () =>
-      Response.json({ status: "approved", sessionToken: "s".repeat(43) }),
+      Response.json({
+        status: "approved",
+        sessionToken: "s".repeat(43),
+        restoreTicket: "FADP1T:" + "A".repeat(64),
+        restoreAvailable: true,
+      }),
     );
     expect(await pollLocalPairing("a".repeat(43), "v".repeat(43), approvedFetch)).toEqual({
       status: "approved",
       sessionToken: "s".repeat(43),
+      restoreTicket: "FADP1T:" + "A".repeat(64),
+      restoreAvailable: true,
     });
+  });
+
+  it("restores a saved pairing after a plugin UI remount without starting OAuth", async () => {
+    const ticket = "FADP1T:" + "A".repeat(64);
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json({ sessionToken: "s".repeat(43) }))
+      .mockResolvedValueOnce(
+        Response.json({
+          companion: "connected",
+          auth: "scope_granted",
+          authLabel: "Ready",
+          planUseAuthorized: true,
+          modelCount: 0,
+        }),
+      );
+
+    await expect(restoreLocalCompanionSession(ticket, fetcher)).resolves.toMatchObject({
+      token: "s".repeat(43),
+      status: { auth: "scope_granted", planUseAuthorized: true },
+    });
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      "http://localhost:1455/v1/pairing/restore",
+      "http://localhost:1455/v1/status",
+    ]);
+    expect(fetcher).not.toHaveBeenCalledWith(
+      expect.stringContaining("/v1/auth/start"),
+      expect.anything(),
+    );
+  });
+
+  it("rejects malformed or forged restore tickets before sending them", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    await expect(restoreLocalSession("not-a-ticket", fetcher)).rejects.toMatchObject({
+      category: "pairing_failed",
+    } satisfies Partial<CompanionClientError>);
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it("reopens the system approval page only for a pending local proof", async () => {

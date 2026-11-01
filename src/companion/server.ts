@@ -11,6 +11,14 @@ import {
 } from "./config.js";
 import type { InstallationStore } from "./installation-store.js";
 import {
+  createMemoryCredentialStore,
+  emptyCredentialState,
+  parseCredentialState,
+  type CredentialState,
+  type CredentialStore,
+  type StoredOAuthSession,
+} from "./credential-store.js";
+import {
   assertTrustedHttpsUrl,
   createAuthorizationTransaction,
   createAuthorizationUrl,
@@ -32,6 +40,7 @@ const MAX_APPROVAL_BODY_BYTES = 2 * 1_024;
 const NETWORK_TIMEOUT_MS = 45_000;
 const PAIRING_ATTEMPT_TTL_MS = 90_000;
 const PAIRING_SESSION_TTL_MS = 15 * 60 * 1_000;
+const PAIRING_TICKET_PREFIX = "FADP1T:";
 const MAX_PAIRING_ATTEMPTS_PER_MINUTE = 5;
 const MAX_PAIRING_POLL_REQUESTS = 180;
 const STATUS_TEXT: Record<string, string> = {
@@ -60,6 +69,7 @@ export interface CompanionServerOptions {
   fetchImpl?: typeof fetch;
   openBrowser?: (url: string) => Promise<void>;
   installationStore: InstallationStore;
+  credentialStore?: CredentialStore;
   now?: () => number;
   requestTimeoutMs?: number;
 }
@@ -74,6 +84,7 @@ interface LiveSession {
   refreshToken?: string;
   clientId: string;
   subject: string;
+  subjectHash: string;
   scopes: Set<string>;
   expiresAt: number;
   models: AccountModel[];
@@ -111,17 +122,34 @@ interface TokenResponse {
   scope?: unknown;
 }
 
+interface PairingSession {
+  expiresAt: number;
+  pairingGrantId: string;
+}
+
+interface PairingRestoreTicket {
+  version: 1;
+  id: string;
+  secret: string;
+}
+
 export function createCompanionServer(options: CompanionServerOptions) {
   const fetchImpl = options.fetchImpl ?? fetch;
   const now = options.now ?? Date.now;
+  const credentialStore = options.credentialStore ?? createMemoryCredentialStore();
   const timeoutMs = options.requestTimeoutMs ?? NETWORK_TIMEOUT_MS;
   const port = options.port ?? COMPANION_PORT;
   const pairingAttempts = new Map<string, PairingAttempt>();
-  const sessionTokenHashes = new Map<string, number>();
+  const sessionTokenHashes = new Map<string, PairingSession>();
   const pairingStartTimes: number[] = [];
   let authStatus: AuthStatus = "signed_out";
   let safeMessage: string | undefined;
   let liveSession: LiveSession | undefined;
+  let credentialState: CredentialState = emptyCredentialState();
+  let credentialStorageFailure: string | undefined;
+  let refreshPromise:
+    | Promise<{ ok: true; value: LiveSession } | { ok: false; statusCode: number; error: string }>
+    | undefined;
   let pendingAuthorization: PendingAuthorization | undefined;
   let servers: Server[] = [];
   let actualPort = port;
@@ -141,6 +169,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
 
   async function start(): Promise<CompanionServerHandle> {
     if (servers.length > 0) throw new Error("companion_already_started");
+    await restorePersistentState();
     const started: Server[] = [];
     try {
       for (const address of COMPANION_BIND_ADDRESSES) {
@@ -164,6 +193,99 @@ export function createCompanionServer(options: CompanionServerOptions) {
       port: actualPort,
       close: async () => close(),
     };
+  }
+
+  async function restorePersistentState(): Promise<void> {
+    try {
+      credentialState = await credentialStore.load();
+      credentialStorageFailure = undefined;
+    } catch (error) {
+      credentialState = emptyCredentialState();
+      credentialStorageFailure = storageErrorCategory(error);
+      authStatus = "blocked";
+      safeMessage = credentialStorageFailure;
+      return;
+    }
+
+    for (const grant of credentialState.pairingGrants) {
+      // The durable approval is a hash only; a new UI session gets a short-lived bearer on restore.
+      if (!/^[0-9a-f]{64}$/iu.test(grant.secretHash)) {
+        credentialStorageFailure = "credential_store_corrupt";
+        authStatus = "blocked";
+        safeMessage = credentialStorageFailure;
+        return;
+      }
+    }
+
+    const saved = credentialState.oauthSession;
+    if (!saved) {
+      if (credentialState.reauthorizationRequired) {
+        authStatus = "session_expired";
+        safeMessage = "session_expired";
+      }
+      return;
+    }
+
+    try {
+      const metadata = await options.installationStore.load();
+      if (metadata.clientId !== saved.clientId || metadata.subjectHash !== saved.subjectHash) {
+        authStatus = "blocked";
+        safeMessage = "account_mismatch";
+        return;
+      }
+    } catch (error) {
+      authStatus = "blocked";
+      safeMessage = classifyError(error);
+      return;
+    }
+
+    liveSession = liveSessionFromStored(saved);
+    authStatus = liveSession.scopes.has(PLAN_USE_SCOPE) ? "scope_granted" : "signed_in_no_plan";
+    safeMessage = undefined;
+
+    if (liveSession.expiresAt <= now() + 60_000) {
+      await refreshLiveSession();
+    }
+  }
+
+  function liveSessionFromStored(saved: StoredOAuthSession): LiveSession {
+    return {
+      accessToken: saved.accessToken,
+      ...(saved.refreshToken ? { refreshToken: saved.refreshToken } : {}),
+      clientId: saved.clientId,
+      subject: saved.subject,
+      subjectHash: saved.subjectHash,
+      scopes: new Set(saved.scopes),
+      expiresAt: saved.expiresAt,
+      models: [],
+    };
+  }
+
+  function storedSessionFromLive(session: LiveSession): StoredOAuthSession {
+    return {
+      subject: session.subject,
+      subjectHash: session.subjectHash,
+      clientId: session.clientId,
+      accessToken: session.accessToken,
+      ...(session.refreshToken ? { refreshToken: session.refreshToken } : {}),
+      scopes: [...session.scopes],
+      expiresAt: session.expiresAt,
+    };
+  }
+
+  async function persistCredentialState(next: CredentialState): Promise<boolean> {
+    let checked: CredentialState;
+    try {
+      checked = parseCredentialState(next);
+      await credentialStore.save(checked);
+    } catch (error) {
+      credentialStorageFailure = storageErrorCategory(error);
+      safeMessage = credentialStorageFailure;
+      return false;
+    }
+    credentialState = checked;
+    credentialStorageFailure = undefined;
+    return true;
   }
 
   async function close(): Promise<void> {
@@ -233,6 +355,10 @@ export function createCompanionServer(options: CompanionServerOptions) {
       await handlePairingPoll(request, response);
       return;
     }
+    if (url.pathname === "/v1/pairing/restore" && request.method === "POST") {
+      await handlePairingRestore(request, response);
+      return;
+    }
     if (url.pathname === "/v1/pairing/open" && request.method === "POST") {
       await handlePairingOpen(request, response);
       return;
@@ -256,8 +382,30 @@ export function createCompanionServer(options: CompanionServerOptions) {
         return;
       }
       const header = request.headers.authorization;
+      let grantId: string | undefined;
+      let tokenHash: string | undefined;
       if (header?.startsWith("Bearer ")) {
-        sessionTokenHashes.delete(hashSecret(header.slice(7)));
+        tokenHash = hashSecret(header.slice(7));
+        grantId = sessionTokenHashes.get(tokenHash)?.pairingGrantId;
+      }
+      if (grantId && credentialState.pairingGrants.some((grant) => grant.id === grantId)) {
+        const nextState: CredentialState = {
+          ...credentialState,
+          pairingGrants: credentialState.pairingGrants.filter((grant) => grant.id !== grantId),
+        };
+        if (!(await persistCredentialState(nextState))) {
+          sendJson(response, 503, {
+            error: credentialStorageFailure ?? "secure_storage_unavailable",
+          });
+          return;
+        }
+      }
+      if (grantId) {
+        for (const [activeHash, session] of sessionTokenHashes) {
+          if (session.pairingGrantId === grantId) sessionTokenHashes.delete(activeHash);
+        }
+      } else if (tokenHash) {
+        sessionTokenHashes.delete(tokenHash);
       }
       sendJson(response, 200, { disconnected: true });
       return;
@@ -405,11 +553,42 @@ export function createCompanionServer(options: CompanionServerOptions) {
       return;
     }
     if (attempt.status === "approved") {
+      const grantId = randomBytes(16).toString("base64url");
+      const grantSecret = randomBytes(32).toString("base64url");
+      let restoreTicket: string | undefined;
+      try {
+        const protectedTicket = `${PAIRING_TICKET_PREFIX}${await credentialStore.protectText(
+          JSON.stringify({
+            version: 1,
+            id: grantId,
+            secret: grantSecret,
+          } satisfies PairingRestoreTicket),
+        )}`;
+        const nextState: CredentialState = {
+          ...credentialState,
+          pairingGrants: [
+            ...credentialState.pairingGrants.slice(-63),
+            { id: grantId, secretHash: hashSecret(grantSecret), createdAt: now() },
+          ],
+        };
+        if (await persistCredentialState(nextState)) restoreTicket = protectedTicket;
+      } catch (error) {
+        credentialStorageFailure = storageErrorCategory(error);
+        safeMessage = credentialStorageFailure;
+      }
       const sessionToken = randomBytes(32).toString("base64url");
-      sessionTokenHashes.set(hashSecret(sessionToken), now() + PAIRING_SESSION_TTL_MS);
+      sessionTokenHashes.set(hashSecret(sessionToken), {
+        expiresAt: now() + PAIRING_SESSION_TTL_MS,
+        pairingGrantId: grantId,
+      });
       attempt.status = "completed";
       attempt.csrfToken = "";
-      sendJson(response, 200, { status: "approved", sessionToken });
+      sendJson(response, 200, {
+        status: "approved",
+        sessionToken,
+        ...(restoreTicket ? { restoreTicket } : {}),
+        restoreAvailable: Boolean(restoreTicket),
+      });
       return;
     }
     if (attempt.status === "denied") {
@@ -425,6 +604,66 @@ export function createCompanionServer(options: CompanionServerOptions) {
       return;
     }
     sendJson(response, 409, { error: "pairing_replayed" });
+  }
+
+  async function handlePairingRestore(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const body = await readJsonBody(request);
+    if (
+      !body.ok ||
+      !hasExactKeys(body.value, ["ticket"]) ||
+      typeof body.value.ticket !== "string" ||
+      !body.value.ticket.startsWith(PAIRING_TICKET_PREFIX) ||
+      body.value.ticket.length < 32 ||
+      body.value.ticket.length > 128_000
+    ) {
+      sendJson(response, 400, { error: "pairing_failed" });
+      return;
+    }
+
+    let ticket: PairingRestoreTicket;
+    try {
+      const value: unknown = JSON.parse(
+        await credentialStore.unprotectText(
+          (body.value.ticket as string).slice(PAIRING_TICKET_PREFIX.length),
+        ),
+      );
+      if (
+        typeof value !== "object" ||
+        value === null ||
+        Array.isArray(value) ||
+        (value as Record<string, unknown>).version !== 1 ||
+        typeof (value as Record<string, unknown>).id !== "string" ||
+        typeof (value as Record<string, unknown>).secret !== "string"
+      ) {
+        throw new Error("invalid_ticket");
+      }
+      const candidate = value as Record<string, unknown>;
+      if (
+        !/^[A-Za-z0-9_-]{22}$/u.test(candidate.id as string) ||
+        !/^[A-Za-z0-9_-]{43}$/u.test(candidate.secret as string)
+      ) {
+        throw new Error("invalid_ticket");
+      }
+      ticket = { version: 1, id: candidate.id as string, secret: candidate.secret as string };
+    } catch {
+      sendJson(response, 403, { error: "pairing_failed" });
+      return;
+    }
+
+    const grant = credentialState.pairingGrants.find((candidate) => candidate.id === ticket.id);
+    if (!grant || !safeDigestEqual(grant.secretHash, hashSecret(ticket.secret))) {
+      sendJson(response, 403, { error: "pairing_failed" });
+      return;
+    }
+    const sessionToken = randomBytes(32).toString("base64url");
+    sessionTokenHashes.set(hashSecret(sessionToken), {
+      expiresAt: now() + PAIRING_SESSION_TTL_MS,
+      pairingGrantId: grant.id,
+    });
+    sendJson(response, 200, { sessionToken });
   }
 
   async function handlePairingCancel(
@@ -606,8 +845,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
       }
       if (currentTime >= attempt.expiresAt + PAIRING_ATTEMPT_TTL_MS) pairingAttempts.delete(id);
     }
-    for (const [tokenHash, expiresAt] of sessionTokenHashes) {
-      if (currentTime >= expiresAt) sessionTokenHashes.delete(tokenHash);
+    for (const [tokenHash, session] of sessionTokenHashes) {
+      if (currentTime >= session.expiresAt) sessionTokenHashes.delete(tokenHash);
     }
   }
 
@@ -618,8 +857,12 @@ export function createCompanionServer(options: CompanionServerOptions) {
     if (!/^[A-Za-z0-9_-]{43}$/u.test(token)) return false;
     prunePairingState();
     const tokenHash = hashSecret(token);
-    if (!sessionTokenHashes.has(tokenHash)) return false;
-    sessionTokenHashes.set(tokenHash, now() + PAIRING_SESSION_TTL_MS);
+    const session = sessionTokenHashes.get(tokenHash);
+    if (!session) return false;
+    sessionTokenHashes.set(tokenHash, {
+      ...session,
+      expiresAt: now() + PAIRING_SESSION_TTL_MS,
+    });
     return true;
   }
 
@@ -641,7 +884,11 @@ export function createCompanionServer(options: CompanionServerOptions) {
       const timer = setNodeTimeout(
         () => {
           clearPendingAuthorization();
-          authStatus = "blocked";
+          authStatus = liveSession
+            ? liveSession.scopes.has(PLAN_USE_SCOPE)
+              ? "scope_granted"
+              : "signed_in_no_plan"
+            : "blocked";
           safeMessage = "sign_in_timed_out";
         },
         Math.max(0, transaction.expiresAt - now()),
@@ -653,7 +900,6 @@ export function createCompanionServer(options: CompanionServerOptions) {
         authorizationUrl: url.toString(),
         browserOpenAttempts: 0,
       };
-      liveSession = undefined;
       authStatus = "signing_in";
       safeMessage = undefined;
       try {
@@ -753,17 +999,25 @@ export function createCompanionServer(options: CompanionServerOptions) {
         throw new Error("account_mismatch");
       }
       await options.installationStore.saveClientId(result.clientId, subjectHash);
-      liveSession = {
+      const nextSession: LiveSession = {
         accessToken: token.access_token,
         ...(typeof token.refresh_token === "string" ? { refreshToken: token.refresh_token } : {}),
         clientId: result.clientId,
         subject: identity.subject,
+        subjectHash,
         scopes,
         expiresAt: now() + token.expires_in * 1_000,
         models: [],
       };
+      const nextState: CredentialState = {
+        version: 1,
+        pairingGrants: credentialState.pairingGrants,
+        oauthSession: storedSessionFromLive(nextSession),
+      };
+      liveSession = nextSession;
       authStatus = scopes.has(PLAN_USE_SCOPE) ? "scope_granted" : "signed_in_no_plan";
-      safeMessage = scopes.has(PLAN_USE_SCOPE) ? undefined : "plan_use_scope_missing";
+      const saved = await persistCredentialState(nextState);
+      if (saved) safeMessage = scopes.has(PLAN_USE_SCOPE) ? undefined : "plan_use_scope_missing";
       sendCallbackPage(response, "complete");
     } catch (error) {
       if (receivedRefreshToken) {
@@ -771,9 +1025,12 @@ export function createCompanionServer(options: CompanionServerOptions) {
           () => false,
         );
       }
-      liveSession = undefined;
       const category = classifyError(error);
-      authStatus = "blocked";
+      authStatus = liveSession
+        ? liveSession.scopes.has(PLAN_USE_SCOPE)
+          ? "scope_granted"
+          : "signed_in_no_plan"
+        : "blocked";
       safeMessage = category;
       sendCallbackPage(response, "blocked");
     }
@@ -791,7 +1048,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       });
       if (!result.ok) {
         const category = classifyHttpStatus(result.status);
-        applySessionHttpFailure(category);
+        await applySessionHttpFailure(category);
         sendJson(response, result.status, { error: category, status: status() });
         return;
       }
@@ -866,7 +1123,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       );
       if (!result.ok) {
         const category = classifyHttpStatus(result.status);
-        applySessionHttpFailure(category);
+        await applySessionHttpFailure(category);
         sendJson(response, result.status, { error: category, status: status() });
         return;
       }
@@ -895,9 +1152,22 @@ export function createCompanionServer(options: CompanionServerOptions) {
   ): Promise<void> {
     clearPendingAuthorization();
     const session = liveSession;
+    const nextState: CredentialState = {
+      version: 1,
+      pairingGrants: credentialState.pairingGrants,
+    };
+    if (!(await persistCredentialState(nextState))) {
+      sendJson(response, 503, {
+        error: credentialStorageFailure ?? "secure_storage_unavailable",
+        status: status(),
+        revocation: "not_available",
+      });
+      return;
+    }
     liveSession = undefined;
     authStatus = "signed_out";
     safeMessage = undefined;
+
     let revocation = "not_available";
     if (session?.refreshToken) {
       try {
@@ -938,48 +1208,90 @@ export function createCompanionServer(options: CompanionServerOptions) {
       return { ok: false, statusCode: 403, error: "plan_use_scope_missing" };
     }
     if (liveSession.expiresAt > now() + 60_000) return { ok: true, value: liveSession };
-    if (!liveSession.refreshToken) {
-      authStatus = "session_expired";
-      safeMessage = "refresh_unavailable";
-      return { ok: false, statusCode: 401, error: "session_expired" };
-    }
-    try {
-      const metadata = await options.installationStore.load();
-      const discovery = await loadDiscovery();
-      validateDiscovery(discovery);
-      const result = await fetchWithTimeout(discovery.token_endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "refresh_token",
-          refresh_token: liveSession.refreshToken,
-          client_id: metadata.clientId ?? liveSession.clientId,
-          resource: RESPONSES_RESOURCE,
-        }),
-      });
-      if (!result.ok) throw new Error(await classifyOAuthResponse(result));
-      const token = (await readJsonResponse(result, 64 * 1_024, timeoutMs)) as TokenResponse;
-      if (!isAccessTokenResponse(token)) throw new Error("token_response_invalid");
-      const scopes =
-        typeof token.scope === "string" ? parseGrantedScopes(token.scope) : liveSession.scopes;
-      if (!scopes.has(PLAN_USE_SCOPE)) throw new Error("plan_use_scope_missing");
-      liveSession = {
-        ...liveSession,
-        accessToken: token.access_token,
-        ...(typeof token.refresh_token === "string" ? { refreshToken: token.refresh_token } : {}),
-        scopes,
-        expiresAt: now() + token.expires_in * 1_000,
-      };
-      authStatus = authStatus === "ready" ? "ready" : "scope_granted";
-      safeMessage = undefined;
-      return { ok: true, value: liveSession };
-    } catch (error) {
-      const category = classifyError(error);
-      authStatus = category === "plan_use_scope_missing" ? "signed_in_no_plan" : "session_expired";
-      safeMessage = category;
-      liveSession = undefined;
-      return { ok: false, statusCode: 401, error: category };
-    }
+    return refreshLiveSession();
+  }
+
+  function refreshLiveSession(): Promise<
+    { ok: true; value: LiveSession } | { ok: false; statusCode: number; error: string }
+  > {
+    if (refreshPromise) return refreshPromise;
+    const session = liveSession;
+    if (!session) return Promise.resolve({ ok: false, statusCode: 401, error: "signed_out" });
+    refreshPromise = (async () => {
+      if (!session.refreshToken) {
+        await requireSignIn("refresh_unavailable");
+        return { ok: false as const, statusCode: 401, error: "session_expired" };
+      }
+      try {
+        const discovery = await loadDiscovery();
+        validateDiscovery(discovery);
+        const result = await fetchWithTimeout(discovery.token_endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: session.refreshToken,
+            client_id: session.clientId,
+            resource: RESPONSES_RESOURCE,
+          }),
+        });
+        if (!result.ok) throw new Error(await classifyOAuthResponse(result));
+        const token = (await readJsonResponse(result, 64 * 1_024, timeoutMs)) as TokenResponse;
+        if (!isAccessTokenResponse(token)) throw new Error("token_response_invalid");
+        const scopes =
+          typeof token.scope === "string" ? parseGrantedScopes(token.scope) : session.scopes;
+        const refreshed: LiveSession = {
+          ...session,
+          accessToken: token.access_token,
+          ...(typeof token.refresh_token === "string" ? { refreshToken: token.refresh_token } : {}),
+          scopes,
+          expiresAt: now() + token.expires_in * 1_000,
+        };
+        liveSession = refreshed;
+        authStatus = scopes.has(PLAN_USE_SCOPE)
+          ? authStatus === "ready"
+            ? "ready"
+            : "scope_granted"
+          : "signed_in_no_plan";
+        safeMessage = scopes.has(PLAN_USE_SCOPE) ? undefined : "plan_use_scope_missing";
+        await persistCredentialState({
+          version: 1,
+          pairingGrants: credentialState.pairingGrants,
+          oauthSession: storedSessionFromLive(refreshed),
+        });
+        if (!scopes.has(PLAN_USE_SCOPE)) {
+          return { ok: false as const, statusCode: 403, error: "plan_use_scope_missing" };
+        }
+        return { ok: true as const, value: refreshed };
+      } catch (error) {
+        const category = classifyError(error);
+        if (category === "session_expired" || category === "client_id_mismatch") {
+          await requireSignIn(category);
+          return { ok: false as const, statusCode: 401, error: "session_expired" };
+        }
+        authStatus = session.scopes.has(PLAN_USE_SCOPE) ? "scope_granted" : "signed_in_no_plan";
+        safeMessage = category;
+        return {
+          ok: false as const,
+          statusCode: category === "plan_use_scope_missing" ? 403 : 503,
+          error: category,
+        };
+      }
+    })().finally(() => {
+      refreshPromise = undefined;
+    });
+    return refreshPromise;
+  }
+
+  async function requireSignIn(reason: string): Promise<void> {
+    liveSession = undefined;
+    authStatus = "session_expired";
+    safeMessage = reason;
+    await persistCredentialState({
+      version: 1,
+      pairingGrants: credentialState.pairingGrants,
+      reauthorizationRequired: true,
+    });
   }
 
   async function exchangeCode(
@@ -1049,9 +1361,11 @@ export function createCompanionServer(options: CompanionServerOptions) {
     }
   }
 
-  function applySessionHttpFailure(category: string): void {
-    if (category === "session_expired" || category === "plan_use_scope_missing") {
-      authStatus = category === "session_expired" ? "session_expired" : "signed_in_no_plan";
+  async function applySessionHttpFailure(category: string): Promise<void> {
+    if (category === "session_expired") {
+      await requireSignIn(category);
+    } else if (category === "plan_use_scope_missing") {
+      authStatus = "signed_in_no_plan";
       safeMessage = category;
     }
   }
@@ -1164,7 +1478,18 @@ async function classifyOAuthResponse(response: Response): Promise<string> {
       typeof (body as { error?: unknown }).error === "string"
     ) {
       const code = (body as { error: string }).error;
-      if (code === "invalid_grant") return "session_expired";
+      if (
+        [
+          "invalid_grant",
+          "invalid_refresh_token",
+          "token_expired",
+          "refresh_token_expired",
+          "refresh_token_invalidated",
+          "refresh_token_reused",
+        ].includes(code)
+      ) {
+        return "session_expired";
+      }
       if (code === "invalid_client" || code === "unauthorized_client") return "client_id_mismatch";
       if (code === "access_denied") return "consent_denied";
     }
@@ -1179,6 +1504,15 @@ function safeDigestEqual(left: string, right: string): boolean {
   const leftBytes = Buffer.from(left, "hex");
   const rightBytes = Buffer.from(right, "hex");
   return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
+}
+
+function storageErrorCategory(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  if (message === "credential_store_corrupt" || message === "secure_storage_corrupt") {
+    return "credential_store_corrupt";
+  }
+  if (message === "secure_storage_timeout") return "secure_storage_timeout";
+  return "secure_storage_unavailable";
 }
 
 function classifyError(error: unknown): string {
@@ -1212,6 +1546,9 @@ function classifyError(error: unknown): string {
     "public_client_unsupported",
     "host_id_invalid",
     "installation_store_invalid",
+    "secure_storage_unavailable",
+    "secure_storage_timeout",
+    "credential_store_corrupt",
   ]);
   if (allowed.has(message)) return message;
   if (error instanceof Error && error.name === "AbortError") return "request_timed_out";

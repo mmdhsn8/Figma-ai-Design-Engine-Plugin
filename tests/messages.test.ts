@@ -2,6 +2,34 @@ import { describe, expect, it } from "vitest";
 import { PluginToUISchema, UIToPluginSchema } from "../src/shared/messages";
 
 describe("plugin message contract", () => {
+  it("allows only encrypted local restore tickets through Figma client storage messages", () => {
+    const sealed = "FADP1T:" + "A".repeat(64);
+    expect(UIToPluginSchema.safeParse({ type: "load-companion-restore-ticket" }).success).toBe(
+      true,
+    );
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "save-companion-restore-ticket",
+        requestId: "storage-1",
+        ticket: sealed,
+      }).success,
+    ).toBe(true);
+    expect(
+      PluginToUISchema.safeParse({
+        type: "companion-restore-ticket",
+        ticket: sealed,
+        storageAvailable: true,
+      }).success,
+    ).toBe(true);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "save-companion-restore-ticket",
+        requestId: "storage-2",
+        ticket: "plaintext-bearer-token",
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts typed validate and generate requests", () => {
     expect(
       UIToPluginSchema.safeParse({ type: "validate", requestId: "r1", json: "{}" }).success,

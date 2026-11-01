@@ -32,8 +32,16 @@ const PairingAttemptSchema = z
   .strict();
 const PairingPollSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("pending") }).strict(),
-  z.object({ status: z.literal("approved"), sessionToken: z.string().min(32).max(128) }).strict(),
+  z
+    .object({
+      status: z.literal("approved"),
+      sessionToken: z.string().min(32).max(128),
+      restoreTicket: z.string().max(12_000).optional(),
+      restoreAvailable: z.boolean(),
+    })
+    .strict(),
 ]);
+const PairingRestoreSchema = z.object({ sessionToken: z.string().min(32).max(128) }).strict();
 const PairingActionSchema = z.object({ disconnected: z.literal(true) }).strict();
 const PairingCancelSchema = z.object({ cancelled: z.literal(true) }).strict();
 const ModelSchema = z
@@ -87,6 +95,9 @@ export type CompanionErrorCategory =
   | "registration_clear_failed"
   | "host_id_invalid"
   | "installation_store_invalid"
+  | "secure_storage_unavailable"
+  | "secure_storage_timeout"
+  | "credential_store_corrupt"
   | "unknown";
 
 export class CompanionClientError extends Error {
@@ -122,7 +133,15 @@ export async function pollLocalPairing(
   verifier: string,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
-): Promise<{ status: "pending" } | { status: "approved"; sessionToken: string }> {
+): Promise<
+  | { status: "pending" }
+  | {
+      status: "approved";
+      sessionToken: string;
+      restoreTicket?: string;
+      restoreAvailable: boolean;
+    }
+> {
   if (!/^[A-Za-z0-9_-]{43}$/u.test(attemptId) || !/^[A-Za-z0-9_-]{43}$/u.test(verifier)) {
     throw new CompanionClientError("pairing_failed");
   }
@@ -136,6 +155,29 @@ export async function pollLocalPairing(
   const parsed = PairingPollSchema.safeParse(body);
   if (!parsed.success) throw new CompanionClientError("unknown");
   return parsed.data;
+}
+
+export async function restoreLocalSession(
+  ticket: string,
+  fetcher: Fetcher = fetch,
+): Promise<string> {
+  if (!/^FADP1T:[A-Za-z0-9+/]+=*$/u.test(ticket) || ticket.length > 12_000) {
+    throw new CompanionClientError("pairing_failed");
+  }
+  const parsed = PairingRestoreSchema.safeParse(
+    await request("/v1/pairing/restore", undefined, { ticket }, fetcher),
+  );
+  if (!parsed.success) throw new CompanionClientError("unknown");
+  return parsed.data.sessionToken;
+}
+
+export async function restoreLocalCompanionSession(
+  ticket: string,
+  fetcher: Fetcher = fetch,
+): Promise<{ token: string; status: CompanionStatus }> {
+  const token = await restoreLocalSession(ticket, fetcher);
+  const status = await getCompanionStatus(token, fetcher);
+  return { token, status };
 }
 
 export async function reopenLocalApproval(
@@ -321,6 +363,9 @@ function mapError(value: string): CompanionErrorCategory {
     "registration_clear_failed",
     "host_id_invalid",
     "installation_store_invalid",
+    "secure_storage_unavailable",
+    "secure_storage_timeout",
+    "credential_store_corrupt",
   ];
   return known.includes(value as CompanionErrorCategory)
     ? (value as CompanionErrorCategory)

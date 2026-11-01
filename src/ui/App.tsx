@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import phase1Sample from "../samples/sample-design.json?raw";
 import phase2Sample from "../samples/phase-2-storefront.json?raw";
 import phase3Sample from "../samples/phase-3-design-system.json?raw";
@@ -34,6 +34,7 @@ import {
   reopenLocalApproval,
   reopenChatGPTSignIn,
   requestLocalPairing,
+  restoreLocalCompanionSession,
   runSmokeRequest,
   startChatGPTSignIn,
   switchChatGPTAccount,
@@ -48,7 +49,13 @@ type Notice = {
 };
 
 export type CompanionConnectionState =
-  "discovering" | "offline" | "available" | "approval_required" | "pairing" | "connected";
+  | "discovering"
+  | "reconnecting"
+  | "offline"
+  | "available"
+  | "approval_required"
+  | "pairing"
+  | "connected";
 
 export type PluginView = "design" | "json" | "assets" | "system" | "quality";
 export type ModelDiscoveryState = "idle" | "loading" | "loaded" | "empty" | "error";
@@ -73,27 +80,33 @@ export function getConnectionSummary(
   if (state !== "connected") {
     return (
       {
-        discovering: "Checking companion",
+        discovering: "Reconnecting",
+        reconnecting: "Reconnecting",
         offline: "Companion offline",
-        available: "Companion available",
-        approval_required: "Approval required",
-        pairing: "Connecting…",
+        available: "Sign-in required",
+        approval_required: "Reconnecting",
+        pairing: "Reconnecting",
         connected: "Connected",
       } satisfies Record<CompanionConnectionState, string>
     )[state];
   }
 
-  return (
-    {
-      signed_out: "ChatGPT not signed in",
-      signing_in: "Signing in",
-      signed_in_no_plan: "ChatGPT signed in",
-      scope_granted: "Plan use authorized",
-      ready: "Inference verified",
-      session_expired: "Session expired",
-      blocked: "Connection needs attention",
-    } satisfies Record<CompanionStatus["auth"], string>
-  )[status?.auth ?? "signed_out"];
+  if (
+    status?.safeMessage === "service_unavailable" ||
+    status?.safeMessage === "request_timed_out"
+  ) {
+    return "Reconnecting";
+  }
+  if (
+    status?.auth === "session_expired" ||
+    status?.auth === "signed_out" ||
+    status?.auth === "blocked"
+  ) {
+    return "Sign-in required";
+  }
+
+  if (status?.auth === "signing_in") return "Reconnecting";
+  return "Connected";
 }
 
 export function getModelAvailabilityMessage(
@@ -174,6 +187,9 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
   const [assetLicense, setAssetLicense] = useState("");
   const [assetAttribution, setAssetAttribution] = useState("");
   const [companionToken, setCompanionToken] = useState<string | null>(null);
+  const [restoreTicket, setRestoreTicket] = useState<string | null>(null);
+  const [restoreTicketLoaded, setRestoreTicketLoaded] = useState(false);
+  const [restoreStorageWarning, setRestoreStorageWarning] = useState(false);
   const [companionConnectionState, setCompanionConnectionState] =
     useState<CompanionConnectionState>("discovering");
   const [pairingAttemptId, setPairingAttemptId] = useState<string | null>(null);
@@ -188,6 +204,9 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
   const smokeAbort = useRef<AbortController | null>(null);
   const pairingAbort = useRef<AbortController | null>(null);
   const pairingAttempt = useRef<{ attemptId: string; verifier: string } | null>(null);
+  const restoreTicketWrites = useRef(
+    new Map<string, { resolve: (success: boolean) => void; timeout: number }>(),
+  );
   const [multiProgress, setMultiProgress] = useState<MultiScreenProgressMessage | null>(null);
   const [multiReport, setMultiReport] = useState<MultiScreenRenderResultMessage | null>(null);
   const currentRequest = useRef<string | null>(null);
@@ -226,6 +245,21 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       const result = PluginToUISchema.safeParse(raw);
       if (!result.success) return;
       const message = result.data;
+      if (message.type === "companion-restore-ticket") {
+        setRestoreTicket(message.ticket);
+        setRestoreTicketLoaded(true);
+        setRestoreStorageWarning(!message.storageAvailable);
+        return;
+      }
+      if (message.type === "companion-restore-ticket-saved") {
+        const pending = restoreTicketWrites.current.get(message.requestId);
+        if (pending) {
+          window.clearTimeout(pending.timeout);
+          restoreTicketWrites.current.delete(message.requestId);
+          pending.resolve(message.success);
+        }
+        return;
+      }
       if (message.type === "protocol-error") {
         currentRequest.current = null;
         setBusy(false);
@@ -336,8 +370,23 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     };
 
     window.addEventListener("message", handleMessage);
+    postToPlugin({ type: "load-companion-restore-ticket" });
     return () => window.removeEventListener("message", handleMessage);
   }, []);
+
+  const persistRestoreTicket = useCallback(
+    (ticket: string | null): Promise<boolean> =>
+      new Promise((resolve) => {
+        const requestId = `storage-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const timeout = window.setTimeout(() => {
+          restoreTicketWrites.current.delete(requestId);
+          resolve(false);
+        }, 5_000);
+        restoreTicketWrites.current.set(requestId, { resolve, timeout });
+        postToPlugin({ type: "save-companion-restore-ticket", requestId, ticket });
+      }),
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -359,14 +408,50 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
             if (cancelled) return;
             setCompanionStatus(status);
             setCompanionConnectionState("connected");
-          } catch {
+          } catch (error) {
             if (cancelled) return;
-            setCompanionToken(null);
-            setCompanionStatus(null);
-            setCompanionModels([]);
-            setSelectedCompanionModel("");
-            setModelDiscovery("idle");
-            setCompanionConnectionState("available");
+            if (error instanceof CompanionClientError && error.category === "pairing_required") {
+              setCompanionToken(null);
+              setCompanionStatus(null);
+              setCompanionModels([]);
+              setSelectedCompanionModel("");
+              setModelDiscovery("idle");
+              setCompanionConnectionState(restoreTicket ? "reconnecting" : "available");
+            } else {
+              setCompanionConnectionState("reconnecting");
+            }
+          }
+        } else if (!restoreTicketLoaded) {
+          setCompanionConnectionState("discovering");
+          timer = window.setTimeout(() => void checkConnection(), 250);
+          return;
+        } else if (restoreTicket) {
+          try {
+            const restored = await restoreLocalCompanionSession(restoreTicket);
+            if (cancelled) return;
+            setCompanionToken(restored.token);
+            setCompanionStatus(restored.status);
+            setCompanionConnectionState("connected");
+            setCompanionError(null);
+          } catch (error) {
+            if (cancelled) return;
+            if (
+              error instanceof CompanionClientError &&
+              ["pairing_failed", "pairing_required"].includes(error.category)
+            ) {
+              const cleared = await persistRestoreTicket(null);
+              setRestoreTicket(null);
+              setRestoreStorageWarning(!cleared);
+              setCompanionConnectionState("available");
+              setCompanionError(
+                cleared
+                  ? "The saved local approval is no longer valid. Connect again to approve this plugin."
+                  : "The saved local approval is no longer valid, and Figma could not clear its saved ticket.",
+              );
+            } else {
+              setCompanionConnectionState("reconnecting");
+              setCompanionError(companionErrorText(error));
+            }
           }
         } else {
           setCompanionConnectionState("available");
@@ -374,13 +459,6 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       } catch {
         if (cancelled) return;
         setCompanionConnectionState("offline");
-        if (companionToken) {
-          setCompanionToken(null);
-          setCompanionStatus(null);
-          setCompanionModels([]);
-          setSelectedCompanionModel("");
-          setModelDiscovery("idle");
-        }
       }
       if (!cancelled) timer = window.setTimeout(() => void checkConnection(), 5_000);
     };
@@ -389,7 +467,13 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [companionConnectionState, companionToken]);
+  }, [
+    companionConnectionState,
+    companionToken,
+    persistRestoreTicket,
+    restoreTicket,
+    restoreTicketLoaded,
+  ]);
 
   useEffect(() => {
     if (
@@ -521,6 +605,8 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     setSmokeResult(null);
     try {
       let token = companionToken;
+      let pairingRestoreTicket: string | null = null;
+      let pairingRestoreAvailable = true;
       if (!token) {
         setCompanionConnectionState("pairing");
         const verifier = createPairingVerifier();
@@ -544,6 +630,8 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
           );
           if (result.status === "approved") {
             token = result.sessionToken;
+            pairingRestoreTicket = result.restoreTicket ?? null;
+            pairingRestoreAvailable = result.restoreAvailable;
             break;
           }
           await new Promise((resolve) => window.setTimeout(resolve, 1_000));
@@ -553,6 +641,14 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
         setPairingAttemptId(null);
         pairingAbort.current = null;
         setCompanionToken(token);
+        setRestoreTicket(pairingRestoreTicket);
+        if (pairingRestoreTicket) {
+          const stored = await persistRestoreTicket(pairingRestoreTicket);
+          setRestoreStorageWarning(!stored);
+        } else {
+          setRestoreStorageWarning(true);
+        }
+        if (!pairingRestoreAvailable) setRestoreStorageWarning(true);
         setCompanionConnectionState("connected");
       }
       let status = await getCompanionStatus(token);
@@ -705,14 +801,21 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     setCompanionBusy(true);
     try {
       await disconnectLocalSession(companionToken);
-      setCompanionError(null);
-    } catch (error) {
-      setCompanionError(companionErrorText(error));
-    } finally {
+      const cleared = await persistRestoreTicket(null);
+      setRestoreTicket(null);
+      setRestoreStorageWarning(!cleared);
       setCompanionToken(null);
       setCompanionStatus(null);
       clearConnectedAccountDetails();
       setCompanionConnectionState("available");
+      setCompanionError(
+        cleared
+          ? null
+          : "The local connection was revoked, but Figma could not clear its encrypted saved ticket.",
+      );
+    } catch (error) {
+      setCompanionError(companionErrorText(error));
+    } finally {
       setCompanionBusy(false);
     }
   };
@@ -935,7 +1038,15 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
           <div className="brand-subtitle">Structured, editable design workflows</div>
         </div>
         <span
-          className={`connection-chip ${companionToken ? "is-connected" : ""}`}
+          className={`connection-chip ${companionToken ? "is-connected" : ""} ${
+            companionConnectionState === "offline"
+              ? "is-offline"
+              : connectionSummary === "Reconnecting"
+                ? "is-reconnecting"
+                : connectionSummary === "Sign-in required"
+                  ? "is-sign-in-required"
+                  : ""
+          }`}
           aria-live="polite"
           aria-label={`Connection status: ${connectionSummary}`}
         >
@@ -1256,6 +1367,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                 (
                   {
                     discovering: "Checking local companion…",
+                    reconnecting: "Restoring saved connection…",
                     offline: "Companion offline",
                     available: "Companion available · sign-in not checked",
                     approval_required: "Local approval required",
@@ -1265,26 +1377,37 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                 )[companionConnectionState]}
             </span>
           </div>
+          {restoreStorageWarning && (
+            <p className="ai-gate-note" role="status">
+              Secure session restoration is unavailable. This connection works now, but Figma or the
+              companion may ask for local approval or ChatGPT sign-in again after a restart.
+            </p>
+          )}
           {!companionToken ? (
             <>
               {companionConnectionState === "offline" ||
-              companionConnectionState === "discovering" ? (
+              companionConnectionState === "discovering" ||
+              companionConnectionState === "reconnecting" ? (
                 <>
                   <p className="ai-gate-note">
-                    The local companion is not available. In PowerShell, run{" "}
-                    <code>npm run companion</code>
-                    from the project folder, then retry here. The plugin cannot launch local
-                    executables.
+                    {companionConnectionState === "reconnecting" && restoreTicket
+                      ? "Restoring the previous local approval. Keep the companion running."
+                      : "The local companion is not available. In PowerShell, run npm run companion from the project folder, then retry here. The plugin cannot launch local executables."}
                   </p>
                   <button
                     className="system-action"
                     type="button"
                     onClick={() => setCompanionConnectionState("discovering")}
-                    disabled={companionConnectionState === "discovering"}
+                    disabled={
+                      companionConnectionState === "discovering" ||
+                      companionConnectionState === "reconnecting"
+                    }
                   >
                     {companionConnectionState === "discovering"
                       ? "Checking companion…"
-                      : "Retry connection"}
+                      : companionConnectionState === "reconnecting"
+                        ? "Restoring connection…"
+                        : "Retry connection"}
                   </button>
                 </>
               ) : companionConnectionState === "approval_required" ||
@@ -1962,6 +2085,12 @@ function companionErrorText(error: unknown): string {
     response_too_large: "The streamed smoke response exceeded the local safety limit.",
     registration_clear_failed:
       "The local session was cleared, but the saved account registration could not be removed. Close the companion before trying again.",
+    secure_storage_unavailable:
+      "Windows protected storage is unavailable. This session works in memory, but it cannot be restored after the companion restarts.",
+    secure_storage_timeout:
+      "Windows protected storage did not respond in time. The session remains available in memory; retry before restarting the companion.",
+    credential_store_corrupt:
+      "The protected session file is damaged or cannot be unlocked. Sign in again after confirming the companion is running as your Windows user.",
     host_id_invalid:
       "The local installation host ID is not in the documented format. Sign-in was stopped before opening the browser.",
     installation_store_invalid:

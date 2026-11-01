@@ -1,11 +1,13 @@
 import { spawn } from "node:child_process";
 import { COMPANION_HOSTNAME, COMPANION_PORT } from "./config.js";
+import { createCredentialStore } from "./credential-store.js";
 import { createInstallationStore } from "./installation-store.js";
 import { createCompanionServer } from "./server.js";
 
 const companion = createCompanionServer({
   port: COMPANION_PORT,
   installationStore: createInstallationStore(),
+  credentialStore: createCredentialStore(),
   openBrowser: openSystemBrowser,
 });
 
@@ -18,7 +20,9 @@ console.log(
 console.log(
   "Open the Figma AI Design Engine plugin and choose Continue with ChatGPT. The first connection opens a local approval page in your system browser.",
 );
-console.log("Press Ctrl+C to stop. OAuth tokens are held in memory only and cleared on exit.");
+console.log(
+  "Press Ctrl+C to stop. Sign-in restores from Windows-protected local storage when available.",
+);
 
 let stopping = false;
 async function stop() {

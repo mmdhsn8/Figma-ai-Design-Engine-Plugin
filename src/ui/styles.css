@@ -1028,6 +1028,18 @@ body {
   background: #78c6a6;
 }
 
+.connection-chip.is-offline .connection-dot {
+  background: #777a84;
+}
+
+.connection-chip.is-reconnecting .connection-dot {
+  background: #dfb15b;
+}
+
+.connection-chip.is-sign-in-required .connection-dot {
+  background: #d89372;
+}
+
 .settings-button {
   min-height: 30px;
   display: inline-flex;

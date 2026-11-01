@@ -7,6 +7,7 @@ import { renderDesign, renderMultiScreenDesign } from "./renderer";
 import { collectFontRequirements, unavailableFontWarnings } from "./font-preflight";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
+const COMPANION_RESTORE_TICKET_KEY = "companion-restore-ticket-v1";
 
 function send(message: PluginToUIMessage): void {
   figma.ui.postMessage(message);
@@ -32,6 +33,43 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     send({
       type: "protocol-error",
       message: "The plugin received an invalid request. Reload the plugin and try again.",
+    });
+    return;
+  }
+
+  if (message.data.type === "load-companion-restore-ticket") {
+    try {
+      const saved: unknown = await figma.clientStorage.getAsync(COMPANION_RESTORE_TICKET_KEY);
+      const ticket =
+        typeof saved === "string" &&
+        saved.length <= 12_000 &&
+        /^FADP1T:[A-Za-z0-9+/]+=*$/u.test(saved)
+          ? saved
+          : null;
+      send({ type: "companion-restore-ticket", ticket, storageAvailable: true });
+    } catch {
+      send({ type: "companion-restore-ticket", ticket: null, storageAvailable: false });
+    }
+    return;
+  }
+
+  if (message.data.type === "save-companion-restore-ticket") {
+    let success = true;
+    try {
+      if (message.data.ticket === null) {
+        await figma.clientStorage.deleteAsync(COMPANION_RESTORE_TICKET_KEY);
+      } else if (/^FADP1T:[A-Za-z0-9+/]+=*$/u.test(message.data.ticket)) {
+        await figma.clientStorage.setAsync(COMPANION_RESTORE_TICKET_KEY, message.data.ticket);
+      } else {
+        success = false;
+      }
+    } catch {
+      success = false;
+    }
+    send({
+      type: "companion-restore-ticket-saved",
+      requestId: message.data.requestId,
+      success,
     });
     return;
   }
@@ -93,11 +131,12 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
   }
 
   if (message.data.type === "generate-multi-screen") {
+    const requestId = message.data.requestId;
     const multiResult = parseMultiScreenText(message.data.json);
     if (!multiResult.success) {
       send({
         type: "render-error",
-        requestId: message.data.requestId,
+        requestId,
         message: "The multi-screen JSON needs corrections before generation.",
         errors: multiResult.errors,
       });
@@ -107,14 +146,13 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       const result = await renderMultiScreenDesign(figma, multiResult.data, {
         gap: message.data.gap,
         maxRowWidth: message.data.maxRowWidth,
-        onProgress: (progress) =>
-          send({ type: "multi-screen-progress", requestId: message.data.requestId, ...progress }),
+        onProgress: (progress) => send({ type: "multi-screen-progress", requestId, ...progress }),
       });
-      send({ type: "multi-screen-result", requestId: message.data.requestId, ...result });
+      send({ type: "multi-screen-result", requestId, ...result });
     } catch (error) {
       send({
         type: "render-error",
-        requestId: message.data.requestId,
+        requestId,
         message:
           error instanceof Error ? error.message : "An unexpected Figma error occurred. Try again.",
       });

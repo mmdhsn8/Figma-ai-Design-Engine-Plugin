@@ -86,12 +86,12 @@ describe("plugin UI navigation and capability states", () => {
 
   it("shows distinct local, account, scope, and inference status labels", () => {
     expect(getConnectionSummary("offline", null)).toBe("Companion offline");
-    expect(getConnectionSummary("connected", status("signed_in_no_plan"))).toBe(
-      "ChatGPT signed in",
-    );
-    expect(getConnectionSummary("connected", status("scope_granted"))).toBe("Plan use authorized");
-    expect(getConnectionSummary("connected", status("ready"))).toBe("Inference verified");
-    expect(getConnectionSummary("connected", status("blocked"))).toBe("Connection needs attention");
+    expect(getConnectionSummary("discovering", null)).toBe("Reconnecting");
+    expect(getConnectionSummary("connected", status("session_expired"))).toBe("Sign-in required");
+    expect(getConnectionSummary("connected", status("signed_out"))).toBe("Sign-in required");
+    expect(getConnectionSummary("connected", status("scope_granted"))).toBe("Connected");
+    expect(getConnectionSummary("connected", status("ready"))).toBe("Connected");
+    expect(getConnectionSummary("connected", status("blocked"))).toBe("Sign-in required");
   });
 
   it("renders truthful loading, empty, error, and unconfigured model states", () => {

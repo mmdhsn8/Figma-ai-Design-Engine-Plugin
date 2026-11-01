@@ -102,6 +102,18 @@ const MultiScreenRenderResultSchema = z
   .strict();
 
 export const UIToPluginSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("load-companion-restore-ticket") }).strict(),
+  z
+    .object({
+      type: z.literal("save-companion-restore-ticket"),
+      requestId: z.string().min(1).max(100),
+      ticket: z
+        .string()
+        .regex(/^FADP1T:[A-Za-z0-9+/]+=*$/u)
+        .max(12_000)
+        .nullable(),
+    })
+    .strict(),
   RequestSchema.extend({ type: z.literal("validate") }).strict(),
   RequestSchema.extend({ type: z.literal("generate") }).strict(),
   RequestSchema.extend({
@@ -116,6 +128,24 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
 ]);
 
 export const PluginToUISchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("companion-restore-ticket"),
+      ticket: z
+        .string()
+        .regex(/^FADP1T:[A-Za-z0-9+/]+=*$/u)
+        .max(12_000)
+        .nullable(),
+      storageAvailable: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("companion-restore-ticket-saved"),
+      requestId: z.string(),
+      success: z.boolean(),
+    })
+    .strict(),
   z
     .object({
       type: z.literal("validation-result"),

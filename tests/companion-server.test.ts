@@ -8,6 +8,7 @@ import {
   createCodeChallenge,
   type OidcDiscovery,
 } from "../src/companion/oauth.js";
+import { createMemoryCredentialStore } from "../src/companion/credential-store.js";
 import { createCompanionServer, type CompanionServerHandle } from "../src/companion/server.js";
 
 const discovery: OidcDiscovery = {
@@ -126,7 +127,11 @@ describe("loopback companion", () => {
       body: { attemptId: pairing.attemptId, verifier },
     });
     expect(paired.status).toBe(200);
-    const pairingResult = (await paired.json()) as { status: string; sessionToken: string };
+    const pairingResult = (await paired.json()) as {
+      status: string;
+      sessionToken: string;
+      restoreTicket: string;
+    };
     expect(pairingResult.status).toBe("approved");
     expect(pairingResult.sessionToken).toHaveLength(43);
 
@@ -150,6 +155,13 @@ describe("loopback companion", () => {
     expect(
       (await request(harness.handle, "/v1/status", { token: pairingResult.sessionToken })).status,
     ).toBe(401);
+    expect(
+      (
+        await request(harness.handle, "/v1/pairing/restore", {
+          body: { ticket: pairingResult.restoreTicket },
+        })
+      ).status,
+    ).toBe(403);
   });
 
   it("renders approval controls for an allowlisted opaque-origin top-level GET and rejects cross-site GET", async () => {
@@ -420,6 +432,126 @@ describe("loopback companion", () => {
     openHandles.push(restartedHandle);
     const oldTokenResponse = await request(restartedHandle, "/v1/status", { token });
     expect(oldTokenResponse.status).toBe(401);
+  });
+
+  it("restores an explicitly approved plugin session after UI and companion restarts", async () => {
+    const harness = await createHarness();
+    const paired = await harness.pairWithTicket();
+    expect(paired.restoreTicket).toMatch(/^FADP1T:/u);
+    expect(
+      (await request(harness.handle, "/v1/status", { token: paired.sessionToken })).status,
+    ).toBe(200);
+
+    const restartedHandle = await harness.restart();
+    expect(
+      (await request(restartedHandle, "/v1/status", { token: paired.sessionToken })).status,
+    ).toBe(401);
+    const restored = await request(restartedHandle, "/v1/pairing/restore", {
+      body: { ticket: paired.restoreTicket },
+    });
+    expect(restored.status).toBe(200);
+    const restoredToken = (await restored.json()) as { sessionToken: string };
+    expect(
+      (await request(restartedHandle, "/v1/status", { token: restoredToken.sessionToken })).status,
+    ).toBe(200);
+    expect(
+      (
+        await request(restartedHandle, "/v1/pairing/restore", {
+          body: { ticket: "FADP1T:" + "A".repeat(64) },
+        })
+      ).status,
+    ).toBe(403);
+  });
+
+  it("restores OAuth after companion restart and rotates the refresh token using the issued client", async () => {
+    const harness = await createHarness({ expiresIn: 2, refresh: true });
+    const paired = await harness.pairWithTicket();
+    await request(harness.handle, "/v1/auth/start", { token: paired.sessionToken, body: {} });
+    await completeLogin(harness);
+    expect(harness.storeSnapshot()).not.toContain("access-secret");
+
+    harness.advanceTime(5_000);
+    const restartedHandle = await harness.restart();
+    expect(harness.refreshRequest).toContain("grant_type=refresh_token");
+    expect(harness.refreshRequest).toContain("client_id=issued-public-client");
+    expect(harness.refreshRequest).toContain("resource=https%3A%2F%2Fapi.openai.com%2Fv1");
+    const restored = await request(restartedHandle, "/v1/pairing/restore", {
+      body: { ticket: paired.restoreTicket },
+    });
+    const restoredToken = (await restored.json()) as { sessionToken: string };
+    const status = await request(restartedHandle, "/v1/status", {
+      token: restoredToken.sessionToken,
+    });
+    expect(await status.json()).toMatchObject({ auth: "scope_granted", planUseAuthorized: true });
+    expect(
+      (
+        await request(restartedHandle, "/v1/models", {
+          token: restoredToken.sessionToken,
+          body: {},
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  it("restores a valid saved OAuth session after a companion restart without another browser prompt", async () => {
+    const harness = await createHarness({ refresh: true });
+    const paired = await harness.pairWithTicket();
+    await request(harness.handle, "/v1/auth/start", { token: paired.sessionToken, body: {} });
+    await completeLogin(harness);
+    const authorizationUrl = harness.openedUrl;
+
+    const restartedHandle = await harness.restart();
+    const restored = await request(restartedHandle, "/v1/pairing/restore", {
+      body: { ticket: paired.restoreTicket },
+    });
+    const restoredToken = ((await restored.json()) as { sessionToken: string }).sessionToken;
+    const status = await request(restartedHandle, "/v1/status", { token: restoredToken });
+    expect(await status.json()).toMatchObject({ auth: "scope_granted", planUseAuthorized: true });
+    expect(harness.openedUrl).toBe(authorizationUrl);
+    expect(harness.refreshRequest).toBeUndefined();
+  });
+
+  it("keeps the local pairing when ChatGPT is disconnected and clears it only on account switch", async () => {
+    const harness = await createHarness();
+    const originalHostId = (await harness.store.load()).extAgentHostId;
+    const paired = await harness.pairWithTicket();
+    await request(harness.handle, "/v1/auth/start", { token: paired.sessionToken, body: {} });
+    await completeLogin(harness);
+    await request(harness.handle, "/v1/disconnect", { token: paired.sessionToken, body: {} });
+
+    let restartedHandle = await harness.restart();
+    const localRestore = await request(restartedHandle, "/v1/pairing/restore", {
+      body: { ticket: paired.restoreTicket },
+    });
+    expect(localRestore.status).toBe(200);
+    const restoredToken = ((await localRestore.json()) as { sessionToken: string }).sessionToken;
+    expect(
+      await (await request(restartedHandle, "/v1/status", { token: restoredToken })).json(),
+    ).toMatchObject({
+      auth: "signed_out",
+    });
+
+    await request(restartedHandle, "/v1/auth/start", { token: restoredToken, body: {} });
+    await completeLogin(harness);
+    const switched = await request(restartedHandle, "/v1/account/switch", {
+      token: restoredToken,
+      body: {},
+    });
+    expect(await switched.json()).toMatchObject({ registrationForgotten: true });
+    expect((await harness.store.load()).clientId).toBeUndefined();
+    expect((await harness.store.load()).extAgentHostId).toBe(originalHostId);
+
+    restartedHandle = await harness.restart();
+    const afterSwitch = await request(restartedHandle, "/v1/pairing/restore", {
+      body: { ticket: paired.restoreTicket },
+    });
+    expect(afterSwitch.status).toBe(200);
+    const tokenAfterSwitch = ((await afterSwitch.json()) as { sessionToken: string }).sessionToken;
+    expect(
+      await (await request(restartedHandle, "/v1/status", { token: tokenAfterSwitch })).json(),
+    ).toMatchObject({
+      auth: "signed_out",
+    });
   });
 
   it("rate limits approval attempts and rejects extra request properties", async () => {
@@ -719,7 +851,8 @@ describe("loopback companion", () => {
 
   it("maps a revoked refresh credential to an expired-session state", async () => {
     const harness = await createHarness({ expiresIn: 2, refresh: true, refreshFailure: true });
-    const token = await harness.pair();
+    const paired = await harness.pairWithTicket();
+    const token = paired.sessionToken;
     await request(harness.handle, "/v1/auth/start", { token, body: {} });
     await completeLogin(harness);
     harness.advanceTime(5_000);
@@ -728,6 +861,38 @@ describe("loopback companion", () => {
     expect(await models.json()).toMatchObject({ error: "session_expired" });
     const status = await request(harness.handle, "/v1/status", { token });
     expect(await status.json()).toMatchObject({ auth: "session_expired" });
+
+    const restartedHandle = await harness.restart();
+    const restored = await request(restartedHandle, "/v1/pairing/restore", {
+      body: { ticket: paired.restoreTicket },
+    });
+    const restoredToken = ((await restored.json()) as { sessionToken: string }).sessionToken;
+    expect(
+      await (await request(restartedHandle, "/v1/status", { token: restoredToken })).json(),
+    ).toMatchObject({ auth: "session_expired" });
+  });
+
+  it("persists sign-in required when an upstream request confirms the access token was revoked", async () => {
+    const harness = await createHarness({ modelsUnauthorized: true });
+    const paired = await harness.pairWithTicket();
+    await request(harness.handle, "/v1/auth/start", { token: paired.sessionToken, body: {} });
+    await completeLogin(harness);
+
+    const rejected = await request(harness.handle, "/v1/models", {
+      token: paired.sessionToken,
+      body: {},
+    });
+    expect(rejected.status).toBe(401);
+    expect(await rejected.json()).toMatchObject({ error: "session_expired" });
+
+    const restartedHandle = await harness.restart();
+    const restored = await request(restartedHandle, "/v1/pairing/restore", {
+      body: { ticket: paired.restoreTicket },
+    });
+    const restoredToken = ((await restored.json()) as { sessionToken: string }).sessionToken;
+    expect(
+      await (await request(restartedHandle, "/v1/status", { token: restoredToken })).json(),
+    ).toMatchObject({ auth: "session_expired" });
   });
 
   it("handles consent denial only after checking the original state and makes no token request", async () => {
@@ -762,7 +927,7 @@ describe("loopback companion", () => {
     await restarted.close();
   });
 
-  it("uses rotated refresh credentials only in memory", async () => {
+  it("persists the rotated refresh credential securely for the next companion restart", async () => {
     const harness = await createHarness({
       scope: `openid profile ${PLAN_USE_SCOPE}`,
       expiresIn: 2,
@@ -777,6 +942,10 @@ describe("loopback companion", () => {
     expect(harness.refreshRequest).toContain("refresh_token=refresh-old");
     expect(harness.storeSnapshot()).not.toContain("refresh-new");
     expect(harness.storeSnapshot()).not.toContain("access-rotated");
+
+    harness.advanceTime(3_601_000);
+    await harness.restart();
+    expect(harness.refreshRequest).toContain("refresh_token=refresh-new");
   });
 });
 
@@ -786,6 +955,7 @@ async function createHarness(
     expiresIn?: number;
     refresh?: boolean;
     refreshFailure?: boolean;
+    modelsUnauthorized?: boolean;
     usageFailure?: boolean;
     stalledStream?: boolean;
     oauthBrowserFailures?: number;
@@ -816,6 +986,7 @@ async function createHarness(
   let authNonce = "";
   let authTransactionUrl: URL | undefined;
   let currentSubject = "opaque-subject";
+  const credentialStore = createMemoryCredentialStore();
   const store = {
     async load() {
       return { ...storeData };
@@ -865,6 +1036,9 @@ async function createHarness(
       });
     }
     if (url === "https://api.openai.com/v1/models") {
+      if (options.modelsUnauthorized) {
+        return Response.json({ error: "invalid_token" }, { status: 401 });
+      }
       const authorization = new Headers(init?.headers).get("authorization");
       if (authorization !== "Bearer access-secret" && authorization !== "Bearer access-rotated") {
         return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -910,25 +1084,27 @@ async function createHarness(
     }
     return Response.json({ error: "unexpected_test_request" }, { status: 500 });
   };
-  const companion = createCompanionServer({
-    port: 0,
-    fetchImpl,
-    installationStore: store,
-    now: () => currentTime,
-    openBrowser: async (url) => {
-      openedUrl = url;
-      const parsedUrl = new URL(url);
-      if (parsedUrl.pathname.includes("/api/accounts/authorize")) {
-        if ((options.oauthBrowserFailures ?? 0) > 0) {
-          options.oauthBrowserFailures = (options.oauthBrowserFailures ?? 0) - 1;
-          throw new Error("system_browser_unavailable");
+  const createCompanion = () =>
+    createCompanionServer({
+      port: 0,
+      fetchImpl,
+      installationStore: store,
+      credentialStore,
+      now: () => currentTime,
+      openBrowser: async (url) => {
+        openedUrl = url;
+        const parsedUrl = new URL(url);
+        if (parsedUrl.pathname.includes("/api/accounts/authorize")) {
+          if ((options.oauthBrowserFailures ?? 0) > 0) {
+            options.oauthBrowserFailures = (options.oauthBrowserFailures ?? 0) - 1;
+            throw new Error("system_browser_unavailable");
+          }
+          authTransactionUrl = parsedUrl;
+          authNonce = parsedUrl.searchParams.get("nonce") ?? "";
         }
-        authTransactionUrl = parsedUrl;
-        authNonce = parsedUrl.searchParams.get("nonce") ?? "";
-      }
-    },
-  });
-  const handle = await companion.start();
+      },
+    });
+  let handle = await createCompanion().start();
   openHandles.push(handle);
 
   return {
@@ -947,6 +1123,9 @@ async function createHarness(
       return codeExchange;
     },
     async pair() {
+      return (await this.pairWithTicket()).sessionToken;
+    },
+    async pairWithTicket() {
       const verifier = randomBytes(32).toString("base64url");
       const attempt = await beginPairing(handle, verifier);
       const approvalPage = await getApprovalPage(handle, attempt.attemptId);
@@ -956,7 +1135,17 @@ async function createHarness(
       const result = await request(handle, "/v1/pairing/poll", {
         body: { attemptId: attempt.attemptId, verifier },
       });
-      return ((await result.json()) as { sessionToken: string }).sessionToken;
+      return (await result.json()) as {
+        sessionToken: string;
+        restoreTicket: string;
+        restoreAvailable: boolean;
+      };
+    },
+    async restart() {
+      await handle.close();
+      handle = await createCompanion().start();
+      openHandles.push(handle);
+      return handle;
     },
     advanceTime(milliseconds: number) {
       currentTime += milliseconds;
