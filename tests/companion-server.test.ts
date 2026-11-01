@@ -78,6 +78,8 @@ describe("loopback companion", () => {
     );
     expect(approvalPage.status).toBe(200);
     const html = await approvalPage.text();
+    expect(html).toContain('name="decision" value="approve"');
+    expect(html).toContain('name="decision" value="deny"');
     expect(html).toContain("cannot verify whether the request came from Figma AI Design Engine");
     expect(html).not.toContain("sessionToken");
     const csrf = html.match(/name="csrf" value="([A-Za-z0-9_-]{43})"/u)?.[1];
@@ -93,8 +95,10 @@ describe("loopback companion", () => {
       },
     );
     expect(crossSiteApproval.status).toBe(403);
+    expect(await crossSiteApproval.text()).toContain("browser origin could not be verified");
     const missingCsrf = await submitApproval(harness.handle, pairing.attemptId, "wrong", "approve");
     expect(missingCsrf.status).toBe(403);
+    expect(await missingCsrf.text()).toContain("approval proof was invalid");
     const approved = await submitApproval(harness.handle, pairing.attemptId, csrf!, "approve");
     expect(approved.status).toBe(200);
     const approvalReplay = await submitApproval(
@@ -103,7 +107,8 @@ describe("loopback companion", () => {
       csrf!,
       "approve",
     );
-    expect(approvalReplay.status).toBe(403);
+    expect(approvalReplay.status).toBe(410);
+    expect(await approvalReplay.text()).toContain("Local companion access was already approved");
 
     const wrongProof = await request(harness.handle, "/v1/pairing/poll", {
       body: { attemptId: pairing.attemptId, verifier: "B".repeat(43) },
@@ -139,6 +144,109 @@ describe("loopback companion", () => {
     ).toBe(401);
   });
 
+  it("accepts a valid browser form when optional Fetch Metadata headers are omitted", async () => {
+    const harness = await createHarness();
+    const verifier = randomBytes(32).toString("base64url");
+    const pairing = await beginPairing(harness.handle, verifier);
+    const page = await fetch(
+      `http://localhost:${harness.handle.port}/local-approval/${pairing.attemptId}`,
+    );
+    const html = await page.text();
+    expect(page.status).toBe(200);
+    expect(html).toContain('name="decision" value="approve"');
+    const csrf = html.match(/name="csrf" value="([A-Za-z0-9_-]{43})"/u)?.[1];
+    expect(csrf).toBeDefined();
+
+    const approved = await submitApproval(harness.handle, pairing.attemptId, csrf!, "approve", {
+      omitFetchMetadata: true,
+    });
+    expect(approved.status).toBe(200);
+    expect(await approved.text()).toContain("Local companion access was approved");
+
+    const paired = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: pairing.attemptId, verifier },
+    });
+    expect(paired.status).toBe(200);
+    expect(await paired.json()).toMatchObject({ status: "approved" });
+  });
+
+  it("accepts a user-initiated navigation metadata value with the CSRF proof", async () => {
+    const harness = await createHarness();
+    const verifier = randomBytes(32).toString("base64url");
+    const pairing = await beginPairing(harness.handle, verifier);
+    const page = await fetch(
+      `http://localhost:${harness.handle.port}/local-approval/${pairing.attemptId}`,
+    );
+    const html = await page.text();
+    const csrf = html.match(/name="csrf" value="([A-Za-z0-9_-]{43})"/u)?.[1] ?? "";
+    const approved = await submitApproval(harness.handle, pairing.attemptId, csrf, "approve", {
+      fetchSite: "none",
+    });
+    expect(approved.status).toBe(200);
+  });
+
+  it("keeps a rejected browser-context post pending so the same approval can be retried", async () => {
+    const harness = await createHarness();
+    const verifier = randomBytes(32).toString("base64url");
+    const pairing = await beginPairing(harness.handle, verifier);
+    const approvalUrl = harness.openedUrl;
+    const page = await fetch(
+      `http://localhost:${harness.handle.port}/local-approval/${pairing.attemptId}`,
+    );
+    const html = await page.text();
+    const csrf = html.match(/name="csrf" value="([A-Za-z0-9_-]{43})"/u)?.[1] ?? "";
+    const rejected = await submitApproval(harness.handle, pairing.attemptId, csrf, "approve", {
+      fetchSite: "cross-site",
+    });
+    expect(rejected.status).toBe(403);
+    expect(await rejected.text()).toContain("marked this approval as cross-origin");
+
+    const stillPending = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: pairing.attemptId, verifier },
+    });
+    expect(await stillPending.json()).toEqual({ status: "pending" });
+    const reopened = await request(harness.handle, "/v1/pairing/open", {
+      body: { attemptId: pairing.attemptId, verifier },
+    });
+    expect(reopened.status).toBe(200);
+    expect(harness.openedUrl).toBe(approvalUrl);
+
+    const retried = await submitApproval(harness.handle, pairing.attemptId, csrf, "approve", {
+      omitFetchMetadata: true,
+    });
+    expect(retried.status).toBe(200);
+    const paired = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: pairing.attemptId, verifier },
+    });
+    expect(paired.status).toBe(200);
+  });
+
+  it.each(["127.0.0.1", "[::1]"])(
+    "serves and accepts the approval form through the %s loopback host",
+    async (host) => {
+      const harness = await createHarness();
+      const verifier = randomBytes(32).toString("base64url");
+      const pairing = await beginPairing(harness.handle, verifier);
+      const authority = `${host}:${harness.handle.port}`;
+      const page = await fetch(`http://${authority}/local-approval/${pairing.attemptId}`);
+      const html = await page.text();
+      expect(page.status).toBe(200);
+      expect(html).toContain('name="decision" value="approve"');
+      const csrf = html.match(/name="csrf" value="([A-Za-z0-9_-]{43})"/u)?.[1];
+      expect(csrf).toBeDefined();
+
+      const approved = await submitApproval(harness.handle, pairing.attemptId, csrf!, "approve", {
+        host,
+        omitFetchMetadata: true,
+      });
+      expect(approved.status).toBe(200);
+      const paired = await request(harness.handle, "/v1/pairing/poll", {
+        body: { attemptId: pairing.attemptId, verifier },
+      });
+      expect(paired.status).toBe(200);
+    },
+  );
+
   it("rejects concurrent approval attempts and reports explicit denial and expiration", async () => {
     const harness = await createHarness();
     const firstVerifier = randomBytes(32).toString("base64url");
@@ -159,6 +267,10 @@ describe("loopback companion", () => {
     });
     expect(deniedPoll.status).toBe(403);
     expect(await deniedPoll.json()).toMatchObject({ error: "pairing_denied" });
+    const deniedPage = await fetch(
+      `http://localhost:${harness.handle.port}/local-approval/${first.attemptId}`,
+    );
+    expect(await deniedPage.text()).toContain("Local companion access was denied");
 
     const expiringVerifier = randomBytes(32).toString("base64url");
     const expiring = await beginPairing(harness.handle, expiringVerifier);
@@ -168,6 +280,10 @@ describe("loopback companion", () => {
     });
     expect(expiredPoll.status).toBe(410);
     expect(await expiredPoll.json()).toMatchObject({ error: "pairing_expired" });
+    const expiredPage = await fetch(
+      `http://localhost:${harness.handle.port}/local-approval/${expiring.attemptId}`,
+    );
+    expect(await expiredPage.text()).toContain("This local approval expired");
   });
 
   it("cancels pairing only with the matching verifier and invalidates sessions on companion restart", async () => {
@@ -187,6 +303,27 @@ describe("loopback companion", () => {
     });
     expect(cancelledPoll.status).toBe(403);
     expect(await cancelledPoll.json()).toMatchObject({ error: "pairing_cancelled" });
+    const cancelledPage = await fetch(
+      `http://localhost:${harness.handle.port}/local-approval/${attempt.attemptId}`,
+    );
+    expect(await cancelledPage.text()).toContain("This local approval was cancelled");
+
+    const approvedVerifier = randomBytes(32).toString("base64url");
+    const approvedAttempt = await beginPairing(harness.handle, approvedVerifier);
+    const approvedPage = await fetch(
+      `http://localhost:${harness.handle.port}/local-approval/${approvedAttempt.attemptId}`,
+    );
+    const approvedHtml = await approvedPage.text();
+    const approvedCsrf = approvedHtml.match(/name="csrf" value="([A-Za-z0-9_-]{43})"/u)?.[1] ?? "";
+    await submitApproval(harness.handle, approvedAttempt.attemptId, approvedCsrf, "approve");
+    const cancelBeforeDelivery = await request(harness.handle, "/v1/pairing/cancel", {
+      body: { attemptId: approvedAttempt.attemptId, verifier: approvedVerifier },
+    });
+    expect(cancelBeforeDelivery.status).toBe(200);
+    const cancelledBeforeDeliveryPoll = await request(harness.handle, "/v1/pairing/poll", {
+      body: { attemptId: approvedAttempt.attemptId, verifier: approvedVerifier },
+    });
+    expect(await cancelledBeforeDeliveryPoll.json()).toMatchObject({ error: "pairing_cancelled" });
 
     const token = await harness.pair();
     await harness.handle.close();
@@ -798,21 +935,34 @@ async function submitApproval(
   attemptId: string,
   csrf: string,
   decision: "approve" | "deny",
-  options: { origin?: string; csrfHeader?: string } = {},
+  options: {
+    origin?: string;
+    csrfHeader?: string;
+    omitFetchMetadata?: boolean;
+    host?: string;
+    fetchSite?: string;
+    fetchMode?: string;
+  } = {},
 ): Promise<Response> {
   const body = new URLSearchParams({ csrf: options.csrfHeader ?? csrf, decision }).toString();
+  const requestHost = options.host ?? "localhost";
+  const authority = `${requestHost}:${handle.port}`;
   return new Promise((resolve, reject) => {
     const outgoing = httpRequest(
       {
-        host: "localhost",
+        host: requestHost === "[::1]" ? "::1" : requestHost,
         port: handle.port,
         path: `/local-approval/${attemptId}`,
         method: "POST",
         headers: {
-          Host: `localhost:${handle.port}`,
-          Origin: options.origin ?? `http://localhost:${handle.port}`,
-          "Sec-Fetch-Site": "same-origin",
-          "Sec-Fetch-Mode": "navigate",
+          Host: authority,
+          Origin: options.origin ?? `http://${authority}`,
+          ...(options.omitFetchMetadata
+            ? {}
+            : {
+                "Sec-Fetch-Site": options.fetchSite ?? "same-origin",
+                "Sec-Fetch-Mode": options.fetchMode ?? "navigate",
+              }),
           "Content-Type": "application/x-www-form-urlencoded",
           "Content-Length": Buffer.byteLength(body),
         },

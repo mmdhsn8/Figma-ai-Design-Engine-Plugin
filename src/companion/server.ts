@@ -440,7 +440,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       typeof verifier !== "string" ||
       !/^[A-Za-z0-9_-]{43}$/u.test(verifier) ||
       !safeStringEqual(attempt.verifierHash, hashSecret(verifier)) ||
-      attempt.status !== "pending"
+      (attempt.status !== "pending" && attempt.status !== "approved")
     ) {
       sendJson(response, 403, { error: "pairing_failed" });
       return;
@@ -485,17 +485,17 @@ export function createCompanionServer(options: CompanionServerOptions) {
     response: ServerResponse,
     url: URL,
   ): Promise<void> {
-    if (request.headers.host !== `${COMPANION_HOSTNAME}:${actualPort}`) {
+    if (!isAllowedApprovalHost(request.headers.host, actualPort)) {
       sendApprovalHtml(response, 400, approvalMessagePage("This local approval link is invalid."));
       return;
     }
     const attempt = getAttempt(url.pathname.slice("/local-approval/".length));
-    if (!attempt || attempt.status !== "pending") {
-      sendApprovalHtml(
-        response,
-        410,
-        approvalMessagePage("This approval request expired or was already handled."),
-      );
+    if (!attempt) {
+      sendApprovalHtml(response, 404, approvalMessagePage("This local approval link is invalid."));
+      return;
+    }
+    if (attempt.status !== "pending") {
+      sendApprovalHtml(response, 410, approvalMessagePage(approvalAttemptStatusMessage(attempt)));
       return;
     }
     sendApprovalHtml(response, 200, approvalFormPage(attempt.id, attempt.csrfToken));
@@ -506,33 +506,36 @@ export function createCompanionServer(options: CompanionServerOptions) {
     response: ServerResponse,
     url: URL,
   ): Promise<void> {
-    if (
-      request.headers.host !== `${COMPANION_HOSTNAME}:${actualPort}` ||
-      request.headers.origin !== `http://${COMPANION_HOSTNAME}:${actualPort}` ||
-      request.headers["sec-fetch-site"] !== "same-origin" ||
-      request.headers["sec-fetch-mode"] !== "navigate"
-    ) {
+    const rejection = approvalRequestRejection(request, actualPort);
+    if (rejection) {
       request.resume();
-      sendApprovalHtml(
-        response,
-        403,
-        approvalMessagePage("The local approval request was rejected."),
-      );
+      sendApprovalHtml(response, 403, approvalMessagePage(rejection));
       return;
     }
     const attempt = getAttempt(url.pathname.slice("/local-approval/".length));
     const form = await readFormBody(request, MAX_APPROVAL_BODY_BYTES);
-    if (
-      !attempt ||
-      attempt.status !== "pending" ||
-      !form ||
-      typeof form.get("csrf") !== "string" ||
-      !safeStringEqual(attempt.csrfToken, form.get("csrf") ?? "")
-    ) {
+    if (!attempt) {
+      sendApprovalHtml(response, 404, approvalMessagePage("This local approval link is invalid."));
+      return;
+    }
+    if (attempt.status !== "pending") {
+      sendApprovalHtml(response, 410, approvalMessagePage(approvalAttemptStatusMessage(attempt)));
+      return;
+    }
+    if (!form || Array.from(form.keys()).length !== 2) {
+      sendApprovalHtml(
+        response,
+        400,
+        approvalMessagePage("The approval form was malformed. No connection was approved."),
+      );
+      return;
+    }
+    const csrf = form.get("csrf");
+    if (csrf === null || !safeStringEqual(attempt.csrfToken, csrf)) {
       sendApprovalHtml(
         response,
         403,
-        approvalMessagePage("The local approval request was invalid or expired."),
+        approvalMessagePage("The approval proof was invalid. No connection was approved."),
       );
       return;
     }
@@ -552,6 +555,23 @@ export function createCompanionServer(options: CompanionServerOptions) {
           : "Local companion access was denied. Return to Figma to retry if you initiated this request.",
       ),
     );
+  }
+
+  function approvalAttemptStatusMessage(attempt: PairingAttempt): string {
+    switch (attempt.status) {
+      case "denied":
+        return "Local companion access was denied. No ChatGPT sign-in was started.";
+      case "cancelled":
+        return "This local approval was cancelled in the Figma plugin.";
+      case "expired":
+        return "This local approval expired. Start a new connection from the Figma plugin.";
+      case "completed":
+        return "This local approval was already used. Start a new connection from the Figma plugin.";
+      case "approved":
+        return "Local companion access was already approved. Return to the Figma plugin.";
+      case "pending":
+        return "This local approval is still waiting for your choice.";
+    }
   }
 
   function getAttempt(value: unknown): PairingAttempt | undefined {
@@ -1323,6 +1343,54 @@ function sendApprovalHtml(response: ServerResponse, statusCode: number, html: st
     "X-Frame-Options": "DENY",
   });
   response.end(html);
+}
+
+function isAllowedApprovalHost(host: string | undefined, port: number): boolean {
+  if (!host) return false;
+  const normalized = host.toLowerCase();
+  return [`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`].includes(normalized);
+}
+
+function approvalRequestRejection(request: IncomingMessage, port: number): string | undefined {
+  const host = request.headers.host?.toLowerCase();
+  if (!isAllowedApprovalHost(host, port)) {
+    return "This approval used an unexpected local address. No connection was approved.";
+  }
+
+  // Origin and Fetch Metadata are defense in depth. Some system browsers omit
+  // them for shell-opened local pages; the handler still requires the one-use
+  // CSRF value from the same-origin form before recording any user decision.
+  const origin = request.headers.origin;
+  if (origin !== undefined) {
+    if (Array.isArray(origin)) {
+      return "The browser origin could not be verified. No connection was approved.";
+    }
+    try {
+      const parsed = new URL(origin);
+      if (
+        parsed.origin !== `http://${host}` ||
+        parsed.pathname !== "/" ||
+        parsed.search !== "" ||
+        parsed.hash !== "" ||
+        parsed.username !== "" ||
+        parsed.password !== ""
+      ) {
+        return "The browser origin did not match this local approval page. No connection was approved.";
+      }
+    } catch {
+      return "The browser origin could not be verified. No connection was approved.";
+    }
+  }
+
+  const fetchSite = request.headers["sec-fetch-site"];
+  if (fetchSite !== undefined && fetchSite !== "same-origin" && fetchSite !== "none") {
+    return "The browser marked this approval as cross-origin. No connection was approved.";
+  }
+  const fetchMode = request.headers["sec-fetch-mode"];
+  if (fetchMode !== undefined && fetchMode !== "navigate") {
+    return "The browser did not submit a page navigation. No connection was approved.";
+  }
+  return undefined;
 }
 
 function hashSecret(value: string): string {
