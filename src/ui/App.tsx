@@ -22,6 +22,18 @@ import { planDesignSystemApply } from "../plugin/design-system/apply-design-syst
 import { DEFAULT_MAX_ROW_WIDTH, DEFAULT_MIN_CANVAS_GAP } from "../plugin/canvas-placement";
 import { auditVisualQuality, type VisualQualityAudit } from "../shared/visual-quality";
 import { inspectEmbeddedImage, parseSafeSvg } from "../shared/visual-assets";
+import {
+  CompanionClientError,
+  disconnectChatGPT,
+  discoverAuthorizedModels,
+  getCompanionStatus,
+  pairWithCompanion,
+  runSmokeRequest,
+  startChatGPTSignIn,
+  switchChatGPTAccount,
+  type CompanionModel,
+  type CompanionStatus,
+} from "./companion-client";
 
 type Notice = {
   tone: "neutral" | "success" | "error";
@@ -78,6 +90,16 @@ export default function App() {
   const [rowWidth, setRowWidth] = useState(DEFAULT_MAX_ROW_WIDTH);
   const [assetLicense, setAssetLicense] = useState("");
   const [assetAttribution, setAssetAttribution] = useState("");
+  const [pairingCode, setPairingCode] = useState("");
+  const [companionToken, setCompanionToken] = useState<string | null>(null);
+  const [companionStatus, setCompanionStatus] = useState<CompanionStatus | null>(null);
+  const [companionError, setCompanionError] = useState<string | null>(null);
+  const [companionBusy, setCompanionBusy] = useState(false);
+  const [companionModels, setCompanionModels] = useState<CompanionModel[]>([]);
+  const [selectedCompanionModel, setSelectedCompanionModel] = useState("");
+  const [smokeResult, setSmokeResult] = useState<string | null>(null);
+  const [smokeInFlight, setSmokeInFlight] = useState(false);
+  const smokeAbort = useRef<AbortController | null>(null);
   const [multiProgress, setMultiProgress] = useState<MultiScreenProgressMessage | null>(null);
   const [multiReport, setMultiReport] = useState<MultiScreenRenderResultMessage | null>(null);
   const currentRequest = useRef<string | null>(null);
@@ -229,6 +251,36 @@ export default function App() {
     return () => window.removeEventListener("message", handleMessage);
   }, []);
 
+  useEffect(() => {
+    if (!companionToken || companionStatus?.auth !== "signing_in") return;
+    let cancelled = false;
+    let timer: number | undefined;
+    let attempts = 0;
+    const poll = async () => {
+      attempts += 1;
+      try {
+        const next = await getCompanionStatus(companionToken);
+        if (cancelled) return;
+        setCompanionStatus(next);
+        setCompanionError(next.safeMessage ? companionErrorText(next.safeMessage) : null);
+        if (next.auth === "signing_in" && attempts < 120) {
+          timer = window.setTimeout(() => void poll(), 1_500);
+        } else if (next.auth === "signing_in") {
+          setCompanionError("Sign-in timed out. Restart the companion and try again.");
+        }
+      } catch (error) {
+        if (cancelled) return;
+        setCompanionError(companionErrorText(error));
+        timer = window.setTimeout(() => void poll(), 3_000);
+      }
+    };
+    timer = window.setTimeout(() => void poll(), 1_000);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [companionStatus?.auth, companionToken]);
+
   const nextRequestId = () => `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   const validate = () => {
@@ -315,6 +367,121 @@ export default function App() {
     setBusy(true);
     setNotice({ tone: "neutral", title: "Creating the design system and editable preview…" });
     postToPlugin({ type: "apply-design-system", requestId, json, updateOwned });
+  };
+
+  const pairCompanion = async () => {
+    setCompanionBusy(true);
+    setCompanionError(null);
+    setSmokeResult(null);
+    try {
+      const token = await pairWithCompanion(pairingCode);
+      setCompanionToken(token);
+      setPairingCode("");
+      const status = await getCompanionStatus(token);
+      setCompanionStatus(status);
+    } catch (error) {
+      setCompanionError(companionErrorText(error));
+    } finally {
+      setCompanionBusy(false);
+    }
+  };
+
+  const signInWithChatGPT = async () => {
+    if (!companionToken) return;
+    setCompanionBusy(true);
+    setCompanionError(null);
+    setSmokeResult(null);
+    try {
+      const status = await startChatGPTSignIn(companionToken);
+      setCompanionStatus(status);
+      setCompanionError(null);
+    } catch (error) {
+      setCompanionError(companionErrorText(error));
+    } finally {
+      setCompanionBusy(false);
+    }
+  };
+
+  const discoverModels = async () => {
+    if (!companionToken) return;
+    setCompanionBusy(true);
+    setCompanionError(null);
+    try {
+      const models = await discoverAuthorizedModels(companionToken);
+      setCompanionModels(models);
+      setSelectedCompanionModel(models[0]?.slug ?? "");
+      setCompanionError(
+        models.length ? null : "No account-visible model was returned for this session.",
+      );
+      const status = await getCompanionStatus(companionToken);
+      setCompanionStatus(status);
+    } catch (error) {
+      setCompanionError(companionErrorText(error));
+    } finally {
+      setCompanionBusy(false);
+    }
+  };
+
+  const runCompanionSmoke = async () => {
+    if (!companionToken || !selectedCompanionModel) return;
+    const controller = new AbortController();
+    smokeAbort.current = controller;
+    setSmokeInFlight(true);
+    setCompanionBusy(true);
+    setCompanionError(null);
+    setSmokeResult(null);
+    try {
+      const text = await runSmokeRequest(
+        companionToken,
+        selectedCompanionModel,
+        fetch,
+        controller.signal,
+      );
+      setSmokeResult(text || "Completed successfully with an empty text delta.");
+      setCompanionStatus(await getCompanionStatus(companionToken));
+    } catch (error) {
+      setCompanionError(companionErrorText(error));
+    } finally {
+      if (smokeAbort.current === controller) smokeAbort.current = null;
+      setSmokeInFlight(false);
+      setCompanionBusy(false);
+    }
+  };
+
+  const cancelCompanionSmoke = () => smokeAbort.current?.abort();
+
+  const clearConnectedAccountDetails = () => {
+    setCompanionModels([]);
+    setSelectedCompanionModel("");
+    setSmokeResult(null);
+  };
+
+  const disconnectCompanion = async (switchAccount = false) => {
+    if (!companionToken) return;
+    setCompanionBusy(true);
+    try {
+      const result = switchAccount
+        ? await switchChatGPTAccount(companionToken)
+        : await disconnectChatGPT(companionToken);
+      clearConnectedAccountDetails();
+      setCompanionStatus(await getCompanionStatus(companionToken));
+      setCompanionError(
+        result === "revoked"
+          ? null
+          : "Local tokens were cleared. Remote revocation was unavailable; use OpenAI account settings if you need to revoke access.",
+      );
+    } catch (error) {
+      setCompanionError(companionErrorText(error));
+      clearConnectedAccountDetails();
+      try {
+        setCompanionStatus(await getCompanionStatus(companionToken));
+      } catch {
+        setCompanionToken(null);
+        setCompanionStatus(null);
+      }
+    } finally {
+      setCompanionBusy(false);
+    }
   };
 
   const loadSample = (content: string, label: string) => {
@@ -508,7 +675,7 @@ export default function App() {
       </header>
 
       <section className="intro-row" aria-label="Import instructions">
-        <span className="step-indicator">PHASE 01–04</span>
+        <span className="step-indicator">PHASE 01–04.6</span>
         <span className="intro-copy">Paste a design spec or import a .json file</span>
       </section>
 
@@ -616,6 +783,156 @@ export default function App() {
           Reset
         </button>
       </div>
+
+      <section className="ai-gate-panel" aria-labelledby="ai-gate-title">
+        <div className="design-system-heading">
+          <div>
+            <span className="section-kicker">PHASE 4.6 · LIVE GATE</span>
+            <h2 id="ai-gate-title">ChatGPT connection proof of concept</h2>
+          </div>
+          <span className={`system-status ${companionStatus?.auth === "ready" ? "is-ready" : ""}`}>
+            {companionStatus?.authLabel ?? "Companion not paired"}
+          </span>
+        </div>
+        {!companionToken ? (
+          <>
+            <p className="ai-gate-note">
+              Start <code>npm run companion</code> in PowerShell, then enter its one-time pairing
+              code here. The code connects this plugin window to your local process.
+            </p>
+            <label className="ai-gate-field">
+              <span>One-time local pairing code</span>
+              <input
+                type="password"
+                autoComplete="off"
+                value={pairingCode}
+                maxLength={128}
+                onChange={(event) => setPairingCode(event.target.value)}
+                aria-label="Local companion pairing code"
+                placeholder="Paste code from the companion terminal"
+              />
+            </label>
+            <button
+              className="system-action"
+              type="button"
+              onClick={() => void pairCompanion()}
+              disabled={companionBusy || pairingCode.trim().length < 32}
+            >
+              {companionBusy ? "Connecting…" : "Connect local companion"}
+            </button>
+          </>
+        ) : (
+          <>
+            <p className="ai-gate-note">
+              Sign-in opens your system browser. Identity permission and direct plan-use permission
+              are separate; the granted scope is checked after return.
+            </p>
+            {!companionStatus?.planUseAuthorized ? (
+              <button
+                className="system-action"
+                type="button"
+                onClick={() => void signInWithChatGPT()}
+                disabled={companionBusy || companionStatus?.auth === "signing_in"}
+              >
+                {companionStatus?.auth === "signing_in"
+                  ? "Waiting for browser sign-in…"
+                  : "Continue with ChatGPT"}
+              </button>
+            ) : (
+              <>
+                <p className="ai-gate-note ai-gate-ready">
+                  {companionStatus.auth === "ready"
+                    ? "A real Responses smoke test completed in this companion session."
+                    : "The direct-use scope was granted, but live inference is not verified yet. Load models from this account and run the separate fixed smoke test."}
+                </p>
+                <button
+                  className="system-action"
+                  type="button"
+                  onClick={() => void discoverModels()}
+                  disabled={companionBusy}
+                >
+                  {companionBusy ? "Checking account models…" : "Load available models"}
+                </button>
+                {companionModels.length > 0 && (
+                  <label className="ai-gate-field">
+                    <span>Account-visible model</span>
+                    <select
+                      value={selectedCompanionModel}
+                      onChange={(event) => setSelectedCompanionModel(event.target.value)}
+                      disabled={companionBusy}
+                    >
+                      {companionModels.map((model) => (
+                        <option key={model.slug} value={model.slug}>
+                          {model.displayName}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                <button
+                  className="secondary-action ai-smoke-action"
+                  type="button"
+                  onClick={() => void runCompanionSmoke()}
+                  disabled={
+                    companionBusy || !companionStatus.planUseAuthorized || !selectedCompanionModel
+                  }
+                >
+                  {companionBusy ? "Waiting for Responses…" : "Run fixed Responses smoke test"}
+                </button>
+                {smokeInFlight && (
+                  <button
+                    className="text-button ai-disconnect"
+                    type="button"
+                    onClick={cancelCompanionSmoke}
+                  >
+                    Cancel smoke request
+                  </button>
+                )}
+              </>
+            )}
+            <button
+              className="text-button ai-disconnect"
+              type="button"
+              onClick={() => void disconnectCompanion()}
+              disabled={companionBusy}
+            >
+              Disconnect and clear local session
+            </button>
+            <button
+              className="text-button ai-disconnect"
+              type="button"
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "Clear the saved local account registration and start a fresh ChatGPT account sign-in? The stable installation host ID will remain.",
+                  )
+                ) {
+                  void disconnectCompanion(true);
+                }
+              }}
+              disabled={companionBusy}
+            >
+              Forget account registration and switch account
+            </button>
+          </>
+        )}
+        {companionError && (
+          <p className="ai-gate-error" role="alert">
+            {companionError}
+          </p>
+        )}
+        {smokeResult && (
+          <p className="ai-gate-result" role="status">
+            Real Responses request completed. Output: <code>{smokeResult}</code>
+          </p>
+        )}
+        <p className="ai-gate-privacy">
+          This gate build sends no design JSON or custom prompt. The only inference input is the
+          fixed text “Reply with exactly OK.” after you activate the smoke test. Sign-in does not
+          grant access to ChatGPT conversations, files, or memory. Natural-language design
+          generation remains disabled until live authorization and inference are confirmed.
+        </p>
+      </section>
 
       <section
         className={`status-card status-${notice.tone}`}
@@ -1016,10 +1333,56 @@ export default function App() {
         <span className="local-icon" aria-hidden="true">
           ●
         </span>
-        <span>Local only</span>
+        <span>Offline JSON</span>
         <span className="footer-divider">·</span>
-        <span>Native editable layers · no cloud service</span>
+        <span>Optional user-authorized companion · native editable layers</span>
       </footer>
     </main>
   );
+}
+
+function companionErrorText(error: unknown): string {
+  const category =
+    error instanceof CompanionClientError
+      ? error.category
+      : typeof error === "string"
+        ? error
+        : "connection_failed";
+  const messages: Record<string, string> = {
+    pairing_unavailable:
+      "Pairing code is no longer available. Restart the companion for a new code.",
+    pairing_failed: "Pairing failed. Check the code in the companion terminal and try again.",
+    pairing_required: "Reconnect the local companion from its current one-time code.",
+    sign_in_already_pending:
+      "A browser sign-in is already pending. Finish or cancel that attempt first.",
+    consent_denied: "ChatGPT sign-in or permission was declined.",
+    callback_invalid: "The sign-in callback did not match this attempt. Start sign-in again.",
+    client_id_mismatch:
+      "The returned OAuth client did not match this installation. Restart sign-in.",
+    plan_use_scope_missing:
+      "Identity sign-in succeeded, but direct plan-use permission was not granted.",
+    plan_use_not_admitted:
+      "The service did not admit this plan-authorized request. Check eligibility and permission.",
+    quota_or_rate_limit:
+      "The account reached a rate or usage limit. Try later or check account eligibility.",
+    session_expired: "The local authorization expired. Sign in again.",
+    request_timed_out: "The request timed out. Check your connection and retry once.",
+    request_cancelled:
+      "The smoke request was cancelled. The companion asks the upstream stream to stop.",
+    service_unavailable: "The OpenAI service is temporarily unavailable.",
+    model_not_verified_for_account: "Choose a model returned by this account's model list.",
+    account_mismatch:
+      "This registration belongs to another account. Use Forget account registration and switch account before signing in with a different account.",
+    public_client_unsupported:
+      "The discovered OAuth server did not advertise the required public-client method.",
+    response_incomplete: "The Responses stream ended without a successful completion event.",
+    response_too_large: "The streamed smoke response exceeded the local safety limit.",
+    registration_clear_failed:
+      "The local session was cleared, but the saved account registration could not be removed. Close the companion before trying again.",
+    request_rejected:
+      "The request was rejected. Check the account's authorization and availability.",
+    unknown: "The companion returned an invalid response. Restart it and reconnect.",
+    connection_failed: "Could not reach the local companion. Confirm it is running on port 1455.",
+  };
+  return messages[category] ?? "The companion could not complete that step.";
 }

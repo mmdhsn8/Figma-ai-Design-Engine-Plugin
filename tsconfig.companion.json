@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": false,
+    "noEmit": false,
+    "outDir": "dist-companion",
+    "rootDir": "src/companion",
+    "types": ["node"]
+  },
+  "include": ["src/companion/**/*.ts"],
+  "exclude": []
+}

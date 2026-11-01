@@ -2,7 +2,7 @@
 
 Figma AI Design Engine is a local plugin for Figma Desktop. It reads a structured JSON design and creates editable native Figma layers from it. You can start with one of the included examples or write/import your own JSON, validate it, generate the design, and keep editing it in Figma.
 
-The plugin name includes “AI,” but this version does not generate designs from text prompts. It uses the JSON design you provide and does not need an API key, cloud account, backend, or internet connection at runtime.
+The plugin can render JSON fully offline. A gated Phase 4.6 proof of concept adds an optional local companion for ChatGPT sign-in and a user-triggered authorization smoke test; it does not yet generate designs from natural-language prompts. The companion makes internet requests only after the user initiates sign-in, model discovery, or the smoke test.
 
 ## What the plugin can do
 
@@ -14,6 +14,7 @@ The plugin name includes “AI,” but this version does not generate designs fr
 - Validate the JSON and report errors before adding layers to the Figma document.
 - Preserve existing page content and place each new design in a clear canvas area.
 - Keep Persian and other Unicode text editable in Figma text layers. Font availability and complex right-to-left shaping depend on the local Figma environment.
+- Phase 4.6 proof of concept: optional local browser sign-in and direct plan-use smoke test; natural-language design generation is held behind live acceptance.
 
 The **Phase 1 sample**, **Phase 2 demo**, and **Phase 3 demo** buttons are examples in the same plugin, not separate programs. Phase 1 demonstrates a coordinate-based design. Phase 2 shows nested Auto Layout and linked components. Phase 3 adds an optional design-system section to schema 1.0.0.
 
@@ -356,6 +357,50 @@ The button **Visual demo** loads `src/samples/phase-4.5-visual-design.json`, whi
 
 The prior Phase 2.2, Phase 3 and Phase 4 Desktop acceptance gates also remain pending unless the user reports their results. Phase 4.5 is implemented in code; product acceptance is pending this manual review. Phase 5 has not started.
 
+## Phase 4.6 ChatGPT connection proof of concept
+
+Phase 4.6 is currently a **local authorization/inference proof of concept**, not a text-to-design feature. The feasibility decision and documented protocol contract are recorded in [`docs/phase-4.6-feasibility.md`](docs/phase-4.6-feasibility.md). The flow is conditional on the app and account being eligible, the user's region/policy status, consent, quota, and the currently available model. Signing in proves identity only; the UI separately checks whether the token response granted `chatgpt.tokens.use.direct`.
+
+The Phase 4.6 interface adds no natural-language prompt editor and never sends the open JSON document to OpenAI. It offers separate actions for browser sign-in, account-visible model discovery, and a fixed minimal Responses smoke request. The smoke request is sent only after the user clicks **Run fixed Responses smoke test**. It uses the account-visible model selected by the user, `store: false`, and streaming; it has no API-key billing fallback. ChatGPT sign-in does not grant access to conversations, files, or memory. If scope, eligibility, region, or quota blocks the request, the companion reports a sanitized status and offline JSON rendering remains available.
+
+### Windows companion setup
+
+1. Install the project dependencies and build the Figma plugin:
+
+   ```powershell
+   npm install
+   npm run build
+   ```
+
+2. In Figma Desktop, import or reload the development plugin using this repository's `manifest.json`.
+3. In a separate PowerShell window at the repository root, run `npm run companion`. Keep that terminal open. It binds to `127.0.0.1:1455`, prints a random one-time pairing code, and opens no browser until sign-in is explicitly started from the plugin.
+4. Paste the one-time code into **ChatGPT connection proof of concept → Connect local companion**. If the plugin UI is reloaded after pairing, restart the companion to print a fresh code and pair again; the session bearer is intentionally held only in UI memory.
+5. Click **Continue with ChatGPT**. Complete the official flow in the system browser and return to the plugin. The callback is accepted only for the exact loopback URI, one-time state, PKCE transaction, expected nonce, validated ID-token signature/issuer/audience/expiry, and the callback's issued public client ID.
+6. Check the displayed authorization state. `Signed in; plan use not authorized` is not AI-ready. When ready, click **Load available models**, choose a listed model, then separately click **Run fixed Responses smoke test**. Capture only the sanitized status and success/failure category; never paste credentials or callback URLs into issues/logs.
+7. Click **Disconnect and clear local session**, then press Ctrl+C in the companion terminal. Disconnect attempts token revocation if a refresh token is present; local token memory is cleared even if remote revocation fails.
+
+The companion stores a stable `ext_agent_host_id`, the issued public `client_id`, and a SHA-256 hash of the validated `sub` used to bind that one registration to its account under `%LOCALAPPDATA%\Figma AI Design Engine\installation.json`. It does not store access/refresh/ID tokens; those are held only in companion process memory and are cleared when it exits. Because this gate build does not persist refresh tokens, a new companion process requires a new sign-in. The `dynamic_agent_client` value is used only as the documented first-registration entry point; the issued callback client ID is retained for subsequent sign-in. **Forget account registration and switch account** attempts revocation and clears the saved client ID/account hash while keeping the stable host ID. No password, browser cookie, session credential, ChatGPT API key, custom prompt, or design JSON is collected or stored by this proof of concept.
+
+### Loopback security and current gate limits
+
+- The companion binds only to `127.0.0.1`, checks the Figma iframe's opaque `Origin: null`, has no cookies, and requires a random one-time pairing code followed by an in-memory bearer for every companion action. CORS is an additional browser boundary, not the authentication mechanism.
+- Request bodies and remote response bodies have explicit size limits; OAuth state expires after five minutes and is consumed once. Callback/token/JWKS/HTTP failures are exposed only as sanitized categories. There is no general proxy endpoint.
+- **Threat model:** protect OAuth code/verifier/state/nonce, access/refresh tokens, and the pairing/session bearers from the Figma document, plugin messages, logs, disk, other web origins, and unrelated local callers. Mitigations are loopback-only binding, a one-use high-entropy terminal pairing code, bearer authorization on every bridge action, strict `Origin: null` and `Host` checks, exact redirect matching, PKCE, state replay prevention, nonce/signature/issuer/audience/expiry checks, body/time limits, no cookies, and in-memory-only credential lifetimes. Process inspection or code executing inside the paired Figma iframe/user account remains in the local user security boundary; loopback/CORS do not defend against a compromised same-user process.
+- The manifest keeps production `allowedDomains` at `none` and adds only the local development host in `devAllowedDomains`. This Figma Desktop network exception and Chromium local-network behavior still need actual Desktop verification.
+- Access, refresh and ID tokens are not persisted in this gate build. A single account registration is supported; an explicit switch action clears it. Protected Windows token storage, multi-account session profiles, automatic design planning, schema generation, bounded repair, and design prompt transfer are **not implemented** until the live authorization and inference gate is passed.
+- No Figma Desktop connection, ChatGPT account authorization, granted scope, model-list access, or live Responses call has been performed by the coding agent. Automated tests below use mocked OAuth/provider responses and do not pass the live gate.
+
+### Phase 4.6 manual acceptance gates
+
+**All live checks are pending.** After rebuilding and reloading the manifest in Figma Desktop:
+
+1. **Gate A — live sign-in:** Start the companion, pair the plugin, click **Continue with ChatGPT**, complete the official browser flow, return, and verify the UI says `Ready for AI` only if the actual token response grants the direct plan-use scope. Also verify consent denial and a missing-scope status. Share only sanitized results.
+2. **Gate B — live inference:** Click **Load available models**, choose a model actually returned for the signed-in account, then explicitly run the fixed smoke request. Verify a real streamed `response.completed` result. Note any eligibility, region, quota, 401, or 403 block. Do not substitute a paid API key.
+3. **Gate C — design generation:** **Blocked / not implemented at this gate.** Do not treat a mock test or the smoke response as design generation. This stage requires a separate implementation after A and B are confirmed.
+4. **Gate D — offline regression:** Stop the companion, reload the plugin, and confirm Phase 1–4.5 JSON validation, samples, rendering and placement still work without sign-in or network access.
+
+The earlier Phase 2.2, Phase 3, Phase 4 and Phase 4.5 manual Figma acceptance gates remain pending unless the user has separately reported passing them.
+
 ## Limitations
 
 - The plugin creates designs from JSON; it does not create a design from a natural-language prompt.
@@ -382,7 +427,7 @@ npm run test
 npm run format:check
 ```
 
-Runtime dependencies are React, React DOM, and Zod. Other project dependencies are used for development and building. The manifest disables network access, so the plugin has no runtime network calls or paid service dependencies.
+Runtime dependencies are React, React DOM, and Zod. Other project dependencies are used for development and building. The Figma main/controller stays offline; the companion uses only official OpenAI OAuth and API endpoints after explicit user actions. No paid dependency, separately billed API key fallback, telemetry, cloud backend, or runtime third-party service was added. The production manifest domain list remains `none`; only the local development companion is allowlisted via Figma's development-only network setting.
 
 ### Phase 3 Windows / Figma Desktop acceptance
 

@@ -1,6 +1,7 @@
 node_modules/
 .npm-cache/
 dist/
+dist-companion/
 coverage/
 *.log
 .env
