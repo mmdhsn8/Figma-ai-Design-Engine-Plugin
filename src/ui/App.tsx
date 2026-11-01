@@ -1379,6 +1379,10 @@ function companionErrorText(error: unknown): string {
     response_too_large: "The streamed smoke response exceeded the local safety limit.",
     registration_clear_failed:
       "The local session was cleared, but the saved account registration could not be removed. Close the companion before trying again.",
+    host_id_invalid:
+      "The local installation host ID is not in the documented format. Sign-in was stopped before opening the browser.",
+    installation_store_invalid:
+      "The saved local installation metadata is invalid and was preserved. Do not delete it; share this sanitized error category with support.",
     request_rejected:
       "The request was rejected. Check the account's authorization and availability.",
     unknown: "The companion returned an invalid response. Restart it and reconnect.",

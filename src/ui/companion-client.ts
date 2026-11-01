@@ -62,6 +62,8 @@ export type CompanionErrorCategory =
   | "response_too_large"
   | "request_rejected"
   | "registration_clear_failed"
+  | "host_id_invalid"
+  | "installation_store_invalid"
   | "unknown";
 
 export class CompanionClientError extends Error {
@@ -213,6 +215,8 @@ function mapError(value: string): CompanionErrorCategory {
     "response_too_large",
     "request_rejected",
     "registration_clear_failed",
+    "host_id_invalid",
+    "installation_store_invalid",
   ];
   return known.includes(value as CompanionErrorCategory)
     ? (value as CompanionErrorCategory)

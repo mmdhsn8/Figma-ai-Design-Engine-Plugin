@@ -22,6 +22,7 @@ const discovery: OidcDiscovery = {
   token_endpoint_auth_methods_supported: ["client_secret_basic", "none"],
   id_token_signing_alg_values_supported: ["RS256"],
 };
+const TEST_HOST_ID = "urn:uuid:123e4567-e89b-42d3-a456-426614174000";
 
 const openHandles: CompanionServerHandle[] = [];
 
@@ -94,7 +95,7 @@ describe("loopback companion", () => {
     expect(harness.openedUrl).toBeDefined();
     const authorization = new URL(harness.openedUrl as string);
     expect(authorization.searchParams.get("client_id")).toBe("dynamic_agent_client");
-    expect(authorization.searchParams.get("ext_agent_host_id")).toBe("host-12345678");
+    expect(authorization.searchParams.get("ext_agent_host_id")).toBe(TEST_HOST_ID);
     const callback = new URL(`http://127.0.0.1:${harness.handle.port}/auth/callback`);
     callback.searchParams.set("state", authorization.searchParams.get("state") ?? "");
     callback.searchParams.set("code", "test-code");
@@ -163,7 +164,7 @@ describe("loopback companion", () => {
     await request(harness.handle, "/v1/auth/start", { token, body: {} });
     const reauthorization = new URL(harness.openedUrl as string);
     expect(reauthorization.searchParams.get("client_id")).toBe("issued-public-client");
-    expect(reauthorization.searchParams.get("ext_agent_host_id")).toBe("host-12345678");
+    expect(reauthorization.searchParams.get("ext_agent_host_id")).toBe(TEST_HOST_ID);
     expect(reauthorization.searchParams.has("agent_name_hint")).toBe(false);
 
     const callback = new URL(`http://127.0.0.1:${harness.handle.port}/auth/callback`);
@@ -185,7 +186,7 @@ describe("loopback companion", () => {
     const switchResponse = await request(harness.handle, "/v1/account/switch", { token, body: {} });
     expect(switchResponse.status).toBe(200);
     expect(await switchResponse.json()).toMatchObject({ registrationForgotten: true });
-    expect(JSON.parse(harness.storeSnapshot())).toMatchObject({ extAgentHostId: "host-12345678" });
+    expect(JSON.parse(harness.storeSnapshot())).toMatchObject({ extAgentHostId: TEST_HOST_ID });
     expect(JSON.parse(harness.storeSnapshot())).not.toHaveProperty("clientId");
     expect(JSON.parse(harness.storeSnapshot())).not.toHaveProperty("subjectHash");
 
@@ -193,7 +194,7 @@ describe("loopback companion", () => {
     await request(harness.handle, "/v1/auth/start", { token, body: {} });
     const freshRegistration = new URL(harness.openedUrl as string);
     expect(freshRegistration.searchParams.get("client_id")).toBe("dynamic_agent_client");
-    expect(freshRegistration.searchParams.get("ext_agent_host_id")).toBe("host-12345678");
+    expect(freshRegistration.searchParams.get("ext_agent_host_id")).toBe(TEST_HOST_ID);
     expect(freshRegistration.searchParams.get("agent_name_hint")).toBe("Figma AI Design Engine");
     const callback = new URL(`http://127.0.0.1:${harness.handle.port}/auth/callback`);
     callback.searchParams.set("state", freshRegistration.searchParams.get("state") ?? "");
@@ -360,7 +361,7 @@ async function createHarness(
     alg: "RS256",
   };
   const storeData = {
-    extAgentHostId: "host-12345678",
+    extAgentHostId: TEST_HOST_ID,
     clientId: undefined as string | undefined,
     subjectHash: undefined as string | undefined,
   };

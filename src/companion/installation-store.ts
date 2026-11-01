@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { DYNAMIC_CLIENT_ENTRYPOINT, isClientId } from "./oauth.js";
+import {
+  DYNAMIC_CLIENT_ENTRYPOINT,
+  isClientId,
+  isLegacyBareHostUuid,
+  isSupportedAgentHostId,
+} from "./oauth.js";
 
 export interface InstallationMetadata {
   extAgentHostId: string;
@@ -23,33 +28,54 @@ export function createInstallationStore(directory = defaultDataDirectory()): Ins
   async function load(): Promise<InstallationMetadata> {
     if (cached) return { ...cached };
     await mkdir(directory, { recursive: true, mode: 0o700 });
+    let raw: string | undefined;
     try {
-      const raw = await readFile(filePath, "utf8");
-      const value = JSON.parse(raw) as {
-        extAgentHostId?: unknown;
-        clientId?: unknown;
-        subjectHash?: unknown;
-      };
-      if (
-        typeof value.extAgentHostId === "string" &&
-        /^[0-9a-f-]{36}$/iu.test(value.extAgentHostId) &&
-        (value.clientId === undefined || isClientId(value.clientId as string)) &&
-        (value.subjectHash === undefined || /^[0-9a-f]{64}$/iu.test(String(value.subjectHash)))
-      ) {
-        cached = {
-          extAgentHostId: value.extAgentHostId,
-          ...(typeof value.clientId === "string" ? { clientId: value.clientId } : {}),
-          ...(typeof value.subjectHash === "string" ? { subjectHash: value.subjectHash } : {}),
-        };
-        return { ...cached };
-      }
+      raw = await readFile(filePath, "utf8");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        raw = undefined;
+      } else {
         throw new Error("installation_store_invalid", { cause: error });
       }
     }
 
-    cached = { extAgentHostId: randomUUID() };
+    if (raw !== undefined) {
+      let value: unknown;
+      try {
+        value = JSON.parse(raw) as unknown;
+      } catch (error) {
+        throw new Error("installation_store_invalid", { cause: error });
+      }
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error("installation_store_invalid");
+      }
+      const record = value as {
+        extAgentHostId?: unknown;
+        clientId?: unknown;
+        subjectHash?: unknown;
+      };
+      const migratedHostId = isLegacyBareHostUuid(record.extAgentHostId)
+        ? `urn:uuid:${record.extAgentHostId}`
+        : record.extAgentHostId;
+      if (
+        !isSupportedAgentHostId(migratedHostId) ||
+        (record.clientId !== undefined &&
+          (typeof record.clientId !== "string" || !isClientId(record.clientId))) ||
+        (record.subjectHash !== undefined &&
+          (typeof record.subjectHash !== "string" || !/^[0-9a-f]{64}$/iu.test(record.subjectHash)))
+      ) {
+        throw new Error("installation_store_invalid");
+      }
+      cached = {
+        extAgentHostId: migratedHostId,
+        ...(typeof record.clientId === "string" ? { clientId: record.clientId } : {}),
+        ...(typeof record.subjectHash === "string" ? { subjectHash: record.subjectHash } : {}),
+      };
+      if (migratedHostId !== record.extAgentHostId) await persist(filePath, cached);
+      return { ...cached };
+    }
+
+    cached = { extAgentHostId: `urn:uuid:${randomUUID()}` };
     await persist(filePath, cached);
     return { ...cached };
   }

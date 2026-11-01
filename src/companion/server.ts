@@ -825,6 +825,8 @@ function classifyError(error: unknown): string {
     "account_mismatch",
     "request_cancelled",
     "public_client_unsupported",
+    "host_id_invalid",
+    "installation_store_invalid",
   ]);
   if (allowed.has(message)) return message;
   if (error instanceof Error && error.name === "AbortError") return "request_timed_out";

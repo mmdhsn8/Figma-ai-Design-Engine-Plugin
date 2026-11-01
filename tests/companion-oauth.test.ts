@@ -9,6 +9,7 @@ import {
   OIDC_ISSUER,
   parseGrantedScopes,
   PLAN_USE_SCOPE,
+  REQUESTED_SCOPES,
   validateAuthorizationCallback,
   validateIdToken,
   type OidcDiscovery,
@@ -21,6 +22,7 @@ const discovery: OidcDiscovery = {
   revocation_endpoint: `${OIDC_ISSUER}/api/accounts/oauth/revoke`,
   jwks_uri: `${OIDC_ISSUER}/.well-known/jwks.json`,
 };
+const TEST_HOST_ID = "urn:uuid:123e4567-e89b-42d3-a456-426614174000";
 
 describe("Sign in with ChatGPT OAuth contract helpers", () => {
   it("creates PKCE S256, state, nonce, resource and documented dynamic registration fields", () => {
@@ -29,18 +31,68 @@ describe("Sign in with ChatGPT OAuth contract helpers", () => {
       "http://127.0.0.1:1455/auth/callback",
       1_000,
     );
-    const url = createAuthorizationUrl(discovery, transaction, "stable-host-id");
+    const url = createAuthorizationUrl(discovery, transaction, TEST_HOST_ID);
 
-    expect(url.origin).toBe(OIDC_ISSUER);
+    expect(url.toString()).toContain("https://auth.openai.com/api/accounts/authorize?");
     expect(url.searchParams.get("client_id")).toBe(DYNAMIC_CLIENT_ENTRYPOINT);
+    expect(url.searchParams.get("response_type")).toBe("code");
+    expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:1455/auth/callback");
+    expect(url.searchParams.get("scope")).toBe(REQUESTED_SCOPES);
     expect(url.searchParams.get("agent_name_hint")).toBe("Figma AI Design Engine");
-    expect(url.searchParams.get("ext_agent_host_id")).toBe("stable-host-id");
+    expect(url.searchParams.get("ext_agent_host_id")).toBe(TEST_HOST_ID);
+    expect(url.searchParams.get("resource")).toBe("https://api.openai.com/v1");
+    expect(url.searchParams.get("state")).toBe(transaction.state);
+    expect(url.searchParams.get("nonce")).toBe(transaction.nonce);
+    expect(transaction.state).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(transaction.nonce).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(transaction.codeVerifier).toMatch(/^[A-Za-z0-9_-]{43}$/u);
     expect(url.searchParams.get("code_challenge")).toBe(
       createCodeChallenge(transaction.codeVerifier),
     );
+    expect(url.searchParams.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/u);
     expect(url.searchParams.get("code_challenge_method")).toBe("S256");
-    expect(url.searchParams.get("resource")).toBe("https://api.openai.com/v1");
-    expect(url.searchParams.get("scope")).toContain(PLAN_USE_SCOPE);
+    expect([...url.searchParams.keys()].sort()).toEqual(
+      [
+        "agent_name_hint",
+        "client_id",
+        "code_challenge",
+        "code_challenge_method",
+        "ext_agent_host_id",
+        "nonce",
+        "redirect_uri",
+        "resource",
+        "response_type",
+        "scope",
+        "state",
+      ].sort(),
+    );
+  });
+
+  it("rejects a missing or malformed host identifier instead of constructing an auth URL", () => {
+    const transaction = createAuthorizationTransaction(
+      DYNAMIC_CLIENT_ENTRYPOINT,
+      "http://127.0.0.1:1455/auth/callback",
+    );
+    expect(() => createAuthorizationUrl(discovery, transaction, "")).toThrow("host_id_invalid");
+    expect(() =>
+      createAuthorizationUrl(discovery, transaction, "123e4567-e89b-42d3-a456-426614174000"),
+    ).toThrow("host_id_invalid");
+    expect(() => createAuthorizationUrl(discovery, transaction, "urn:uuid:not-a-uuid")).toThrow(
+      "host_id_invalid",
+    );
+  });
+
+  it("uses an issued client ID on reauthorization and omits initial-registration hints", () => {
+    const transaction = createAuthorizationTransaction(
+      "oaiapp_issued_public_client",
+      "http://127.0.0.1:1455/auth/callback",
+    );
+    const url = createAuthorizationUrl(discovery, transaction, TEST_HOST_ID);
+
+    expect(url.searchParams.get("client_id")).toBe("oaiapp_issued_public_client");
+    expect(url.searchParams.has("agent_name_hint")).toBe(false);
+    expect(url.searchParams.get("ext_agent_host_id")).toBe(TEST_HOST_ID);
+    expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:1455/auth/callback");
   });
 
   it("accepts only state-matched callbacks and the issued client ID", () => {

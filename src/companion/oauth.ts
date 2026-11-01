@@ -20,6 +20,10 @@ export const REQUESTED_SCOPES = [
   PLAN_USE_SCOPE,
 ].join(" ");
 
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const UUID_V4_URN_PATTERN =
+  /^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
 export interface OidcDiscovery {
   issuer: string;
   authorization_endpoint: string;
@@ -74,6 +78,7 @@ export function createAuthorizationUrl(
   hostId: string,
 ): URL {
   assertTrustedHttpsUrl(discovery.authorization_endpoint);
+  if (!isSupportedAgentHostId(hostId)) throw new Error("host_id_invalid");
   const url = new URL(discovery.authorization_endpoint);
   url.searchParams.set("client_id", transaction.clientId);
   url.searchParams.set("response_type", "code");
@@ -89,6 +94,16 @@ export function createAuthorizationUrl(
     url.searchParams.set("agent_name_hint", "Figma AI Design Engine");
   }
   return url;
+}
+
+/** This app uses the documented UUIDv4 URN form for its stable host identity. */
+export function isSupportedAgentHostId(value: unknown): value is string {
+  return typeof value === "string" && UUID_V4_URN_PATTERN.test(value);
+}
+
+/** Recognize only the legacy bare UUIDv4 previously emitted by this app. */
+export function isLegacyBareHostUuid(value: unknown): value is string {
+  return typeof value === "string" && UUID_V4_PATTERN.test(value);
 }
 
 export function createCodeChallenge(verifier: string): string {
