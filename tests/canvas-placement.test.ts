@@ -116,6 +116,7 @@ describe("canvas geometry", () => {
     }
     const elapsedMs = performance.now() - startedAt;
     expect(Number.isFinite(elapsedMs)).toBe(true);
+    expect(elapsedMs).toBeLessThan(5_000);
     expect(existing).toHaveLength(count);
     const columnsPerRow = Math.floor(
       (DEFAULT_MAX_ROW_WIDTH + DEFAULT_MIN_CANVAS_GAP) / (390 + DEFAULT_MIN_CANVAS_GAP),
@@ -187,6 +188,7 @@ describe("canvas geometry", () => {
     const elapsedMs = performance.now() - startedAt;
     expect(elapsedMs).toBeGreaterThanOrEqual(0);
     expect(Number.isFinite(elapsedMs)).toBe(true);
+    expect(elapsedMs).toBeLessThan(5_000);
     expect(planned).toHaveLength(500);
     for (let first = 0; first < planned.length; first++) {
       for (let second = first + 1; second < planned.length; second++) {

@@ -1,0 +1,2134 @@
+{
+  "schemaVersion": "1.0.0",
+  "id": "persian-commerce-app",
+  "name": "فروشگاه پوشاک — جریان خرید",
+  "designSystem": {
+    "id": "apparel-core",
+    "namespace": "apparel-core",
+    "name": "Persian Apparel Storefront",
+    "version": "1.0.0",
+    "colors": {
+      "color.brand.deepNavy": "#123B5D",
+      "color.action.primary": "#2563EB",
+      "color.action.highlight": "#38BDF8",
+      "color.surface.pale": "#EFF6FF",
+      "color.page.background": "#F8FAFC",
+      "color.surface.default": "#FFFFFF",
+      "color.text.primary": "#0F172A",
+      "color.text.muted": "#64748B",
+      "color.border.default": "#E2E8F0",
+      "color.status.success": "#16A34A",
+      "color.status.error": "#DC2626"
+    },
+    "typography": {
+      "typography.heading": {
+        "fontFamily": "Arial",
+        "fontStyle": "Bold",
+        "fontSize": 24,
+        "lineHeight": 32,
+        "textAlign": "right"
+      },
+      "typography.body": {
+        "fontFamily": "Arial",
+        "fontStyle": "Regular",
+        "fontSize": 14,
+        "lineHeight": 22,
+        "textAlign": "right"
+      },
+      "typography.price": {
+        "fontFamily": "Arial",
+        "fontStyle": "Bold",
+        "fontSize": 16,
+        "lineHeight": 24,
+        "textAlign": "right"
+      },
+      "typography.button": {
+        "fontFamily": "Arial",
+        "fontStyle": "Bold",
+        "fontSize": 14,
+        "lineHeight": 20,
+        "textAlign": "center"
+      }
+    },
+    "spacing": {
+      "scale": [4, 8, 12, 16, 24, 32],
+      "aliases": {
+        "spacing.xs": {
+          "token": "spacing.scale.0"
+        },
+        "spacing.sm": {
+          "token": "spacing.scale.1"
+        },
+        "spacing.md": {
+          "token": "spacing.scale.2"
+        },
+        "spacing.lg": {
+          "token": "spacing.scale.3"
+        },
+        "spacing.xl": {
+          "token": "spacing.scale.4"
+        },
+        "spacing.cardPadding": {
+          "token": "spacing.scale.4"
+        }
+      }
+    },
+    "radii": {
+      "scale": [4, 8, 12, 16],
+      "aliases": {
+        "radius.control": {
+          "token": "radius.scale.1"
+        },
+        "radius.card": {
+          "token": "radius.scale.2"
+        }
+      }
+    },
+    "borders": {
+      "border.default": {
+        "width": 1,
+        "color": {
+          "token": "color.border.default"
+        }
+      },
+      "border.error": {
+        "width": 1,
+        "color": {
+          "token": "color.status.error"
+        }
+      }
+    },
+    "components": [
+      {
+        "type": "component",
+        "id": "button.primary",
+        "key": "button.primary",
+        "variant": {
+          "state": "primary"
+        },
+        "name": "Button — Primary",
+        "width": 184,
+        "height": 44,
+        "background": {
+          "token": "color.action.primary"
+        },
+        "cornerRadius": {
+          "token": "radius.control"
+        },
+        "layout": {
+          "mode": "horizontal",
+          "padding": {
+            "top": {
+              "token": "spacing.sm"
+            },
+            "right": {
+              "token": "spacing.lg"
+            },
+            "bottom": {
+              "token": "spacing.sm"
+            },
+            "left": {
+              "token": "spacing.lg"
+            }
+          },
+          "primaryAxisAlign": "center",
+          "counterAxisAlign": "center"
+        },
+        "children": [
+          {
+            "type": "text",
+            "name": "Button Label",
+            "text": "افزودن به سبد خرید",
+            "textStyle": {
+              "token": "typography.button"
+            },
+            "color": "#FFFFFF"
+          }
+        ]
+      },
+      {
+        "type": "component",
+        "id": "button.secondary",
+        "key": "button.secondary",
+        "variant": {
+          "state": "secondary"
+        },
+        "name": "Button — Secondary",
+        "width": 184,
+        "height": 44,
+        "background": {
+          "token": "color.surface.pale"
+        },
+        "stroke": {
+          "token": "border.default"
+        },
+        "cornerRadius": {
+          "token": "radius.control"
+        },
+        "layout": {
+          "mode": "horizontal",
+          "padding": {
+            "top": {
+              "token": "spacing.sm"
+            },
+            "right": {
+              "token": "spacing.lg"
+            },
+            "bottom": {
+              "token": "spacing.sm"
+            },
+            "left": {
+              "token": "spacing.lg"
+            }
+          },
+          "primaryAxisAlign": "center",
+          "counterAxisAlign": "center"
+        },
+        "children": [
+          {
+            "type": "text",
+            "name": "Button Label",
+            "text": "مشاهده جزئیات",
+            "textStyle": {
+              "token": "typography.button"
+            },
+            "color": {
+              "token": "color.brand.deepNavy"
+            }
+          }
+        ]
+      },
+      {
+        "type": "component",
+        "id": "button.disabled",
+        "key": "button.disabled",
+        "variant": {
+          "state": "disabled"
+        },
+        "name": "Button — Disabled",
+        "width": 184,
+        "height": 44,
+        "background": {
+          "token": "color.border.default"
+        },
+        "cornerRadius": {
+          "token": "radius.control"
+        },
+        "layout": {
+          "mode": "horizontal",
+          "padding": {
+            "top": {
+              "token": "spacing.sm"
+            },
+            "right": {
+              "token": "spacing.lg"
+            },
+            "bottom": {
+              "token": "spacing.sm"
+            },
+            "left": {
+              "token": "spacing.lg"
+            }
+          },
+          "primaryAxisAlign": "center",
+          "counterAxisAlign": "center"
+        },
+        "children": [
+          {
+            "type": "text",
+            "name": "Button Label",
+            "text": "ناموجود",
+            "textStyle": {
+              "token": "typography.button"
+            },
+            "color": {
+              "token": "color.text.muted"
+            }
+          }
+        ]
+      },
+      {
+        "type": "component",
+        "id": "product-card.basic",
+        "key": "product-card.basic",
+        "name": "Product Card",
+        "width": 346,
+        "height": 374,
+        "background": {
+          "token": "color.surface.default"
+        },
+        "stroke": {
+          "token": "border.default"
+        },
+        "cornerRadius": {
+          "token": "radius.card"
+        },
+        "layout": {
+          "mode": "vertical",
+          "gap": {
+            "token": "spacing.md"
+          },
+          "padding": {
+            "top": {
+              "token": "spacing.md"
+            },
+            "right": {
+              "token": "spacing.md"
+            },
+            "bottom": {
+              "token": "spacing.md"
+            },
+            "left": {
+              "token": "spacing.md"
+            }
+          },
+          "primaryAxisAlign": "start",
+          "counterAxisAlign": "stretch"
+        },
+        "children": [
+          {
+            "type": "frame",
+            "name": "Image Placeholder",
+            "width": 314,
+            "height": 196,
+            "background": {
+              "token": "color.action.highlight"
+            },
+            "cornerRadius": {
+              "token": "radius.control"
+            },
+            "layout": {
+              "mode": "horizontal",
+              "primaryAxisAlign": "center",
+              "counterAxisAlign": "center"
+            },
+            "children": [
+              {
+                "type": "text",
+                "name": "Image Placeholder Label",
+                "text": "جایگاه تصویر محصول",
+                "textStyle": {
+                  "token": "typography.body"
+                },
+                "color": {
+                  "token": "color.brand.deepNavy"
+                },
+                "textAlign": "center"
+              }
+            ]
+          },
+          {
+            "type": "text",
+            "name": "Product Title",
+            "text": "مانتو کتان روزمره",
+            "textStyle": {
+              "token": "typography.body"
+            },
+            "color": {
+              "token": "color.text.primary"
+            }
+          },
+          {
+            "type": "text",
+            "name": "Product Price",
+            "text": "۱٬۲۹۰٬۰۰۰ تومان",
+            "textStyle": {
+              "token": "typography.price"
+            },
+            "color": {
+              "token": "color.status.success"
+            }
+          },
+          {
+            "type": "instance",
+            "componentId": "button.primary",
+            "name": "Purchase Action",
+            "sizing": {
+              "width": "fill",
+              "height": "fixed"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "screens": [
+    {
+      "id": "splash",
+      "name": "صفحه آغاز",
+      "group": "شروع",
+      "order": 10,
+      "devicePreset": "mobile",
+      "width": 390,
+      "height": 844,
+      "background": {
+        "token": "color.page.background"
+      },
+      "layout": {
+        "mode": "vertical",
+        "gap": {
+          "token": "spacing.md"
+        },
+        "padding": {
+          "top": {
+            "token": "spacing.lg"
+          },
+          "right": {
+            "token": "spacing.lg"
+          },
+          "bottom": {
+            "token": "spacing.lg"
+          },
+          "left": {
+            "token": "spacing.lg"
+          }
+        },
+        "primaryAxisAlign": "start",
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "frame",
+          "name": "Splash artwork placeholder",
+          "width": 342,
+          "height": 300,
+          "background": {
+            "token": "color.surface.pale"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Welcome mark",
+              "text": "✦",
+              "textStyle": {
+                "token": "typography.heading"
+              },
+              "color": {
+                "token": "color.action.primary"
+              },
+              "textAlign": "center",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            },
+            {
+              "type": "text",
+              "name": "Welcome label",
+              "text": "کالکشن تازه",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.brand.deepNavy"
+              },
+              "textAlign": "center",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "Splash title",
+          "text": "استایل روزمره، انتخابی ساده",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.brand.deepNavy"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "text",
+          "name": "Splash subtitle",
+          "text": "لباس‌های کاربردی برای لحظه‌های هر روز",
+          "textStyle": {
+            "token": "typography.body"
+          },
+          "color": {
+            "token": "color.text.muted"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "instance",
+          "componentId": "button.primary",
+          "name": "Start shopping",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sign-in",
+      "name": "ورود",
+      "group": "شروع",
+      "order": 20,
+      "devicePreset": "mobile",
+      "width": 390,
+      "height": 844,
+      "background": {
+        "token": "color.page.background"
+      },
+      "layout": {
+        "mode": "vertical",
+        "gap": {
+          "token": "spacing.md"
+        },
+        "padding": {
+          "top": {
+            "token": "spacing.lg"
+          },
+          "right": {
+            "token": "spacing.lg"
+          },
+          "bottom": {
+            "token": "spacing.lg"
+          },
+          "left": {
+            "token": "spacing.lg"
+          }
+        },
+        "primaryAxisAlign": "start",
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "text",
+          "name": "Sign in title",
+          "text": "ورود به حساب",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.brand.deepNavy"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "text",
+          "name": "Sign in description",
+          "text": "برای ادامه شماره موبایل خود را وارد کنید.",
+          "textStyle": {
+            "token": "typography.body"
+          },
+          "color": {
+            "token": "color.text.muted"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "frame",
+          "name": "Phone field",
+          "width": 342,
+          "height": 56,
+          "background": {
+            "token": "color.surface.pale"
+          },
+          "cornerRadius": {
+            "token": "radius.control"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Phone field label",
+              "text": "شماره تلفن همراه",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.muted"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "instance",
+          "componentId": "button.primary",
+          "name": "Send verification code",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        },
+        {
+          "type": "text",
+          "name": "Sign in privacy note",
+          "text": "با ادامه، شرایط استفاده و حریم خصوصی را می‌پذیرید.",
+          "textStyle": {
+            "token": "typography.body"
+          },
+          "color": {
+            "token": "color.text.muted"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        }
+      ]
+    },
+    {
+      "id": "home",
+      "name": "خانه",
+      "group": "فروشگاه",
+      "order": 10,
+      "devicePreset": "mobile",
+      "width": 390,
+      "height": 900,
+      "background": {
+        "token": "color.page.background"
+      },
+      "layout": {
+        "mode": "vertical",
+        "gap": {
+          "token": "spacing.md"
+        },
+        "padding": {
+          "top": {
+            "token": "spacing.lg"
+          },
+          "right": {
+            "token": "spacing.lg"
+          },
+          "bottom": {
+            "token": "spacing.lg"
+          },
+          "left": {
+            "token": "spacing.lg"
+          }
+        },
+        "primaryAxisAlign": "start",
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "text",
+          "name": "Home greeting",
+          "text": "سلام، خوش آمدید",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.brand.deepNavy"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "frame",
+          "name": "Home search",
+          "width": 342,
+          "height": 56,
+          "background": {
+            "token": "color.surface.pale"
+          },
+          "cornerRadius": {
+            "token": "radius.control"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Home search label",
+              "text": "جست‌وجوی محصول",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.muted"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "name": "Home campaign placeholder",
+          "width": 342,
+          "height": 190,
+          "background": {
+            "token": "color.surface.pale"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Campaign title",
+              "text": "برای روزهای تازه",
+              "textStyle": {
+                "token": "typography.heading"
+              },
+              "color": {
+                "token": "color.brand.deepNavy"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            },
+            {
+              "type": "text",
+              "name": "Campaign subtitle",
+              "text": "مدل‌های جدید این فصل را ببینید",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.muted"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "Featured products heading",
+          "text": "پیشنهادهای منتخب",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.text.primary"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "instance",
+          "componentId": "product-card.basic",
+          "name": "Home featured product",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "categories",
+      "name": "دسته‌بندی‌ها",
+      "group": "فروشگاه",
+      "order": 20,
+      "devicePreset": "mobile",
+      "width": 390,
+      "height": 844,
+      "background": {
+        "token": "color.page.background"
+      },
+      "layout": {
+        "mode": "vertical",
+        "gap": {
+          "token": "spacing.md"
+        },
+        "padding": {
+          "top": {
+            "token": "spacing.lg"
+          },
+          "right": {
+            "token": "spacing.lg"
+          },
+          "bottom": {
+            "token": "spacing.lg"
+          },
+          "left": {
+            "token": "spacing.lg"
+          }
+        },
+        "primaryAxisAlign": "start",
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "text",
+          "name": "Categories heading",
+          "text": "دسته‌بندی پوشاک",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.brand.deepNavy"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "frame",
+          "name": "Women category",
+          "width": 342,
+          "height": 100,
+          "background": {
+            "token": "color.surface.pale"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Women category name",
+              "text": "زنانه",
+              "textStyle": {
+                "token": "typography.heading"
+              },
+              "color": {
+                "token": "color.brand.deepNavy"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "name": "Men category",
+          "width": 342,
+          "height": 100,
+          "background": {
+            "token": "color.surface.default"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Men category name",
+              "text": "مردانه",
+              "textStyle": {
+                "token": "typography.heading"
+              },
+              "color": {
+                "token": "color.brand.deepNavy"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "name": "Accessories category",
+          "width": 342,
+          "height": 100,
+          "background": {
+            "token": "color.surface.pale"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Accessories category name",
+              "text": "اکسسوری",
+              "textStyle": {
+                "token": "typography.heading"
+              },
+              "color": {
+                "token": "color.brand.deepNavy"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "instance",
+          "componentId": "product-card.basic",
+          "name": "Category featured item",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "search-results",
+      "name": "جست‌وجو و نتایج",
+      "group": "فروشگاه",
+      "order": 30,
+      "devicePreset": "mobile",
+      "width": 390,
+      "height": 960,
+      "background": {
+        "token": "color.page.background"
+      },
+      "layout": {
+        "mode": "vertical",
+        "gap": {
+          "token": "spacing.md"
+        },
+        "padding": {
+          "top": {
+            "token": "spacing.lg"
+          },
+          "right": {
+            "token": "spacing.lg"
+          },
+          "bottom": {
+            "token": "spacing.lg"
+          },
+          "left": {
+            "token": "spacing.lg"
+          }
+        },
+        "primaryAxisAlign": "start",
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "text",
+          "name": "Search results heading",
+          "text": "نتایج جست‌وجو",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.brand.deepNavy"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "frame",
+          "name": "Search query",
+          "width": 342,
+          "height": 56,
+          "background": {
+            "token": "color.surface.pale"
+          },
+          "cornerRadius": {
+            "token": "radius.control"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Search query label",
+              "text": "مانتو کتان",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.muted"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "Search result count",
+          "text": "۱۲ محصول پیدا شد",
+          "textStyle": {
+            "token": "typography.body"
+          },
+          "color": {
+            "token": "color.text.muted"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "instance",
+          "componentId": "product-card.basic",
+          "name": "Search result product 1",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        },
+        {
+          "type": "instance",
+          "componentId": "product-card.basic",
+          "name": "Search result product 2",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "tablet-catalog",
+      "name": "فهرست محصولات",
+      "group": "فروشگاه",
+      "order": 40,
+      "devicePreset": "tablet",
+      "width": 834,
+      "height": 1112,
+      "background": {
+        "token": "color.page.background"
+      },
+      "layout": {
+        "mode": "vertical",
+        "gap": {
+          "token": "spacing.md"
+        },
+        "padding": {
+          "top": {
+            "token": "spacing.lg"
+          },
+          "right": {
+            "token": "spacing.lg"
+          },
+          "bottom": {
+            "token": "spacing.lg"
+          },
+          "left": {
+            "token": "spacing.lg"
+          }
+        },
+        "primaryAxisAlign": "start",
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "text",
+          "name": "Tablet catalog heading",
+          "text": "محصولات جدید",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.brand.deepNavy"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "frame",
+          "name": "Tablet catalog search",
+          "width": 342,
+          "height": 56,
+          "background": {
+            "token": "color.surface.pale"
+          },
+          "cornerRadius": {
+            "token": "radius.control"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Tablet catalog search label",
+              "text": "جست‌وجوی محصول",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.muted"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "name": "Tablet product row",
+          "width": 786,
+          "height": 390,
+          "layout": {
+            "mode": "horizontal",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "start"
+          },
+          "children": [
+            {
+              "type": "instance",
+              "componentId": "product-card.basic",
+              "name": "Tablet product 1",
+              "sizing": {
+                "width": "fill",
+                "height": "fixed"
+              }
+            },
+            {
+              "type": "instance",
+              "componentId": "product-card.basic",
+              "name": "Tablet product 2",
+              "sizing": {
+                "width": "fill",
+                "height": "fixed"
+              }
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "Tablet catalog note",
+          "text": "انتخاب‌های تازه برای فصل پیش رو",
+          "textStyle": {
+            "token": "typography.body"
+          },
+          "color": {
+            "token": "color.text.muted"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        }
+      ]
+    },
+    {
+      "id": "product-detail",
+      "name": "جزئیات محصول",
+      "group": "خرید",
+      "order": 10,
+      "devicePreset": "mobile",
+      "width": 390,
+      "height": 1040,
+      "background": {
+        "token": "color.page.background"
+      },
+      "layout": {
+        "mode": "vertical",
+        "gap": {
+          "token": "spacing.md"
+        },
+        "padding": {
+          "top": {
+            "token": "spacing.lg"
+          },
+          "right": {
+            "token": "spacing.lg"
+          },
+          "bottom": {
+            "token": "spacing.lg"
+          },
+          "left": {
+            "token": "spacing.lg"
+          }
+        },
+        "primaryAxisAlign": "start",
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "frame",
+          "name": "Product image placeholder",
+          "width": 342,
+          "height": 340,
+          "background": {
+            "token": "color.action.highlight"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Product image placeholder label",
+              "text": "جایگاه تصویر محصول",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.brand.deepNavy"
+              },
+              "textAlign": "center",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "Product detail title",
+          "text": "مانتو کتان روزمره",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.text.primary"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "text",
+          "name": "Product detail price",
+          "text": "۱٬۲۹۰٬۰۰۰ تومان",
+          "textStyle": {
+            "token": "typography.price"
+          },
+          "color": {
+            "token": "color.status.success"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "text",
+          "name": "Product detail description",
+          "text": "پارچه سبک و خوش‌فرم، مناسب استفاده روزانه.",
+          "textStyle": {
+            "token": "typography.body"
+          },
+          "color": {
+            "token": "color.text.muted"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "frame",
+          "name": "Product size selector",
+          "width": 342,
+          "height": 56,
+          "background": {
+            "token": "color.surface.pale"
+          },
+          "cornerRadius": {
+            "token": "radius.control"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Product size selector label",
+              "text": "انتخاب سایز",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.muted"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "instance",
+          "componentId": "button.primary",
+          "name": "Add product to cart",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "cart",
+      "name": "سبد خرید",
+      "group": "خرید",
+      "order": 20,
+      "devicePreset": "mobile",
+      "width": 390,
+      "height": 920,
+      "background": {
+        "token": "color.page.background"
+      },
+      "layout": {
+        "mode": "vertical",
+        "gap": {
+          "token": "spacing.md"
+        },
+        "padding": {
+          "top": {
+            "token": "spacing.lg"
+          },
+          "right": {
+            "token": "spacing.lg"
+          },
+          "bottom": {
+            "token": "spacing.lg"
+          },
+          "left": {
+            "token": "spacing.lg"
+          }
+        },
+        "primaryAxisAlign": "start",
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "text",
+          "name": "Cart heading",
+          "text": "سبد خرید",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.brand.deepNavy"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "instance",
+          "componentId": "product-card.basic",
+          "name": "Cart product",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        },
+        {
+          "type": "frame",
+          "name": "Cart summary",
+          "width": 342,
+          "height": 170,
+          "background": {
+            "token": "color.surface.default"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Cart subtotal",
+              "text": "جمع کالاها   ۱٬۲۹۰٬۰۰۰ تومان",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.primary"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            },
+            {
+              "type": "text",
+              "name": "Cart shipping",
+              "text": "هزینه ارسال   محاسبه در مرحله بعد",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.muted"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "instance",
+          "componentId": "button.primary",
+          "name": "Continue to checkout",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "checkout",
+      "name": "تکمیل سفارش",
+      "group": "خرید",
+      "order": 30,
+      "devicePreset": "mobile",
+      "width": 390,
+      "height": 980,
+      "background": {
+        "token": "color.page.background"
+      },
+      "layout": {
+        "mode": "vertical",
+        "gap": {
+          "token": "spacing.md"
+        },
+        "padding": {
+          "top": {
+            "token": "spacing.lg"
+          },
+          "right": {
+            "token": "spacing.lg"
+          },
+          "bottom": {
+            "token": "spacing.lg"
+          },
+          "left": {
+            "token": "spacing.lg"
+          }
+        },
+        "primaryAxisAlign": "start",
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "text",
+          "name": "Checkout heading",
+          "text": "تکمیل سفارش",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.brand.deepNavy"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "frame",
+          "name": "Delivery address",
+          "width": 342,
+          "height": 130,
+          "background": {
+            "token": "color.surface.default"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Delivery address title",
+              "text": "نشانی تحویل",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.muted"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            },
+            {
+              "type": "text",
+              "name": "Delivery address value",
+              "text": "تهران، خیابان نمونه، پلاک ۱۲",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.primary"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "name": "Payment method",
+          "width": 342,
+          "height": 100,
+          "background": {
+            "token": "color.surface.default"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Payment method title",
+              "text": "روش پرداخت",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.muted"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            },
+            {
+              "type": "text",
+              "name": "Payment method value",
+              "text": "پرداخت آنلاین",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.primary"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "name": "Checkout total",
+          "width": 342,
+          "height": 80,
+          "background": {
+            "token": "color.surface.default"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Checkout total label",
+              "text": "مبلغ نهایی",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.muted"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            },
+            {
+              "type": "text",
+              "name": "Checkout total amount",
+              "text": "۱٬۳۴۰٬۰۰۰ تومان",
+              "textStyle": {
+                "token": "typography.price"
+              },
+              "color": {
+                "token": "color.brand.deepNavy"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "instance",
+          "componentId": "button.primary",
+          "name": "Confirm order",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "order-confirmation",
+      "name": "تأیید سفارش",
+      "group": "پایان خرید",
+      "order": 10,
+      "devicePreset": "mobile",
+      "width": 390,
+      "height": 820,
+      "background": {
+        "token": "color.page.background"
+      },
+      "layout": {
+        "mode": "vertical",
+        "gap": {
+          "token": "spacing.md"
+        },
+        "padding": {
+          "top": {
+            "token": "spacing.lg"
+          },
+          "right": {
+            "token": "spacing.lg"
+          },
+          "bottom": {
+            "token": "spacing.lg"
+          },
+          "left": {
+            "token": "spacing.lg"
+          }
+        },
+        "primaryAxisAlign": "start",
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "frame",
+          "name": "Order success mark",
+          "width": 342,
+          "height": 240,
+          "background": {
+            "token": "color.surface.pale"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Order success icon",
+              "text": "✓",
+              "textStyle": {
+                "token": "typography.heading"
+              },
+              "color": {
+                "token": "color.status.success"
+              },
+              "textAlign": "center",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "Order confirmation heading",
+          "text": "سفارش شما ثبت شد",
+          "textStyle": {
+            "token": "typography.heading"
+          },
+          "color": {
+            "token": "color.brand.deepNavy"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "text",
+          "name": "Order confirmation body",
+          "text": "جزئیات سفارش و زمان ارسال به شما اطلاع داده می‌شود.",
+          "textStyle": {
+            "token": "typography.body"
+          },
+          "color": {
+            "token": "color.text.muted"
+          },
+          "textAlign": "right",
+          "sizing": {
+            "width": "fill",
+            "height": "hug"
+          }
+        },
+        {
+          "type": "frame",
+          "name": "Order number",
+          "width": 342,
+          "height": 72,
+          "background": {
+            "token": "color.surface.default"
+          },
+          "cornerRadius": {
+            "token": "radius.card"
+          },
+          "layout": {
+            "mode": "vertical",
+            "gap": {
+              "token": "spacing.md"
+            },
+            "padding": {
+              "top": {
+                "token": "spacing.md"
+              },
+              "right": {
+                "token": "spacing.md"
+              },
+              "bottom": {
+                "token": "spacing.md"
+              },
+              "left": {
+                "token": "spacing.md"
+              }
+            },
+            "primaryAxisAlign": "start",
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Order number label",
+              "text": "شماره سفارش: ۸۴۲۱۶",
+              "textStyle": {
+                "token": "typography.body"
+              },
+              "color": {
+                "token": "color.text.primary"
+              },
+              "textAlign": "right",
+              "sizing": {
+                "width": "fill",
+                "height": "hug"
+              }
+            }
+          ]
+        },
+        {
+          "type": "instance",
+          "componentId": "button.secondary",
+          "name": "Continue browsing",
+          "sizing": {
+            "width": "fill",
+            "height": "fixed"
+          }
+        }
+      ]
+    }
+  ]
+}

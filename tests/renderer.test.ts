@@ -2,12 +2,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import phase1Sample from "../src/samples/sample-design.json";
 import storefront from "../src/samples/phase-2-storefront.json";
 import phase3Sample from "../src/samples/phase-3-design-system.json";
+import phase4Sample from "../src/samples/phase-4-multi-screen.json";
 import {
   mapLayoutSpec,
   mapSizingMode,
   renderDesign,
+  renderMultiScreenDesign,
   type RendererFigmaApi,
 } from "../src/plugin/renderer";
+import { boundsIntersectWithGap, DEFAULT_MIN_CANVAS_GAP } from "../src/plugin/canvas-placement";
 import { parseDesignValue, type DesignSpec } from "../src/shared/schema";
 
 interface MockNode {
@@ -624,5 +627,241 @@ describe("renderDesign", () => {
     expect(mock.paintStyles).toEqual([]);
     expect(mock.textStyles).toEqual([]);
     expect(mock.unrelated.removed).toBe(false);
+  });
+
+  it("renders a multi-screen batch with shared native styles, masters, and collision-free placement", async () => {
+    const result = await renderMultiScreenDesign(mock.api, phase4Sample, { maxRowWidth: 2_000 });
+    const screenRoots = mock.roots.filter((node) =>
+      node.pluginData.has("fad.multi-screen.screen-id"),
+    );
+    const componentArea = mock.roots.find((node) =>
+      node.pluginData.has("fad.multi-screen.components-batch"),
+    );
+
+    expect(result).toMatchObject({
+      totalScreens: 10,
+      generatedScreens: 10,
+      failedScreens: 0,
+      gap: DEFAULT_MIN_CANVAS_GAP,
+      maxRowWidth: 2_000,
+    });
+    expect(screenRoots).toHaveLength(10);
+    expect(componentArea).toBeDefined();
+    expect(mock.raw.createComponentFromNode).toHaveBeenCalledTimes(4);
+    expect(mock.paintStyles).toHaveLength(11);
+    expect(mock.textStyles).toHaveLength(4);
+    expect(result.counts.components).toBe(4);
+    expect(result.designSystem?.created).toContain("component:button.primary");
+    expect(mock.find("Home featured product")?.mainComponent?.name).toContain("product-card.basic");
+    expect(mock.raw.currentPage.selection).toEqual([screenRoots[0]]);
+    expect(mock.raw.viewport.scrollAndZoomIntoView).toHaveBeenCalledWith([screenRoots[0]]);
+
+    for (let first = 0; first < screenRoots.length; first++) {
+      const firstBounds = {
+        x: screenRoots[first].x,
+        y: screenRoots[first].y,
+        width: screenRoots[first].width,
+        height: screenRoots[first].height,
+      };
+      expect(
+        boundsIntersectWithGap(
+          firstBounds,
+          {
+            x: mock.unrelated.x,
+            y: mock.unrelated.y,
+            width: mock.unrelated.width,
+            height: mock.unrelated.height,
+          },
+          DEFAULT_MIN_CANVAS_GAP,
+        ),
+      ).toBe(false);
+      expect(
+        boundsIntersectWithGap(
+          firstBounds,
+          {
+            x: componentArea!.x,
+            y: componentArea!.y,
+            width: componentArea!.width,
+            height: componentArea!.height,
+          },
+          DEFAULT_MIN_CANVAS_GAP,
+        ),
+      ).toBe(false);
+      for (let second = first + 1; second < screenRoots.length; second++) {
+        expect(
+          boundsIntersectWithGap(
+            firstBounds,
+            {
+              x: screenRoots[second].x,
+              y: screenRoots[second].y,
+              width: screenRoots[second].width,
+              height: screenRoots[second].height,
+            },
+            DEFAULT_MIN_CANVAS_GAP,
+          ),
+        ).toBe(false);
+      }
+    }
+    expect(
+      boundsIntersectWithGap(
+        {
+          x: componentArea!.x,
+          y: componentArea!.y,
+          width: componentArea!.width,
+          height: componentArea!.height,
+        },
+        {
+          x: mock.unrelated.x,
+          y: mock.unrelated.y,
+          width: mock.unrelated.width,
+          height: mock.unrelated.height,
+        },
+        DEFAULT_MIN_CANVAS_GAP,
+      ),
+    ).toBe(false);
+  });
+
+  it("creates a new named batch on repeat and reuses shared design-system assets", async () => {
+    const first = await renderMultiScreenDesign(mock.api, phase4Sample);
+    const firstRoots = mock.roots.filter((node) =>
+      node.pluginData.has("fad.multi-screen.screen-id"),
+    );
+    const firstCoordinates = firstRoots.map(({ x, y }) => [x, y]);
+    const masters = mock.allCreated.filter((node) => node.type === "COMPONENT");
+
+    const second = await renderMultiScreenDesign(mock.api, phase4Sample);
+
+    expect(second.generatedScreens).toBe(10);
+    expect(second.designSystem?.created).toEqual([]);
+    expect(second.designSystem?.reused).toHaveLength(19);
+    expect(mock.raw.createComponentFromNode).toHaveBeenCalledTimes(4);
+    expect(mock.paintStyles).toHaveLength(11);
+    expect(mock.textStyles).toHaveLength(4);
+    expect(
+      mock.roots.filter((node) => node.pluginData.has("fad.multi-screen.screen-id")),
+    ).toHaveLength(20);
+    expect(firstRoots.map(({ x, y }) => [x, y])).toEqual(firstCoordinates);
+    expect(masters.every((node) => !node.removed)).toBe(true);
+    expect(first.generatedScreens).toBe(10);
+  });
+
+  it("renders 100 empty roots from one batch without overlap", async () => {
+    const batch = {
+      schemaVersion: "1.0.0",
+      id: "stress-batch",
+      name: "Stress Batch",
+      screens: Array.from({ length: 100 }, (_, index) => ({
+        id: `screen-${String(index).padStart(3, "0")}`,
+        name: `Screen ${String(index).padStart(3, "0")}`,
+        order: index,
+        devicePreset: "custom" as const,
+        width: index % 2 === 0 ? 390 : 834,
+        height: 844 + (index % 3) * 100,
+        background: "#FFFFFF",
+        children: [],
+      })),
+    };
+    const startedAt = performance.now();
+    const result = await renderMultiScreenDesign(mock.api, batch, { maxRowWidth: 6_000 });
+    const elapsedMs = performance.now() - startedAt;
+    const roots = mock.roots.filter((node) => node.pluginData.has("fad.multi-screen.screen-id"));
+
+    expect(Number.isFinite(elapsedMs)).toBe(true);
+    expect(elapsedMs).toBeLessThan(5_000);
+    expect(result.generatedScreens).toBe(100);
+    expect(result.screens).toHaveLength(100);
+    expect(roots).toHaveLength(100);
+    for (let first = 0; first < roots.length; first++) {
+      expect(
+        boundsIntersectWithGap(
+          {
+            x: roots[first].x,
+            y: roots[first].y,
+            width: roots[first].width,
+            height: roots[first].height,
+          },
+          {
+            x: mock.unrelated.x,
+            y: mock.unrelated.y,
+            width: mock.unrelated.width,
+            height: mock.unrelated.height,
+          },
+          DEFAULT_MIN_CANVAS_GAP,
+        ),
+      ).toBe(false);
+      for (let second = first + 1; second < roots.length; second++) {
+        expect(
+          boundsIntersectWithGap(
+            {
+              x: roots[first].x,
+              y: roots[first].y,
+              width: roots[first].width,
+              height: roots[first].height,
+            },
+            {
+              x: roots[second].x,
+              y: roots[second].y,
+              width: roots[second].width,
+              height: roots[second].height,
+            },
+            DEFAULT_MIN_CANVAS_GAP,
+          ),
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("cleans only a failed screen and continues the remaining batch", async () => {
+    const originalCreateText = mock.raw.createText.getMockImplementation();
+    if (!originalCreateText) throw new Error("Mock text factory is missing.");
+    let textCalls = 0;
+    let failedOnce = false;
+    mock.raw.createText.mockImplementation(() => {
+      textCalls++;
+      if (textCalls === 7 && !failedOnce) {
+        failedOnce = true;
+        throw new Error("Mock failure in first screen.");
+      }
+      return originalCreateText();
+    });
+    const originalPosition = { x: mock.unrelated.x, y: mock.unrelated.y };
+
+    const result = await renderMultiScreenDesign(mock.api, phase4Sample);
+
+    expect(result.generatedScreens).toBe(9);
+    expect(result.failedScreens).toBe(1);
+    expect(result.screens[0].status).toBe("failed");
+    expect(result.screens[0].error).toContain("Mock failure in first screen");
+    expect(mock.unrelated).toMatchObject({ ...originalPosition, removed: false });
+    expect(
+      mock.roots.filter((node) => node.pluginData.has("fad.multi-screen.screen-id")),
+    ).toHaveLength(9);
+    expect(mock.textStyles).toHaveLength(4);
+    expect(mock.paintStyles).toHaveLength(11);
+  });
+
+  it("rolls back shared assets when every screen fails before commit", async () => {
+    const originalCreateText = mock.raw.createText.getMockImplementation();
+    if (!originalCreateText) throw new Error("Mock text factory is missing.");
+    let textCalls = 0;
+    mock.raw.createText.mockImplementation(() => {
+      textCalls++;
+      if (textCalls > 6) throw new Error("Every screen text creation failed.");
+      return originalCreateText();
+    });
+
+    const result = await renderMultiScreenDesign(mock.api, phase4Sample);
+
+    expect(result.generatedScreens).toBe(0);
+    expect(result.failedScreens).toBe(10);
+    expect(result.createdNodeCount).toBe(0);
+    expect(result.screens).toHaveLength(10);
+    expect(result.screens.every((screen) => screen.status === "failed")).toBe(true);
+    expect(result.designSystem?.created).toEqual([]);
+    expect(result.warnings.join(" ")).toContain("rolled back");
+    expect(mock.roots).toEqual([mock.unrelated]);
+    expect(mock.unrelated.removed).toBe(false);
+    expect(mock.paintStyles).toEqual([]);
+    expect(mock.textStyles).toEqual([]);
   });
 });

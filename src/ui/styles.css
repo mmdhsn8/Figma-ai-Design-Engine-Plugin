@@ -488,6 +488,121 @@ textarea:disabled {
   max-height: 88px;
   overflow: auto;
 }
+.multi-screen-panel {
+  padding: 13px;
+  border: 1px solid #333541;
+  border-radius: 9px;
+  background: linear-gradient(145deg, rgba(94, 176, 238, 0.08), rgba(28, 30, 37, 0.96));
+}
+.multi-screen-summary,
+.multi-screen-note {
+  margin: 7px 0 0;
+  color: #a6a9b5;
+  font-size: 8px;
+  line-height: 13px;
+}
+.multi-screen-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 190px;
+  overflow-y: auto;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.multi-screen-list li {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 5px 6px;
+  border: 1px solid #333640;
+  border-radius: 5px;
+  background: rgba(15, 16, 21, 0.42);
+}
+.screen-order {
+  color: #7f9fc0;
+  font: 8px var(--mono);
+}
+.screen-info {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.screen-info strong {
+  overflow: hidden;
+  color: #d4d6de;
+  font-size: 9px;
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.screen-info small {
+  color: #858a99;
+  font-size: 8px;
+}
+.screen-outcome {
+  font-size: 8px;
+  white-space: nowrap;
+}
+.screen-generated {
+  color: #7fd1aa;
+}
+.screen-failed {
+  color: #ff9699;
+}
+.multi-screen-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 9px;
+}
+.multi-screen-options label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #a5a8b5;
+  font-size: 8px;
+}
+.multi-screen-options input {
+  width: 100%;
+  min-height: 30px;
+  padding: 0 7px;
+  border: 1px solid #393c47;
+  border-radius: 5px;
+  outline: none;
+  color: #e0e1e8;
+  background: #1d1f26;
+  font: 9px var(--mono);
+}
+.multi-screen-options input:focus-visible {
+  border-color: #72b1e5;
+  outline: 2px solid rgba(114, 177, 229, 0.25);
+}
+.multi-progress {
+  margin-top: 9px;
+}
+.multi-progress [role="progressbar"] {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #30323b;
+}
+.multi-progress [role="progressbar"] span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #4e9bd8, #79c7dd);
+  transition: width 150ms ease;
+}
+.multi-progress p {
+  margin: 4px 0 0;
+  color: #a6b9c9;
+  font-size: 8px;
+}
 .spinner,
 .button-spinner {
   width: 13px;

@@ -388,6 +388,26 @@ export function resolveDesignSystemTokens(spec: DesignSpec): {
   return { spec: resolved, tables };
 }
 
+/** Resolves a screen root against the token tables shared by a multi-screen batch. */
+export function resolveDesignSpecWithTables(
+  spec: DesignSpec,
+  base: ResolvedDesignSpec,
+  tables: ResolvedTokenTables,
+): ResolvedDesignSpec {
+  return {
+    ...base,
+    document: {
+      ...base.document,
+      name: spec.document.name,
+      width: spec.document.width,
+      height: spec.document.height,
+      background: resolveColor(spec.document.background, tables),
+      layout: resolveLayout(spec.document.layout, tables),
+      children: spec.document.children.map((node) => resolveNode(node, tables)),
+    },
+  };
+}
+
 export function tokenReference(token: string): TokenReference {
   return { token };
 }

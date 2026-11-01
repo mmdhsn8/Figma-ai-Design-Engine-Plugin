@@ -1,6 +1,7 @@
 import { countDesignNodes, parseDesignText } from "../shared/schema";
+import { isMultiScreenInput, parseMultiScreenText } from "../shared/multi-screen-schema";
 import { UIToPluginSchema, type PluginToUIMessage } from "../shared/messages";
-import { renderDesign } from "./renderer";
+import { renderDesign, renderMultiScreenDesign } from "./renderer";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
 
@@ -19,6 +20,36 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
   }
 
   if (message.data.type === "validate") {
+    if (isMultiScreenInput(message.data.json)) {
+      const multiResult = parseMultiScreenText(message.data.json);
+      send(
+        multiResult.success
+          ? {
+              type: "validation-result",
+              requestId: message.data.requestId,
+              success: true,
+              multiScreen: {
+                totalScreens: multiResult.data.screens.length,
+                nodeCount: multiResult.nodeCount,
+                screens: multiResult.data.screens.map((screen) => ({
+                  id: screen.id,
+                  name: screen.name,
+                  group: screen.group,
+                  devicePreset: screen.devicePreset,
+                  width: screen.width,
+                  height: screen.height,
+                })),
+              },
+            }
+          : {
+              type: "validation-result",
+              requestId: message.data.requestId,
+              success: false,
+              errors: multiResult.errors,
+            },
+      );
+      return;
+    }
     const result = parseDesignText(message.data.json);
     send(
       result.success
@@ -35,6 +66,36 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
             errors: result.errors,
           },
     );
+    return;
+  }
+
+  if (message.data.type === "generate-multi-screen") {
+    const multiResult = parseMultiScreenText(message.data.json);
+    if (!multiResult.success) {
+      send({
+        type: "render-error",
+        requestId: message.data.requestId,
+        message: "The multi-screen JSON needs corrections before generation.",
+        errors: multiResult.errors,
+      });
+      return;
+    }
+    try {
+      const result = await renderMultiScreenDesign(figma, multiResult.data, {
+        gap: message.data.gap,
+        maxRowWidth: message.data.maxRowWidth,
+        onProgress: (progress) =>
+          send({ type: "multi-screen-progress", requestId: message.data.requestId, ...progress }),
+      });
+      send({ type: "multi-screen-result", requestId: message.data.requestId, ...result });
+    } catch (error) {
+      send({
+        type: "render-error",
+        requestId: message.data.requestId,
+        message:
+          error instanceof Error ? error.message : "An unexpected Figma error occurred. Try again.",
+      });
+    }
     return;
   }
 

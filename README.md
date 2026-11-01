@@ -127,6 +127,81 @@ Figma's [Variables guide](https://help.figma.com/hc/en-us/articles/1533965713538
 
 The sample's primary/secondary/disabled buttons are separate native masters. Component properties and instance text overrides are not exposed, so changing product copy currently means editing the master or adding another keyed component definition.
 
+## Phase 4 multi-screen generation
+
+Phase 4 adds an optional batch document shape while keeping `schemaVersion: "1.0.0"` and all earlier single-design JSON unchanged. Use `src/samples/phase-4-multi-screen.json` from the **Phase 4 demo** button, or import/paste a JSON document with this structure:
+
+```json
+{
+  "schemaVersion": "1.0.0",
+  "id": "storefront-app",
+  "name": "Storefront App",
+  "screens": [
+    {
+      "id": "home",
+      "name": "Home",
+      "group": "Shopping",
+      "order": 20,
+      "devicePreset": "mobile",
+      "width": 390,
+      "height": 844,
+      "background": "#F8FAFC",
+      "layout": {
+        "mode": "vertical",
+        "gap": 16,
+        "padding": { "top": 24, "right": 20, "bottom": 24, "left": 20 }
+      },
+      "children": [
+        {
+          "type": "text",
+          "name": "Title",
+          "text": "صفحهٔ خانه",
+          "fontSize": 24,
+          "color": "#0F172A"
+        }
+      ]
+    }
+  ]
+}
+```
+
+`designSystem` and batch-level `components` are optional and shared across the batch. Each screen is itself the root frame; its `children` and optional `layout` use the existing Phase 1–3 node schema. Screens support a stable `id`, safe display `name`, optional `group`, integer `order`, informational `devicePreset` (`mobile`, `tablet`, `desktop`, or `custom`), 1–10,000 px dimensions, optional background and up to 20 primitive metadata fields. Names and IDs are unique within the batch. Ordering is deterministic: group name, then `order`, then ID; RTL text direction does not affect canvas order. JSON remains schema version 1.0.0.
+
+### Import and generate
+
+1. Load **Phase 4 demo** or click **Import JSON** / paste a batch document.
+2. Review validation messages; paths identify the failing screen and field. The preview lists screen IDs, names, groups, device presets and dimensions, plus a dry-run node estimate and the shared Design System reuse policy.
+3. Set **Minimum gap** and **Target row width** if needed (defaults: 120 px and 6,000 px; accepted ranges: 0–1,000 px and 390–20,000 px).
+4. Click **Generate all screens**. The controller reports per-screen started/generated/failed progress and a final actual node count. Per-screen tree creation is rolled back if that screen fails; already completed screens remain. This is deliberately not presented as an all-or-nothing document transaction. If every screen fails, newly created shared assets are cleaned up when safe.
+5. The import always creates new screen frames rather than updating prior generated screens. Shared plugin-owned styles/components are resolved once and reused through Phase 3 ownership metadata. Existing screens, styles, frames, and unrelated content are left in place. The component master area is placed as another member of the planned batch.
+
+The planner preserves Phase 2.2 horizontal-first row packing and expands existing page-level bounds by the configured gap. It plans the full batch before mutation, uses the mixed screen dimensions and master-area bounds, then checks actual created frame bounds. A changed actual screen size causes later screens to be replanned around the canvas as it now exists. New content is placed on the current Figma Page; it does not make a Page per screen or require a paid plan. The viewport focuses the first generated screen in logical batch order. Progress is delivered screen by screen, but an active generation cannot currently be cancelled.
+
+### Limits and re-import behavior
+
+- At most 100 screens and 5,000 estimated native nodes per batch (shared component definitions are counted once). Each screen tree supports the legacy schema's 500-node and 8-level limits.
+- Screen dimensions: 1–10,000 px. The JSON file/editor limit remains 1 MB. Screen names are 1–100 characters and reject path separators/control characters.
+- Device presets are descriptive metadata; Phase 4 does not apply responsive rules or generate variants for other sizes.
+- The node estimate includes roots, shared component trees and the component-area container when definitions are present. Figma creates styles as document assets, and reuse or API-specific node details can make the final count differ; the final report is the actual count from the plugin's node tracker.
+- Components remain native linked instances and styles follow the Phase 3 registry and fallback rules. Persian text remains editable; full bidirectional shaping and responsive behavior are not promised.
+
+### Phase 4 Windows / Figma Desktop acceptance
+
+These checks are **pending**; automated tests use a mocked Figma API and do not establish real Figma Desktop behavior. After `npm run build`, close the running development plugin and reload it from this repository's `manifest.json` in Figma Desktop. Then:
+
+1. Load `phase-4-multi-screen.json`, validate, inspect the 10-screen preview and node estimate, then generate all screens. Confirm 10 top-level screen frames and a shared Generated Components area.
+2. Inspect each screen and its nested frames/text/rectangles in the Layers panel; edit text and Auto Layout to confirm native editability.
+3. Confirm the Button and Product Card instances remain linked to their component masters. Change a master and check Figma's normal instance propagation.
+4. Inspect Paint/Text Style bindings and the resolved numeric spacing/radius fallbacks from Phase 3.
+5. Confirm horizontal reading order, the configured gap, and wrapping after lowering row width; check mixed mobile/tablet dimensions and taller screens.
+6. Place an unrelated frame/component near the available canvas region, generate again, and confirm it is not moved or overlapped.
+7. Generate the same batch again; confirm new screens are added and previous screen coordinates/edits remain unchanged while shared owned styles/components are reused.
+8. Inspect Persian text rendering, alignment and editability in Figma Desktop.
+9. Cause one screen to fail with a valid but unavailable font or document issue where practical; confirm that screen's partial tree is removed and other outcomes are accurately reported.
+10. If practical, use a test file with 100+ existing frames and a 100-screen batch; inspect non-overlap and responsiveness.
+
+Phase 2.2 and Phase 3 Desktop checks have also not been confirmed with itemized results in this thread. Phase 4 is implemented, but its manual acceptance and those earlier manual gates remain pending until the user confirms them.
+
 ### Validation limits
 
 - Document, frame, and component dimensions: 1–10,000 px.
@@ -163,7 +238,7 @@ Phase 2.2 remains pending until these checks pass in Figma Desktop and the user 
 - Full right-to-left/bidirectional shaping, component variants, configurable component properties, and instance overrides are not implemented.
 - Rotated nodes reserve their full axis-aligned envelope, which may leave extra space. Figma render bounds may omit editor-only effects; geometric bounds are used when render bounds are unavailable.
 - The 6,000 px row width is a layout target rather than a hard canvas limit. Existing Phase 2.1 clusters are not rearranged automatically.
-- Numeric design-system tokens are resolved values and do not update through Figma Variables. Shadow/effect tokens, native component sets, variant properties, instance text overrides, multi-screen orchestration, advanced responsive rules, prototyping links, and publishing workflows are outside the current scope.
+- Numeric design-system tokens are resolved values and do not update through Figma Variables. Shadow/effect tokens, native component sets, variant properties, instance text overrides, advanced responsive rules, prototyping links, and publishing workflows are outside the current scope.
 - Font appearance and some text shaping depend on fonts installed and available to Figma Desktop.
 
 ## Build and development
@@ -174,7 +249,7 @@ The production build writes `dist\plugin.js` and `dist\ui.html`, which are refer
 npm run dev
 ```
 
-After a rebuild, close the running development plugin, rebuild, then rerun it from **Plugins → Development** in Figma Desktop. If the UI still shows an older bundle, use **Plugins → Development → Import plugin from manifest…** again with this repository's `manifest.json`. Project checks are available with:
+After source changes, close the running development plugin, run `npm run build`, then reopen it from **Plugins → Development** in Figma Desktop. If the UI still shows an older bundle, choose **Plugins → Development → Import plugin from manifest…** and select this repository's `manifest.json` again, then reopen the plugin. Project checks are available with:
 
 ```powershell
 npm run typecheck

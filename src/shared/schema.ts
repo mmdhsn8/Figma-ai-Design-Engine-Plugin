@@ -235,7 +235,7 @@ const InstanceNodeSchema = z
   })
   .strict();
 
-const DesignNodeSchema: z.ZodType<DesignNode> = z.lazy(
+export const DesignNodeSchema: z.ZodType<DesignNode> = z.lazy(
   () =>
     z.discriminatedUnion("type", [
       TextNodeSchema,
@@ -263,7 +263,7 @@ const FrameNodeSchema = z
   })
   .strict();
 
-const ComponentDefinitionSchema: z.ZodType<ComponentDefinitionSpec> = z
+export const ComponentDefinitionSchema: z.ZodType<ComponentDefinitionSpec> = z
   .object({
     type: z.literal("component"),
     id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,99}$/),
@@ -287,7 +287,7 @@ const ComponentDefinitionSchema: z.ZodType<ComponentDefinitionSpec> = z
   })
   .strict();
 
-const DesignSystemSchema = DesignSystemTokensSchema.extend({
+export const DesignSystemSchema = DesignSystemTokensSchema.extend({
   components: z.array(ComponentDefinitionSchema).max(MAX_COMPONENT_COUNT).optional(),
 });
 
@@ -925,7 +925,7 @@ export function parseDesignText(source: string): DesignParseResult {
   return parseDesignValue(value);
 }
 
-function findDuplicateJsonKeys(source: string): string[] {
+export function findDuplicateJsonKeys(source: string): string[] {
   let cursor = 0;
   const errors: string[] = [];
   const skipWhitespace = () => {

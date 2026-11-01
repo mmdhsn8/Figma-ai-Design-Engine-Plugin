@@ -34,8 +34,11 @@ export function getCanvasNodeBounds(node: SceneNode): CanvasBounds {
 }
 
 /** Reads page-level children only; descendants are already represented by their top-level parent bounds. */
-export function readTopLevelCanvasObstacles(page: Pick<PageNode, "children">): CanvasBounds[] {
-  return page.children.map(getCanvasNodeBounds);
+export function readTopLevelCanvasObstacles(
+  page: Pick<PageNode, "children">,
+  excludeNodeIds: ReadonlySet<string> = new Set(),
+): CanvasBounds[] {
+  return page.children.filter((node) => !excludeNodeIds.has(node.id)).map(getCanvasNodeBounds);
 }
 
 /** Moves only the newly generated page-level root so its measured AABB reaches the planned point. */

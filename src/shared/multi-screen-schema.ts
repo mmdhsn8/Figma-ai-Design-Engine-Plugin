@@ -1,0 +1,261 @@
+import { z } from "zod";
+import { TokenColorValueSchema, type TokenColorValue } from "./design-system-schema";
+import {
+  ComponentDefinitionSchema,
+  DESIGN_SCHEMA_VERSION,
+  DesignNodeSchema,
+  DesignSystemSchema,
+  LayoutSchema,
+  MAX_COMPONENT_COUNT,
+  MAX_JSON_LENGTH,
+  findDuplicateJsonKeys,
+  parseDesignValue,
+  type ComponentDefinitionSpec,
+  type DesignCounts,
+  type DesignNode,
+  type DesignSpec,
+} from "./schema";
+
+export const MAX_MULTI_SCREEN_COUNT = 100;
+export const MAX_MULTI_SCREEN_NODE_COUNT = 5_000;
+
+const nameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(100)
+  .refine(
+    (value) =>
+      !/[\\/]/.test(value) &&
+      !Array.from(value).some((character) => {
+        const code = character.charCodeAt(0);
+        return code <= 0x1f || code === 0x7f;
+      }),
+    {
+      message: "Use a name without slashes or control characters.",
+    },
+  );
+
+const idSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,79}$/);
+const dimensionSchema = z.number().finite().min(1).max(10_000);
+const metadataSchema = z
+  .record(
+    z.string().trim().min(1).max(40),
+    z.union([z.string().max(500), z.number().finite(), z.boolean()]),
+  )
+  .optional()
+  .superRefine((value, context) => {
+    if (value && Object.keys(value).length > 20) {
+      context.addIssue({ code: "custom", message: "Metadata supports at most 20 entries." });
+    }
+  });
+
+export const MultiScreenItemSchema = z
+  .object({
+    id: idSchema,
+    name: nameSchema,
+    group: nameSchema.optional(),
+    order: z.number().int().min(0).max(1_000_000).optional(),
+    devicePreset: z.enum(["mobile", "tablet", "desktop", "custom"]).optional(),
+    width: dimensionSchema,
+    height: dimensionSchema,
+    background: TokenColorValueSchema.optional(),
+    layout: LayoutSchema.optional(),
+    children: z.array(DesignNodeSchema).max(250),
+    metadata: metadataSchema,
+  })
+  .strict();
+
+export const MultiScreenSpecSchema = z
+  .object({
+    schemaVersion: z.literal(DESIGN_SCHEMA_VERSION),
+    id: idSchema,
+    name: nameSchema,
+    designSystem: DesignSystemSchema.optional(),
+    components: z.array(ComponentDefinitionSchema).max(MAX_COMPONENT_COUNT).optional(),
+    screens: z.array(MultiScreenItemSchema).min(1).max(MAX_MULTI_SCREEN_COUNT),
+  })
+  .strict();
+
+export type MultiScreenItem = z.infer<typeof MultiScreenItemSchema>;
+export interface MultiScreenSpec {
+  schemaVersion: typeof DESIGN_SCHEMA_VERSION;
+  id: string;
+  name: string;
+  designSystem?: DesignSpec["designSystem"];
+  components?: ComponentDefinitionSpec[];
+  screens: MultiScreenItem[];
+}
+
+export type MultiScreenParseResult =
+  | { success: true; data: MultiScreenSpec; nodeCount: number }
+  | { success: false; errors: string[] };
+
+function issuePath(path: PropertyKey[]): string {
+  return path.map(String).join(".") || "Input";
+}
+
+function issueMessages(issues: z.ZodIssue[]): string[] {
+  return issues.map((issue) => `${issuePath(issue.path)}: ${issue.message}`);
+}
+
+function screenAsDesignSpec(batch: MultiScreenSpec, screen: MultiScreenItem): DesignSpec {
+  const pageBackground: TokenColorValue = batch.designSystem?.colors["color.page.background"]
+    ? { token: "color.page.background" }
+    : "#FFFFFF";
+  return {
+    schemaVersion: DESIGN_SCHEMA_VERSION,
+    designSystem: batch.designSystem,
+    document: {
+      name: `${screen.name} — ${screen.id}`,
+      width: screen.width,
+      height: screen.height,
+      background: screen.background ?? pageBackground,
+      children: screen.children,
+      layout: screen.layout,
+      components: batch.components,
+    },
+  };
+}
+
+function totalNodes(counts: DesignCounts): number {
+  return counts.frames + counts.texts + counts.rectangles + counts.components + counts.instances;
+}
+
+function componentTreeNodeCount(components: ComponentDefinitionSpec[]): number {
+  let count = components.length;
+  const visit = (nodes: DesignNode[]) => {
+    for (const node of nodes) {
+      count++;
+      if (node.type === "frame") visit(node.children);
+    }
+  };
+  for (const component of components) visit(component.children);
+  return count;
+}
+
+function referencePrefix(screenId: string, errors: string[]): string[] {
+  return errors.map((error) => `screens["${screenId}"]: ${error}`);
+}
+
+export function orderMultiScreenItems(screens: readonly MultiScreenItem[]): MultiScreenItem[] {
+  return [...screens].sort((first, second) => {
+    const firstGroup = (first.group ?? "").toLocaleLowerCase("en-US");
+    const secondGroup = (second.group ?? "").toLocaleLowerCase("en-US");
+    if (firstGroup !== secondGroup) return firstGroup < secondGroup ? -1 : 1;
+    const orderDifference = (first.order ?? 0) - (second.order ?? 0);
+    if (orderDifference !== 0) return orderDifference;
+    return first.id < second.id ? -1 : first.id > second.id ? 1 : 0;
+  });
+}
+
+export function designSpecForScreen(batch: MultiScreenSpec, screen: MultiScreenItem): DesignSpec {
+  return screenAsDesignSpec(batch, screen);
+}
+
+export function parseMultiScreenValue(value: unknown): MultiScreenParseResult {
+  const parsed = MultiScreenSpecSchema.safeParse(value);
+  if (!parsed.success)
+    return { success: false, errors: issueMessages(parsed.error.issues).slice(0, 100) };
+
+  const batch = parsed.data as MultiScreenSpec;
+  const errors: string[] = [];
+  const ids = new Set<string>();
+  const names = new Map<string, string>();
+  for (const screen of batch.screens) {
+    if (ids.has(screen.id)) errors.push(`Screen id “${screen.id}” is duplicated.`);
+    ids.add(screen.id);
+    const normalizedName = screen.name.trim().toLocaleLowerCase("en-US");
+    const previousId = names.get(normalizedName);
+    if (previousId) {
+      errors.push(
+        `Screens “${previousId}” and “${screen.id}” use colliding display names “${screen.name}”.`,
+      );
+    } else {
+      names.set(normalizedName, screen.id);
+    }
+  }
+
+  const sharedComponents = [...(batch.components ?? []), ...(batch.designSystem?.components ?? [])];
+  // One generated component-area frame contains the shared masters when any are new.
+  const sharedNodes = componentTreeNodeCount(sharedComponents) + (sharedComponents.length ? 1 : 0);
+  let nodeCount = 0;
+  for (const screen of batch.screens) {
+    const checked = parseDesignValue(screenAsDesignSpec(batch, screen));
+    if (!checked.success) {
+      errors.push(...referencePrefix(screen.id, checked.errors));
+    } else {
+      nodeCount += totalNodes(countScreenTree(screen));
+    }
+  }
+
+  // Shared component masters are counted once for the batch instead of once per screen.
+  nodeCount += sharedNodes;
+  if (nodeCount > MAX_MULTI_SCREEN_NODE_COUNT) {
+    errors.push(
+      `The batch contains ${nodeCount} nodes; the limit is ${MAX_MULTI_SCREEN_NODE_COUNT}. Reduce screens or layers before generating.`,
+    );
+  }
+
+  const uniqueErrors = [...new Set(errors)].slice(0, 100);
+  if (uniqueErrors.length) return { success: false, errors: uniqueErrors };
+  return {
+    success: true,
+    data: { ...batch, screens: orderMultiScreenItems(batch.screens) },
+    nodeCount,
+  };
+}
+
+function countScreenTree(screen: MultiScreenItem): DesignCounts {
+  const counts: DesignCounts = { frames: 1, texts: 0, rectangles: 0, components: 0, instances: 0 };
+  const visit = (nodes: MultiScreenItem["children"]) => {
+    for (const node of nodes) {
+      if (node.type === "text") counts.texts++;
+      else if (node.type === "rectangle") counts.rectangles++;
+      else if (node.type === "instance") counts.instances++;
+      else if (node.type === "frame") {
+        counts.frames++;
+        visit(node.children);
+      }
+    }
+  };
+  visit(screen.children);
+  return counts;
+}
+
+export function parseMultiScreenText(source: string): MultiScreenParseResult {
+  if (source.length > MAX_JSON_LENGTH) {
+    return { success: false, errors: [`JSON is larger than ${MAX_JSON_LENGTH} characters.`] };
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(source) as unknown;
+  } catch (error) {
+    return {
+      success: false,
+      errors: [
+        `Invalid JSON syntax: ${error instanceof Error ? error.message : "Could not parse JSON."}`,
+      ],
+    };
+  }
+  const duplicates = findDuplicateJsonKeys(source);
+  if (duplicates.length) return { success: false, errors: duplicates };
+  return parseMultiScreenValue(value);
+}
+
+export function isMultiScreenInput(source: string): boolean {
+  try {
+    const value = JSON.parse(source) as Record<string, unknown>;
+    return typeof value === "object" && value !== null && "screens" in value;
+  } catch {
+    return false;
+  }
+}
+
+export function multiScreenDesignSystem(batch: MultiScreenSpec): DesignSpec["designSystem"] {
+  return batch.designSystem;
+}
+
+export function multiScreenComponents(batch: MultiScreenSpec): ComponentDefinitionSpec[] {
+  return [...(batch.components ?? []), ...(batch.designSystem?.components ?? [])];
+}

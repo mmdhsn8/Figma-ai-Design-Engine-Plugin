@@ -11,6 +11,22 @@ describe("plugin message contract", () => {
     ).toBe(true);
     expect(
       UIToPluginSchema.safeParse({
+        type: "generate-multi-screen",
+        requestId: "r5",
+        json: "{}",
+      }).success,
+    ).toBe(true);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "generate-multi-screen",
+        requestId: "r6",
+        json: "{}",
+        gap: 1_200,
+        maxRowWidth: 6_000,
+      }).success,
+    ).toBe(false);
+    expect(
+      UIToPluginSchema.safeParse({
         type: "apply-design-system",
         requestId: "r3",
         json: "{}",
@@ -86,5 +102,68 @@ describe("plugin message contract", () => {
         warnings: [],
       }).success,
     ).toBe(false);
+  });
+
+  it("accepts multi-screen validation, progress, and per-screen outcome reports", () => {
+    expect(
+      PluginToUISchema.safeParse({
+        type: "validation-result",
+        requestId: "r6",
+        success: true,
+        multiScreen: {
+          totalScreens: 1,
+          nodeCount: 3,
+          screens: [
+            {
+              id: "home",
+              name: "خانه",
+              width: 390,
+              height: 844,
+              devicePreset: "mobile",
+            },
+          ],
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      PluginToUISchema.safeParse({
+        type: "multi-screen-progress",
+        requestId: "r6",
+        index: 1,
+        total: 1,
+        screenId: "home",
+        screenName: "خانه",
+        status: "generated",
+      }).success,
+    ).toBe(true);
+    expect(
+      PluginToUISchema.safeParse({
+        type: "multi-screen-result",
+        requestId: "r6",
+        batchId: "commerce",
+        batchName: "Commerce",
+        totalScreens: 1,
+        generatedScreens: 1,
+        failedScreens: 0,
+        estimatedNodeCount: 3,
+        createdNodeCount: 3,
+        gap: 120,
+        maxRowWidth: 6_000,
+        counts: { frames: 1, texts: 2, rectangles: 0, components: 0, instances: 0 },
+        screens: [
+          {
+            id: "home",
+            name: "خانه",
+            width: 390,
+            height: 844,
+            status: "generated",
+            counts: { frames: 1, texts: 2, rectangles: 0, components: 0, instances: 0 },
+            warnings: [],
+          },
+        ],
+        warnings: [],
+        fontSelections: [],
+      }).success,
+    ).toBe(true);
   });
 });

@@ -2,9 +2,22 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import phase1Sample from "../samples/sample-design.json?raw";
 import phase2Sample from "../samples/phase-2-storefront.json?raw";
 import phase3Sample from "../samples/phase-3-design-system.json?raw";
+import phase4Sample from "../samples/phase-4-multi-screen.json?raw";
 import { parseDesignText } from "../shared/schema";
-import { PluginToUISchema, type UIToPluginMessage } from "../shared/messages";
+import {
+  PluginToUISchema,
+  type MultiScreenProgressMessage,
+  type MultiScreenRenderResultMessage,
+  type UIToPluginMessage,
+} from "../shared/messages";
+import { isMultiScreenInput, parseMultiScreenText } from "../shared/multi-screen-schema";
+import {
+  createMultiScreenPreview,
+  multiScreenProgressText,
+  multiScreenResultLines,
+} from "../shared/multi-screen-preview";
 import { planDesignSystemApply } from "../plugin/design-system/apply-design-system";
+import { DEFAULT_MAX_ROW_WIDTH, DEFAULT_MIN_CANVAS_GAP } from "../plugin/canvas-placement";
 
 type Notice = {
   tone: "neutral" | "success" | "error";
@@ -34,9 +47,33 @@ export default function App() {
   });
   const [busy, setBusy] = useState(false);
   const [updateOwned, setUpdateOwned] = useState(false);
+  const [canvasGap, setCanvasGap] = useState(DEFAULT_MIN_CANVAS_GAP);
+  const [rowWidth, setRowWidth] = useState(DEFAULT_MAX_ROW_WIDTH);
+  const [multiProgress, setMultiProgress] = useState<MultiScreenProgressMessage | null>(null);
+  const [multiReport, setMultiReport] = useState<MultiScreenRenderResultMessage | null>(null);
   const currentRequest = useRef<string | null>(null);
   const parsed = useMemo(() => parseDesignText(json), [json]);
+  const batchMode = useMemo(() => isMultiScreenInput(json), [json]);
+  const batchParsed = useMemo(
+    () => (batchMode ? parseMultiScreenText(json) : undefined),
+    [batchMode, json],
+  );
+  const batchPreview = useMemo(
+    () =>
+      batchParsed?.success
+        ? createMultiScreenPreview(batchParsed.data, batchParsed.nodeCount)
+        : undefined,
+    [batchParsed],
+  );
   const dryRun = parsed.success ? planDesignSystemApply(parsed.data) : undefined;
+  const inputValid = batchMode ? Boolean(batchParsed?.success) : parsed.success;
+  const placementOptionsValid =
+    Number.isFinite(canvasGap) &&
+    canvasGap >= 0 &&
+    canvasGap <= 1_000 &&
+    Number.isFinite(rowWidth) &&
+    rowWidth >= 390 &&
+    rowWidth <= 20_000;
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent<unknown>) => {
@@ -52,10 +89,46 @@ export default function App() {
       }
       if (message.requestId !== currentRequest.current) return;
 
+      if (message.type === "multi-screen-progress") {
+        setMultiProgress(message);
+        setNotice({
+          tone: "neutral",
+          title: "Generating screen " + message.index + " of " + message.total,
+          details: [
+            multiScreenProgressText(message),
+            ...(message.message ? [message.message] : []),
+          ],
+        });
+        return;
+      }
+
       currentRequest.current = null;
       setBusy(false);
       if (message.type === "validation-result") {
         const counts = message.counts;
+        if (message.success && message.multiScreen) {
+          setNotice({
+            tone: "success",
+            title: "Multi-screen JSON is valid",
+            details: [
+              message.multiScreen.totalScreens +
+                " screens · " +
+                message.multiScreen.nodeCount +
+                " estimated nodes.",
+              ...message.multiScreen.screens.map(
+                (screen) =>
+                  screen.name +
+                  " · " +
+                  screen.width +
+                  " × " +
+                  screen.height +
+                  (screen.devicePreset ? " · " + screen.devicePreset : "") +
+                  (screen.group ? " · " + screen.group : ""),
+              ),
+            ],
+          });
+          return;
+        }
         setNotice(
           message.success
             ? {
@@ -72,6 +145,21 @@ export default function App() {
           tone: "error",
           title: message.message,
           details: message.errors,
+        });
+        setMultiProgress(null);
+      } else if (message.type === "multi-screen-result") {
+        setMultiProgress(null);
+        setMultiReport(message);
+        const tone =
+          message.generatedScreens === message.totalScreens
+            ? "success"
+            : message.generatedScreens > 0
+              ? "neutral"
+              : "error";
+        setNotice({
+          tone,
+          title: message.generatedScreens + " of " + message.totalScreens + " screens generated",
+          details: multiScreenResultLines(message),
         });
       } else {
         const counts = message.counts;
@@ -107,7 +195,15 @@ export default function App() {
   const nextRequestId = () => `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   const validate = () => {
-    if (!parsed.success) {
+    if (batchMode && !batchParsed?.success) {
+      setNotice({
+        tone: "error",
+        title: "Multi-screen validation failed",
+        details: batchParsed?.errors ?? ["Provide a valid screens array."],
+      });
+      return;
+    }
+    if (!batchMode && !parsed.success) {
       setNotice({ tone: "error", title: "Validation failed", details: parsed.errors });
       return;
     }
@@ -119,8 +215,14 @@ export default function App() {
   };
 
   const generate = () => {
-    if (!parsed.success) {
-      setNotice({ tone: "error", title: "Fix the JSON before generating", details: parsed.errors });
+    if (!parsed.success || batchMode) {
+      setNotice({
+        tone: "error",
+        title: "Use the correct generation action for this JSON",
+        details: parsed.success
+          ? ["Multi-screen input uses the dedicated batch action."]
+          : parsed.errors,
+      });
       return;
     }
     const requestId = nextRequestId();
@@ -128,6 +230,38 @@ export default function App() {
     setBusy(true);
     setNotice({ tone: "neutral", title: "Creating native Figma layers…" });
     postToPlugin({ type: "generate", requestId, json });
+  };
+
+  const generateMultiScreen = () => {
+    if (!batchParsed?.success) {
+      setNotice({
+        tone: "error",
+        title: "Fix the multi-screen JSON before generating",
+        details: batchParsed?.errors ?? ["Provide a valid screens array."],
+      });
+      return;
+    }
+    if (!placementOptionsValid) {
+      setNotice({
+        tone: "error",
+        title: "Canvas placement settings are out of range",
+        details: ["Gap must be 0–1,000 px and row width must be 390–20,000 px."],
+      });
+      return;
+    }
+    const requestId = nextRequestId();
+    currentRequest.current = requestId;
+    setBusy(true);
+    setMultiProgress(null);
+    setMultiReport(null);
+    setNotice({ tone: "neutral", title: "Planning the multi-screen batch…" });
+    postToPlugin({
+      type: "generate-multi-screen",
+      requestId,
+      json,
+      gap: canvasGap,
+      maxRowWidth: rowWidth,
+    });
   };
 
   const applyDesignSystem = () => {
@@ -148,6 +282,8 @@ export default function App() {
 
   const loadSample = (content: string, label: string) => {
     setJson(content.trim());
+    setMultiProgress(null);
+    setMultiReport(null);
     currentRequest.current = null;
     setBusy(false);
     setNotice({
@@ -159,6 +295,8 @@ export default function App() {
 
   const reset = () => {
     setJson("");
+    setMultiProgress(null);
+    setMultiReport(null);
     currentRequest.current = null;
     setBusy(false);
     setNotice({ tone: "neutral", title: "Editor cleared" });
@@ -205,7 +343,7 @@ export default function App() {
       </header>
 
       <section className="intro-row" aria-label="Import instructions">
-        <span className="step-indicator">PHASE 01–03</span>
+        <span className="step-indicator">PHASE 01–04</span>
         <span className="intro-copy">Paste a design spec or import a .json file</span>
       </section>
 
@@ -222,20 +360,20 @@ export default function App() {
             autoCorrect="off"
             aria-describedby="editor-help"
             value={json}
-            onChange={(event) => setJson(event.target.value)}
+            onChange={(event) => {
+              setJson(event.target.value);
+              setMultiProgress(null);
+              setMultiReport(null);
+            }}
             disabled={busy}
             placeholder={'{\n  "schemaVersion": "1.0.0",\n  "document": { ... }\n}'}
           />
           <div className="editor-foot" id="editor-help">
             <span
-              className={`validation-dot ${parsed.success ? "is-valid" : json ? "is-invalid" : ""}`}
+              className={`validation-dot ${inputValid ? "is-valid" : json ? "is-invalid" : ""}`}
             />
             <span>
-              {parsed.success
-                ? "Structure looks good"
-                : json
-                  ? "Needs attention"
-                  : "Waiting for JSON"}
+              {inputValid ? "Structure looks good" : json ? "Needs attention" : "Waiting for JSON"}
             </span>
             <span className="char-count">{json.length.toLocaleString()} / 1,000,000</span>
           </div>
@@ -281,6 +419,14 @@ export default function App() {
           Phase 3 demo
         </button>
         <button
+          className="text-button"
+          type="button"
+          onClick={() => loadSample(phase4Sample, "Phase 4 multi-screen demo")}
+          disabled={busy}
+        >
+          Phase 4 demo
+        </button>
+        <button
           className="text-button muted"
           type="button"
           onClick={reset}
@@ -321,71 +467,227 @@ export default function App() {
         </div>
       </section>
 
-      <section className="design-system-panel" aria-labelledby="design-system-title">
-        <div className="design-system-heading">
-          <div>
-            <span className="section-kicker">PHASE 03</span>
-            <h2 id="design-system-title">Design System</h2>
-          </div>
-          <span className={`system-status ${dryRun ? "is-ready" : ""}`}>
-            {dryRun ? "Ready to preview" : "No valid system"}
-          </span>
-        </div>
-        {dryRun ? (
-          <>
-            <p className="system-namespace">
-              <strong>{dryRun.namespace}</strong> · {dryRun.name}
-            </p>
-            <div className="system-counts">
-              <span>{dryRun.colors} colors</span>
-              <span>{dryRun.typography} type</span>
-              <span>{dryRun.spacing} spacing</span>
-              <span>{dryRun.radii} radii</span>
-              <span>{dryRun.borders} borders</span>
-              <span>{dryRun.components} components</span>
+      {batchMode ? (
+        <section className="multi-screen-panel" aria-labelledby="multi-screen-title">
+          <div className="design-system-heading">
+            <div>
+              <span className="section-kicker">PHASE 04</span>
+              <h2 id="multi-screen-title">Multi-Screen Generator</h2>
             </div>
-            <div className="dry-run-summary">
-              <strong>Dry run</strong>
-              <p>{dryRun.message}</p>
-              {dryRun.fallbacks.map((fallback) => (
-                <p className="system-fallback" key={fallback}>
-                  {fallback}
+            <span className="system-status is-ready">
+              {batchParsed?.success ? "Preview ready" : "Fix JSON"}
+            </span>
+          </div>
+          {batchParsed?.success && batchPreview ? (
+            <>
+              <p className="system-namespace">
+                <strong>{batchPreview.name}</strong> · {batchPreview.id}
+              </p>
+              <p className="multi-screen-summary">
+                {batchPreview.screens.length} screens · {batchPreview.estimatedNodeCount} estimated
+                native nodes.
+                {" " + batchPreview.sharedAssetSummary}
+              </p>
+              <ul className="multi-screen-list" aria-label="Screen preview">
+                {batchPreview.screens.map((screen, index) => {
+                  const result = multiReport?.screens.find((item) => item.id === screen.id);
+                  return (
+                    <li key={screen.id} className={result ? "has-result" : ""}>
+                      <span className="screen-order">{String(index + 1).padStart(2, "0")}</span>
+                      <span className="screen-info">
+                        <strong>{screen.name}</strong>
+                        <small>
+                          {screen.width} × {screen.height}
+                          {screen.devicePreset ? " · " + screen.devicePreset : ""}
+                          {screen.group ? " · " + screen.group : ""}
+                        </small>
+                      </span>
+                      {result && (
+                        <span
+                          className={"screen-outcome screen-" + result.status}
+                          aria-label={result.status}
+                        >
+                          {result.status === "generated" ? "Created" : "Failed"}
+                        </span>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+              <div className="multi-screen-options">
+                <label>
+                  <span>Minimum gap (px)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1_000}
+                    step={10}
+                    value={canvasGap}
+                    onChange={(event) => setCanvasGap(Number(event.target.value))}
+                    disabled={busy}
+                    aria-label="Canvas gap in pixels"
+                  />
+                </label>
+                <label>
+                  <span>Target row width (px)</span>
+                  <input
+                    type="number"
+                    min={390}
+                    max={20_000}
+                    step={100}
+                    value={rowWidth}
+                    onChange={(event) => setRowWidth(Number(event.target.value))}
+                    disabled={busy}
+                    aria-label="Canvas row width in pixels"
+                  />
+                </label>
+              </div>
+              {!placementOptionsValid && (
+                <p className="system-validation">
+                  Gap range: 0–1,000 px. Row width range: 390–20,000 px.
                 </p>
-              ))}
-            </div>
-            <label className="update-owned-option">
-              <input
-                type="checkbox"
-                checked={updateOwned}
-                onChange={(event) => setUpdateOwned(event.target.checked)}
-                disabled={busy}
+              )}
+              {multiProgress && (
+                <div className="multi-progress" aria-live="polite">
+                  <div
+                    role="progressbar"
+                    aria-label="Multi-screen generation progress"
+                    aria-valuemin={0}
+                    aria-valuemax={multiProgress.total}
+                    aria-valuenow={
+                      multiProgress.status === "started"
+                        ? multiProgress.index - 1
+                        : multiProgress.index
+                    }
+                    aria-valuetext={
+                      multiProgress.status +
+                      " screen " +
+                      multiProgress.index +
+                      " of " +
+                      multiProgress.total
+                    }
+                  >
+                    <span
+                      style={{
+                        width:
+                          ((multiProgress.status === "started"
+                            ? multiProgress.index - 1
+                            : multiProgress.index) /
+                            multiProgress.total) *
+                            100 +
+                          "%",
+                      }}
+                    />
+                  </div>
+                  <p>
+                    {multiProgress.status === "started" ? "Working on " : "Last screen: "}
+                    {multiProgress.screenName} · {multiProgress.index}/{multiProgress.total}
+                  </p>
+                </div>
+              )}
+              {multiReport && (
+                <p className="multi-screen-summary" role="status">
+                  Actual result: {multiReport.generatedScreens} generated,{" "}
+                  {multiReport.failedScreens} failed; created {multiReport.createdNodeCount} native
+                  nodes.
+                </p>
+              )}
+              <button
+                className="system-action"
+                type="button"
+                onClick={generateMultiScreen}
+                disabled={busy || !batchParsed.success || !placementOptionsValid}
+              >
+                {busy ? "Generating screens…" : "Generate all screens"}
+              </button>
+              <p className="multi-screen-note">
+                Preview counts are estimates. Successful screens remain if another screen fails; the
+                current batch cannot be cancelled.
+              </p>
+            </>
+          ) : (
+            <div className="system-validation">
+              <strong>Validation issues, including screen paths and unresolved references</strong>
+              <ErrorList
+                errors={
+                  batchParsed && !batchParsed.success
+                    ? batchParsed.errors.slice(0, 8)
+                    : ["Enter a valid screens array."]
+                }
               />
-              <span>
-                Update plugin-owned styles only if their saved fingerprint shows they were not
-                manually edited.
-              </span>
-            </label>
-            <button
-              className="system-action"
-              type="button"
-              onClick={applyDesignSystem}
-              disabled={busy || !parsed.success}
-            >
-              {busy ? "Working…" : "Create / Update Design System"}
-            </button>
-          </>
-        ) : parsed.success ? (
-          <p className="system-empty">
-            Add a valid optional designSystem section to preview assets.
-          </p>
-        ) : (
-          <div className="system-validation">
-            <strong>Validation issues, including unresolved token references</strong>
-            <ErrorList errors={parsed.errors.slice(0, 5)} />
-            {parsed.errors.length > 5 && <p>+{parsed.errors.length - 5} more errors</p>}
+              {batchParsed && !batchParsed.success && batchParsed.errors.length > 8 && (
+                <p>+{batchParsed.errors.length - 8} more errors</p>
+              )}
+            </div>
+          )}
+        </section>
+      ) : (
+        <section className="design-system-panel" aria-labelledby="design-system-title">
+          <div className="design-system-heading">
+            <div>
+              <span className="section-kicker">PHASE 03</span>
+              <h2 id="design-system-title">Design System</h2>
+            </div>
+            <span className={`system-status ${dryRun ? "is-ready" : ""}`}>
+              {dryRun ? "Ready to preview" : "No valid system"}
+            </span>
           </div>
-        )}
-      </section>
+          {dryRun ? (
+            <>
+              <p className="system-namespace">
+                <strong>{dryRun.namespace}</strong> · {dryRun.name}
+              </p>
+              <div className="system-counts">
+                <span>{dryRun.colors} colors</span>
+                <span>{dryRun.typography} type</span>
+                <span>{dryRun.spacing} spacing</span>
+                <span>{dryRun.radii} radii</span>
+                <span>{dryRun.borders} borders</span>
+                <span>{dryRun.components} components</span>
+              </div>
+              <div className="dry-run-summary">
+                <strong>Dry run</strong>
+                <p>{dryRun.message}</p>
+                {dryRun.fallbacks.map((fallback) => (
+                  <p className="system-fallback" key={fallback}>
+                    {fallback}
+                  </p>
+                ))}
+              </div>
+              <label className="update-owned-option">
+                <input
+                  type="checkbox"
+                  checked={updateOwned}
+                  onChange={(event) => setUpdateOwned(event.target.checked)}
+                  disabled={busy}
+                />
+                <span>
+                  Update plugin-owned styles only if their saved fingerprint shows they were not
+                  manually edited.
+                </span>
+              </label>
+              <button
+                className="system-action"
+                type="button"
+                onClick={applyDesignSystem}
+                disabled={busy || !parsed.success}
+              >
+                {busy ? "Working…" : "Create / Update Design System"}
+              </button>
+            </>
+          ) : parsed.success ? (
+            <p className="system-empty">
+              Add a valid optional designSystem section to preview assets.
+            </p>
+          ) : (
+            <div className="system-validation">
+              <strong>Validation issues, including unresolved token references</strong>
+              <ErrorList errors={parsed.errors.slice(0, 5)} />
+              {parsed.errors.length > 5 && <p>+{parsed.errors.length - 5} more errors</p>}
+            </div>
+          )}
+        </section>
+      )}
 
       <div className="actions">
         <button className="secondary-action" type="button" onClick={validate} disabled={busy}>
@@ -396,7 +698,10 @@ export default function App() {
           type="button"
           onClick={generate}
           disabled={
-            busy || !parsed.success || (parsed.success && Boolean(parsed.data.designSystem))
+            busy ||
+            batchMode ||
+            !parsed.success ||
+            (parsed.success && Boolean(parsed.data.designSystem))
           }
         >
           {busy ? (
@@ -408,9 +713,11 @@ export default function App() {
           )}
           {busy
             ? "Working…"
-            : parsed.success && parsed.data.designSystem
-              ? "Use design-system action"
-              : "Generate in Figma"}
+            : batchMode
+              ? "Use multi-screen panel"
+              : parsed.success && parsed.data.designSystem
+                ? "Use design-system action"
+                : "Generate in Figma"}
         </button>
       </div>
 

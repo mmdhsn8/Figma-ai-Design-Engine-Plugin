@@ -6,7 +6,14 @@ import type {
 } from "../shared/schema";
 import { orderComponentDefinitions, parseDesignValue } from "../shared/schema";
 import type { FontSelection } from "../shared/messages";
-import { planCanvasPlacements, type CanvasBounds, type PlacementItem } from "./canvas-placement";
+import {
+  DEFAULT_MAX_ROW_WIDTH,
+  DEFAULT_MIN_CANVAS_GAP,
+  normalizePlacementSettings,
+  planCanvasPlacements,
+  type CanvasBounds,
+  type PlacementItem,
+} from "./canvas-placement";
 import {
   getCanvasNodeBounds,
   placeTopLevelNode,
@@ -15,6 +22,7 @@ import {
 import { hexToRgb } from "./figma-utils";
 import {
   resolveDesignSystemTokens,
+  resolveDesignSpecWithTables,
   type ResolvedComponentDefinition,
   type ResolvedDesignNode,
   type ResolvedDesignSpec,
@@ -23,6 +31,12 @@ import {
   type ResolvedRectangleNodeSpec,
   type ResolvedTextNodeSpec,
 } from "./design-system/token-resolver";
+import {
+  designSpecForScreen,
+  parseMultiScreenValue,
+  type MultiScreenItem,
+  type MultiScreenSpec,
+} from "../shared/multi-screen-schema";
 import {
   createOrReuseNativeStyles,
   type StyleBindings,
@@ -70,6 +84,52 @@ export interface RenderResult {
   };
 }
 
+export interface MultiScreenProgress {
+  index: number;
+  total: number;
+  screenId: string;
+  screenName: string;
+  status: "started" | "generated" | "failed";
+  message?: string;
+}
+
+export interface MultiScreenResult {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  group?: string;
+  devicePreset?: MultiScreenItem["devicePreset"];
+  status: "generated" | "failed";
+  frameName?: string;
+  counts: DesignCounts;
+  error?: string;
+  warnings: string[];
+}
+
+export interface MultiScreenRenderResult {
+  batchId: string;
+  batchName: string;
+  totalScreens: number;
+  generatedScreens: number;
+  failedScreens: number;
+  estimatedNodeCount: number;
+  createdNodeCount: number;
+  gap: number;
+  maxRowWidth: number;
+  counts: DesignCounts;
+  screens: MultiScreenResult[];
+  warnings: string[];
+  fontSelections: FontSelection[];
+  designSystem?: RenderResult["designSystem"];
+}
+
+export interface MultiScreenRenderOptions {
+  gap?: number;
+  maxRowWidth?: number;
+  onProgress?: (progress: MultiScreenProgress) => void;
+}
+
 export class DesignRenderError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -84,6 +144,10 @@ const COMPONENT_AREA_OFFSET = 56;
 const TYPOGRAPHY_TOKEN_KEY = "fad.design-system.typography-token";
 const TYPOGRAPHY_OVERRIDES_KEY = "fad.design-system.typography-overrides";
 const TEXT_COLOR_KEY = "fad.design-system.text-color";
+const MULTI_SCREEN_BATCH_KEY = "fad.multi-screen.batch-id";
+const MULTI_SCREEN_ID_KEY = "fad.multi-screen.screen-id";
+const MULTI_SCREEN_META_KEY = "fad.multi-screen.metadata";
+const COMPONENT_AREA_BATCH_KEY = "fad.multi-screen.components-batch";
 
 interface LayoutMapping {
   mode: "HORIZONTAL" | "VERTICAL";
@@ -536,12 +600,19 @@ function createComponentDefinition(
   return component;
 }
 
-function uniqueName(api: RendererFigmaApi, base: string, reserved: Set<string>): string {
+function uniqueName(
+  api: RendererFigmaApi,
+  base: string,
+  reserved: Set<string>,
+  existingNames?: ReadonlySet<string>,
+): string {
   let candidate = base;
   let suffix = 2;
   while (
     reserved.has(candidate) ||
-    api.currentPage.findAll((node) => node.name === candidate).length > 0
+    (existingNames
+      ? existingNames.has(candidate)
+      : api.currentPage.findAll((node) => node.name === candidate).length > 0)
   ) {
     candidate = `${base} (${suffix++})`;
   }
@@ -950,5 +1021,585 @@ export async function renderDesign(
       `Figma could not finish creating the design. ${error instanceof Error ? error.message : "Check the document and try again."}`,
       { cause: error },
     );
+  }
+}
+
+function emptyDesignCounts(): DesignCounts {
+  return { frames: 0, texts: 0, rectangles: 0, components: 0, instances: 0 };
+}
+
+function addDesignCounts(target: DesignCounts, source: DesignCounts): void {
+  target.frames += source.frames;
+  target.texts += source.texts;
+  target.rectangles += source.rectangles;
+  target.components += source.components;
+  target.instances += source.instances;
+}
+
+function sumDesignCounts(counts: DesignCounts): number {
+  return counts.frames + counts.texts + counts.rectangles + counts.components + counts.instances;
+}
+
+function screenPlacementId(screenId: string): string {
+  return `screen:${screenId}`;
+}
+
+function safeProgress(
+  callback: MultiScreenRenderOptions["onProgress"],
+  progress: MultiScreenProgress,
+): void {
+  try {
+    callback?.(progress);
+  } catch {
+    // UI progress delivery must not affect document generation.
+  }
+}
+
+function failedMultiScreenResult(
+  batch: MultiScreenSpec,
+  message: string,
+  options: Required<Pick<MultiScreenRenderOptions, "gap" | "maxRowWidth">>,
+  fontSelections: FontSelection[] = [],
+): MultiScreenRenderResult {
+  return {
+    batchId: batch.id,
+    batchName: batch.name,
+    totalScreens: batch.screens.length,
+    generatedScreens: 0,
+    failedScreens: batch.screens.length,
+    estimatedNodeCount: 0,
+    createdNodeCount: 0,
+    gap: options.gap,
+    maxRowWidth: options.maxRowWidth,
+    counts: emptyDesignCounts(),
+    screens: batch.screens.map((screen) => ({
+      id: screen.id,
+      name: screen.name,
+      width: screen.width,
+      height: screen.height,
+      group: screen.group,
+      devicePreset: screen.devicePreset,
+      status: "failed",
+      counts: emptyDesignCounts(),
+      error: message,
+      warnings: [],
+    })),
+    warnings: [message],
+    fontSelections,
+  };
+}
+
+/**
+ * Generates all screens as independent page-level frames. Shared tokens, fonts,
+ * styles, and component masters are prepared once for the batch. Each screen has
+ * its own rollback boundary; the default import always creates new screen roots.
+ */
+export async function renderMultiScreenDesign(
+  api: RendererFigmaApi,
+  input: unknown,
+  options: MultiScreenRenderOptions = {},
+): Promise<MultiScreenRenderResult> {
+  const parsed = parseMultiScreenValue(input);
+  if (!parsed.success) throw new DesignRenderError(parsed.errors.join("\n"));
+  const batch = parsed.data;
+  const defaults = { gap: DEFAULT_MIN_CANVAS_GAP, maxRowWidth: DEFAULT_MAX_ROW_WIDTH };
+  const normalized = normalizePlacementSettings({
+    gap: options.gap ?? defaults.gap,
+    maxRowWidth: options.maxRowWidth ?? defaults.maxRowWidth,
+  });
+  if (normalized.gap > 1_000) {
+    throw new DesignRenderError("Canvas gap must be between 0 and 1,000 px.");
+  }
+  if (normalized.maxRowWidth < 390 || normalized.maxRowWidth > 20_000) {
+    throw new DesignRenderError("Canvas row width must be between 390 and 20,000 px.");
+  }
+  const placementSettings = normalized;
+  const orderedScreens = batch.screens;
+  const screenResults: MultiScreenResult[] = [];
+  const warnings: string[] = [];
+  const counts = emptyDesignCounts();
+  const previousSelection = [...api.currentPage.selection];
+  const sharedTracker = createTracker();
+  const successfulRoots: FrameNode[] = [];
+  let styleBindings: StyleBindings | undefined;
+  let fontResolution: FontResolution | undefined;
+  let componentArea: FrameNode | undefined;
+  const estimatedNodeCount = parsed.nodeCount;
+  const frameNames = new Set<string>();
+  // Snapshot page names once; repeated full-page scans are costly on large batches.
+  const existingNames = new Set(api.currentPage.findAll(() => true).map((node) => node.name));
+  const componentCreated: string[] = [];
+  const componentReused: string[] = [];
+  const componentSkipped: string[] = [];
+  const componentWarnings: string[] = [];
+
+  const markRemainingScreensFailed = (startIndex: number, error: string) => {
+    for (let index = startIndex; index < orderedScreens.length; index++) {
+      const screen = orderedScreens[index];
+      const message = `Not attempted because the remaining canvas layout could not be planned: ${error}`;
+      screenResults.push({
+        id: screen.id,
+        name: screen.name,
+        width: screen.width,
+        height: screen.height,
+        group: screen.group,
+        devicePreset: screen.devicePreset,
+        status: "failed",
+        counts: emptyDesignCounts(),
+        error: message,
+        warnings: [],
+      });
+      safeProgress(options.onProgress, {
+        index: index + 1,
+        total: orderedScreens.length,
+        screenId: screen.id,
+        screenName: screen.name,
+        status: "failed",
+        message,
+      });
+    }
+  };
+
+  try {
+    const sourceSpecs = orderedScreens.map((screen) => designSpecForScreen(batch, screen));
+    const baseResolved = resolveDesignSystemTokens(sourceSpecs[0]);
+    const resolvedSpecs = sourceSpecs.map((spec) =>
+      resolveDesignSpecWithTables(spec, baseResolved.spec, baseResolved.tables),
+    );
+    const fontSpec: ResolvedDesignSpec = {
+      ...baseResolved.spec,
+      document: {
+        ...baseResolved.spec.document,
+        children: resolvedSpecs.flatMap((spec) => spec.document.children),
+      },
+    };
+    fontResolution = await resolveFonts(api, fontSpec, baseResolved.tables.typography);
+
+    const designSystemId = batch.designSystem?.id ?? batch.id;
+    const designSystemNamespace = batch.designSystem?.namespace;
+    const definitions = [
+      ...(baseResolved.spec.document.components ?? []),
+      ...(baseResolved.spec.designSystem?.components ?? []),
+    ] as ResolvedComponentDefinition[];
+    const existingRegistry = readOwnedComponents(api.currentPage, designSystemId, definitions);
+    componentWarnings.push(...existingRegistry.warnings);
+    const components = new Map(existingRegistry.byComponentId);
+    const systemComponentIds = new Set(
+      (baseResolved.spec.designSystem?.components ?? []).map((component) => component.id),
+    );
+    for (const definition of definitions) {
+      const existing = existingRegistry.byComponentId.get(definition.id);
+      if (!existing) continue;
+      const key = definition.key ?? definition.id;
+      if (
+        existing.getPluginData(COMPONENT_FINGERPRINT_KEY) ===
+        componentDefinitionFingerprint(definition)
+      ) {
+        componentReused.push(key);
+      } else {
+        componentSkipped.push(key);
+        componentWarnings.push(
+          `Component master “${key}” already exists with a different definition and was reused unchanged. Add a new stable key to preserve existing instances and manual edits.`,
+        );
+      }
+    }
+    const newDefinitions = orderComponentDefinitions(
+      definitions.filter(
+        (definition) => !components.has(definition.id),
+      ) as ComponentDefinitionSpec[],
+    ) as ResolvedComponentDefinition[];
+    const componentAreaWidth = Math.max(
+      COMPONENT_AREA_WIDTH,
+      ...newDefinitions.map((definition) => definition.width + 32),
+    );
+    const componentAreaHeight =
+      COMPONENT_AREA_VERTICAL_PADDING +
+      newDefinitions.reduce((height, definition) => height + definition.height, 0) +
+      Math.max(0, newDefinitions.length - 1) * COMPONENT_AREA_GAP;
+    const componentAreaItem: PlacementItem | undefined = newDefinitions.length
+      ? {
+          id: "shared-components",
+          width: componentAreaWidth,
+          height: componentAreaHeight,
+        }
+      : undefined;
+    const screenItems: PlacementItem[] = orderedScreens.map((screen) => ({
+      id: screenPlacementId(screen.id),
+      width: screen.width,
+      height: screen.height,
+    }));
+    const placementItems = componentAreaItem ? [...screenItems, componentAreaItem] : screenItems;
+    const existingBounds = readTopLevelCanvasObstacles(api.currentPage);
+    let planned = planCanvasPlacements(placementItems, existingBounds, placementSettings);
+    const placementById = new Map(planned.map((placement) => [placement.id, placement]));
+
+    if (batch.designSystem) {
+      styleBindings = await createOrReuseNativeStyles(
+        api,
+        batch.designSystem.namespace,
+        baseResolved.tables,
+        { byToken: fontResolution.typographyFonts },
+        false,
+      );
+      const variableCapability = inspectVariableCapability(api.variables);
+      if (
+        (baseResolved.tables.spacing.size > 0 || baseResolved.tables.radii.size > 0) &&
+        variableCapability.fallback
+      ) {
+        styleBindings.report.fallbacks.push(variableCapability.fallback);
+        styleBindings.report.warnings.push(variableCapability.fallback);
+      }
+    }
+
+    const componentContext: BuildContext = {
+      api,
+      tracker: sharedTracker,
+      fonts: fontResolution.fonts,
+      components,
+      designSystemId,
+      designSystemNamespace,
+    };
+    if (newDefinitions.length && componentAreaItem) {
+      componentArea = createComponentArea(
+        api,
+        sharedTracker,
+        uniqueName(
+          api,
+          `Generated Components — ${designSystemNamespace ?? batch.name}`,
+          frameNames,
+          existingNames,
+        ),
+        componentAreaWidth,
+      );
+      componentArea.setPluginData(COMPONENT_AREA_BATCH_KEY, batch.id);
+      for (const definition of newDefinitions) {
+        const key = definition.key ?? definition.id;
+        const masterName = systemComponentIds.has(definition.id)
+          ? `${designSystemNamespace}/${key}`
+          : `${batch.name}/${key}`;
+        createComponentDefinition(
+          componentArea,
+          definition,
+          uniqueName(api, masterName, frameNames, existingNames),
+          componentContext,
+          true,
+        );
+        componentCreated.push(key);
+      }
+      if (styleBindings) await applyNativeStyleBindings(componentArea, styleBindings);
+
+      const measuredAreaBounds = getCanvasNodeBounds(componentArea);
+      const actualAreaItem = {
+        ...componentAreaItem,
+        width: measuredAreaBounds.width,
+        height: measuredAreaBounds.height,
+      };
+      if (
+        Math.abs(actualAreaItem.width - componentAreaItem.width) > 0.5 ||
+        Math.abs(actualAreaItem.height - componentAreaItem.height) > 0.5
+      ) {
+        planned = planCanvasPlacements(
+          [...screenItems, actualAreaItem],
+          existingBounds,
+          placementSettings,
+        );
+        placementById.clear();
+        for (const placement of planned) placementById.set(placement.id, placement);
+      }
+      const areaPlacement = placementById.get("shared-components");
+      if (!areaPlacement) throw new DesignRenderError("Component placement was not planned.");
+      placeTopLevelNode(componentArea, measuredAreaBounds, areaPlacement);
+    }
+
+    const refreshRemainingPlacements = (startIndex: number) => {
+      if (startIndex >= orderedScreens.length) return;
+      const remaining = orderedScreens.slice(startIndex).map((screen) => ({
+        id: screenPlacementId(screen.id),
+        width: screen.width,
+        height: screen.height,
+      }));
+      const replanned = planCanvasPlacements(
+        remaining,
+        readTopLevelCanvasObstacles(api.currentPage),
+        placementSettings,
+      );
+      for (const placement of replanned) placementById.set(placement.id, placement);
+    };
+
+    for (let index = 0; index < orderedScreens.length; index++) {
+      const screen = orderedScreens[index];
+      const screenSpec = resolvedSpecs[index];
+      const placementId = screenPlacementId(screen.id);
+      let plannedScreen = placementById.get(placementId);
+      if (!plannedScreen) {
+        refreshRemainingPlacements(index);
+        plannedScreen = placementById.get(placementId);
+      }
+      if (!plannedScreen)
+        throw new DesignRenderError(`No placement was planned for “${screen.id}”.`);
+
+      const displayName = `${String(index + 1).padStart(2, "0")} — ${screen.name}`;
+      safeProgress(options.onProgress, {
+        index: index + 1,
+        total: orderedScreens.length,
+        screenId: screen.id,
+        screenName: screen.name,
+        status: "started",
+      });
+      const screenTracker = createTracker();
+      const context: BuildContext = {
+        ...componentContext,
+        tracker: screenTracker,
+        components,
+      };
+      const warningsBeforeScreen = styleBindings?.report.warnings.length ?? 0;
+      let requiresReplan = false;
+      try {
+        const frameName = uniqueName(api, displayName, frameNames, existingNames);
+        const root = createDocumentFrame(
+          api,
+          screenSpec,
+          frameName,
+          context,
+          undefined,
+          plannedScreen,
+        );
+        root.setPluginData(MULTI_SCREEN_BATCH_KEY, batch.id);
+        root.setPluginData(MULTI_SCREEN_ID_KEY, screen.id);
+        root.setPluginData(
+          MULTI_SCREEN_META_KEY,
+          JSON.stringify({
+            group: screen.group,
+            devicePreset: screen.devicePreset,
+            order: screen.order,
+            metadata: screen.metadata,
+          }),
+        );
+        if (styleBindings) await applyNativeStyleBindings(root, styleBindings);
+        const measuredBounds = getCanvasNodeBounds(root);
+        let actualPlacement = plannedScreen;
+        if (
+          Math.abs(measuredBounds.width - screen.width) > 0.5 ||
+          Math.abs(measuredBounds.height - screen.height) > 0.5
+        ) {
+          const actualAndRemaining: PlacementItem[] = [
+            { id: placementId, width: measuredBounds.width, height: measuredBounds.height },
+            ...orderedScreens.slice(index + 1).map((remainingScreen) => ({
+              id: screenPlacementId(remainingScreen.id),
+              width: remainingScreen.width,
+              height: remainingScreen.height,
+            })),
+          ];
+          const replanned = planCanvasPlacements(
+            actualAndRemaining,
+            readTopLevelCanvasObstacles(api.currentPage, new Set([root.id])),
+            placementSettings,
+          );
+          for (const placement of replanned) placementById.set(placement.id, placement);
+          actualPlacement = placementById.get(placementId) ?? plannedScreen;
+        }
+        placeTopLevelNode(root, measuredBounds, actualPlacement);
+        successfulRoots.push(root);
+        const screenWarnings = styleBindings?.report.warnings.slice(warningsBeforeScreen) ?? [];
+        screenResults.push({
+          id: screen.id,
+          name: screen.name,
+          width: screen.width,
+          height: screen.height,
+          group: screen.group,
+          devicePreset: screen.devicePreset,
+          status: "generated",
+          frameName,
+          counts: screenTracker.counts,
+          warnings: screenWarnings,
+        });
+        addDesignCounts(counts, screenTracker.counts);
+        safeProgress(options.onProgress, {
+          index: index + 1,
+          total: orderedScreens.length,
+          screenId: screen.id,
+          screenName: screen.name,
+          status: "generated",
+        });
+      } catch (error) {
+        screenTracker.cleanup();
+        requiresReplan = true;
+        const message =
+          error instanceof Error ? error.message : "Figma could not create this screen.";
+        warnings.push(`Screen “${screen.id}” failed: ${message}`);
+        screenResults.push({
+          id: screen.id,
+          name: screen.name,
+          width: screen.width,
+          height: screen.height,
+          group: screen.group,
+          devicePreset: screen.devicePreset,
+          status: "failed",
+          counts: emptyDesignCounts(),
+          error: message,
+          warnings: [],
+        });
+        safeProgress(options.onProgress, {
+          index: index + 1,
+          total: orderedScreens.length,
+          screenId: screen.id,
+          screenName: screen.name,
+          status: "failed",
+          message,
+        });
+      }
+
+      if (requiresReplan && index + 1 < orderedScreens.length) {
+        try {
+          // A failed screen left no page-level obstacle; fill that slot with the remaining batch.
+          refreshRemainingPlacements(index + 1);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Canvas placement failed.";
+          warnings.push(`The remaining screens could not be placed: ${message}`);
+          markRemainingScreensFailed(index + 1, message);
+          break;
+        }
+      }
+    }
+
+    const generatedScreens = screenResults.filter((screen) => screen.status === "generated").length;
+    if (generatedScreens === 0) {
+      sharedTracker.cleanup();
+      styleBindings?.rollback();
+      const rolledBackAssets =
+        componentCreated.length > 0 || (styleBindings?.report.created.length ?? 0) > 0;
+      componentCreated.length = 0;
+      if (styleBindings) styleBindings.report.created.length = 0;
+      if (rolledBackAssets) {
+        warnings.push(
+          "New shared design-system assets were rolled back because no screen succeeded.",
+        );
+      }
+      try {
+        api.currentPage.selection = previousSelection;
+      } catch {
+        // Preserve the batch report if the original selection is no longer writable.
+      }
+    } else {
+      addDesignCounts(counts, sharedTracker.counts);
+      try {
+        api.currentPage.selection = [successfulRoots[0]];
+        api.viewport.scrollAndZoomIntoView([successfulRoots[0]]);
+      } catch {
+        warnings.push(
+          "The screens were created, but Figma could not focus the first generated screen.",
+        );
+      }
+    }
+
+    warnings.push(...componentWarnings, ...(styleBindings?.report.warnings ?? []));
+    const createdNodeCount = sumDesignCounts(counts);
+    const styleReport = styleBindings?.report;
+    return {
+      batchId: batch.id,
+      batchName: batch.name,
+      totalScreens: orderedScreens.length,
+      generatedScreens,
+      failedScreens: orderedScreens.length - generatedScreens,
+      estimatedNodeCount,
+      createdNodeCount,
+      gap: placementSettings.gap,
+      maxRowWidth: placementSettings.maxRowWidth,
+      counts,
+      screens: screenResults,
+      warnings: [...fontResolution.warnings, ...warnings],
+      fontSelections: fontResolution.selections,
+      designSystem:
+        batch.designSystem && styleReport
+          ? {
+              namespace: batch.designSystem.namespace,
+              created: [
+                ...styleReport.created.map((key) => `style:${key}`),
+                ...componentCreated.map((key) => `component:${key}`),
+              ],
+              reused: [
+                ...styleReport.reused.map((key) => `style:${key}`),
+                ...componentReused.map((key) => `component:${key}`),
+              ],
+              updated: styleReport.updated.map((key) => `style:${key}`),
+              skipped: [
+                ...styleReport.skipped.map((key) => `style:${key}`),
+                ...componentSkipped.map((key) => `component:${key}`),
+              ],
+              fallbacks: styleReport.fallbacks,
+              warnings: [...componentWarnings, ...styleReport.warnings],
+            }
+          : undefined,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Figma could not generate the batch.";
+    if (successfulRoots.length === 0) {
+      sharedTracker.cleanup();
+      styleBindings?.rollback();
+      try {
+        api.currentPage.selection = previousSelection;
+      } catch {
+        // Keep the original failure as the actionable result.
+      }
+      const result = failedMultiScreenResult(
+        batch,
+        message,
+        { gap: placementSettings.gap, maxRowWidth: placementSettings.maxRowWidth },
+        fontResolution?.selections,
+      );
+      result.estimatedNodeCount = estimatedNodeCount;
+      return result;
+    }
+    warnings.push(`Batch stopped after an unexpected error: ${message}`);
+    warnings.push(...componentWarnings, ...(styleBindings?.report.warnings ?? []));
+    const attemptedCount = screenResults.length;
+    if (attemptedCount < orderedScreens.length) markRemainingScreensFailed(attemptedCount, message);
+    addDesignCounts(counts, sharedTracker.counts);
+    try {
+      if (successfulRoots.length > 0) {
+        api.currentPage.selection = [successfulRoots[0]];
+        api.viewport.scrollAndZoomIntoView([successfulRoots[0]]);
+      }
+    } catch {
+      warnings.push(
+        "The partial batch was created, but Figma could not focus its first generated screen.",
+      );
+    }
+    return {
+      batchId: batch.id,
+      batchName: batch.name,
+      totalScreens: orderedScreens.length,
+      generatedScreens: successfulRoots.length,
+      failedScreens: orderedScreens.length - successfulRoots.length,
+      estimatedNodeCount,
+      createdNodeCount: sumDesignCounts(counts),
+      gap: placementSettings.gap,
+      maxRowWidth: placementSettings.maxRowWidth,
+      counts,
+      screens: screenResults,
+      warnings: [...(fontResolution?.warnings ?? []), ...warnings],
+      fontSelections: fontResolution?.selections ?? [],
+      designSystem:
+        batch.designSystem && styleBindings
+          ? {
+              namespace: batch.designSystem.namespace,
+              created: [
+                ...styleBindings.report.created.map((key) => `style:${key}`),
+                ...componentCreated.map((key) => `component:${key}`),
+              ],
+              reused: [
+                ...styleBindings.report.reused.map((key) => `style:${key}`),
+                ...componentReused.map((key) => `component:${key}`),
+              ],
+              updated: styleBindings.report.updated.map((key) => `style:${key}`),
+              skipped: [
+                ...styleBindings.report.skipped.map((key) => `style:${key}`),
+                ...componentSkipped.map((key) => `component:${key}`),
+              ],
+              fallbacks: styleBindings.report.fallbacks,
+              warnings: [...componentWarnings, ...styleBindings.report.warnings],
+            }
+          : undefined,
+    };
   }
 }
