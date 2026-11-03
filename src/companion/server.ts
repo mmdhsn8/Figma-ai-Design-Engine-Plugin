@@ -11,6 +11,13 @@ import {
 } from "./config.js";
 import type { InstallationStore } from "./installation-store.js";
 import {
+  createDesignInputText,
+  createDesignInstructions,
+  createDesignPlan,
+  DESIGN_GENERATION_OUTPUT_SCHEMA,
+  DesignGenerationRequestSchema,
+} from "../shared/design-generation.js";
+import {
   createMemoryCredentialStore,
   emptyCredentialState,
   parseCredentialState,
@@ -38,6 +45,7 @@ import {
 const MAX_BODY_BYTES = 16 * 1_024;
 const MAX_APPROVAL_BODY_BYTES = 2 * 1_024;
 const NETWORK_TIMEOUT_MS = 45_000;
+const MAX_DESIGN_OUTPUT_BYTES = 768 * 1_024;
 const PAIRING_ATTEMPT_TTL_MS = 90_000;
 const PAIRING_SESSION_TTL_MS = 15 * 60 * 1_000;
 const PAIRING_TICKET_PREFIX = "FADP1T:";
@@ -61,6 +69,7 @@ export interface CompanionStatus {
   authLabel: string;
   planUseAuthorized: boolean;
   modelCount: number;
+  inferenceVerifiedModel?: string;
   safeMessage?: string;
 }
 
@@ -88,6 +97,7 @@ interface LiveSession {
   scopes: Set<string>;
   expiresAt: number;
   models: AccountModel[];
+  verifiedModel?: string;
 }
 
 export interface AccountModel {
@@ -151,6 +161,10 @@ export function createCompanionServer(options: CompanionServerOptions) {
     | Promise<{ ok: true; value: LiveSession } | { ok: false; statusCode: number; error: string }>
     | undefined;
   let pendingAuthorization: PendingAuthorization | undefined;
+  const activeInferenceControllers = new Set<AbortController>();
+  const generationAttempts = new Map<string, number>();
+  let activeDesignController: AbortController | undefined;
+  let activeSmokeController: AbortController | undefined;
   let servers: Server[] = [];
   let actualPort = port;
 
@@ -160,6 +174,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
     authLabel: STATUS_TEXT[authStatus],
     planUseAuthorized: Boolean(liveSession?.scopes.has(PLAN_USE_SCOPE)),
     modelCount: liveSession?.models.length ?? 0,
+    ...(liveSession?.verifiedModel ? { inferenceVerifiedModel: liveSession.verifiedModel } : {}),
     ...(safeMessage ? { safeMessage } : {}),
   });
 
@@ -290,6 +305,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
 
   async function close(): Promise<void> {
     clearPendingAuthorization();
+    abortActiveInferenceRequests();
+    generationAttempts.clear();
     pairingAttempts.clear();
     sessionTokenHashes.clear();
     pairingStartTimes.length = 0;
@@ -407,6 +424,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
       } else if (tokenHash) {
         sessionTokenHashes.delete(tokenHash);
       }
+      abortActiveInferenceRequests();
+      generationAttempts.clear();
       sendJson(response, 200, { disconnected: true });
       return;
     }
@@ -439,6 +458,10 @@ export function createCompanionServer(options: CompanionServerOptions) {
     }
     if (url.pathname === "/v1/smoke" && request.method === "POST") {
       await handleSmoke(request, response);
+      return;
+    }
+    if (url.pathname === "/v1/design" && request.method === "POST") {
+      await handleDesignGeneration(request, response);
       return;
     }
     if (url.pathname === "/v1/disconnect" && request.method === "POST") {
@@ -1087,16 +1110,13 @@ export function createCompanionServer(options: CompanionServerOptions) {
       sendJson(response, 400, { error: "invalid_model" });
       return;
     }
-    const session = await getAuthorizedSession();
-    if (!session.ok) {
-      sendJson(response, session.statusCode, { error: session.error, status: status() });
-      return;
-    }
-    if (!session.value.models.some(({ slug }) => slug === body.value.model)) {
-      sendJson(response, 400, { error: "model_not_verified_for_account" });
+    if (activeDesignController || activeSmokeController) {
+      sendJson(response, 409, { error: "inference_busy" });
       return;
     }
     const clientAbort = new AbortController();
+    activeSmokeController = clientAbort;
+    activeInferenceControllers.add(clientAbort);
     const abortForClient = () => clientAbort.abort();
     const abortForClosedResponse = () => {
       if (!response.writableEnded) clientAbort.abort();
@@ -1104,6 +1124,24 @@ export function createCompanionServer(options: CompanionServerOptions) {
     request.once("aborted", abortForClient);
     response.once("close", abortForClosedResponse);
     try {
+      const session = await getAuthorizedSession();
+      if (!session.ok) {
+        sendJson(response, session.statusCode, { error: session.error, status: status() });
+        return;
+      }
+      if (clientAbort.signal.aborted || liveSession !== session.value) {
+        if (!request.aborted && !response.destroyed) {
+          sendJson(response, 401, { error: "signed_out", status: status() });
+        }
+        return;
+      }
+      if (!session.value.models.some(({ slug }) => slug === body.value.model)) {
+        sendJson(response, 400, { error: "model_not_verified_for_account" });
+        return;
+      }
+      session.value.verifiedModel = undefined;
+      authStatus = "scope_granted";
+      safeMessage = undefined;
       const result = await fetchWithTimeout(
         `${RESPONSES_RESOURCE}/responses`,
         {
@@ -1128,10 +1166,21 @@ export function createCompanionServer(options: CompanionServerOptions) {
         return;
       }
       const completed = await readCompletedResponse(result, timeoutMs, clientAbort.signal);
+      if (clientAbort.signal.aborted) throw new Error("request_cancelled");
       if (!completed) throw new Error("response_incomplete");
+      if (clientAbort.signal.aborted || liveSession !== session.value) {
+        sendJson(response, 401, { error: "signed_out", status: status() });
+        return;
+      }
+      session.value.verifiedModel = body.value.model;
       authStatus = "ready";
       safeMessage = undefined;
-      sendJson(response, 200, { success: true, completed: true, text: completed.slice(0, 240) });
+      sendJson(response, 200, {
+        success: true,
+        completed: true,
+        text: completed.slice(0, 240),
+        status: status(),
+      });
     } catch (error) {
       if (request.aborted || response.destroyed) return;
       const category = classifyError(error);
@@ -1143,6 +1192,155 @@ export function createCompanionServer(options: CompanionServerOptions) {
     } finally {
       request.off("aborted", abortForClient);
       response.off("close", abortForClosedResponse);
+      activeInferenceControllers.delete(clientAbort);
+      if (activeSmokeController === clientAbort) activeSmokeController = undefined;
+    }
+  }
+
+  async function handleDesignGeneration(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const body = await readJsonBody(request);
+    if (!body.ok) {
+      sendJson(response, 400, { error: "invalid_design_request" });
+      return;
+    }
+    const allowedKeys = new Set(["requestId", "model", "request", "repairIssues"]);
+    if (
+      Object.keys(body.value).some((key) => !allowedKeys.has(key)) ||
+      typeof body.value.requestId !== "string" ||
+      !/^[A-Za-z0-9_-]{1,100}$/u.test(body.value.requestId) ||
+      typeof body.value.model !== "string" ||
+      body.value.model.length < 1 ||
+      body.value.model.length > 200
+    ) {
+      sendJson(response, 400, { error: "invalid_design_request" });
+      return;
+    }
+    const parsedRequest = DesignGenerationRequestSchema.safeParse(body.value.request);
+    const repairIssues = body.value.repairIssues;
+    if (
+      !parsedRequest.success ||
+      (repairIssues !== undefined &&
+        (!Array.isArray(repairIssues) ||
+          repairIssues.length > 8 ||
+          repairIssues.some((issue) => typeof issue !== "string" || issue.length > 300)))
+    ) {
+      sendJson(response, 400, { error: "invalid_design_request" });
+      return;
+    }
+    if (activeDesignController || activeSmokeController) {
+      sendJson(response, 409, { error: "generation_busy" });
+      return;
+    }
+    const clientAbort = new AbortController();
+    activeDesignController = clientAbort;
+    activeInferenceControllers.add(clientAbort);
+    const abortForClient = () => clientAbort.abort();
+    const abortForClosedResponse = () => {
+      if (!response.writableEnded) clientAbort.abort();
+    };
+    request.once("aborted", abortForClient);
+    response.once("close", abortForClosedResponse);
+    try {
+      const session = await getAuthorizedSession();
+      if (!session.ok) {
+        sendJson(response, session.statusCode, { error: session.error, status: status() });
+        return;
+      }
+      if (clientAbort.signal.aborted || liveSession !== session.value) {
+        if (!request.aborted && !response.destroyed) {
+          sendJson(response, 401, { error: "signed_out", status: status() });
+        }
+        return;
+      }
+      if (!session.value.models.some(({ slug }) => slug === body.value.model)) {
+        sendJson(response, 400, { error: "model_not_verified_for_account" });
+        return;
+      }
+      if (session.value.verifiedModel !== body.value.model || authStatus !== "ready") {
+        sendJson(response, 403, { error: "inference_not_verified", status: status() });
+        return;
+      }
+      const plan = createDesignPlan(parsedRequest.data);
+      if (!plan.success) {
+        sendJson(response, 400, { error: "invalid_design_request" });
+        return;
+      }
+      const previousAttempts = generationAttempts.get(body.value.requestId) ?? 0;
+      const isRepair = Array.isArray(repairIssues) && repairIssues.length > 0;
+      if (
+        previousAttempts >= 2 ||
+        (previousAttempts === 0 && isRepair) ||
+        (previousAttempts === 1 && !isRepair)
+      ) {
+        sendJson(response, 409, { error: "generation_retry_limit" });
+        return;
+      }
+      if (!generationAttempts.has(body.value.requestId) && generationAttempts.size >= 128) {
+        const oldestRequestId = generationAttempts.keys().next().value;
+        if (oldestRequestId) generationAttempts.delete(oldestRequestId);
+      }
+      generationAttempts.set(body.value.requestId, previousAttempts + 1);
+
+      const result = await fetchWithTimeout(
+        `${RESPONSES_RESOURCE}/responses`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session.value.accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: body.value.model,
+            instructions: createDesignInstructions(
+              plan.data,
+              Array.isArray(repairIssues) ? (repairIssues as string[]) : [],
+            ),
+            input: [{ role: "user", content: createDesignInputText(plan.data) }],
+            text: {
+              format: {
+                type: "json_schema",
+                name: "figma_design",
+                strict: true,
+                schema: DESIGN_GENERATION_OUTPUT_SCHEMA,
+              },
+            },
+            store: false,
+            stream: true,
+          }),
+        },
+        clientAbort.signal,
+      );
+      if (!result.ok) {
+        const category = classifyHttpStatus(result.status);
+        await applySessionHttpFailure(category);
+        sendJson(response, result.status, { error: category, status: status() });
+        return;
+      }
+      const design = await readCompletedResponse(
+        result,
+        timeoutMs,
+        clientAbort.signal,
+        MAX_DESIGN_OUTPUT_BYTES,
+      );
+      if (clientAbort.signal.aborted) throw new Error("request_cancelled");
+      if (!design) throw new Error("response_incomplete");
+      sendJson(response, 200, { requestId: body.value.requestId, design });
+    } catch (error) {
+      if (request.aborted || response.destroyed) return;
+      const category = classifyError(error);
+      if (category === "quota_or_rate_limit" || category === "plan_use_not_admitted") {
+        authStatus = "scope_granted";
+      }
+      safeMessage = category;
+      sendJson(response, 502, { error: category, status: status() });
+    } finally {
+      request.off("aborted", abortForClient);
+      response.off("close", abortForClosedResponse);
+      activeInferenceControllers.delete(clientAbort);
+      if (activeDesignController === clientAbort) activeDesignController = undefined;
     }
   }
 
@@ -1151,6 +1349,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
     forgetRegistration: boolean,
   ): Promise<void> {
     clearPendingAuthorization();
+    abortActiveInferenceRequests();
+    generationAttempts.clear();
     const session = liveSession;
     const nextState: CredentialState = {
       version: 1,
@@ -1200,6 +1400,12 @@ export function createCompanionServer(options: CompanionServerOptions) {
     });
   }
 
+  function abortActiveInferenceRequests(): void {
+    for (const controller of activeInferenceControllers) controller.abort();
+    activeDesignController = undefined;
+    activeSmokeController = undefined;
+  }
+
   async function getAuthorizedSession(): Promise<
     { ok: true; value: LiveSession } | { ok: false; statusCode: number; error: string }
   > {
@@ -1238,6 +1444,9 @@ export function createCompanionServer(options: CompanionServerOptions) {
         if (!result.ok) throw new Error(await classifyOAuthResponse(result));
         const token = (await readJsonResponse(result, 64 * 1_024, timeoutMs)) as TokenResponse;
         if (!isAccessTokenResponse(token)) throw new Error("token_response_invalid");
+        if (liveSession !== session) {
+          return { ok: false as const, statusCode: 401, error: "signed_out" };
+        }
         const scopes =
           typeof token.scope === "string" ? parseGrantedScopes(token.scope) : session.scopes;
         const refreshed: LiveSession = {
@@ -1852,6 +2061,7 @@ async function readCompletedResponse(
   response: Response,
   timeoutMs: number,
   signal?: AbortSignal,
+  maximumBytes = 256 * 1_024,
 ): Promise<string | undefined> {
   if (!response.body) return undefined;
   const reader = response.body.getReader();
@@ -1876,9 +2086,9 @@ async function readCompletedResponse(
       const { value, done } = await readChunkWithTimeout(reader, remaining);
       if (done) break;
       bytes += value.byteLength;
-      if (bytes > 256 * 1_024) {
+      if (bytes > maximumBytes) {
         await reader.cancel();
-        throw new Error("response_incomplete");
+        throw new Error("response_too_large");
       }
       buffer += decoder.decode(value, { stream: true });
       const records = buffer.split(/\r?\n\r?\n/u);
@@ -1900,7 +2110,7 @@ async function readCompletedResponse(
           output += event.delta;
         }
         if (event.type === "response.failed" || event.type === "error") {
-          throw new Error(responseFailureCategory(event.response) ?? "response_incomplete");
+          throw new Error(responseFailureCategory(event.response) ?? "request_rejected");
         }
         if (event.type === "response.incomplete") throw new Error("response_incomplete");
         if (event.type === "response.completed") return output;

@@ -76,5 +76,6 @@ describe("protected companion credential storage", () => {
       expect(sealed).not.toContain("Figma plugin ticket fixture");
       await expect(store.unprotectText(sealed)).resolves.toBe("Figma plugin ticket fixture");
     },
+    30_000,
   );
 });

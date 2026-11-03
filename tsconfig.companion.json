@@ -7,9 +7,9 @@
     "allowImportingTsExtensions": false,
     "noEmit": false,
     "outDir": "dist-companion",
-    "rootDir": "src/companion",
+    "rootDir": "src",
     "types": ["node"]
   },
-  "include": ["src/companion/**/*.ts"],
+  "include": ["src/companion/**/*.ts", "src/shared/design-generation.ts"],
   "exclude": []
 }

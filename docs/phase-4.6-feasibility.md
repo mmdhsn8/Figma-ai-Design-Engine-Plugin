@@ -58,16 +58,20 @@ The host identifier and issued public client ID are installation metadata, not c
 
 ## Gate status
 
-| Live check                                 | Status                                    |
-| ------------------------------------------ | ----------------------------------------- |
-| Owner's interactive system-browser sign-in | **PENDING USER ACTION**                   |
-| Granted `chatgpt.tokens.use.direct` scope  | **PENDING TOKEN RESPONSE**                |
-| Real model discovery with authorized token | **PENDING USER ACTION**                   |
-| Real minimal streamed Responses request    | **PENDING USER ACTION**                   |
-| Figma Desktop loopback UI connection       | **PENDING USER ACTION**                   |
-| AI design plan / schema generation         | **NOT IMPLEMENTED; BLOCKED ON LIVE GATE** |
+| Live check                                 | Status                                                                   |
+| ------------------------------------------ | ------------------------------------------------------------------------ |
+| Owner's interactive system-browser sign-in | **PENDING USER ACTION**                                                  |
+| Granted `chatgpt.tokens.use.direct` scope  | **PENDING TOKEN RESPONSE**                                               |
+| Real model discovery with authorized token | **PENDING USER ACTION**                                                  |
+| Real minimal streamed Responses request    | **PENDING USER ACTION**                                                  |
+| Figma Desktop loopback UI connection       | **PENDING USER ACTION**                                                  |
+| AI design plan / schema generation         | **Phase 5 implemented behind the runtime gate; live generation pending** |
 
-Do not label Phase 4.6 complete or start the generation planner until the live authorization, inference and Figma Desktop gates are confirmed. Offline JSON remains the supported workflow regardless of gate outcome.
+Do not label Phase 4.6 complete or enable live generation until the live authorization, inference, and Figma Desktop gates are confirmed. Offline JSON remains supported regardless of gate outcome.
+
+## Phase 5 implementation note
+
+The Phase 5 MVP adds a model-specific capability gate: `/v1/design` requires granted direct-use scope, an account-visible selected model, and a completed real smoke request for that exact model in the current companion session. The direct documented Responses call uses `store: false`, `stream: true`, and strict JSON Schema output. The returned data is validated and routed through the existing multi-screen schema/render path; the smoke response itself is never treated as a generated design. This implementation does not change the pending live gate recorded above. See [`phase-5-design-generation.md`](phase-5-design-generation.md).
 
 ## 2026-11 loopback startup repair record
 

@@ -68,18 +68,22 @@ describe("plugin UI navigation and capability states", () => {
     expect(html).not.toContain("Companion &amp; ChatGPT");
   });
 
-  it("keeps the AI action honestly disabled and labels unsupported targets as planned", () => {
+  it("shows interactive target planning but keeps AI generation blocked without a verified account model", () => {
     const html = render();
 
-    expect(html).toContain("Describe your app, website, or interface...");
+    expect(html).toContain("Describe your app, website, or interface");
     expect(html).toContain('id="prompt-count"');
-    const generateButton = html.match(/<button class="design-generate-button"[^>]*>/)?.[0];
+    const generateButton = html.match(/<button class="design-generate-button[^>]*>/)?.[0];
     expect(generateButton).toContain('aria-describedby="generation-help"');
     expect(generateButton).toContain('disabled=""');
-    expect(html).toContain("Natural-language generation is not implemented yet.");
-    expect(html).toContain('aria-label="Mobile, planned"');
-    expect(html).toContain('aria-label="Desktop, planned"');
-    expect(html).toContain('aria-label="Web, planned"');
+    expect(html).toContain("Enter a design brief with at least 10 characters.");
+    expect(html).toContain('aria-pressed="true">Mobile</button>');
+    expect(html).toContain(">Mobile + Desktop</button>");
+    expect(html).not.toContain(">Web</button>");
+    expect(html).toContain("Connect to the local companion in Settings.");
+    expect(html).toContain("Persian storefront · 10 screens");
+    expect(html).toContain("English dashboard · 2 screens");
+    expect(html).toContain("NO AI REQUEST");
     expect(html).toContain("Recent projects aren’t saved yet");
     expect(html).not.toContain("Screen 01");
   });

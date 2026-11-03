@@ -43,7 +43,7 @@ Refresh attempts are serialized. Network and service failures preserve the crede
 - A Figma `clientStorage` value is scoped to this plugin and is treated as inspectable. Its ticket is ciphertext bound to the Windows user through DPAPI. Another plugin without the ticket cannot restore the session.
 - If the Windows user profile is unavailable, reset, or belongs to a different Windows account, the companion cannot decrypt the credential file. The UI must ask for local approval or ChatGPT sign-in again.
 - The companion uses protected storage only when it is available. There is no plaintext fallback. A session may work until the current companion process exits while persistence is unavailable.
-- The current automated environment runs under `CodexSandboxOffline`, not the signed-in desktop user's Windows profile. Its DPAPI CurrentUser round-trip test is therefore skipped after the API reports that the profile is not loaded. This does not verify persistence in Figma Desktop.
+- The automated DPAPI CurrentUser round-trip passes in this execution context with the explicit 30-second test timeout. It does not verify that the interactive Windows profile running Figma Desktop can restore the companion session end to end.
 
 ## Official contract references
 
@@ -56,7 +56,7 @@ Refresh attempts are serialized. Network and service failures preserve the crede
 
 ## Automated verification
 
-Latest run: `npm test` completed with **181 passed and 1 skipped** across 19 test files. The skipped test is the Windows DPAPI ciphertext round-trip; this Codex execution account has no loaded user profile, so the CurrentUser DPAPI call is unavailable here. Typecheck, lint, Prettier check, and production build pass. The tests cover UI-remount restore exchange, companion restart and refresh rotation, expired/revoked credentials, disconnect separation, account switching, approval cancellation/replay, invalid tickets, and missing/corrupt credential data.
+Latest run after the model-bound inference-gate fix: `npm run test` completed with **201 passed across 21 test files**. The Windows DPAPI ciphertext round-trip passed with an explicit 30-second test timeout; it had exceeded Vitest's default 5-second timeout when the suite spawned many workers. Typecheck, companion compile, lint, Prettier check, and production build were also run for this update. The tests cover UI-remount restore exchange, companion restart and refresh rotation, expired/revoked credentials, disconnect separation, account switching, approval cancellation/replay, invalid tickets, and missing/corrupt credential data. Mocked OAuth/provider results do not establish live inference or Figma Desktop acceptance.
 
 ## Manual Windows and Figma Desktop acceptance checklist
 

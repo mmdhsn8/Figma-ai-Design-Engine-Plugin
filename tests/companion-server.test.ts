@@ -499,6 +499,14 @@ describe("loopback companion", () => {
     await request(harness.handle, "/v1/auth/start", { token: paired.sessionToken, body: {} });
     await completeLogin(harness);
     const authorizationUrl = harness.openedUrl;
+    await request(harness.handle, "/v1/models", { token: paired.sessionToken, body: {} });
+    const smoke = await request(harness.handle, "/v1/smoke", {
+      token: paired.sessionToken,
+      body: { model: "account-model" },
+    });
+    expect(await smoke.json()).toMatchObject({
+      status: { inferenceVerifiedModel: "account-model" },
+    });
 
     const restartedHandle = await harness.restart();
     const restored = await request(restartedHandle, "/v1/pairing/restore", {
@@ -506,7 +514,9 @@ describe("loopback companion", () => {
     });
     const restoredToken = ((await restored.json()) as { sessionToken: string }).sessionToken;
     const status = await request(restartedHandle, "/v1/status", { token: restoredToken });
-    expect(await status.json()).toMatchObject({ auth: "scope_granted", planUseAuthorized: true });
+    const statusBody = await status.json();
+    expect(statusBody).toMatchObject({ auth: "scope_granted", planUseAuthorized: true });
+    expect(statusBody).not.toHaveProperty("inferenceVerifiedModel");
     expect(harness.openedUrl).toBe(authorizationUrl);
     expect(harness.refreshRequest).toBeUndefined();
   });
@@ -704,9 +714,14 @@ describe("loopback companion", () => {
       success: true,
       completed: true,
       text: "OK",
+      status: { auth: "ready", inferenceVerifiedModel: "account-model" },
     });
     const liveStatus = await request(harness.handle, "/v1/status", { token });
-    expect(await liveStatus.json()).toMatchObject({ auth: "ready", planUseAuthorized: true });
+    expect(await liveStatus.json()).toMatchObject({
+      auth: "ready",
+      planUseAuthorized: true,
+      inferenceVerifiedModel: "account-model",
+    });
     const sent = harness.responsesRequest as { body: string; headers: HeadersInit };
     const payload = JSON.parse(sent.body) as Record<string, unknown>;
     expect(payload).toMatchObject({
@@ -717,6 +732,164 @@ describe("loopback companion", () => {
     expect(payload).not.toHaveProperty("max_output_tokens");
     expect(payload.model).toBe("account-model");
     expect(new Headers(sent.headers).get("authorization")).toBe("Bearer access-secret");
+  });
+
+  it("requires a model-specific real smoke test before design generation and streams a strict JSON schema request", async () => {
+    const design = {
+      projectName: "Generated Storefront",
+      palette: {
+        brand: "#223344",
+        accent: "#CC7744",
+        page: "#F7F5F0",
+        surface: "#FFFFFF",
+        text: "#17212B",
+        muted: "#647080",
+        border: "#D8DEE6",
+      },
+      screens: [
+        { id: "home", children: [] },
+        { id: "products", children: [] },
+      ],
+    };
+    const harness = await createHarness({ generatedOutput: JSON.stringify(design) });
+    const token = await harness.pair();
+    await request(harness.handle, "/v1/auth/start", { token, body: {} });
+    await completeLogin(harness);
+    await request(harness.handle, "/v1/models", { token, body: {} });
+
+    const requestBody = {
+      requestId: "req-design-test",
+      model: "account-model",
+      request: {
+        prompt: "Create a polished storefront with a home and product catalog.",
+        target: "mobile",
+        screenCount: 2,
+        language: "en",
+        style: "editorial",
+      },
+    };
+    const blocked = await request(harness.handle, "/v1/design", { token, body: requestBody });
+    expect(blocked.status).toBe(403);
+    expect(await blocked.json()).toMatchObject({ error: "inference_not_verified" });
+    expect(harness.responsesRequest).toBeUndefined();
+
+    const smoke = await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    expect(smoke.status).toBe(200);
+    const response = await request(harness.handle, "/v1/design", { token, body: requestBody });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      requestId: "req-design-test",
+      design: JSON.stringify(design),
+    });
+
+    const sent = harness.responsesRequest as { body: string; headers: HeadersInit };
+    const payload = JSON.parse(sent.body) as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      model: "account-model",
+      input: [{ role: "user", content: expect.stringContaining("Create a polished storefront") }],
+      text: { format: { type: "json_schema", name: "figma_design", strict: true } },
+      store: false,
+      stream: true,
+    });
+    expect(payload).toHaveProperty("instructions");
+    expect(payload).not.toHaveProperty("max_output_tokens");
+    expect(JSON.stringify(payload)).not.toContain('"role":"system"');
+    expect(new Headers(sent.headers).get("authorization")).toBe("Bearer access-secret");
+
+    const repeated = await request(harness.handle, "/v1/design", {
+      token,
+      body: { ...requestBody, repairIssues: ["screens[1] was missing a title"] },
+    });
+    expect(repeated.status).toBe(200);
+    const tooManyRepairs = await request(harness.handle, "/v1/design", {
+      token,
+      body: { ...requestBody, repairIssues: ["one repair was already used"] },
+    });
+    expect(tooManyRepairs.status).toBe(409);
+    expect(await tooManyRepairs.json()).toMatchObject({ error: "generation_retry_limit" });
+  });
+
+  it("cancels an in-flight design stream when the paired UI aborts", async () => {
+    const harness = await createHarness();
+    const token = await harness.pair();
+    await request(harness.handle, "/v1/auth/start", { token, body: {} });
+    await completeLogin(harness);
+    await request(harness.handle, "/v1/models", { token, body: {} });
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    harness.stallNextResponse();
+    const controller = new AbortController();
+    const pending = request(harness.handle, "/v1/design", {
+      token,
+      signal: controller.signal,
+      body: {
+        requestId: "req-cancel-design",
+        model: "account-model",
+        request: {
+          prompt: "Create a professional mobile storefront for clothing.",
+          target: "mobile",
+          screenCount: 2,
+          language: "en",
+          style: "",
+        },
+      },
+    });
+    await harness.waitForResponseStream();
+    const duplicate = await request(harness.handle, "/v1/design", {
+      token,
+      body: {
+        requestId: "req-duplicate-design",
+        model: "account-model",
+        request: {
+          prompt: "Create another mobile storefront.",
+          target: "mobile",
+          screenCount: 2,
+          language: "en",
+          style: "",
+        },
+      },
+    });
+    expect(duplicate.status).toBe(409);
+    expect(await duplicate.json()).toMatchObject({ error: "generation_busy" });
+    controller.abort();
+    await expect(pending).rejects.toBeDefined();
+    await vi.waitFor(() => expect(harness.wasResponseStreamCancelled()).toBe(true));
+  });
+
+  it("invalidates an in-flight design request and its verified-model state on account disconnect", async () => {
+    const harness = await createHarness();
+    const token = await harness.pair();
+    await request(harness.handle, "/v1/auth/start", { token, body: {} });
+    await completeLogin(harness);
+    await request(harness.handle, "/v1/models", { token, body: {} });
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    harness.stallNextResponse();
+    const generation = request(harness.handle, "/v1/design", {
+      token,
+      body: {
+        requestId: "req-disconnect-design",
+        model: "account-model",
+        request: {
+          prompt: "Create a professional mobile storefront for clothing.",
+          target: "mobile",
+          screenCount: 2,
+          language: "en",
+          style: "",
+        },
+      },
+    });
+    await harness.waitForResponseStream();
+
+    const disconnected = await request(harness.handle, "/v1/disconnect", { token, body: {} });
+    expect(disconnected.status).toBe(200);
+    expect((await generation).status).toBe(502);
+    await vi.waitFor(() => expect(harness.wasResponseStreamCancelled()).toBe(true));
+    const status = await request(harness.handle, "/v1/status", { token });
+    const statusBody = await status.json();
+    expect(statusBody).toMatchObject({ auth: "signed_out", planUseAuthorized: false });
+    expect(statusBody).not.toHaveProperty("inferenceVerifiedModel");
   });
 
   it("retains the issued client ID for reauthorization and blocks a different validated account", async () => {
@@ -749,6 +922,8 @@ describe("loopback companion", () => {
     const token = await harness.pair();
     await request(harness.handle, "/v1/auth/start", { token, body: {} });
     await completeLogin(harness);
+    await request(harness.handle, "/v1/models", { token, body: {} });
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
 
     const switchResponse = await request(harness.handle, "/v1/account/switch", { token, body: {} });
     expect(switchResponse.status).toBe(200);
@@ -756,6 +931,10 @@ describe("loopback companion", () => {
     expect(JSON.parse(harness.storeSnapshot())).toMatchObject({ extAgentHostId: TEST_HOST_ID });
     expect(JSON.parse(harness.storeSnapshot())).not.toHaveProperty("clientId");
     expect(JSON.parse(harness.storeSnapshot())).not.toHaveProperty("subjectHash");
+    const signedOut = await request(harness.handle, "/v1/status", { token });
+    const signedOutBody = await signedOut.json();
+    expect(signedOutBody).toMatchObject({ auth: "signed_out" });
+    expect(signedOutBody).not.toHaveProperty("inferenceVerifiedModel");
 
     harness.changeSubject("new-validated-account");
     await request(harness.handle, "/v1/auth/start", { token, body: {} });
@@ -784,6 +963,31 @@ describe("loopback companion", () => {
     });
     expect(smoke.status).toBe(502);
     expect(await smoke.json()).toMatchObject({ error: "quota_or_rate_limit" });
+  });
+
+  it("clears the previous model verification as soon as a new smoke test starts and leaves it cleared on failure", async () => {
+    const harness = await createHarness();
+    const token = await harness.pair();
+    await request(harness.handle, "/v1/auth/start", { token, body: {} });
+    await completeLogin(harness);
+    await request(harness.handle, "/v1/models", { token, body: {} });
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    expect(await (await request(harness.handle, "/v1/status", { token })).json()).toMatchObject({
+      auth: "ready",
+      inferenceVerifiedModel: "account-model",
+    });
+
+    harness.failNextResponseWithUsage();
+    const failed = await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    expect(failed.status).toBe(502);
+    expect(await failed.json()).toMatchObject({ error: "quota_or_rate_limit" });
+    const status = await request(harness.handle, "/v1/status", { token });
+    const statusBody = await status.json();
+    expect(statusBody).toMatchObject({ auth: "scope_granted" });
+    expect(statusBody).not.toHaveProperty("inferenceVerifiedModel");
   });
 
   it("cancels the upstream stream when the paired UI aborts the smoke request", async () => {
@@ -958,6 +1162,7 @@ async function createHarness(
     modelsUnauthorized?: boolean;
     usageFailure?: boolean;
     stalledStream?: boolean;
+    generatedOutput?: string;
     oauthBrowserFailures?: number;
   } = {},
 ) {
@@ -979,9 +1184,16 @@ async function createHarness(
   let codeExchange: string | undefined;
   let markResponseStreamStarted = () => {};
   let responseStreamCancelled = false;
-  const responseStreamStarted = new Promise<void>((resolve) => {
+  let responseStreamStarted = new Promise<void>((resolve) => {
     markResponseStreamStarted = resolve;
   });
+  let stallNextResponses = false;
+  let nextResponsesUsageFailure = false;
+  const resetResponseStreamWaiter = () => {
+    responseStreamStarted = new Promise<void>((resolve) => {
+      markResponseStreamStarted = resolve;
+    });
+  };
   let currentTime = Date.now();
   let authNonce = "";
   let authTransactionUrl: URL | undefined;
@@ -1052,7 +1264,8 @@ async function createHarness(
     }
     if (url === "https://api.openai.com/v1/responses") {
       responsesRequest = { body: String(init?.body ?? ""), headers: init?.headers ?? {} };
-      if (options.stalledStream) {
+      if (options.stalledStream || stallNextResponses) {
+        stallNextResponses = false;
         return new Response(
           new ReadableStream({
             start() {
@@ -1065,7 +1278,8 @@ async function createHarness(
           { status: 200, headers: { "Content-Type": "text/event-stream" } },
         );
       }
-      if (options.usageFailure) {
+      if (options.usageFailure || nextResponsesUsageFailure) {
+        nextResponsesUsageFailure = false;
         return new Response(
           `data: ${JSON.stringify({
             type: "response.failed",
@@ -1074,9 +1288,11 @@ async function createHarness(
           { status: 200, headers: { "Content-Type": "text/event-stream" } },
         );
       }
+      const responsePayload = JSON.parse(String(init?.body ?? "")) as { text?: unknown };
+      const outputText = responsePayload.text ? (options.generatedOutput ?? "{}") : "OK";
       return new Response(
         [
-          `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "OK" })}\n\n`,
+          `data: ${JSON.stringify({ type: "response.output_text.delta", delta: outputText })}\n\n`,
           `data: ${JSON.stringify({ type: "response.completed" })}\n\n`,
         ].join(""),
         { status: 200, headers: { "Content-Type": "text/event-stream" } },
@@ -1158,6 +1374,14 @@ async function createHarness(
     },
     waitForResponseStream() {
       return responseStreamStarted;
+    },
+    stallNextResponse() {
+      responseStreamCancelled = false;
+      stallNextResponses = true;
+      resetResponseStreamWaiter();
+    },
+    failNextResponseWithUsage() {
+      nextResponsesUsageFailure = true;
     },
     wasResponseStreamCancelled() {
       return responseStreamCancelled;

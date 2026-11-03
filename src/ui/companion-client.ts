@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { COMPANION_BASE_URL } from "../companion/config";
+import type { DesignGenerationRequest } from "../shared/design-generation";
 
 export const COMPANION_URL = COMPANION_BASE_URL;
 
@@ -18,6 +19,7 @@ const StatusSchema = z
     authLabel: z.string().max(80),
     planUseAuthorized: z.boolean(),
     modelCount: z.number().int().nonnegative().max(100),
+    inferenceVerifiedModel: z.string().min(1).max(200).optional(),
     safeMessage: z.string().max(80).optional(),
   })
   .strict();
@@ -49,7 +51,15 @@ const ModelSchema = z
   .strict();
 const ModelListSchema = z.object({ models: z.array(ModelSchema).max(100) }).passthrough();
 const SmokeSchema = z
-  .object({ success: z.literal(true), completed: z.literal(true), text: z.string().max(240) })
+  .object({
+    success: z.literal(true),
+    completed: z.literal(true),
+    text: z.string().max(240),
+    status: StatusSchema.optional(),
+  })
+  .strict();
+const GeneratedDesignSchema = z
+  .object({ requestId: z.string().min(1).max(100), design: z.string().min(1).max(1_000_000) })
   .strict();
 const DisconnectSchema = z
   .object({
@@ -80,6 +90,11 @@ export type CompanionErrorCategory =
   | "client_id_mismatch"
   | "plan_use_scope_missing"
   | "plan_use_not_admitted"
+  | "inference_not_verified"
+  | "inference_busy"
+  | "generation_busy"
+  | "generation_retry_limit"
+  | "invalid_design_request"
   | "quota_or_rate_limit"
   | "session_expired"
   | "request_timed_out"
@@ -253,10 +268,42 @@ export async function runSmokeRequest(
   model: string,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<{ text: string; status?: CompanionStatus }> {
   const body = SmokeSchema.safeParse(await request("/v1/smoke", token, { model }, fetcher, signal));
   if (!body.success) throw new CompanionClientError("unknown");
-  return body.data.text;
+  return {
+    text: body.data.text,
+    ...(body.data.status ? { status: body.data.status } : {}),
+  };
+}
+
+export async function generateAuthorizedDesign(
+  token: string,
+  requestId: string,
+  model: string,
+  designRequest: DesignGenerationRequest,
+  repairIssues: string[] = [],
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<string> {
+  const body = GeneratedDesignSchema.safeParse(
+    await request(
+      "/v1/design",
+      token,
+      {
+        requestId,
+        model,
+        request: designRequest,
+        ...(repairIssues.length ? { repairIssues } : {}),
+      },
+      fetcher,
+      signal,
+    ),
+  );
+  if (!body.success || body.data.requestId !== requestId) {
+    throw new CompanionClientError("unknown");
+  }
+  return body.data.design;
 }
 
 export async function disconnectChatGPT(token: string, fetcher: Fetcher = fetch): Promise<string> {
@@ -309,12 +356,7 @@ async function request(
     if (signal?.aborted) throw new CompanionClientError("request_cancelled");
     throw new CompanionClientError("connection_failed");
   }
-  let result: unknown;
-  try {
-    result = await response.json();
-  } catch {
-    throw new CompanionClientError("unknown");
-  }
+  const result = await readLimitedJson(response, signal);
   if (!response.ok) {
     const category =
       typeof result === "object" &&
@@ -348,6 +390,11 @@ function mapError(value: string): CompanionErrorCategory {
     "client_id_mismatch",
     "plan_use_scope_missing",
     "plan_use_not_admitted",
+    "inference_not_verified",
+    "inference_busy",
+    "generation_busy",
+    "generation_retry_limit",
+    "invalid_design_request",
     "quota_or_rate_limit",
     "session_expired",
     "request_timed_out",
@@ -370,4 +417,37 @@ function mapError(value: string): CompanionErrorCategory {
   return known.includes(value as CompanionErrorCategory)
     ? (value as CompanionErrorCategory)
     : "unknown";
+}
+
+async function readLimitedJson(response: Response, signal?: AbortSignal): Promise<unknown> {
+  const maximumBytes = 1_100_000;
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
+    throw new CompanionClientError("response_too_large");
+  }
+  if (!response.body) throw new CompanionClientError("unknown");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let byteLength = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      byteLength += value.byteLength;
+      if (byteLength > maximumBytes) {
+        await reader.cancel();
+        throw new CompanionClientError("response_too_large");
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    if (error instanceof CompanionClientError) throw error;
+    if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+    throw new CompanionClientError("unknown");
+  } finally {
+    reader.releaseLock();
+  }
 }

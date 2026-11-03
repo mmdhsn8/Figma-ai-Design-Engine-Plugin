@@ -1,0 +1,688 @@
+{
+  "schemaVersion": "1.0.0",
+  "id": "northstar-dashboard",
+  "name": "Northstar Analytics Dashboard",
+  "designSystem": {
+    "id": "northstar-core",
+    "namespace": "northstar",
+    "name": "Northstar Dashboard",
+    "version": "1.0.0",
+    "colors": {
+      "color.brand.primary": "#5946D2",
+      "color.brand.accent": "#19A982",
+      "color.page.background": "#F4F5FA",
+      "color.surface.default": "#FFFFFF",
+      "color.surface.subtle": "#F0EEFF",
+      "color.text.primary": "#202338",
+      "color.text.secondary": "#74788D",
+      "color.border.default": "#E5E7EF"
+    },
+    "components": [
+      {
+        "type": "component",
+        "id": "global-navigation",
+        "key": "northstar.dashboard.navigation.v1",
+        "name": "Northstar Navigation",
+        "width": 1392,
+        "height": 72,
+        "background": { "token": "color.surface.default" },
+        "cornerRadius": 14,
+        "layout": {
+          "mode": "horizontal",
+          "gap": 20,
+          "padding": { "top": 16, "right": 24, "bottom": 16, "left": 24 },
+          "primaryAxisAlign": "space-between",
+          "counterAxisAlign": "center"
+        },
+        "children": [
+          {
+            "type": "text",
+            "name": "Brand",
+            "text": "northstar",
+            "fontSize": 20,
+            "fontStyle": "Bold",
+            "color": { "token": "color.brand.primary" },
+            "width": 190,
+            "textAutoResize": "height",
+            "qualityRole": "heading"
+          },
+          {
+            "type": "text",
+            "name": "Overview link",
+            "text": "Overview",
+            "fontSize": 13,
+            "fontStyle": "Medium",
+            "color": { "token": "color.text.primary" },
+            "width": 100,
+            "textAutoResize": "height"
+          },
+          {
+            "type": "text",
+            "name": "Orders link",
+            "text": "Orders",
+            "fontSize": 13,
+            "color": { "token": "color.text.secondary" },
+            "width": 80,
+            "textAutoResize": "height"
+          },
+          {
+            "type": "text",
+            "name": "Reports link",
+            "text": "Reports",
+            "fontSize": 13,
+            "color": { "token": "color.text.secondary" },
+            "width": 90,
+            "textAutoResize": "height"
+          },
+          {
+            "type": "text",
+            "name": "Account",
+            "text": "Morgan Lee  ·  Admin",
+            "fontSize": 12,
+            "color": { "token": "color.text.secondary" },
+            "width": 180,
+            "textAlign": "right",
+            "textAutoResize": "height"
+          }
+        ]
+      }
+    ]
+  },
+  "screens": [
+    {
+      "id": "overview",
+      "name": "Overview",
+      "order": 0,
+      "devicePreset": "desktop",
+      "width": 1440,
+      "height": 960,
+      "background": { "token": "color.page.background" },
+      "layout": {
+        "mode": "vertical",
+        "gap": 22,
+        "padding": { "top": 24, "right": 24, "bottom": 24, "left": 24 },
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "instance",
+          "componentId": "global-navigation",
+          "name": "Primary navigation",
+          "sizing": { "width": "fill", "height": "fixed" }
+        },
+        {
+          "type": "frame",
+          "name": "Overview heading",
+          "width": 1392,
+          "height": 74,
+          "layout": { "mode": "vertical", "gap": 6, "counterAxisAlign": "start" },
+          "children": [
+            {
+              "type": "text",
+              "name": "Page title",
+              "text": "Good morning, Morgan",
+              "fontSize": 27,
+              "fontStyle": "Bold",
+              "color": { "token": "color.text.primary" },
+              "width": 760,
+              "textAutoResize": "height",
+              "qualityRole": "heading"
+            },
+            {
+              "type": "text",
+              "name": "Date range summary",
+              "text": "Here’s how your business is performing this month.",
+              "fontSize": 14,
+              "color": { "token": "color.text.secondary" },
+              "width": 760,
+              "textAutoResize": "height",
+              "qualityRole": "body"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "name": "Key performance indicators",
+          "width": 1392,
+          "height": 140,
+          "layout": { "mode": "horizontal", "gap": 16, "counterAxisAlign": "stretch" },
+          "children": [
+            {
+              "type": "frame",
+              "name": "Revenue metric",
+              "width": 336,
+              "height": 140,
+              "background": { "token": "color.surface.default" },
+              "cornerRadius": 14,
+              "layout": {
+                "mode": "vertical",
+                "gap": 12,
+                "padding": { "top": 18, "right": 18, "bottom": 18, "left": 18 },
+                "counterAxisAlign": "start"
+              },
+              "children": [
+                {
+                  "type": "text",
+                  "name": "Revenue label",
+                  "text": "Net revenue",
+                  "fontSize": 13,
+                  "color": { "token": "color.text.secondary" },
+                  "width": 270,
+                  "textAutoResize": "height"
+                },
+                {
+                  "type": "text",
+                  "name": "Revenue value",
+                  "text": "$48,294",
+                  "fontSize": 28,
+                  "fontStyle": "Bold",
+                  "color": { "token": "color.text.primary" },
+                  "width": 270,
+                  "textAutoResize": "height",
+                  "qualityRole": "heading"
+                },
+                {
+                  "type": "text",
+                  "name": "Revenue change",
+                  "text": "↑ 12.8%  vs last month",
+                  "fontSize": 12,
+                  "fontStyle": "Medium",
+                  "color": { "token": "color.brand.accent" },
+                  "width": 270,
+                  "textAutoResize": "height"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "name": "Orders metric",
+              "width": 336,
+              "height": 140,
+              "background": { "token": "color.surface.default" },
+              "cornerRadius": 14,
+              "layout": {
+                "mode": "vertical",
+                "gap": 12,
+                "padding": { "top": 18, "right": 18, "bottom": 18, "left": 18 },
+                "counterAxisAlign": "start"
+              },
+              "children": [
+                {
+                  "type": "text",
+                  "name": "Orders label",
+                  "text": "Orders",
+                  "fontSize": 13,
+                  "color": { "token": "color.text.secondary" },
+                  "width": 270,
+                  "textAutoResize": "height"
+                },
+                {
+                  "type": "text",
+                  "name": "Orders value",
+                  "text": "1,284",
+                  "fontSize": 28,
+                  "fontStyle": "Bold",
+                  "color": { "token": "color.text.primary" },
+                  "width": 270,
+                  "textAutoResize": "height",
+                  "qualityRole": "heading"
+                },
+                {
+                  "type": "text",
+                  "name": "Orders change",
+                  "text": "↑ 8.2%  vs last month",
+                  "fontSize": 12,
+                  "fontStyle": "Medium",
+                  "color": { "token": "color.brand.accent" },
+                  "width": 270,
+                  "textAutoResize": "height"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "name": "Conversion metric",
+              "width": 336,
+              "height": 140,
+              "background": { "token": "color.surface.default" },
+              "cornerRadius": 14,
+              "layout": {
+                "mode": "vertical",
+                "gap": 12,
+                "padding": { "top": 18, "right": 18, "bottom": 18, "left": 18 },
+                "counterAxisAlign": "start"
+              },
+              "children": [
+                {
+                  "type": "text",
+                  "name": "Conversion label",
+                  "text": "Conversion rate",
+                  "fontSize": 13,
+                  "color": { "token": "color.text.secondary" },
+                  "width": 270,
+                  "textAutoResize": "height"
+                },
+                {
+                  "type": "text",
+                  "name": "Conversion value",
+                  "text": "3.42%",
+                  "fontSize": 28,
+                  "fontStyle": "Bold",
+                  "color": { "token": "color.text.primary" },
+                  "width": 270,
+                  "textAutoResize": "height",
+                  "qualityRole": "heading"
+                },
+                {
+                  "type": "text",
+                  "name": "Conversion change",
+                  "text": "↑ 0.6 pts  vs last month",
+                  "fontSize": 12,
+                  "fontStyle": "Medium",
+                  "color": { "token": "color.brand.accent" },
+                  "width": 270,
+                  "textAutoResize": "height"
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "name": "Visitors metric",
+              "width": 336,
+              "height": 140,
+              "background": { "token": "color.surface.default" },
+              "cornerRadius": 14,
+              "layout": {
+                "mode": "vertical",
+                "gap": 12,
+                "padding": { "top": 18, "right": 18, "bottom": 18, "left": 18 },
+                "counterAxisAlign": "start"
+              },
+              "children": [
+                {
+                  "type": "text",
+                  "name": "Visitors label",
+                  "text": "Unique visitors",
+                  "fontSize": 13,
+                  "color": { "token": "color.text.secondary" },
+                  "width": 270,
+                  "textAutoResize": "height"
+                },
+                {
+                  "type": "text",
+                  "name": "Visitors value",
+                  "text": "37,920",
+                  "fontSize": 28,
+                  "fontStyle": "Bold",
+                  "color": { "token": "color.text.primary" },
+                  "width": 270,
+                  "textAutoResize": "height",
+                  "qualityRole": "heading"
+                },
+                {
+                  "type": "text",
+                  "name": "Visitors change",
+                  "text": "↑ 5.4%  vs last month",
+                  "fontSize": 12,
+                  "fontStyle": "Medium",
+                  "color": { "token": "color.brand.accent" },
+                  "width": 270,
+                  "textAutoResize": "height"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "name": "Revenue and activity panels",
+          "width": 1392,
+          "height": 510,
+          "layout": { "mode": "horizontal", "gap": 20, "counterAxisAlign": "stretch" },
+          "children": [
+            {
+              "type": "frame",
+              "name": "Revenue trend panel",
+              "width": 840,
+              "height": 510,
+              "background": { "token": "color.surface.default" },
+              "cornerRadius": 14,
+              "layout": {
+                "mode": "vertical",
+                "gap": 16,
+                "padding": { "top": 22, "right": 22, "bottom": 22, "left": 22 },
+                "counterAxisAlign": "stretch"
+              },
+              "children": [
+                {
+                  "type": "text",
+                  "name": "Revenue trend title",
+                  "text": "Revenue over time",
+                  "fontSize": 17,
+                  "fontStyle": "Bold",
+                  "color": { "token": "color.text.primary" },
+                  "width": 760,
+                  "textAutoResize": "height",
+                  "qualityRole": "heading"
+                },
+                {
+                  "type": "text",
+                  "name": "Revenue trend period",
+                  "text": "Monthly performance  ·  Jan–Jun",
+                  "fontSize": 12,
+                  "color": { "token": "color.text.secondary" },
+                  "width": 760,
+                  "textAutoResize": "height"
+                },
+                {
+                  "type": "frame",
+                  "name": "Editable chart placeholder",
+                  "width": 790,
+                  "height": 365,
+                  "background": { "token": "color.surface.subtle" },
+                  "cornerRadius": 10,
+                  "layout": {
+                    "mode": "vertical",
+                    "gap": 12,
+                    "padding": { "top": 26, "right": 26, "bottom": 26, "left": 26 },
+                    "counterAxisAlign": "start"
+                  },
+                  "children": [
+                    {
+                      "type": "text",
+                      "name": "Chart axis labels",
+                      "text": "$10k       $20k       $30k       $40k",
+                      "fontSize": 12,
+                      "color": { "token": "color.text.secondary" },
+                      "width": 720,
+                      "textAutoResize": "height"
+                    },
+                    {
+                      "type": "rectangle",
+                      "name": "Editable chart bars",
+                      "width": 700,
+                      "height": 210,
+                      "fill": { "token": "color.brand.primary" },
+                      "cornerRadius": 8,
+                      "qualityRole": "decorative"
+                    },
+                    {
+                      "type": "text",
+                      "name": "Chart months",
+                      "text": "Jan        Feb        Mar        Apr        May        Jun",
+                      "fontSize": 11,
+                      "color": { "token": "color.text.secondary" },
+                      "width": 720,
+                      "textAutoResize": "height"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "frame",
+              "name": "Recent activity panel",
+              "width": 532,
+              "height": 510,
+              "background": { "token": "color.surface.default" },
+              "cornerRadius": 14,
+              "layout": {
+                "mode": "vertical",
+                "gap": 18,
+                "padding": { "top": 22, "right": 22, "bottom": 22, "left": 22 },
+                "counterAxisAlign": "stretch"
+              },
+              "children": [
+                {
+                  "type": "text",
+                  "name": "Activity title",
+                  "text": "Recent activity",
+                  "fontSize": 17,
+                  "fontStyle": "Bold",
+                  "color": { "token": "color.text.primary" },
+                  "width": 480,
+                  "textAutoResize": "height",
+                  "qualityRole": "heading"
+                },
+                {
+                  "type": "text",
+                  "name": "Activity summary",
+                  "text": "Latest updates from your store",
+                  "fontSize": 12,
+                  "color": { "token": "color.text.secondary" },
+                  "width": 480,
+                  "textAutoResize": "height"
+                },
+                {
+                  "type": "text",
+                  "name": "Activity item 1",
+                  "text": "New order  ·  #NS-2048\nAvery Chen  ·  $128.00\n12 minutes ago",
+                  "fontSize": 13,
+                  "color": { "token": "color.text.primary" },
+                  "width": 480,
+                  "height": 70,
+                  "textAutoResize": "height"
+                },
+                {
+                  "type": "text",
+                  "name": "Activity item 2",
+                  "text": "Payment received  ·  #NS-2047\nJamie Patel  ·  $86.50\n48 minutes ago",
+                  "fontSize": 13,
+                  "color": { "token": "color.text.primary" },
+                  "width": 480,
+                  "height": 70,
+                  "textAutoResize": "height"
+                },
+                {
+                  "type": "text",
+                  "name": "Activity item 3",
+                  "text": "Inventory updated\nCanvas Tote  ·  24 units added\n2 hours ago",
+                  "fontSize": 13,
+                  "color": { "token": "color.text.primary" },
+                  "width": 480,
+                  "height": 70,
+                  "textAutoResize": "height"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "orders",
+      "name": "Orders",
+      "order": 1,
+      "devicePreset": "desktop",
+      "width": 1440,
+      "height": 960,
+      "background": { "token": "color.page.background" },
+      "layout": {
+        "mode": "vertical",
+        "gap": 22,
+        "padding": { "top": 24, "right": 24, "bottom": 24, "left": 24 },
+        "counterAxisAlign": "stretch"
+      },
+      "children": [
+        {
+          "type": "instance",
+          "componentId": "global-navigation",
+          "name": "Primary navigation",
+          "sizing": { "width": "fill", "height": "fixed" }
+        },
+        {
+          "type": "frame",
+          "name": "Orders heading",
+          "width": 1392,
+          "height": 76,
+          "layout": { "mode": "vertical", "gap": 6, "counterAxisAlign": "start" },
+          "children": [
+            {
+              "type": "text",
+              "name": "Orders title",
+              "text": "Orders",
+              "fontSize": 27,
+              "fontStyle": "Bold",
+              "color": { "token": "color.text.primary" },
+              "width": 760,
+              "textAutoResize": "height",
+              "qualityRole": "heading"
+            },
+            {
+              "type": "text",
+              "name": "Orders supporting copy",
+              "text": "Review, search, and manage your latest customer orders.",
+              "fontSize": 14,
+              "color": { "token": "color.text.secondary" },
+              "width": 760,
+              "textAutoResize": "height",
+              "qualityRole": "body"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "name": "Order filters",
+          "width": 1392,
+          "height": 68,
+          "background": { "token": "color.surface.default" },
+          "cornerRadius": 12,
+          "layout": {
+            "mode": "horizontal",
+            "gap": 16,
+            "padding": { "top": 14, "right": 18, "bottom": 14, "left": 18 },
+            "counterAxisAlign": "center"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Search orders field",
+              "text": "⌕  Search by order or customer",
+              "fontSize": 13,
+              "color": { "token": "color.text.secondary" },
+              "width": 430,
+              "textAutoResize": "height",
+              "qualityRole": "input"
+            },
+            {
+              "type": "text",
+              "name": "Status filter",
+              "text": "Status: All orders  ▾",
+              "fontSize": 13,
+              "color": { "token": "color.text.primary" },
+              "width": 210,
+              "textAutoResize": "height"
+            },
+            {
+              "type": "text",
+              "name": "Date filter",
+              "text": "Last 30 days  ▾",
+              "fontSize": 13,
+              "color": { "token": "color.text.primary" },
+              "width": 170,
+              "textAutoResize": "height"
+            },
+            {
+              "type": "text",
+              "name": "Order count",
+              "text": "1,284 orders",
+              "fontSize": 12,
+              "color": { "token": "color.text.secondary" },
+              "width": 160,
+              "textAlign": "right",
+              "textAutoResize": "height"
+            }
+          ]
+        },
+        {
+          "type": "frame",
+          "name": "Order table panel",
+          "width": 1392,
+          "height": 570,
+          "background": { "token": "color.surface.default" },
+          "cornerRadius": 14,
+          "layout": {
+            "mode": "vertical",
+            "gap": 0,
+            "padding": { "top": 18, "right": 20, "bottom": 18, "left": 20 },
+            "counterAxisAlign": "stretch"
+          },
+          "children": [
+            {
+              "type": "text",
+              "name": "Table column labels",
+              "text": "ORDER ID                    CUSTOMER                         DATE                       TOTAL                       STATUS",
+              "fontSize": 11,
+              "fontStyle": "Bold",
+              "color": { "token": "color.text.secondary" },
+              "width": 1340,
+              "height": 40,
+              "textAutoResize": "height"
+            },
+            {
+              "type": "text",
+              "name": "Order row 1",
+              "text": "#NS-2048                     Avery Chen                       Today, 10:42 AM            $128.00                     Processing",
+              "fontSize": 13,
+              "color": { "token": "color.text.primary" },
+              "width": 1340,
+              "height": 62,
+              "textAutoResize": "height"
+            },
+            {
+              "type": "text",
+              "name": "Order row 2",
+              "text": "#NS-2047                     Jamie Patel                      Today, 9:58 AM             $86.50                      Shipped",
+              "fontSize": 13,
+              "color": { "token": "color.text.primary" },
+              "width": 1340,
+              "height": 62,
+              "textAutoResize": "height"
+            },
+            {
+              "type": "text",
+              "name": "Order row 3",
+              "text": "#NS-2046                     Taylor Brooks                    Yesterday, 4:21 PM        $214.00                     Delivered",
+              "fontSize": 13,
+              "color": { "token": "color.text.primary" },
+              "width": 1340,
+              "height": 62,
+              "textAutoResize": "height"
+            },
+            {
+              "type": "text",
+              "name": "Order row 4",
+              "text": "#NS-2045                     Jordan Kim                       Yesterday, 2:07 PM        $54.00                      Delivered",
+              "fontSize": 13,
+              "color": { "token": "color.text.primary" },
+              "width": 1340,
+              "height": 62,
+              "textAutoResize": "height"
+            },
+            {
+              "type": "text",
+              "name": "Order row 5",
+              "text": "#NS-2044                     Sam Rivera                       Aug 12, 11:32 AM          $162.00                     Refunded",
+              "fontSize": 13,
+              "color": { "token": "color.text.primary" },
+              "width": 1340,
+              "height": 62,
+              "textAutoResize": "height"
+            },
+            {
+              "type": "text",
+              "name": "Pagination",
+              "text": "Showing 1–5 of 1,284 orders                                  Previous   ·   Page 1 of 257   ·   Next",
+              "fontSize": 12,
+              "color": { "token": "color.text.secondary" },
+              "width": 1340,
+              "height": 52,
+              "textAlign": "right",
+              "textAutoResize": "height"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

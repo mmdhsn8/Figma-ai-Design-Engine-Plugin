@@ -5,6 +5,7 @@ import {
   discoverAuthorizedModels,
   getCompanionHealth,
   getCompanionStatus,
+  generateAuthorizedDesign,
   pollLocalPairing,
   reopenChatGPTSignIn,
   reopenLocalApproval,
@@ -174,6 +175,20 @@ describe("Figma UI companion client", () => {
     await expect(discoverAuthorizedModels("x".repeat(40), denied)).rejects.toMatchObject({
       category: "plan_use_scope_missing",
     });
+
+    const verified = vi.fn<typeof fetch>(async () =>
+      Response.json({
+        companion: "connected",
+        auth: "ready",
+        authLabel: "Ready",
+        planUseAuthorized: true,
+        modelCount: 1,
+        inferenceVerifiedModel: "account-model",
+      }),
+    );
+    await expect(getCompanionStatus("x".repeat(40), verified)).resolves.toMatchObject({
+      inferenceVerifiedModel: "account-model",
+    });
   });
 
   it("preserves the official model slug/display-name shape", async () => {
@@ -187,13 +202,78 @@ describe("Figma UI companion client", () => {
 
   it("sends only the selected account-visible model through the smoke action", async () => {
     const fetcher = vi.fn<typeof fetch>(async () =>
-      Response.json({ success: true, completed: true, text: "OK" }),
+      Response.json({
+        success: true,
+        completed: true,
+        text: "OK",
+        status: {
+          companion: "connected",
+          auth: "ready",
+          authLabel: "Ready",
+          planUseAuthorized: true,
+          modelCount: 1,
+          inferenceVerifiedModel: "account-model",
+        },
+      }),
     );
-    expect(await runSmokeRequest("session-bearer", "account-model", fetcher)).toBe("OK");
+    await expect(
+      runSmokeRequest("session-bearer", "account-model", fetcher),
+    ).resolves.toMatchObject({
+      text: "OK",
+      status: { inferenceVerifiedModel: "account-model" },
+    });
     const options = fetcher.mock.calls[0]?.[1];
     expect(options?.method).toBe("POST");
     expect(new Headers(options?.headers).get("authorization")).toBe("Bearer session-bearer");
     expect(options?.body).toBe(JSON.stringify({ model: "account-model" }));
+  });
+
+  it("sends one bounded design request to the companion and checks its request ID", async () => {
+    const designRequest = {
+      prompt: "Create a two-screen English dashboard for a small team.",
+      target: "desktop" as const,
+      screenCount: 2,
+      language: "en" as const,
+      style: "calm and editorial",
+      projectType: "dashboard" as const,
+      theme: "light" as const,
+    };
+    const fetcher = vi.fn<typeof fetch>(async () =>
+      Response.json({ requestId: "req-design", design: '{"screens":[]}' }),
+    );
+    await expect(
+      generateAuthorizedDesign(
+        "session-bearer",
+        "req-design",
+        "account-model",
+        designRequest,
+        [],
+        fetcher,
+      ),
+    ).resolves.toBe('{"screens":[]}');
+    const [url, options] = fetcher.mock.calls[0]!;
+    expect(url).toBe("http://localhost:1455/v1/design");
+    expect(options?.method).toBe("POST");
+    expect(new Headers(options?.headers).get("authorization")).toBe("Bearer session-bearer");
+    expect(JSON.parse(String(options?.body))).toEqual({
+      requestId: "req-design",
+      model: "account-model",
+      request: designRequest,
+    });
+
+    const mismatched = vi.fn<typeof fetch>(async () =>
+      Response.json({ requestId: "other-request", design: "{}" }),
+    );
+    await expect(
+      generateAuthorizedDesign(
+        "session-bearer",
+        "req-design",
+        "account-model",
+        designRequest,
+        [],
+        mismatched,
+      ),
+    ).rejects.toMatchObject({ category: "unknown" });
   });
 
   it("reports user cancellation separately from a connection failure", async () => {
@@ -213,5 +293,17 @@ describe("Figma UI companion client", () => {
     const pending = runSmokeRequest("x".repeat(40), "account-model", fetcher, controller.signal);
     controller.abort();
     await expect(pending).rejects.toMatchObject({ category: "request_cancelled" });
+  });
+
+  it("rejects oversized local companion responses before parsing them", async () => {
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response(JSON.stringify({ models: [], unused: "x".repeat(1_100_100) }), {
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    await expect(discoverAuthorizedModels("x".repeat(40), fetcher)).rejects.toMatchObject({
+      category: "response_too_large",
+    });
   });
 });

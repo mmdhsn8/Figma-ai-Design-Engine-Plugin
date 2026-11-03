@@ -4,6 +4,7 @@ import phase2Sample from "../samples/phase-2-storefront.json?raw";
 import phase3Sample from "../samples/phase-3-design-system.json?raw";
 import phase4Sample from "../samples/phase-4-multi-screen.json?raw";
 import phase45Sample from "../samples/phase-4.5-visual-design.json?raw";
+import phase5DashboardSample from "../samples/phase-5-english-dashboard.json?raw";
 import visualLtrFixture from "../samples/visual-ltr-fixture.json?raw";
 import { parseDesignText } from "../shared/schema";
 import {
@@ -21,6 +22,19 @@ import {
 import { planDesignSystemApply } from "../plugin/design-system/apply-design-system";
 import { DEFAULT_MAX_ROW_WIDTH, DEFAULT_MIN_CANVAS_GAP } from "../plugin/canvas-placement";
 import { auditVisualQuality, type VisualQualityAudit } from "../shared/visual-quality";
+import {
+  createDesignPlan,
+  MAX_DESIGN_PROMPT_LENGTH,
+  type DesignGenerationRequest,
+  type DesignPlan,
+} from "../shared/design-generation";
+import { prepareGeneratedDesign } from "./design-generation";
+import {
+  getInferenceEligibility,
+  getInferenceStatusLabel,
+  retainSelectedAccountModel,
+  type InferenceEligibility,
+} from "./inference-eligibility";
 import { inspectEmbeddedImage, parseSafeSvg } from "../shared/visual-assets";
 import {
   CompanionClientError,
@@ -30,6 +44,7 @@ import {
   discoverAuthorizedModels,
   getCompanionHealth,
   getCompanionStatus,
+  generateAuthorizedDesign,
   pollLocalPairing,
   reopenLocalApproval,
   reopenChatGPTSignIn,
@@ -48,6 +63,15 @@ type Notice = {
   details?: string[];
 };
 
+type GenerationPreview = {
+  json: string;
+  plan: DesignPlan;
+  projectName: string;
+  nodeCount: number;
+  repairAttempts: number;
+  warnings: string[];
+};
+
 export type CompanionConnectionState =
   | "discovering"
   | "reconnecting"
@@ -59,6 +83,17 @@ export type CompanionConnectionState =
 
 export type PluginView = "design" | "json" | "assets" | "system" | "quality";
 export type ModelDiscoveryState = "idle" | "loading" | "loaded" | "empty" | "error";
+type GenerationTarget = DesignGenerationRequest["target"];
+type GenerationLanguage = DesignGenerationRequest["language"];
+type GenerationState =
+  | "idle"
+  | "planning"
+  | "generating"
+  | "validating"
+  | "preparing"
+  | "ready"
+  | "failed"
+  | "cancelled";
 
 type NavigationState = { activeView: PluginView; settingsOpen: boolean };
 type NavigationAction =
@@ -174,6 +209,19 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
   });
   const { activeView, settingsOpen } = navigation;
   const [prompt, setPrompt] = useState("");
+  const [generationTarget, setGenerationTarget] = useState<GenerationTarget>("mobile");
+  const [generationScreenCount, setGenerationScreenCount] = useState(2);
+  const [generationScreenNames, setGenerationScreenNames] = useState("");
+  const [generationLanguage, setGenerationLanguage] = useState<GenerationLanguage>("auto");
+  const [generationStyle, setGenerationStyle] = useState("");
+  const [generationProjectType, setGenerationProjectType] =
+    useState<DesignGenerationRequest["projectType"]>("auto");
+  const [generationTheme, setGenerationTheme] = useState<DesignGenerationRequest["theme"]>("auto");
+  const [generationState, setGenerationState] = useState<GenerationState>("idle");
+  const [generationPreview, setGenerationPreview] = useState<GenerationPreview | null>(null);
+  const [generationErrors, setGenerationErrors] = useState<string[]>([]);
+  const generationAbort = useRef<AbortController | null>(null);
+  const generationRequest = useRef<string | null>(null);
   const [modelDiscovery, setModelDiscovery] = useState<ModelDiscoveryState>("idle");
   const [json, setJson] = useState(phase1Sample.trim());
   const [notice, setNotice] = useState<Notice>({
@@ -210,6 +258,51 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
   const [multiProgress, setMultiProgress] = useState<MultiScreenProgressMessage | null>(null);
   const [multiReport, setMultiReport] = useState<MultiScreenRenderResultMessage | null>(null);
   const currentRequest = useRef<string | null>(null);
+  const designGenerationInput = useMemo<DesignGenerationRequest>(
+    () => ({
+      prompt,
+      target: generationTarget,
+      screenCount: generationScreenCount,
+      ...(parseScreenNames(generationScreenNames).length
+        ? { screenNames: parseScreenNames(generationScreenNames) }
+        : {}),
+      language: generationLanguage,
+      style: generationStyle,
+      projectType: generationProjectType,
+      theme: generationTheme,
+    }),
+    [
+      generationLanguage,
+      generationProjectType,
+      generationScreenCount,
+      generationScreenNames,
+      generationStyle,
+      generationTheme,
+      generationTarget,
+      prompt,
+    ],
+  );
+  const generationPlan = useMemo(
+    () => createDesignPlan(designGenerationInput),
+    [designGenerationInput],
+  );
+  const generationInFlight = ["planning", "generating", "validating", "preparing"].includes(
+    generationState,
+  );
+  const inferenceEligibility = getInferenceEligibility({
+    companionConnected: Boolean(companionToken) && companionConnectionState === "connected",
+    status: companionStatus,
+    models: companionModels,
+    selectedModel: selectedCompanionModel,
+    smokeInFlight,
+  });
+  const generationBlockReason = getDesignGenerationBlockReason({
+    prompt,
+    planValid: generationPlan.success,
+    planErrors: generationPlan.success ? [] : generationPlan.errors,
+    inferenceEligibility,
+    inFlight: generationInFlight,
+  });
   const parsed = useMemo(() => parseDesignText(json), [json]);
   const batchMode = useMemo(() => isMultiScreenInput(json), [json]);
   const batchParsed = useMemo(
@@ -238,6 +331,14 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     Number.isFinite(rowWidth) &&
     rowWidth >= 390 &&
     rowWidth <= 20_000;
+
+  useEffect(
+    () => () => {
+      generationRequest.current = null;
+      generationAbort.current?.abort();
+    },
+    [],
+  );
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent<unknown>) => {
@@ -407,6 +508,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
             const status = await getCompanionStatus(companionToken);
             if (cancelled) return;
             setCompanionStatus(status);
+            if (status.auth !== "ready" || !status.inferenceVerifiedModel) setSmokeResult(null);
             setCompanionConnectionState("connected");
           } catch (error) {
             if (cancelled) return;
@@ -745,13 +847,19 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     setCompanionError(null);
     try {
       const models = await discoverAuthorizedModels(companionToken);
+      const status = await getCompanionStatus(companionToken);
+      const nextModel = retainSelectedAccountModel(
+        models,
+        selectedCompanionModel,
+        status.inferenceVerifiedModel,
+      );
       setCompanionModels(models);
-      setSelectedCompanionModel(models[0]?.slug ?? "");
+      setSelectedCompanionModel(nextModel);
+      if (nextModel !== selectedCompanionModel) setSmokeResult(null);
       setModelDiscovery(models.length ? "loaded" : "empty");
       setCompanionError(
         models.length ? null : "No account-visible model was returned for this session.",
       );
-      const status = await getCompanionStatus(companionToken);
       setCompanionStatus(status);
     } catch (error) {
       setModelDiscovery("error");
@@ -770,16 +878,45 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     setCompanionError(null);
     setSmokeResult(null);
     try {
-      const text = await runSmokeRequest(
+      const smoke = await runSmokeRequest(
         companionToken,
         selectedCompanionModel,
         fetch,
         controller.signal,
       );
-      setSmokeResult(text || "Completed successfully with an empty text delta.");
-      setCompanionStatus(await getCompanionStatus(companionToken));
+      setSmokeResult(smoke.text || "Completed successfully with an empty text delta.");
+      let nextStatus = smoke.status;
+      if (!nextStatus) {
+        try {
+          nextStatus = await getCompanionStatus(companionToken);
+        } catch {
+          setCompanionStatus(null);
+          setCompanionError(
+            "The smoke response completed, but the companion could not confirm which model was tested. Refresh Settings and rerun the test.",
+          );
+          return;
+        }
+      }
+      setCompanionStatus(nextStatus);
+      const eligibility = getInferenceEligibility({
+        companionConnected: true,
+        status: nextStatus,
+        models: companionModels,
+        selectedModel: selectedCompanionModel,
+        smokeInFlight: false,
+      });
+      setCompanionError(
+        eligibility.eligible
+          ? null
+          : `Responses returned, but generation remains disabled: ${eligibility.message}`,
+      );
     } catch (error) {
       setCompanionError(companionErrorText(error));
+      try {
+        setCompanionStatus(await getCompanionStatus(companionToken));
+      } catch {
+        setCompanionStatus(null);
+      }
     } finally {
       if (smokeAbort.current === controller) smokeAbort.current = null;
       setSmokeInFlight(false);
@@ -790,6 +927,11 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
   const cancelCompanionSmoke = () => smokeAbort.current?.abort();
 
   const clearConnectedAccountDetails = () => {
+    if (generationAbort.current) {
+      generationAbort.current.abort();
+      setGenerationPreview(null);
+      setGenerationState("cancelled");
+    }
     setCompanionModels([]);
     setSelectedCompanionModel("");
     setModelDiscovery("idle");
@@ -859,6 +1001,128 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       title: `${label} loaded`,
       details: ["Validate the JSON, then generate editable native Figma layers."],
     });
+  };
+
+  const openOfflineFixture = (content: string, label: string) => {
+    loadSample(content, label);
+    dispatchNavigation({ type: "navigate", view: "json" });
+  };
+
+  const generateDesignFromBrief = async () => {
+    if (generationRequest.current) return;
+    const planResult = createDesignPlan(designGenerationInput);
+    if (!planResult.success) {
+      setGenerationState("failed");
+      setGenerationErrors(planResult.errors);
+      return;
+    }
+    if (generationBlockReason || !companionToken || !selectedCompanionModel) {
+      setGenerationState("failed");
+      setGenerationErrors([generationBlockReason ?? "Connect the authorized companion first."]);
+      return;
+    }
+
+    const requestId = nextRequestId();
+    const controller = new AbortController();
+    generationRequest.current = requestId;
+    generationAbort.current = controller;
+    setGenerationPreview(null);
+    setGenerationErrors([]);
+    setGenerationState("planning");
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    if (controller.signal.aborted) {
+      generationRequest.current = null;
+      generationAbort.current = null;
+      setGenerationState("cancelled");
+      setGenerationErrors(["Generation was cancelled. No Figma layers were created."]);
+      return;
+    }
+
+    let repairIssues: string[] = [];
+    try {
+      for (let attempt = 0; attempt <= 1; attempt += 1) {
+        setGenerationState("generating");
+        const raw = await generateAuthorizedDesign(
+          companionToken,
+          requestId,
+          selectedCompanionModel,
+          planResult.data.request,
+          repairIssues,
+          fetch,
+          controller.signal,
+        );
+        if (controller.signal.aborted || generationRequest.current !== requestId) return;
+        setGenerationState("validating");
+        const prepared = prepareGeneratedDesign(raw, planResult.data);
+        if (prepared.success) {
+          setGenerationState("preparing");
+          const audit = auditVisualQuality(prepared.data.batch);
+          const warnings = [
+            "No image assets were generated or downloaded. Import licensed local assets or keep editable placeholders.",
+            "Check font availability, Persian shaping, text wrapping, and visual balance in Figma Desktop.",
+            ...audit.diagnostics.slice(0, 6).map((item) => `${item.code}: ${item.message}`),
+          ];
+          setGenerationPreview({
+            json: prepared.data.json,
+            plan: planResult.data,
+            projectName: prepared.data.batch.name,
+            nodeCount: prepared.data.nodeCount,
+            repairAttempts: attempt,
+            warnings: [...new Set(warnings)],
+          });
+          setGenerationState("ready");
+          return;
+        }
+        if (attempt === 0) {
+          repairIssues = prepared.errors;
+          setGenerationErrors(prepared.errors);
+        } else {
+          setGenerationErrors(prepared.errors);
+          setGenerationState("failed");
+          return;
+        }
+      }
+    } catch (error) {
+      if (generationRequest.current !== requestId) return;
+      if (
+        controller.signal.aborted ||
+        (error instanceof CompanionClientError && error.category === "request_cancelled")
+      ) {
+        setGenerationState("cancelled");
+        setGenerationErrors(["Generation was cancelled. No Figma layers were created."]);
+      } else {
+        setGenerationState("failed");
+        setGenerationErrors([companionErrorText(error)]);
+        if (companionToken) {
+          try {
+            setCompanionStatus(await getCompanionStatus(companionToken));
+          } catch {
+            // The original failure remains the actionable status if the companion is now offline.
+          }
+        }
+      }
+    } finally {
+      if (generationRequest.current === requestId) generationRequest.current = null;
+      if (generationAbort.current === controller) generationAbort.current = null;
+    }
+  };
+
+  const cancelDesignGeneration = () => generationAbort.current?.abort();
+
+  const inspectGeneratedJson = () => {
+    if (!generationPreview) return;
+    if (
+      !window.confirm(
+        "Load this generated design into the existing JSON editor? Its current contents will be replaced. You can review and edit the generated JSON before rendering.",
+      )
+    ) {
+      return;
+    }
+    setJson(generationPreview.json);
+    setMultiProgress(null);
+    setMultiReport(null);
+    currentRequest.current = null;
+    dispatchNavigation({ type: "navigate", view: "json" });
   };
 
   const reset = () => {
@@ -1126,15 +1390,31 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
               id="design-prompt"
               className="prompt-input"
               value={prompt}
-              onChange={(event) => setPrompt(event.target.value.slice(0, 2000))}
-              maxLength={2000}
-              placeholder="Describe your app, website, or interface..."
+              onChange={(event) => {
+                setPrompt(event.target.value.slice(0, MAX_DESIGN_PROMPT_LENGTH));
+                setGenerationPreview(null);
+                setGenerationErrors([]);
+                if (generationState === "ready") setGenerationState("idle");
+              }}
+              maxLength={MAX_DESIGN_PROMPT_LENGTH}
+              dir={
+                generationLanguage === "fa" ||
+                (generationLanguage === "auto" &&
+                  (/[\u0600-\u06ff]/u.test(prompt) || /\b(farsi|persian|rtl)\b/iu.test(prompt)))
+                  ? "rtl"
+                  : "ltr"
+              }
+              placeholder="Describe your app, website, or interface… / یک فروشگاه اینترنتی فارسی طراحی کن…"
               aria-describedby="prompt-status prompt-count"
+              disabled={generationInFlight}
             />
             <div className="prompt-footer">
-              <span id="prompt-status">Prompt-to-design generation is not available yet.</span>
+              <span id="prompt-status">
+                Persian, Finglish, and English briefs · max{" "}
+                {MAX_DESIGN_PROMPT_LENGTH.toLocaleString()} characters.
+              </span>
               <span id="prompt-count" className="char-count">
-                {prompt.length.toLocaleString()} / 2,000
+                {prompt.length.toLocaleString()} / {MAX_DESIGN_PROMPT_LENGTH.toLocaleString()}
               </span>
             </div>
           </section>
@@ -1142,18 +1422,136 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
           <section className="design-options" aria-label="Generation options">
             <div className="option-heading">
               <span>Target</span>
-              <span className="planned-tag">Planned</span>
+              <span className="planned-tag">Native frames</span>
             </div>
             <div className="target-options" aria-describedby="target-help">
-              {(["Mobile", "Desktop", "Web"] as const).map((target) => (
-                <button key={target} type="button" disabled aria-label={`${target}, planned`}>
-                  {target}
+              {(["mobile", "desktop", "both"] as const).map((target) => (
+                <button
+                  key={target}
+                  type="button"
+                  className={generationTarget === target ? "is-selected" : ""}
+                  aria-pressed={generationTarget === target}
+                  onClick={() => {
+                    setGenerationTarget(target);
+                    setGenerationPreview(null);
+                    if (generationState === "ready") setGenerationState("idle");
+                  }}
+                  disabled={generationInFlight}
+                >
+                  {target === "both"
+                    ? "Mobile + Desktop"
+                    : target === "mobile"
+                      ? "Mobile"
+                      : "Desktop"}
                 </button>
               ))}
             </div>
             <p className="option-help" id="target-help">
-              Target presets will be enabled when prompt generation is implemented.
+              {generationTarget === "both"
+                ? "Creates matching Mobile and Desktop counterparts for every planned screen."
+                : "Uses a standard target frame; no custom dimensions are inferred."}
             </p>
+
+            <div className="generation-fields">
+              <label>
+                <span>Screens</span>
+                <select
+                  value={generationScreenCount}
+                  onChange={(event) => {
+                    setGenerationScreenCount(Number(event.target.value));
+                    setGenerationPreview(null);
+                    if (generationState === "ready") setGenerationState("idle");
+                  }}
+                  disabled={generationInFlight}
+                >
+                  {[2, 3, 4].map((count) => (
+                    <option value={count} key={count}>
+                      {count} screens
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Copy language</span>
+                <select
+                  value={generationLanguage}
+                  onChange={(event) => {
+                    setGenerationLanguage(event.target.value as GenerationLanguage);
+                    setGenerationPreview(null);
+                    if (generationState === "ready") setGenerationState("idle");
+                  }}
+                  disabled={generationInFlight}
+                >
+                  <option value="auto">Match brief</option>
+                  <option value="fa">Persian (فارسی)</option>
+                  <option value="en">English</option>
+                </select>
+              </label>
+              <label>
+                <span>Project type</span>
+                <select
+                  value={generationProjectType}
+                  onChange={(event) => {
+                    setGenerationProjectType(
+                      event.target.value as DesignGenerationRequest["projectType"],
+                    );
+                    setGenerationPreview(null);
+                    if (generationState === "ready") setGenerationState("idle");
+                  }}
+                  disabled={generationInFlight}
+                >
+                  <option value="auto">Detect from brief</option>
+                  <option value="storefront">Storefront</option>
+                  <option value="dashboard">Dashboard</option>
+                  <option value="product">General product</option>
+                </select>
+              </label>
+              <label>
+                <span>Theme</span>
+                <select
+                  value={generationTheme}
+                  onChange={(event) => {
+                    setGenerationTheme(event.target.value as DesignGenerationRequest["theme"]);
+                    setGenerationPreview(null);
+                    if (generationState === "ready") setGenerationState("idle");
+                  }}
+                  disabled={generationInFlight}
+                >
+                  <option value="auto">Match brief</option>
+                  <option value="light">Light</option>
+                  <option value="dark">Dark</option>
+                </select>
+              </label>
+            </div>
+            <label className="generation-text-field">
+              <span>Screen names (optional; one per line or comma-separated)</span>
+              <input
+                value={generationScreenNames}
+                onChange={(event) => {
+                  setGenerationScreenNames(event.target.value.slice(0, 500));
+                  setGenerationPreview(null);
+                  if (generationState === "ready") setGenerationState("idle");
+                }}
+                maxLength={500}
+                disabled={generationInFlight}
+                placeholder="Home, Products, Cart"
+                dir={generationLanguage === "fa" ? "rtl" : "auto"}
+              />
+            </label>
+            <label className="generation-text-field">
+              <span>Visual direction (optional)</span>
+              <input
+                value={generationStyle}
+                onChange={(event) => {
+                  setGenerationStyle(event.target.value.slice(0, 160));
+                  setGenerationPreview(null);
+                  if (generationState === "ready") setGenerationState("idle");
+                }}
+                maxLength={160}
+                disabled={generationInFlight}
+                placeholder="Editorial, calm, premium…"
+              />
+            </label>
 
             <div className="model-option">
               <label htmlFor="design-model">Model</label>
@@ -1162,8 +1560,11 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                   <select
                     id="design-model"
                     value={selectedCompanionModel}
-                    onChange={(event) => setSelectedCompanionModel(event.target.value)}
-                    disabled={companionBusy}
+                    onChange={(event) => {
+                      setSelectedCompanionModel(event.target.value);
+                      setSmokeResult(null);
+                    }}
+                    disabled={companionBusy || generationInFlight}
                   >
                     {companionModels.map((model) => (
                       <option key={model.slug} value={model.slug}>
@@ -1190,31 +1591,130 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                   </button>
                 </div>
               )}
+              <p className="model-verification-note" role="status">
+                {inferenceEligibility.eligible
+                  ? "A real Responses smoke request succeeded for this exact account-visible model."
+                  : inferenceEligibility.message}
+              </p>
             </div>
           </section>
 
           <button
             className="design-generate-button"
             type="button"
-            disabled
+            onClick={() => void generateDesignFromBrief()}
+            disabled={Boolean(generationBlockReason)}
             aria-describedby="generation-help"
           >
             <svg viewBox="0 0 16 16" aria-hidden="true">
               <path d="M8 1.5v13m-6.5-6.5h13M3.75 3.75l8.5 8.5m0-8.5-8.5 8.5" />
             </svg>
-            Generate in Figma
+            Generate Design
           </button>
           <p className="generation-help" id="generation-help">
-            Natural-language generation is not implemented yet. To create editable layers now, use
-            the{" "}
-            <button
-              type="button"
-              onClick={() => dispatchNavigation({ type: "navigate", view: "json" })}
-            >
-              JSON workflow
-            </button>
-            .
+            {generationBlockReason ??
+              "Generation creates a validated JSON plan only; review it in the existing JSON tab before rendering."}
           </p>
+
+          {generationInFlight && (
+            <div className="generation-progress" role="status" aria-live="polite">
+              <span className="spinner" aria-hidden="true" />
+              <span>{generationProgressText(generationState)}</span>
+              <button className="text-button" type="button" onClick={cancelDesignGeneration}>
+                Cancel
+              </button>
+            </div>
+          )}
+
+          {generationState === "failed" || generationState === "cancelled" ? (
+            <section className="generation-result generation-failure" role="alert">
+              <strong>
+                {generationState === "cancelled"
+                  ? "Generation cancelled"
+                  : "Generation needs attention"}
+              </strong>
+              <ErrorList errors={generationErrors} />
+            </section>
+          ) : null}
+
+          {generationPlan.success && prompt.trim().length >= 10 && (
+            <section className="generation-plan" aria-label="Planned screen inventory">
+              <div className="section-title-row">
+                <h2>Planned screens</h2>
+                <span className="section-caption">{generationPlan.data.screens.length} frames</span>
+              </div>
+              <ul className="planned-screen-list">
+                {generationPlan.data.screens.map((screen) => (
+                  <li key={screen.id}>
+                    <strong>{screen.name}</strong>
+                    <span>
+                      {screen.width} × {screen.height} · {screen.devicePreset}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {generationState === "ready" && generationPreview && (
+            <section className="generation-result" aria-labelledby="generation-result-title">
+              <div className="section-title-row">
+                <h2 id="generation-result-title">Design plan ready</h2>
+                <span className="section-caption">NOT RENDERED</span>
+              </div>
+              <p className="generation-summary">
+                <strong>{generationPreview.projectName}</strong> ·{" "}
+                {generationPreview.plan.screens.length} screens · {generationPreview.nodeCount}{" "}
+                estimated editable nodes · {generationPreview.warnings.length} warnings
+                {generationPreview.repairAttempts ? " · repaired once" : ""}
+              </p>
+              <ul className="planned-screen-list">
+                {generationPreview.plan.screens.map((screen) => (
+                  <li key={screen.id}>
+                    <strong>{screen.name}</strong>
+                    <span>
+                      {screen.width} × {screen.height} · {screen.devicePreset}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <details className="generation-warnings">
+                <summary>
+                  Warnings and review checklist ({generationPreview.warnings.length})
+                </summary>
+                <ErrorList errors={generationPreview.warnings} />
+              </details>
+              <button className="secondary-action" type="button" onClick={inspectGeneratedJson}>
+                Review JSON before rendering
+              </button>
+            </section>
+          )}
+
+          <section className="offline-fixtures" aria-label="Offline design fixtures">
+            <div className="section-title-row">
+              <h2>Offline fixtures</h2>
+              <span className="section-caption">NO AI REQUEST</span>
+            </div>
+            <p>Deterministic editable examples remain available when the companion is offline.</p>
+            <div className="fixture-actions">
+              <button
+                type="button"
+                onClick={() => openOfflineFixture(phase45Sample, "Persian storefront fixture")}
+                disabled={generationInFlight}
+              >
+                Persian storefront · 10 screens
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  openOfflineFixture(phase5DashboardSample, "English dashboard fixture")
+                }
+                disabled={generationInFlight}
+              >
+                English dashboard · 2 screens
+              </button>
+            </div>
+          </section>
 
           <section className="recent-section" aria-labelledby="recent-title">
             <div className="section-title-row">
@@ -1360,10 +1860,8 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
               <span className="section-kicker">PHASE 4.6 · CONNECTION</span>
               <h2 id="ai-gate-title">Companion &amp; ChatGPT</h2>
             </div>
-            <span
-              className={`system-status ${companionStatus?.auth === "ready" ? "is-ready" : ""}`}
-            >
-              {companionStatus?.authLabel ??
+            <span className={`system-status ${inferenceEligibility.eligible ? "is-ready" : ""}`}>
+              {getInferenceStatusLabel(companionStatus, inferenceEligibility) ||
                 (
                   {
                     discovering: "Checking local companion…",
@@ -1488,15 +1986,15 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
               ) : (
                 <>
                   <p className="ai-gate-note ai-gate-ready">
-                    {companionStatus.auth === "ready"
-                      ? "A real Responses smoke test completed in this companion session."
-                      : "The direct-use scope was granted, but live inference is not verified yet. Load models from this account and run the separate fixed smoke test."}
+                    {inferenceEligibility.eligible
+                      ? `A real Responses smoke test completed for ${companionModels.find(({ slug }) => slug === inferenceEligibility.verifiedModel)?.displayName ?? inferenceEligibility.verifiedModel}.`
+                      : inferenceEligibility.message}
                   </p>
                   <button
                     className="system-action"
                     type="button"
                     onClick={() => void discoverModels()}
-                    disabled={companionBusy}
+                    disabled={companionBusy || generationInFlight}
                   >
                     {companionBusy ? "Checking account models…" : "Load available models"}
                   </button>
@@ -1505,8 +2003,11 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                       <span>Account-visible model</span>
                       <select
                         value={selectedCompanionModel}
-                        onChange={(event) => setSelectedCompanionModel(event.target.value)}
-                        disabled={companionBusy}
+                        onChange={(event) => {
+                          setSelectedCompanionModel(event.target.value);
+                          setSmokeResult(null);
+                        }}
+                        disabled={companionBusy || generationInFlight}
                       >
                         {companionModels.map((model) => (
                           <option key={model.slug} value={model.slug}>
@@ -1528,6 +2029,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                       onClick={() => void runCompanionSmoke()}
                       disabled={
                         companionBusy ||
+                        generationInFlight ||
                         !companionStatus.planUseAuthorized ||
                         !selectedCompanionModel
                       }
@@ -1545,7 +2047,10 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                     )}
                     {smokeResult && (
                       <p className="ai-gate-result" role="status">
-                        Real Responses request completed. Output: <code>{smokeResult}</code>
+                        Responses output: <code>{smokeResult}</code>.{" "}
+                        {inferenceEligibility.eligible
+                          ? "The selected model is verified for design generation."
+                          : `Generation remains disabled: ${inferenceEligibility.message}`}
                       </p>
                     )}
                   </details>
@@ -1591,10 +2096,11 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
             </p>
           )}
           <p className="ai-gate-privacy">
-            This gate build sends no design JSON or custom prompt. The only inference input is the
-            fixed text “Reply with exactly OK.” after you activate the smoke test. Sign-in does not
-            grant access to ChatGPT conversations, files, or memory. Natural-language design
-            generation remains disabled until live authorization and inference are confirmed.
+            Sign-in does not grant access to ChatGPT conversations, files, or memory. The smoke
+            action sends only “Reply with exactly OK.” An explicit Generate Design action sends the
+            brief and fixed screen plan to the local companion for one streamed Responses request;
+            the open JSON document and local assets are not sent. Live structured-output support is
+            not guaranteed by the smoke test and may vary by account-visible model.
           </p>
         </section>
       )}
@@ -2074,7 +2580,17 @@ function companionErrorText(error: unknown): string {
     session_expired: "The local authorization expired. Sign in again.",
     request_timed_out: "The request timed out. Check your connection and retry once.",
     request_cancelled:
-      "The smoke request was cancelled. The companion asks the upstream stream to stop.",
+      "The inference request was cancelled. The companion asks the upstream stream to stop.",
+    inference_not_verified:
+      "The selected model has not passed a real Responses smoke test in this companion session. Run the fixed test in Settings first.",
+    inference_busy:
+      "Another Responses request is in progress in the companion. Wait for it to finish, then retry.",
+    generation_busy:
+      "Another design request is already running in the companion. Wait for it to finish, then retry.",
+    generation_retry_limit:
+      "This request has used its one schema-repair attempt. Start a new generation if you want to try again.",
+    invalid_design_request:
+      "The brief or screen options are outside the supported generation limits.",
     service_unavailable: "The OpenAI service is temporarily unavailable.",
     model_not_verified_for_account: "Choose a model returned by this account's model list.",
     account_mismatch:
@@ -2082,7 +2598,7 @@ function companionErrorText(error: unknown): string {
     public_client_unsupported:
       "The discovered OAuth server did not advertise the required public-client method.",
     response_incomplete: "The Responses stream ended without a successful completion event.",
-    response_too_large: "The streamed smoke response exceeded the local safety limit.",
+    response_too_large: "The streamed response exceeded the local safety limit.",
     registration_clear_failed:
       "The local session was cleared, but the saved account registration could not be removed. Close the companion before trying again.",
     secure_storage_unavailable:
@@ -2096,10 +2612,46 @@ function companionErrorText(error: unknown): string {
     installation_store_invalid:
       "The saved local installation metadata is invalid and was preserved. Do not delete it; share this sanitized error category with support.",
     request_rejected:
-      "The request was rejected. Check the account's authorization and availability.",
+      "The request was rejected. The selected account model may not support the documented structured JSON response format.",
     unknown: "The companion returned an invalid response. Restart it and reconnect.",
     connection_failed:
       "Cannot reach the local companion. If it is running, Figma or the browser may have blocked localhost (manifest CSP, CORS, or private-network access); reload the development plugin and inspect its console.",
   };
   return messages[category] ?? "The companion could not complete that step.";
+}
+
+function parseScreenNames(value: string): string[] {
+  return value
+    .split(/[\n,،]+/u)
+    .map((name) => name.trim())
+    .filter(Boolean);
+}
+
+function getDesignGenerationBlockReason(input: {
+  prompt: string;
+  planValid: boolean;
+  planErrors: string[];
+  inferenceEligibility: InferenceEligibility;
+  inFlight: boolean;
+}): string | null {
+  if (input.inFlight) return "A design request is already running.";
+  if (input.prompt.trim().length < 10) return "Enter a design brief with at least 10 characters.";
+  if (!input.planValid) return input.planErrors[0] ?? "Review the screen plan options.";
+  if (!input.inferenceEligibility.eligible) return input.inferenceEligibility.message;
+  return null;
+}
+
+function generationProgressText(state: GenerationState): string {
+  return (
+    {
+      idle: "Waiting",
+      planning: "Planning the screen inventory…",
+      generating: "Generating a structured design with the selected account model…",
+      validating: "Validating the response against the native design schema…",
+      preparing: "Preparing the JSON review and quality warnings…",
+      ready: "Ready for review",
+      failed: "Generation failed",
+      cancelled: "Generation cancelled",
+    } satisfies Record<GenerationState, string>
+  )[state];
 }
