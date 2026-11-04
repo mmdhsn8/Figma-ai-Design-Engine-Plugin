@@ -15,7 +15,7 @@ The plugin can render JSON fully offline. Phase 5 adds an explicit prompt-to-val
 - Preserve existing page content and place each new design in a clear canvas area.
 - Keep Persian and other Unicode text editable in Figma text layers. Font availability and complex right-to-left shaping depend on the local Figma environment.
 - Phase 4.6/4.7.1: official browser sign-in, plan-use permission checks, model discovery, fixed smoke test, local pairing, and DPAPI-protected session restoration.
-- Phase 5 MVP: Persian/English prompt planning for 2–4 screen families, optional Mobile/Desktop counterparts, strict structured output validation, one bounded repair, quality warnings, and explicit review through the existing JSON editor.
+- Phase 5 MVP: Persian/English prompt planning for named multi-screen batches, optional Mobile/Desktop counterparts, strict per-screen structured-output validation, in-session resume, quality warnings, and explicit review through the existing JSON editor.
 
 The **Phase 1 sample**, **Phase 2 demo**, and **Phase 3 demo** buttons are examples in the same plugin, not separate programs. Phase 1 demonstrates a coordinate-based design. Phase 2 shows nested Auto Layout and linked components. Phase 3 adds an optional design-system section to schema 1.0.0.
 
@@ -44,7 +44,7 @@ The plugin is set up for local development and is not configured for publishing 
 ## Use the plugin
 
 1. Load **Phase 1 sample** for a small, positioned example, **Phase 2 demo** for the storefront, **Phase 3 demo** for native styles/components, or **Visual demo** for native editorial visuals and the 10-screen Persian storefront.
-2. To use your own design, click **Import JSON** to select a `.json` file, or paste/edit JSON in the editor. The import/editor limit is 1 MB.
+2. To use your own design, click **Import JSON** to select a `.json` file, or paste/edit JSON in the editor. JSON has no application-level byte cap; actual memory and host limits still apply.
 3. Click **Validate JSON**. Fix any errors shown in the status area before continuing.
 4. Click **Generate in Figma** for Phase 1/2 documents. For JSON containing `designSystem`, inspect its dry-run summary and click **Create / Update Design System**. The plugin creates native editable layers on the current page and focuses the new design in the viewport.
 5. Edit the generated layers as usual in Figma. Running Generate again adds another design; it does not replace earlier results.
@@ -115,7 +115,7 @@ Reusable legacy component definitions go in `document.components`; Phase 3 defin
 
 The optional `designSystem` property extends schema 1.0.0; older Phase 1/2 JSON remains valid without migration. The Phase 3 demo is version-controlled at `src/samples/phase-3-design-system.json` and includes the exact requested palette, typography, numeric scales and aliases, two border tokens, three button masters, a Product Card master, nested linked instances, and editable Persian preview text. It does not add a Figma Page.
 
-Tokens use explicit references such as `{ "token": "color.brand.deepNavy" }`. Supported categories are `color.*`, `typography.*`, `spacing.*`, `radius.*`, and `border.*`. Spacing and radius scales expose stable `spacing.scale.N` and `radius.scale.N` references; named aliases can point to another token in the same category. Missing, cross-category, duplicate, cyclic, unsupported, and out-of-range references fail validation before Figma document mutation. Colors accept six-digit `#RRGGBB` only; alpha is not supported. Shadows/effects are intentionally unsupported. Design systems are limited to 200 tokens and the combined legacy plus Phase 3 component/node limits still apply.
+Tokens use explicit references such as `{ "token": "color.brand.deepNavy" }`. Supported categories are `color.*`, `typography.*`, `spacing.*`, `radius.*`, and `border.*`. Spacing and radius scales expose stable `spacing.scale.N` and `radius.scale.N` references; named aliases can point to another token in the same category. Missing, cross-category, duplicate, cyclic, unsupported, and out-of-range references fail validation before Figma document mutation. Colors accept six-digit `#RRGGBB` only; alpha is not supported. Shadows/effects are intentionally unsupported. Token, component, and node counts have no fixed application cap; nesting depth and embedded-asset safeguards remain.
 
 The **Design System** panel shows the namespace, token/component counts, validation errors, and an estimated dry-run summary before writes. Creating a design system is a separate, explicit action. On import, the renderer resolves local fonts before creating any assets, creates/reuses owned resources, and rolls back newly created nodes/styles if rendering fails. Native styles and components carry private plugin metadata with stable IDs. Same-name unowned styles are never overwritten; generated style names receive a suffix if necessary. Styles are only updated when the user enables the checkbox and the stored fingerprint confirms the current style still matches the plugin's previous value. Manually changed styles are skipped. Existing component masters are reused and never rebuilt; a changed definition with the same key is reported as skipped. Use a new stable key to add a new version without disturbing instances or manual edits.
 
@@ -182,8 +182,8 @@ The planner preserves Phase 2.2 horizontal-first row packing and expands existin
 
 ### Limits and re-import behavior
 
-- At most 100 screens and 5,000 estimated native nodes per batch (shared component definitions are counted once). Each screen tree supports the legacy schema's 500-node and 8-level limits.
-- Screen dimensions: 1–10,000 px. The JSON file/editor limit remains 1 MB. Screen names are 1–100 characters and reject path separators/control characters.
+- Screen and node counts have no fixed application cap. Nested frames/components retain the eight-level safety bound; Figma Desktop performance and memory remain practical constraints.
+- Screen dimensions: 1–10,000 px. JSON file/editor size has no application-level cap. Screen names are 1–100 characters and reject path separators/control characters.
 - Device presets are descriptive metadata; Phase 4 does not apply responsive rules or generate variants for other sizes.
 - The node estimate includes roots, shared component trees and the component-area container when definitions are present. Figma creates styles as document assets, and reuse or API-specific node details can make the final count differ; the final report is the actual count from the plugin's node tracker.
 - Components remain native linked instances and styles follow the Phase 3 registry and fallback rules. Persian text remains editable; full bidirectional shaping and responsive behavior are not promised.
@@ -209,10 +209,10 @@ Phase 2.2 and Phase 3 Desktop checks have also not been confirmed with itemized 
 
 - Document, frame, and component dimensions: 1–10,000 px.
 - Coordinates: −10,000–10,000 px.
-- Maximum 500 total nodes, 50 component definitions, and 8 nested node levels.
+- No fixed total node or component-count cap; nested node depth is limited to eight levels.
 - Text: up to 5,000 characters per text layer.
 - Layout gap/padding: 0–1,000 px; corner radii: 0–5,000 px; stroke width: 0.25–100 px.
-- JSON objects reject unsupported fields; the editor/import limit is 1 MB.
+- JSON objects reject unsupported fields; the editor/import has no application-level byte cap.
 
 ## Canvas organization
 
@@ -321,7 +321,7 @@ Use **Import local PNG / JPEG / GIF / safe SVG** in the panel after entering a s
 
 The example fragment omits the required document fields for brevity. Import a real file through the UI to populate bytes and dimensions. Figma receives the bytes through `figma.createImage` and renders them as a native, replaceable image fill on an editable rectangle. Identical local bytes are converted once per generation, then reused by their Figma image hash. No external URL is accepted.
 
-Limits: 20 assets per document, 256 KiB per raster file, 4,096 px per dimension, 700 KiB total decoded asset bytes, and the existing 1 MB JSON/editor limit. PNG chunk lengths/checksums and JPEG/GIF container headers are checked locally; Figma's image importer remains the final decoder. Invalid bytes stop before visible nodes are created and the error suggests re-exporting or using an editable vector placeholder. Figma image resources created before a later render error may remain as invisible file resources because the Plugin API has no image-resource delete operation; no image rectangle or unrelated node is left behind by the tested failure path.
+Limits: 20 assets per document, 256 KiB per raster file, 4,096 px per dimension, and 700 KiB total decoded asset bytes. PNG chunk lengths/checksums and JPEG/GIF container headers are checked locally; Figma's image importer remains the final decoder. Invalid bytes stop before visible nodes are created and the error suggests re-exporting or using an editable vector placeholder. Figma image resources created before a later render error may remain as invisible file resources because the Plugin API has no image-resource delete operation; no image rectangle or unrelated node is left behind by the tested failure path.
 
 SVG imports are intentionally narrow and offline: one root `viewBox` beginning at `0 0`, with 1–32 direct self-closing paths. The parser accepts solid six-digit fills and bounded absolute `M`, `L`, `Q`, `C`, and `Z` path commands. Markup is limited to 50 KB, combined path data to 40 KB, and path coordinates/complexity are bounded. Scripts, entities, images, groups, CSS, transforms, URLs, gradients, relative commands, and other SVG features are rejected with an error. Accepted paths become separate editable Vector nodes inside a clipped frame; raster asset fills remain pixels in a replaceable image fill. SVG tiling is not supported and is fit proportionally with a warning.
 
@@ -383,7 +383,7 @@ The Phase 4.6 connection panel offers separate actions for browser sign-in, acco
    npm run companion
    ```
 
-   The listener should show only `127.0.0.1` and `::1`, both on port `1455`; it binds the two addresses explicitly and does not listen on LAN interfaces. `localhost` may resolve to IPv6 first on Windows, so both loopback families are served. The companion prints no pairing code or OAuth material. In normal use it opens a short-lived local approval page after you click **Continue with ChatGPT** in the plugin.
+   The listener should show only `127.0.0.1` and `::1`, both on port `1455`; it binds the two addresses explicitly and does not listen on LAN interfaces. `localhost` may resolve to IPv6 first on Windows, so both loopback families are served. `npm run companion` recompiles and starts `dist-companion\companion\main.js`; after changing companion code, stop the old process with Ctrl+C and run the command again. The companion prints no pairing code or OAuth material. In normal use it opens a short-lived local approval page after you click **Continue with ChatGPT** in the plugin.
 
 4. Open the plugin and click **Continue with ChatGPT**. The first local connection opens a separate browser approval page. Approve only if you just initiated the request in the intended plugin; the page explicitly says it cannot cryptographically identify which Figma plugin started the request. No terminal code is copied or pasted. The short-lived session bearer remains in UI memory; Phase 4.7.1 can restore a new bearer from the protected pairing ticket after a UI or companion restart when Windows DPAPI storage is available.
 5. After local approval, the official flow opens in the system browser. If Windows does not open it automatically, use **Open sign-in page in system browser again** in the plugin. Complete the official flow and return to the plugin. The OAuth callback stays `http://127.0.0.1:1455/auth/callback` (OpenAI's OSS flow explicitly requires `127.0.0.1`; do not replace this callback host with `localhost`). It is accepted only for the exact URI, one-time state, PKCE transaction, expected nonce, validated ID-token signature/issuer/audience/expiry, and callback's issued public client ID.
@@ -432,7 +432,7 @@ The loopback repair regression tests compare the UI endpoint, both listener addr
 
 ## Phase 5 prompt-to-design MVP
 
-The Design tab has an explicit Persian/English prompt workflow with a deterministic 2–4-screen plan, Mobile/Desktop presets, model-specific inference verification, a strict structured-output contract, one bounded validation repair, warnings, and a confirmation before opening the generated JSON in the existing editor. The same model must have passed the real fixed Responses smoke test; live structured-output support is still account/model-dependent. The AI response does not render directly: review and validate the JSON, then use the existing multi-screen render action.
+The Design tab has an explicit Persian/English prompt workflow with a deterministic named multi-screen plan, Mobile/Desktop presets, model-specific inference verification, strict per-screen structured output, one validation repair per screen, in-session resume, warnings, and a confirmation before opening the generated JSON in the existing editor. The same model must have passed the real fixed Responses smoke test; live structured-output support is still account/model-dependent. The AI response does not render directly: review and validate the JSON, then use the existing multi-screen render action.
 
 The **Persian storefront · 10 screens** and **English dashboard · 2 screens** buttons load deterministic local JSON fixtures and work with the companion offline. Detailed request flow, limits, security boundaries, fixture inventory, and the manual Figma acceptance checklist are in [`docs/phase-5-design-generation.md`](docs/phase-5-design-generation.md).
 

@@ -2,7 +2,8 @@ import { DESIGN_SCHEMA_VERSION } from "../shared/schema";
 import { parseMultiScreenText, type MultiScreenSpec } from "../shared/multi-screen-schema";
 import {
   DESIGN_GENERATION_COLOR_TOKENS,
-  validateGeneratedDesignResponse,
+  normalizeGeneratedDesignResponse,
+  type GeneratedDesign,
   type DesignPlan,
   type GeneratedDesignNode,
 } from "../shared/design-generation";
@@ -16,8 +17,25 @@ export type PreparedGeneratedDesign = {
 export type PreparedDesignResult =
   { success: true; data: PreparedGeneratedDesign } | { success: false; errors: string[] };
 
+export function pendingGenerationScreens(
+  plan: DesignPlan,
+  completedScreens: readonly GeneratedDesign["screens"][number][],
+): DesignPlan["screens"] {
+  const completedIds = new Set(completedScreens.map(({ id }) => id));
+  return plan.screens.filter(({ id }) => !completedIds.has(id));
+}
+
+export function retainGeneratedScreen(
+  completedScreens: GeneratedDesign["screens"],
+  screen: GeneratedDesign["screens"][number],
+): GeneratedDesign["screens"] {
+  return completedScreens.some(({ id }) => id === screen.id)
+    ? completedScreens
+    : [...completedScreens, screen];
+}
+
 export function prepareGeneratedDesign(raw: string, plan: DesignPlan): PreparedDesignResult {
-  const parsed = validateGeneratedDesignResponse(raw, plan);
+  const parsed = normalizeGeneratedDesignResponse(raw, plan);
   if (!parsed.success) return parsed;
 
   const { design } = parsed.data;
@@ -61,17 +79,11 @@ export function prepareGeneratedDesign(raw: string, plan: DesignPlan): PreparedD
         counterAxisAlign: "stretch",
       },
       children: (screensById.get(screen.id)?.children ?? []).map((node) =>
-        mapNode(node, plan.direction),
+        mapNode(node, plan.direction, "vertical"),
       ),
     })),
   };
   const json = JSON.stringify(batch, null, 2);
-  if (json.length > 1_000_000) {
-    return {
-      success: false,
-      errors: ["The prepared JSON exceeds the existing 1 MB editor limit."],
-    };
-  }
   const validated = parseMultiScreenText(json);
   if (!validated.success) return { success: false, errors: validated.errors.slice(0, 12) };
   return {
@@ -83,9 +95,19 @@ export function prepareGeneratedDesign(raw: string, plan: DesignPlan): PreparedD
 function mapNode(
   node: GeneratedDesignNode,
   direction: DesignPlan["direction"],
+  parentLayout: "vertical" | "horizontal",
 ): MultiScreenSpec["screens"][number]["children"][number] {
   const token =
     node.palette === "none" ? undefined : { token: DESIGN_GENERATION_COLOR_TOKENS[node.palette] };
+  const interactive = node.qualityRole === "button" || node.qualityRole === "input";
+  const touchSizing = interactive
+    ? {
+        sizing: {
+          width: parentLayout === "vertical" ? ("fill" as const) : ("fixed" as const),
+          height: parentLayout === "horizontal" ? ("fill" as const) : ("fixed" as const),
+        },
+      }
+    : {};
   const visual =
     node.elevation === "soft"
       ? {
@@ -119,8 +141,9 @@ function mapNode(
               ? "right"
               : "left",
       width: node.width,
-      sizing: { width: "fill", height: "hug" },
-      textAutoResize: "height",
+      ...(interactive ? { height: node.height } : {}),
+      sizing: interactive ? touchSizing.sizing : { width: "fill", height: "hug" },
+      textAutoResize: interactive ? "truncate" : "height",
       qualityRole: node.qualityRole,
       ...(visual ? { visual } : {}),
     };
@@ -131,7 +154,10 @@ function mapNode(
       name: node.name,
       width: node.width,
       height: node.height,
-      children: node.children.map((child) => mapNode(child, direction)),
+      children: node.children.map((child) =>
+        mapNode(child, direction, node.layout === "horizontal" ? "horizontal" : "vertical"),
+      ),
+      ...touchSizing,
       ...(token ? { background: token } : {}),
       ...(node.children.length
         ? {
@@ -159,6 +185,7 @@ function mapNode(
     width: node.width,
     height: node.height,
     fill: token ?? { token: DESIGN_GENERATION_COLOR_TOKENS.surface },
+    ...touchSizing,
     ...(node.cornerRadius ? { cornerRadius: node.cornerRadius } : {}),
     qualityRole: node.qualityRole,
     ...(visual ? { visual } : {}),

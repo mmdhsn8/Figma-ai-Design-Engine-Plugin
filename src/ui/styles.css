@@ -248,6 +248,13 @@ textarea:disabled {
   font-size: 9px;
   line-height: 14px;
 }
+.inference-diagnostic {
+  display: block;
+  margin-top: 5px;
+  color: #9698a3;
+  font: 9px/14px var(--mono);
+  overflow-wrap: anywhere;
+}
 .ai-gate-note code,
 .ai-gate-result code {
   color: #c8e8fb;
@@ -1348,6 +1355,7 @@ textarea.prompt-input::placeholder {
 }
 
 .generation-fields select,
+.generation-fields input,
 .generation-text-field input {
   width: 100%;
   min-width: 0;
@@ -1364,6 +1372,7 @@ textarea.prompt-input::placeholder {
 }
 
 .generation-fields select:disabled,
+.generation-fields input:disabled,
 .generation-text-field input:disabled,
 .target-options button:disabled {
   opacity: 0.58;

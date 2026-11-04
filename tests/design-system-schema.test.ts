@@ -87,7 +87,7 @@ describe("design-system schema and token resolution", () => {
       expect(duplicateKeyResult.errors.join(" ")).toContain("component key");
   });
 
-  it("enforces six-digit alpha-free colors, typography bounds, and token-count limits", () => {
+  it("enforces six-digit alpha-free colors and typography value bounds without a token-count cap", () => {
     const alpha = structuredClone(phase3) as unknown as DesignSpec;
     alpha.designSystem!.colors["color.brand.deepNavy"] = "#123B5D80";
     const alphaResult = parseDesignValue(alpha);
@@ -111,9 +111,7 @@ describe("design-system schema and token resolution", () => {
     for (let index = 0; index < 200; index++) {
       tooMany.designSystem!.colors[`color.extra.token${index}`] = "#123456";
     }
-    const limitResult = parseDesignValue(tooMany);
-    expect(limitResult.success).toBe(false);
-    if (!limitResult.success) expect(limitResult.errors.join(" ")).toContain("limit is 200");
+    expect(parseDesignValue(tooMany).success).toBe(true);
   });
 
   it("reports malformed JSON and keeps schema 1.0.0 unchanged", () => {

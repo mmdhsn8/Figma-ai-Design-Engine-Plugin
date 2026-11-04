@@ -50,16 +50,62 @@ const ModelSchema = z
   .object({ slug: z.string().min(1).max(200), displayName: z.string().min(1).max(200) })
   .strict();
 const ModelListSchema = z.object({ models: z.array(ModelSchema).max(100) }).passthrough();
+export const InferenceDiagnosticSchema = z
+  .object({
+    model: z
+      .string()
+      .min(1)
+      .max(200)
+      .regex(/^[A-Za-z0-9._:/-]+$/u),
+    stage: z.enum(["http", "stream"]),
+    outcome: z.enum([
+      "completed",
+      "failed",
+      "incomplete",
+      "stream_ended_without_terminal",
+      "timed_out",
+      "cancelled",
+      "invalid_event",
+      "resource_exhausted",
+      "transport_error",
+      "http_error",
+    ]),
+    httpStatus: z.number().int().min(100).max(599).optional(),
+    terminalEvent: z.literal("response.completed").optional(),
+    lastEvent: z
+      .string()
+      .regex(/^[A-Za-z0-9_.-]{1,100}$/u)
+      .optional(),
+    eventCount: z.number().int().nonnegative().optional(),
+    responseBytes: z.number().int().nonnegative().optional(),
+    generatedBytes: z.number().int().nonnegative().optional(),
+    timeoutKind: z.enum(["headers", "idle", "overall"]).optional(),
+    elapsedMs: z.number().int().nonnegative().optional(),
+    idleMs: z.number().int().nonnegative().optional(),
+    lastEventAgeMs: z.number().int().nonnegative().optional(),
+    lastDeltaAgeMs: z.number().int().nonnegative().optional(),
+    errorCode: z
+      .string()
+      .regex(/^[A-Za-z0-9_.:-]{1,100}$/u)
+      .optional(),
+    errorParam: z
+      .string()
+      .regex(/^[A-Za-z0-9_.:-]{1,100}$/u)
+      .optional(),
+    incompleteReason: z
+      .string()
+      .regex(/^[A-Za-z0-9_.:-]{1,100}$/u)
+      .optional(),
+  })
+  .strict();
 const SmokeSchema = z
   .object({
     success: z.literal(true),
     completed: z.literal(true),
     text: z.string().max(240),
     status: StatusSchema.optional(),
+    diagnostic: InferenceDiagnosticSchema.optional(),
   })
-  .strict();
-const GeneratedDesignSchema = z
-  .object({ requestId: z.string().min(1).max(100), design: z.string().min(1).max(1_000_000) })
   .strict();
 const DisconnectSchema = z
   .object({
@@ -70,6 +116,7 @@ const DisconnectSchema = z
 
 export type CompanionStatus = z.infer<typeof StatusSchema>;
 export type CompanionModel = z.infer<typeof ModelSchema>;
+export type InferenceDiagnostic = z.infer<typeof InferenceDiagnosticSchema>;
 export type CompanionErrorCategory =
   | "pairing_busy"
   | "pairing_rate_limited"
@@ -90,6 +137,10 @@ export type CompanionErrorCategory =
   | "client_id_mismatch"
   | "plan_use_scope_missing"
   | "plan_use_not_admitted"
+  | "account_not_eligible"
+  | "unsupported_capability"
+  | "route_not_supported"
+  | "responses_transport_error"
   | "inference_not_verified"
   | "inference_busy"
   | "generation_busy"
@@ -103,8 +154,13 @@ export type CompanionErrorCategory =
   | "connection_failed"
   | "model_not_verified_for_account"
   | "account_mismatch"
+  | "account_not_eligible"
+  | "unsupported_capability"
+  | "route_not_supported"
   | "public_client_unsupported"
   | "response_incomplete"
+  | "response_invalid"
+  | "resource_exhausted"
   | "response_too_large"
   | "request_rejected"
   | "registration_clear_failed"
@@ -116,7 +172,11 @@ export type CompanionErrorCategory =
   | "unknown";
 
 export class CompanionClientError extends Error {
-  constructor(readonly category: CompanionErrorCategory) {
+  constructor(
+    readonly category: CompanionErrorCategory,
+    readonly diagnostic?: InferenceDiagnostic,
+    readonly validationIssues?: string[],
+  ) {
     super(category);
     this.name = "CompanionClientError";
   }
@@ -268,12 +328,13 @@ export async function runSmokeRequest(
   model: string,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
-): Promise<{ text: string; status?: CompanionStatus }> {
+): Promise<{ text: string; status?: CompanionStatus; diagnostic?: InferenceDiagnostic }> {
   const body = SmokeSchema.safeParse(await request("/v1/smoke", token, { model }, fetcher, signal));
   if (!body.success) throw new CompanionClientError("unknown");
   return {
     text: body.data.text,
     ...(body.data.status ? { status: body.data.status } : {}),
+    ...(body.data.diagnostic ? { diagnostic: body.data.diagnostic } : {}),
   };
 }
 
@@ -285,25 +346,61 @@ export async function generateAuthorizedDesign(
   repairIssues: string[] = [],
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
+  screenIds?: string[],
+  onIncompleteStreamRetry?: () => void,
 ): Promise<string> {
-  const body = GeneratedDesignSchema.safeParse(
-    await request(
-      "/v1/design",
-      token,
-      {
-        requestId,
-        model,
-        request: designRequest,
-        ...(repairIssues.length ? { repairIssues } : {}),
-      },
-      fetcher,
-      signal,
-    ),
-  );
-  if (!body.success || body.data.requestId !== requestId) {
-    throw new CompanionClientError("unknown");
+  let retriedIncompleteStream = false;
+  while (true) {
+    if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+    try {
+      const response = await fetchResponse(
+        "/v1/design",
+        token,
+        {
+          requestId,
+          model,
+          request: designRequest,
+          ...(repairIssues.length ? { repairIssues } : {}),
+          ...(screenIds ? { screenIds } : {}),
+        },
+        fetcher,
+        signal,
+      );
+      if (!response.ok) throwResponseError(await readLimitedJson(response, signal));
+      const declaredBytes = Number(response.headers.get("x-fad-response-bytes"));
+      if (
+        response.headers.get("x-fad-request-id") !== requestId ||
+        response.headers.get("x-fad-model") !== model ||
+        response.headers.get("x-fad-completed") !== "response.completed" ||
+        !Number.isSafeInteger(declaredBytes) ||
+        declaredBytes < 1 ||
+        !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")
+      ) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new CompanionClientError("response_incomplete");
+      }
+      return await readGeneratedDesignText(response, declaredBytes, signal);
+    } catch (error) {
+      if (retriedIncompleteStream || signal?.aborted || !isRetryableStreamInterruption(error)) {
+        throw error;
+      }
+      retriedIncompleteStream = true;
+      onIncompleteStreamRetry?.();
+      if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+    }
   }
-  return body.data.design;
+}
+
+function isRetryableStreamInterruption(error: unknown): error is CompanionClientError {
+  if (!(error instanceof CompanionClientError) || error.diagnostic?.stage !== "stream")
+    return false;
+  return (
+    (error.category === "response_incomplete" &&
+      error.diagnostic.outcome === "stream_ended_without_terminal") ||
+    (error.category === "request_timed_out" &&
+      error.diagnostic.outcome === "timed_out" &&
+      (error.diagnostic.timeoutKind === "idle" || error.diagnostic.timeoutKind === "overall"))
+  );
 }
 
 export async function disconnectChatGPT(token: string, fetcher: Fetcher = fetch): Promise<string> {
@@ -336,6 +433,19 @@ async function request(
   fetcher: Fetcher,
   signal?: AbortSignal,
 ): Promise<unknown> {
+  const response = await fetchResponse(path, token, body, fetcher, signal);
+  const result = await readLimitedJson(response, signal);
+  if (!response.ok) throwResponseError(result);
+  return result;
+}
+
+async function fetchResponse(
+  path: string,
+  token: string | undefined,
+  body: Record<string, unknown> | undefined,
+  fetcher: Fetcher,
+  signal?: AbortSignal,
+): Promise<Response> {
   let response: Response;
   try {
     response = await fetcher(`${COMPANION_URL}${path}`, {
@@ -356,17 +466,61 @@ async function request(
     if (signal?.aborted) throw new CompanionClientError("request_cancelled");
     throw new CompanionClientError("connection_failed");
   }
-  const result = await readLimitedJson(response, signal);
-  if (!response.ok) {
-    const category =
-      typeof result === "object" &&
-      result !== null &&
-      typeof (result as { error?: unknown }).error === "string"
-        ? mapError((result as { error: string }).error)
-        : "unknown";
-    throw new CompanionClientError(category);
+  return response;
+}
+
+function throwResponseError(result: unknown): never {
+  const error = isRecord(result) && typeof result.error === "string" ? result.error : "unknown";
+  const issues =
+    isRecord(result) && result.issues !== undefined
+      ? z.array(z.string().min(1).max(240)).max(8).safeParse(result.issues)
+      : undefined;
+  const diagnostic =
+    isRecord(result) && result.diagnostic !== undefined
+      ? InferenceDiagnosticSchema.safeParse(result.diagnostic)
+      : undefined;
+  throw new CompanionClientError(
+    mapError(error),
+    diagnostic?.success ? diagnostic.data : undefined,
+    issues?.success ? issues.data : undefined,
+  );
+}
+
+async function readGeneratedDesignText(
+  response: Response,
+  expectedBytes: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (!response.body) throw new CompanionClientError("response_incomplete");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const chunks: string[] = [];
+  let byteLength = 0;
+  const cancelReader = () => void reader.cancel().catch(() => undefined);
+  signal?.addEventListener("abort", cancelReader, { once: true });
+  try {
+    while (true) {
+      if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+      const { done, value } = await reader.read();
+      if (done) break;
+      byteLength += value.byteLength;
+      if (byteLength > expectedBytes) throw new CompanionClientError("response_incomplete");
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+    if (byteLength !== expectedBytes) throw new CompanionClientError("response_incomplete");
+    return chunks.join("");
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    if (error instanceof CompanionClientError) throw error;
+    if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+    throw new CompanionClientError("response_incomplete");
+  } finally {
+    signal?.removeEventListener("abort", cancelReader);
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
-  return result;
 }
 
 function mapError(value: string): CompanionErrorCategory {
@@ -390,6 +544,10 @@ function mapError(value: string): CompanionErrorCategory {
     "client_id_mismatch",
     "plan_use_scope_missing",
     "plan_use_not_admitted",
+    "account_not_eligible",
+    "unsupported_capability",
+    "route_not_supported",
+    "responses_transport_error",
     "inference_not_verified",
     "inference_busy",
     "generation_busy",
@@ -403,8 +561,13 @@ function mapError(value: string): CompanionErrorCategory {
     "connection_failed",
     "model_not_verified_for_account",
     "account_mismatch",
+    "account_not_eligible",
+    "unsupported_capability",
+    "route_not_supported",
     "public_client_unsupported",
     "response_incomplete",
+    "response_invalid",
+    "resource_exhausted",
     "response_too_large",
     "request_rejected",
     "registration_clear_failed",
@@ -417,6 +580,10 @@ function mapError(value: string): CompanionErrorCategory {
   return known.includes(value as CompanionErrorCategory)
     ? (value as CompanionErrorCategory)
     : "unknown";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function readLimitedJson(response: Response, signal?: AbortSignal): Promise<unknown> {

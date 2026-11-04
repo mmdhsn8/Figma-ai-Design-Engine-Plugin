@@ -1,5 +1,12 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { mkdtemp, open, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { performance } from "node:perf_hooks";
+import { getHeapStatistics } from "node:v8";
 import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from "node:timers";
 import {
   COMPANION_BIND_ADDRESSES,
@@ -8,6 +15,10 @@ import {
   COMPANION_OAUTH_HOST,
   COMPANION_PORT,
   COMPANION_UI_ORIGIN,
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  DEFAULT_STREAM_OVERALL_TIMEOUT_MS,
+  MAX_STREAM_IDLE_TIMEOUT_MS,
+  MAX_STREAM_OVERALL_TIMEOUT_MS,
 } from "./config.js";
 import type { InstallationStore } from "./installation-store.js";
 import {
@@ -45,7 +56,6 @@ import {
 const MAX_BODY_BYTES = 16 * 1_024;
 const MAX_APPROVAL_BODY_BYTES = 2 * 1_024;
 const NETWORK_TIMEOUT_MS = 45_000;
-const MAX_DESIGN_OUTPUT_BYTES = 768 * 1_024;
 const PAIRING_ATTEMPT_TTL_MS = 90_000;
 const PAIRING_SESSION_TTL_MS = 15 * 60 * 1_000;
 const PAIRING_TICKET_PREFIX = "FADP1T:";
@@ -81,6 +91,9 @@ export interface CompanionServerOptions {
   credentialStore?: CredentialStore;
   now?: () => number;
   requestTimeoutMs?: number;
+  streamIdleTimeoutMs?: number;
+  streamOverallTimeoutMs?: number;
+  temporaryDirectory?: string;
 }
 
 export interface CompanionServerHandle {
@@ -143,11 +156,93 @@ interface PairingRestoreTicket {
   secret: string;
 }
 
+type ResponsesDiagnosticOutcome =
+  | "completed"
+  | "failed"
+  | "incomplete"
+  | "stream_ended_without_terminal"
+  | "timed_out"
+  | "cancelled"
+  | "invalid_event"
+  | "resource_exhausted"
+  | "transport_error"
+  | "http_error";
+
+type TimeoutKind = "headers" | "idle" | "overall";
+
+interface ResponsesDiagnostic {
+  model: string;
+  stage: "http" | "stream";
+  outcome: ResponsesDiagnosticOutcome;
+  httpStatus?: number;
+  terminalEvent?: "response.completed";
+  lastEvent?: string;
+  eventCount?: number;
+  responseBytes?: number;
+  generatedBytes?: number;
+  errorCode?: string;
+  errorParam?: string;
+  incompleteReason?: string;
+  timeoutKind?: TimeoutKind;
+  elapsedMs?: number;
+  idleMs?: number;
+  lastEventAgeMs?: number;
+  lastDeltaAgeMs?: number;
+}
+
+interface CompletedResponsesStream {
+  text: string;
+  diagnostic: ResponsesDiagnostic;
+}
+
+class ResponsesStreamError extends Error {
+  constructor(
+    readonly category: string,
+    readonly diagnostic: ResponsesDiagnostic,
+  ) {
+    super(category);
+    this.name = "ResponsesStreamError";
+  }
+}
+
+class RequestTimeoutError extends Error {
+  constructor(readonly timeoutKind: TimeoutKind) {
+    super("request_timed_out");
+    this.name = "RequestTimeoutError";
+  }
+}
+
+function boundedTimeout(value: number | undefined, fallback: number, maximum: number): number {
+  return value !== undefined && Number.isSafeInteger(value) && value > 0
+    ? Math.min(value, maximum)
+    : fallback;
+}
+
+function isRetryableStreamInterruption(error: unknown): error is ResponsesStreamError {
+  return (
+    error instanceof ResponsesStreamError &&
+    error.diagnostic.stage === "stream" &&
+    (error.diagnostic.outcome === "stream_ended_without_terminal" ||
+      (error.diagnostic.outcome === "timed_out" &&
+        (error.diagnostic.timeoutKind === "idle" || error.diagnostic.timeoutKind === "overall")))
+  );
+}
+
 export function createCompanionServer(options: CompanionServerOptions) {
   const fetchImpl = options.fetchImpl ?? fetch;
   const now = options.now ?? Date.now;
   const credentialStore = options.credentialStore ?? createMemoryCredentialStore();
   const timeoutMs = options.requestTimeoutMs ?? NETWORK_TIMEOUT_MS;
+  const streamIdleTimeoutMs = boundedTimeout(
+    options.streamIdleTimeoutMs,
+    DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    MAX_STREAM_IDLE_TIMEOUT_MS,
+  );
+  const streamOverallTimeoutMs = boundedTimeout(
+    options.streamOverallTimeoutMs,
+    DEFAULT_STREAM_OVERALL_TIMEOUT_MS,
+    MAX_STREAM_OVERALL_TIMEOUT_MS,
+  );
   const port = options.port ?? COMPANION_PORT;
   const pairingAttempts = new Map<string, PairingAttempt>();
   const sessionTokenHashes = new Map<string, PairingSession>();
@@ -163,6 +258,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
   let pendingAuthorization: PendingAuthorization | undefined;
   const activeInferenceControllers = new Set<AbortController>();
   const generationAttempts = new Map<string, number>();
+  const generationStreamRetries = new Map<string, Set<boolean>>();
   let activeDesignController: AbortController | undefined;
   let activeSmokeController: AbortController | undefined;
   let servers: Server[] = [];
@@ -307,6 +403,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
     clearPendingAuthorization();
     abortActiveInferenceRequests();
     generationAttempts.clear();
+    generationStreamRetries.clear();
     pairingAttempts.clear();
     sessionTokenHashes.clear();
     pairingStartTimes.length = 0;
@@ -426,6 +523,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       }
       abortActiveInferenceRequests();
       generationAttempts.clear();
+      generationStreamRetries.clear();
       sendJson(response, 200, { disconnected: true });
       return;
     }
@@ -1160,35 +1258,73 @@ export function createCompanionServer(options: CompanionServerOptions) {
         clientAbort.signal,
       );
       if (!result.ok) {
-        const category = classifyHttpStatus(result.status);
+        const upstreamError = await readResponsesHttpError(result, timeoutMs);
+        const category = classifyResponsesHttpError(result.status, upstreamError);
         await applySessionHttpFailure(category);
-        sendJson(response, result.status, { error: category, status: status() });
+        sendJson(response, result.status, {
+          error: category,
+          status: status(),
+          diagnostic: responsesHttpDiagnostic(
+            body.value.model,
+            result.status,
+            category,
+            upstreamError,
+          ),
+        });
         return;
       }
-      const completed = await readCompletedResponse(result, timeoutMs, clientAbort.signal);
+      const streamStartedAt = performance.now();
+      const completed = await readCompletedResponse(
+        result,
+        Math.min(timeoutMs, streamIdleTimeoutMs),
+        streamStartedAt + timeoutMs,
+        clientAbort.signal,
+        body.value.model,
+        undefined,
+        streamStartedAt,
+      );
       if (clientAbort.signal.aborted) throw new Error("request_cancelled");
-      if (!completed) throw new Error("response_incomplete");
       if (clientAbort.signal.aborted || liveSession !== session.value) {
         sendJson(response, 401, { error: "signed_out", status: status() });
         return;
       }
-      session.value.verifiedModel = body.value.model;
+      session.value.verifiedModel = completed.diagnostic.model;
       authStatus = "ready";
       safeMessage = undefined;
       sendJson(response, 200, {
         success: true,
         completed: true,
-        text: completed.slice(0, 240),
+        text: completed.text.slice(0, 240),
         status: status(),
+        diagnostic: completed.diagnostic,
       });
     } catch (error) {
       if (request.aborted || response.destroyed) return;
-      const category = classifyError(error);
-      if (category === "quota_or_rate_limit" || category === "plan_use_not_admitted") {
+      const category = classifyResponsesTransportError(error);
+      if (category === "session_expired" || category === "plan_use_scope_missing") {
+        await applySessionHttpFailure(category);
+      } else if (category === "quota_or_rate_limit" || category === "plan_use_not_admitted") {
         authStatus = "scope_granted";
       }
       safeMessage = category;
-      sendJson(response, 502, { error: category, status: status() });
+      sendJson(response, 502, {
+        error: category,
+        status: status(),
+        diagnostic:
+          error instanceof ResponsesStreamError
+            ? error.diagnostic
+            : responsesTransportDiagnostic(
+                body.value.model,
+                category,
+                error instanceof Error && error.message === "request_timed_out"
+                  ? "timed_out"
+                  : error instanceof Error && error.message === "request_cancelled"
+                    ? "cancelled"
+                    : "transport_error",
+                undefined,
+                error instanceof RequestTimeoutError ? error.timeoutKind : undefined,
+              ),
+      });
     } finally {
       request.off("aborted", abortForClient);
       response.off("close", abortForClosedResponse);
@@ -1203,31 +1339,84 @@ export function createCompanionServer(options: CompanionServerOptions) {
   ): Promise<void> {
     const body = await readJsonBody(request);
     if (!body.ok) {
-      sendJson(response, 400, { error: "invalid_design_request" });
+      sendJson(response, 400, {
+        error: "invalid_design_request",
+        issues: [
+          body.reason === "too_large"
+            ? "The request exceeds the companion's 16 KiB safety limit. Shorten the brief or screen names."
+            : "The companion expected a valid JSON generation request.",
+        ],
+      });
       return;
     }
-    const allowedKeys = new Set(["requestId", "model", "request", "repairIssues"]);
+    const allowedKeys = new Set(["requestId", "model", "request", "repairIssues", "screenIds"]);
+    if (Object.keys(body.value).some((key) => !allowedKeys.has(key))) {
+      sendJson(response, 400, {
+        error: "invalid_design_request",
+        issues: ["The request contains unsupported fields; reload the plugin and companion."],
+      });
+      return;
+    }
     if (
-      Object.keys(body.value).some((key) => !allowedKeys.has(key)) ||
       typeof body.value.requestId !== "string" ||
-      !/^[A-Za-z0-9_-]{1,100}$/u.test(body.value.requestId) ||
+      !/^[A-Za-z0-9_-]{1,100}$/u.test(body.value.requestId)
+    ) {
+      sendJson(response, 400, {
+        error: "invalid_design_request",
+        issues: ["The generation request ID is invalid; reload the plugin and try again."],
+      });
+      return;
+    }
+    if (
       typeof body.value.model !== "string" ||
       body.value.model.length < 1 ||
       body.value.model.length > 200
     ) {
-      sendJson(response, 400, { error: "invalid_design_request" });
+      sendJson(response, 400, {
+        error: "invalid_design_request",
+        issues: ["Select a valid account-visible model and run its smoke test."],
+      });
+      return;
+    }
+    if (
+      body.value.screenIds !== undefined &&
+      (!Array.isArray(body.value.screenIds) ||
+        body.value.screenIds.length === 0 ||
+        body.value.screenIds.some(
+          (screenId) =>
+            typeof screenId !== "string" || !/^[a-z0-9][a-z0-9._-]{0,79}$/u.test(screenId),
+        ) ||
+        new Set(body.value.screenIds).size !== body.value.screenIds.length)
+    ) {
+      sendJson(response, 400, {
+        error: "invalid_design_request",
+        issues: ["Requested screen IDs must be valid and unique; reload the plugin and retry."],
+      });
       return;
     }
     const parsedRequest = DesignGenerationRequestSchema.safeParse(body.value.request);
     const repairIssues = body.value.repairIssues;
+    if (!parsedRequest.success) {
+      sendJson(response, 400, {
+        error: "invalid_design_request",
+        issues: parsedRequest.error.issues
+          .slice(0, 8)
+          .map((issue) =>
+            issue.path.length ? `${issue.path.join(".")}: ${issue.message}` : issue.message,
+          ),
+      });
+      return;
+    }
     if (
-      !parsedRequest.success ||
-      (repairIssues !== undefined &&
-        (!Array.isArray(repairIssues) ||
-          repairIssues.length > 8 ||
-          repairIssues.some((issue) => typeof issue !== "string" || issue.length > 300)))
+      repairIssues !== undefined &&
+      (!Array.isArray(repairIssues) ||
+        repairIssues.length > 8 ||
+        repairIssues.some((issue) => typeof issue !== "string" || issue.length > 300))
     ) {
-      sendJson(response, 400, { error: "invalid_design_request" });
+      sendJson(response, 400, {
+        error: "invalid_design_request",
+        issues: ["Repair instructions must contain at most eight entries of 300 characters each."],
+      });
       return;
     }
     if (activeDesignController || activeSmokeController) {
@@ -1237,6 +1426,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
     const clientAbort = new AbortController();
     activeDesignController = clientAbort;
     activeInferenceControllers.add(clientAbort);
+    let spoolDirectory: string | undefined;
+    let spoolFile: Awaited<ReturnType<typeof open>> | undefined;
     const abortForClient = () => clientAbort.abort();
     const abortForClosedResponse = () => {
       if (!response.writableEnded) clientAbort.abort();
@@ -1263,10 +1454,32 @@ export function createCompanionServer(options: CompanionServerOptions) {
         sendJson(response, 403, { error: "inference_not_verified", status: status() });
         return;
       }
-      const plan = createDesignPlan(parsedRequest.data);
-      if (!plan.success) {
-        sendJson(response, 400, { error: "invalid_design_request" });
+      const completePlan = createDesignPlan(parsedRequest.data);
+      if (!completePlan.success) {
+        sendJson(response, 400, { error: "invalid_design_request", issues: completePlan.errors });
         return;
+      }
+      let plan = completePlan.data;
+      if (Array.isArray(body.value.screenIds)) {
+        const screensById = new Map(plan.screens.map((screen) => [screen.id, screen]));
+        const selectedScreens = body.value.screenIds.map((screenId) =>
+          screensById.get(screenId as string),
+        );
+        if (selectedScreens.some((screen) => screen === undefined)) {
+          sendJson(response, 400, {
+            error: "invalid_design_request",
+            issues: [
+              "The requested screen IDs do not match the brief's plan; reload the plugin and companion to align their generation contract.",
+            ],
+          });
+          return;
+        }
+        plan = {
+          ...plan,
+          screens: selectedScreens.filter(
+            (screen): screen is NonNullable<typeof screen> => screen !== undefined,
+          ),
+        };
       }
       const previousAttempts = generationAttempts.get(body.value.requestId) ?? 0;
       const isRepair = Array.isArray(repairIssues) && repairIssues.length > 0;
@@ -1280,10 +1493,20 @@ export function createCompanionServer(options: CompanionServerOptions) {
       }
       if (!generationAttempts.has(body.value.requestId) && generationAttempts.size >= 128) {
         const oldestRequestId = generationAttempts.keys().next().value;
-        if (oldestRequestId) generationAttempts.delete(oldestRequestId);
+        if (oldestRequestId) {
+          generationAttempts.delete(oldestRequestId);
+          generationStreamRetries.delete(oldestRequestId);
+        }
       }
       generationAttempts.set(body.value.requestId, previousAttempts + 1);
 
+      spoolDirectory = await mkdtemp(join(options.temporaryDirectory ?? tmpdir(), "fad-design-"));
+      const outputPath = join(spoolDirectory, "design.json");
+      spoolFile = await open(outputPath, "wx", 0o600);
+      const outputFile = spoolFile;
+
+      const generationStartedAt = performance.now();
+      const generationDeadline = generationStartedAt + streamOverallTimeoutMs;
       const result = await fetchWithTimeout(
         `${RESPONSES_RESOURCE}/responses`,
         {
@@ -1295,10 +1518,10 @@ export function createCompanionServer(options: CompanionServerOptions) {
           body: JSON.stringify({
             model: body.value.model,
             instructions: createDesignInstructions(
-              plan.data,
+              plan,
               Array.isArray(repairIssues) ? (repairIssues as string[]) : [],
             ),
-            input: [{ role: "user", content: createDesignInputText(plan.data) }],
+            input: [{ role: "user", content: createDesignInputText(plan) }],
             text: {
               format: {
                 type: "json_schema",
@@ -1312,35 +1535,139 @@ export function createCompanionServer(options: CompanionServerOptions) {
           }),
         },
         clientAbort.signal,
+        Math.max(1, Math.ceil(generationDeadline - performance.now())),
+        "overall",
       );
       if (!result.ok) {
-        const category = classifyHttpStatus(result.status);
+        const upstreamError = await readResponsesHttpError(result, timeoutMs);
+        const category = classifyResponsesHttpError(result.status, upstreamError);
         await applySessionHttpFailure(category);
-        sendJson(response, result.status, { error: category, status: status() });
+        sendJson(response, result.status, {
+          error: category,
+          status: status(),
+          diagnostic: responsesHttpDiagnostic(
+            body.value.model,
+            result.status,
+            category,
+            upstreamError,
+          ),
+        });
         return;
       }
-      const design = await readCompletedResponse(
-        result,
-        timeoutMs,
-        clientAbort.signal,
-        MAX_DESIGN_OUTPUT_BYTES,
-      );
+      let completed: CompletedResponsesStream;
+      try {
+        completed = await readCompletedResponse(
+          result,
+          streamIdleTimeoutMs,
+          generationDeadline,
+          clientAbort.signal,
+          body.value.model,
+          async (delta) => {
+            try {
+              await outputFile.writeFile(delta, { encoding: "utf8" });
+            } catch (error) {
+              const spoolError = new Error("resource_exhausted", { cause: error }) as Error & {
+                code: string;
+              };
+              spoolError.code = getSystemErrorCode(error) ?? "spool_write_failed";
+              throw spoolError;
+            }
+          },
+          generationStartedAt,
+        );
+      } catch (error) {
+        if (isRetryableStreamInterruption(error)) {
+          let retries = generationStreamRetries.get(body.value.requestId);
+          if (!retries) {
+            if (generationStreamRetries.size >= 128) {
+              const oldestRequestId = generationStreamRetries.keys().next().value;
+              if (oldestRequestId) generationStreamRetries.delete(oldestRequestId);
+            }
+            retries = new Set();
+            generationStreamRetries.set(body.value.requestId, retries);
+          }
+          if (!retries.has(isRepair)) {
+            // Keep one interrupted-stream retry separate from the schema-repair attempt budget.
+            retries.add(isRepair);
+            if (previousAttempts === 0) generationAttempts.delete(body.value.requestId);
+            else generationAttempts.set(body.value.requestId, previousAttempts);
+          }
+        }
+        throw error;
+      }
       if (clientAbort.signal.aborted) throw new Error("request_cancelled");
-      if (!design) throw new Error("response_incomplete");
-      sendJson(response, 200, { requestId: body.value.requestId, design });
+      const fileStats = await spoolFile.stat();
+      if (fileStats.size !== completed.diagnostic.generatedBytes) {
+        throw new ResponsesStreamError("response_incomplete", {
+          ...completed.diagnostic,
+          outcome: "invalid_event",
+          errorCode: "spool_byte_mismatch",
+        });
+      }
+      await spoolFile.sync();
+      await spoolFile.close();
+      spoolFile = undefined;
+      response.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+        "X-FAD-Request-Id": body.value.requestId,
+        "X-FAD-Model": sanitizeDiagnosticModel(body.value.model),
+        "X-FAD-Completed": completed.diagnostic.terminalEvent ?? "",
+        "X-FAD-Response-Bytes": String(fileStats.size),
+        "X-FAD-Stream-Bytes": String(completed.diagnostic.responseBytes ?? 0),
+        "X-FAD-Event-Count": String(completed.diagnostic.eventCount ?? 0),
+      });
+      await pipeline(createReadStream(outputPath), response, { signal: clientAbort.signal });
     } catch (error) {
       if (request.aborted || response.destroyed) return;
-      const category = classifyError(error);
-      if (category === "quota_or_rate_limit" || category === "plan_use_not_admitted") {
+      if (response.headersSent) {
+        response.destroy();
+        return;
+      }
+      if (isRetryableStreamInterruption(error)) {
+        if (spoolFile) await spoolFile.close().catch(() => undefined);
+        spoolFile = undefined;
+        if (spoolDirectory)
+          await rm(spoolDirectory, { recursive: true, force: true }).catch(() => undefined);
+        spoolDirectory = undefined;
+        activeInferenceControllers.delete(clientAbort);
+        if (activeDesignController === clientAbort) activeDesignController = undefined;
+      }
+      const category = classifyResponsesTransportError(error);
+      if (category === "session_expired" || category === "plan_use_scope_missing") {
+        await applySessionHttpFailure(category);
+      } else if (category === "quota_or_rate_limit" || category === "plan_use_not_admitted") {
         authStatus = "scope_granted";
       }
       safeMessage = category;
-      sendJson(response, 502, { error: category, status: status() });
+      sendJson(response, 502, {
+        error: category,
+        status: status(),
+        diagnostic:
+          error instanceof ResponsesStreamError
+            ? error.diagnostic
+            : responsesTransportDiagnostic(
+                body.value.model as string,
+                category,
+                error instanceof Error && error.message === "request_timed_out"
+                  ? "timed_out"
+                  : error instanceof Error && error.message === "request_cancelled"
+                    ? "cancelled"
+                    : category === "resource_exhausted"
+                      ? "resource_exhausted"
+                      : "transport_error",
+                getSystemErrorCode(error),
+                error instanceof RequestTimeoutError ? error.timeoutKind : undefined,
+              ),
+      });
     } finally {
       request.off("aborted", abortForClient);
       response.off("close", abortForClosedResponse);
       activeInferenceControllers.delete(clientAbort);
       if (activeDesignController === clientAbort) activeDesignController = undefined;
+      if (spoolFile) await spoolFile.close().catch(() => undefined);
+      if (spoolDirectory)
+        await rm(spoolDirectory, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 
@@ -1351,6 +1678,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
     clearPendingAuthorization();
     abortActiveInferenceRequests();
     generationAttempts.clear();
+    generationStreamRetries.clear();
     const session = liveSession;
     const nextState: CredentialState = {
       version: 1,
@@ -1556,14 +1884,27 @@ export function createCompanionServer(options: CompanionServerOptions) {
     input: string | URL,
     init: RequestInit = {},
     externalSignal?: AbortSignal,
+    requestTimeoutMs = timeoutMs,
+    timeoutKind: TimeoutKind = "headers",
   ): Promise<Response> {
     const controller = new AbortController();
-    const timer = setNodeTimeout(() => controller.abort(), timeoutMs);
+    let timedOut = false;
+    const timer = setNodeTimeout(
+      () => {
+        timedOut = true;
+        controller.abort();
+      },
+      Math.max(1, requestTimeoutMs),
+    );
     const abortFromCaller = () => controller.abort();
     if (externalSignal?.aborted) controller.abort();
     else externalSignal?.addEventListener("abort", abortFromCaller, { once: true });
     try {
       return await fetchImpl(input, { ...init, redirect: "error", signal: controller.signal });
+    } catch (error) {
+      if (externalSignal?.aborted) throw new Error("request_cancelled", { cause: error });
+      if (timedOut) throw new RequestTimeoutError(timeoutKind);
+      throw error;
     } finally {
       clearNodeTimeout(timer);
       externalSignal?.removeEventListener("abort", abortFromCaller);
@@ -1594,6 +1935,10 @@ export function createCompanionServer(options: CompanionServerOptions) {
     response.setHeader("Access-Control-Allow-Origin", "*");
     response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    response.setHeader(
+      "Access-Control-Expose-Headers",
+      "X-FAD-Request-Id, X-FAD-Model, X-FAD-Completed, X-FAD-Response-Bytes, X-FAD-Stream-Bytes, X-FAD-Event-Count",
+    );
     if (request.headers["access-control-request-private-network"] === "true") {
       response.setHeader("Access-Control-Allow-Private-Network", "true");
     }
@@ -1737,17 +2082,22 @@ function classifyError(error: unknown): string {
     "session_expired",
     "plan_use_scope_missing",
     "plan_use_not_admitted",
+    "account_not_eligible",
     "quota_or_rate_limit",
     "service_unavailable",
+    "unsupported_capability",
+    "route_not_supported",
     "request_rejected",
+    "responses_transport_error",
     "response_incomplete",
+    "response_invalid",
     "refresh_unavailable",
     "authorization_code_unsupported",
     "pkce_s256_unsupported",
     "untrusted_endpoint",
     "request_timed_out",
     "response_too_large",
-    "response_invalid",
+    "resource_exhausted",
     "system_browser_unavailable",
     "sign_in_timed_out",
     "account_mismatch",
@@ -1764,17 +2114,49 @@ function classifyError(error: unknown): string {
   return "connection_failed";
 }
 
+function classifyResponsesTransportError(error: unknown): string {
+  if (isResourceExhaustion(error)) return "resource_exhausted";
+  const category = classifyError(error);
+  return category === "connection_failed" ? "responses_transport_error" : category;
+}
+
+function getSystemErrorCode(error: unknown): string | undefined {
+  const value = isPlainRecord(error)
+    ? error
+    : error instanceof Error && isPlainRecord(error.cause)
+      ? error.cause
+      : undefined;
+  return typeof value?.code === "string" && /^[A-Z0-9_]{1,32}$/u.test(value.code)
+    ? value.code
+    : undefined;
+}
+
+function isResourceExhaustionCode(code: string | undefined): boolean {
+  return (
+    code !== undefined && ["EDQUOT", "EFBIG", "EMFILE", "ENFILE", "ENOMEM", "ENOSPC"].includes(code)
+  );
+}
+
+function isResourceExhaustion(error: unknown): boolean {
+  return (
+    (error instanceof Error && error.message === "resource_exhausted") ||
+    isResourceExhaustionCode(getSystemErrorCode(error))
+  );
+}
+
 async function readJsonBody(
   request: IncomingMessage,
-): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false }> {
+): Promise<
+  { ok: true; value: Record<string, unknown> } | { ok: false; reason: "invalid" | "too_large" }
+> {
   if (!request.headers["content-type"]?.toLowerCase().startsWith("application/json")) {
     request.resume();
-    return { ok: false };
+    return { ok: false, reason: "invalid" };
   }
   const declaredLength = Number(request.headers["content-length"]);
   if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
     request.resume();
-    return { ok: false };
+    return { ok: false, reason: "too_large" };
   }
   const chunks: Buffer[] = [];
   let length = 0;
@@ -1784,16 +2166,16 @@ async function readJsonBody(
       length += buffer.length;
       if (length > MAX_BODY_BYTES) {
         request.resume();
-        return { ok: false };
+        return { ok: false, reason: "too_large" };
       }
       chunks.push(buffer);
     }
     const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
-      return { ok: false };
+      return { ok: false, reason: "invalid" };
     return { ok: true, value: parsed as Record<string, unknown> };
   } catch {
-    return { ok: false };
+    return { ok: false, reason: "invalid" };
   }
 }
 
@@ -2059,77 +2441,446 @@ function sendCallbackPage(response: ServerResponse, result: string): void {
 
 async function readCompletedResponse(
   response: Response,
-  timeoutMs: number,
+  idleTimeoutMs: number,
+  deadline: number,
   signal?: AbortSignal,
-  maximumBytes = 256 * 1_024,
-): Promise<string | undefined> {
-  if (!response.body) return undefined;
+  model = "unavailable",
+  onTextDelta?: (delta: string) => Promise<void>,
+  startedAt = performance.now(),
+): Promise<CompletedResponsesStream> {
+  if (!response.body) {
+    throw new ResponsesStreamError(
+      "response_incomplete",
+      createStreamDiagnostic(model, "stream_ended_without_terminal", 0, 0),
+    );
+  }
   const reader = response.body.getReader();
-  const cancelReader = () => void reader.cancel();
+  const cancelReader = () => void reader.cancel().catch(() => undefined);
   signal?.addEventListener("abort", cancelReader, { once: true });
   const decoder = new TextDecoder();
+  let lastActivityAt = performance.now();
   let buffer = "";
+  let bufferedBytes = 0;
   let bytes = 0;
   let output = "";
-  const deadline = Date.now() + timeoutMs;
+  let generatedBytes = 0;
+  let eventName = "";
+  let dataLines: string[] = [];
+  let pendingFrameBytes = 0;
+  let eventCount = 0;
+  let lastEvent: string | undefined;
+  let lastEventAt: number | undefined;
+  let lastDeltaAt: number | undefined;
+
+  const streamTiming = () => {
+    const current = performance.now();
+    const ageMs = (at: number) => Math.max(0, Math.round(current - at));
+    return {
+      elapsedMs: ageMs(startedAt),
+      idleMs: ageMs(lastActivityAt),
+      ...(lastEventAt !== undefined ? { lastEventAgeMs: ageMs(lastEventAt) } : {}),
+      ...(lastDeltaAt !== undefined ? { lastDeltaAgeMs: ageMs(lastDeltaAt) } : {}),
+    };
+  };
+
+  const diagnostic = (
+    outcome: ResponsesDiagnosticOutcome,
+    additional: Partial<ResponsesDiagnostic> = {},
+  ): ResponsesDiagnostic => ({
+    model: sanitizeDiagnosticModel(model),
+    stage: "stream",
+    outcome,
+    httpStatus: response.status,
+    eventCount,
+    responseBytes: bytes,
+    generatedBytes,
+    ...streamTiming(),
+    ...(lastEvent ? { lastEvent } : {}),
+    ...additional,
+  });
+  const timeoutError = (timeoutKind: "idle" | "overall") =>
+    new ResponsesStreamError(
+      "request_timed_out",
+      diagnostic("timed_out", {
+        timeoutKind,
+        errorCode: `stream_${timeoutKind}_timeout`,
+      }),
+    );
+  const ensureFrameFitsAvailableMemory = () => {
+    const availableHeap = getHeapStatistics().heap_size_limit - process.memoryUsage().heapUsed;
+    if (bufferedBytes + pendingFrameBytes > availableHeap) {
+      throw new ResponsesStreamError(
+        "resource_exhausted",
+        diagnostic("resource_exhausted", { errorCode: "heap_capacity" }),
+      );
+    }
+  };
+
+  const dispatchFrame = async (): Promise<CompletedResponsesStream | undefined> => {
+    if (dataLines.length === 0) {
+      eventName = "";
+      pendingFrameBytes = 0;
+      return undefined;
+    }
+    const data = dataLines.length === 1 ? dataLines[0]! : dataLines.join("\n");
+    const namedEvent = eventName;
+    dataLines = [];
+    eventName = "";
+    pendingFrameBytes = Buffer.byteLength(data, "utf8");
+    ensureFrameFitsAvailableMemory();
+    if (data.trim() === "[DONE]") {
+      lastEvent = namedEvent || "done";
+      pendingFrameBytes = 0;
+      return undefined;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data) as unknown;
+    } catch {
+      pendingFrameBytes = 0;
+      eventCount++;
+      lastEvent = sanitizeSseEvent(namedEvent) ?? "unknown";
+      throw new ResponsesStreamError("response_invalid", diagnostic("invalid_event"));
+    }
+    pendingFrameBytes = 0;
+    eventCount++;
+    const payloadRecord = isPlainRecord(payload) ? payload : undefined;
+    const eventType =
+      typeof payloadRecord?.type === "string"
+        ? sanitizeSseEvent(payloadRecord.type)
+        : sanitizeSseEvent(namedEvent);
+    lastEvent = eventType ?? "unknown";
+    lastEventAt = performance.now();
+
+    if (eventType === "response.failed" || eventType === "error") {
+      const details = responseFailureDetails(payload);
+      const category = classifyResponsesErrorCode(details.code, details.param);
+      throw new ResponsesStreamError(
+        category,
+        diagnostic("failed", {
+          ...(details.code ? { errorCode: details.code } : {}),
+          ...(details.param ? { errorParam: details.param } : {}),
+        }),
+      );
+    }
+    if (eventType === "response.incomplete") {
+      const reason = responseIncompleteReason(payload);
+      throw new ResponsesStreamError(
+        "response_incomplete",
+        diagnostic("incomplete", reason ? { incompleteReason: reason } : {}),
+      );
+    }
+    if (
+      eventType === "response.output_text.delta" &&
+      payloadRecord &&
+      typeof payloadRecord.delta === "string"
+    ) {
+      const delta = payloadRecord.delta;
+      lastDeltaAt = lastEventAt;
+      generatedBytes += Buffer.byteLength(delta, "utf8");
+      if (onTextDelta) {
+        try {
+          await onTextDelta(delta);
+        } catch (error) {
+          throw new ResponsesStreamError(
+            "resource_exhausted",
+            diagnostic("resource_exhausted", {
+              errorCode: getSystemErrorCode(error) ?? "spool_write_failed",
+            }),
+          );
+        }
+      } else if (output.length < 240) {
+        output += delta.slice(0, 240 - output.length);
+      }
+    }
+    if (eventType === "response.completed") {
+      if (performance.now() >= deadline) throw timeoutError("overall");
+      return {
+        text: output,
+        diagnostic: diagnostic("completed", {
+          terminalEvent: "response.completed",
+        }),
+      };
+    }
+    return undefined;
+  };
+
+  const consumeLine = async (line: string): Promise<CompletedResponsesStream | undefined> => {
+    if (line === "") return dispatchFrame();
+    if (line.startsWith(":")) return undefined;
+    const colon = line.indexOf(":");
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") {
+      eventName = value;
+      pendingFrameBytes += Buffer.byteLength(value, "utf8");
+    } else if (field === "data") {
+      dataLines.push(value);
+      pendingFrameBytes += Buffer.byteLength(value, "utf8");
+    }
+    return undefined;
+  };
+
+  const consumeAvailableLines = async (
+    final: boolean,
+  ): Promise<CompletedResponsesStream | undefined> => {
+    let offset = 0;
+    while (offset < buffer.length) {
+      const lf = buffer.indexOf("\n", offset);
+      const cr = buffer.indexOf("\r", offset);
+      const end = lf === -1 ? cr : cr === -1 ? lf : Math.min(lf, cr);
+      if (end === -1) break;
+      if (!final && buffer[end] === "\r" && end === buffer.length - 1) break;
+      const line = buffer.slice(offset, end);
+      const next = buffer[end] === "\r" && buffer[end + 1] === "\n" ? end + 2 : end + 1;
+      const completed = await consumeLine(line);
+      offset = next;
+      if (completed) {
+        buffer = buffer.slice(offset);
+        return completed;
+      }
+    }
+    buffer = buffer.slice(offset);
+    bufferedBytes = Buffer.byteLength(buffer, "utf8");
+    ensureFrameFitsAvailableMemory();
+    if (final && buffer.length > 0) {
+      const completed = await consumeLine(buffer);
+      buffer = "";
+      bufferedBytes = 0;
+      if (completed) return completed;
+    }
+    return undefined;
+  };
+
   try {
     if (signal?.aborted) {
       await reader.cancel();
-      throw new Error("request_cancelled");
+      throw new ResponsesStreamError("request_cancelled", diagnostic("cancelled"));
     }
     while (true) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
+      const current = performance.now();
+      const overallRemaining = deadline - current;
+      if (overallRemaining <= 0) {
         await reader.cancel();
-        throw new Error("request_timed_out");
+        throw timeoutError("overall");
       }
-      const { value, done } = await readChunkWithTimeout(reader, remaining);
-      if (done) break;
-      bytes += value.byteLength;
-      if (bytes > maximumBytes) {
+      const idleRemaining = idleTimeoutMs - (current - lastActivityAt);
+      if (idleRemaining <= 0) {
         await reader.cancel();
-        throw new Error("response_too_large");
+        throw timeoutError("idle");
       }
-      buffer += decoder.decode(value, { stream: true });
-      const records = buffer.split(/\r?\n\r?\n/u);
-      buffer = records.pop() ?? "";
-      for (const record of records) {
-        const data = record
-          .split(/\r?\n/u)
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).trim())
-          .join("\n");
-        if (!data || data === "[DONE]") continue;
-        let event: { type?: unknown; delta?: unknown; response?: unknown };
-        try {
-          event = JSON.parse(data) as typeof event;
-        } catch {
-          continue;
+      const timeoutKind = idleRemaining <= overallRemaining ? "idle" : "overall";
+      let chunk: StreamReadResult<Uint8Array>;
+      try {
+        chunk = await readChunkWithTimeout(
+          reader,
+          Math.min(idleRemaining, overallRemaining),
+          `stream_${timeoutKind}_timeout`,
+        );
+      } catch (error) {
+        if (signal?.aborted)
+          throw new ResponsesStreamError("request_cancelled", diagnostic("cancelled"));
+        if (error instanceof Error && error.message === "stream_idle_timeout") {
+          throw timeoutError("idle");
         }
-        if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
-          output += event.delta;
+        if (error instanceof Error && error.message === "stream_overall_timeout") {
+          throw timeoutError("overall");
         }
-        if (event.type === "response.failed" || event.type === "error") {
-          throw new Error(responseFailureCategory(event.response) ?? "request_rejected");
-        }
-        if (event.type === "response.incomplete") throw new Error("response_incomplete");
-        if (event.type === "response.completed") return output;
+        throw new ResponsesStreamError("responses_transport_error", diagnostic("transport_error"));
       }
+      if (chunk.done) break;
+      if (chunk.value.byteLength > 0) lastActivityAt = performance.now();
+      bytes += chunk.value.byteLength;
+      const decoded = decoder.decode(chunk.value, { stream: true });
+      buffer += decoded;
+      bufferedBytes += Buffer.byteLength(decoded, "utf8");
+      ensureFrameFitsAvailableMemory();
+      const completed = await consumeAvailableLines(false);
+      if (completed) return completed;
     }
-    return undefined;
+    if (signal?.aborted) {
+      throw new ResponsesStreamError("request_cancelled", diagnostic("cancelled"));
+    }
+    if (performance.now() >= deadline) throw timeoutError("overall");
+    const finalText = decoder.decode();
+    buffer += finalText;
+    bufferedBytes += Buffer.byteLength(finalText, "utf8");
+    ensureFrameFitsAvailableMemory();
+    const completed = (await consumeAvailableLines(true)) ?? (await dispatchFrame());
+    if (completed) return completed;
+    throw new ResponsesStreamError(
+      "response_incomplete",
+      diagnostic("stream_ended_without_terminal"),
+    );
+  } catch (error) {
+    if (error instanceof ResponsesStreamError) throw error;
+    const category = isResourceExhaustion(error)
+      ? "resource_exhausted"
+      : signal?.aborted
+        ? "request_cancelled"
+        : error instanceof Error && error.message === "request_timed_out"
+          ? "request_timed_out"
+          : "responses_transport_error";
+    const outcome =
+      category === "resource_exhausted"
+        ? "resource_exhausted"
+        : category === "request_cancelled"
+          ? "cancelled"
+          : category === "request_timed_out"
+            ? "timed_out"
+            : "transport_error";
+    throw new ResponsesStreamError(category, diagnostic(outcome));
   } finally {
     signal?.removeEventListener("abort", cancelReader);
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 }
 
-function responseFailureCategory(response: unknown): string | undefined {
-  if (typeof response !== "object" || response === null) return undefined;
-  const error = (response as { error?: unknown }).error;
-  if (typeof error !== "object" || error === null) return undefined;
-  const code = (error as { code?: unknown }).code;
-  if (code === "subscription_sharing_usage_limit_exceeded") return "quota_or_rate_limit";
-  if (code === "subscription_sharing_usage_unavailable") return "plan_use_not_admitted";
-  return undefined;
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeDiagnosticToken(value: unknown): string | undefined {
+  return typeof value === "string" && /^[A-Za-z0-9_.:/-]{1,200}$/u.test(value) ? value : undefined;
+}
+
+function sanitizeDiagnosticModel(value: string): string {
+  return sanitizeDiagnosticToken(value) ?? "unavailable";
+}
+
+function sanitizeSseEvent(value: unknown): string | undefined {
+  return typeof value === "string" && /^[A-Za-z0-9_.-]{1,100}$/u.test(value) ? value : undefined;
+}
+
+function createStreamDiagnostic(
+  model: string,
+  outcome: ResponsesDiagnosticOutcome,
+  eventCount: number,
+  responseBytes: number,
+): ResponsesDiagnostic {
+  return {
+    model: sanitizeDiagnosticModel(model),
+    stage: "stream",
+    outcome,
+    eventCount,
+    responseBytes,
+  };
+}
+
+function responseFailureDetails(payload: unknown): { code?: string; param?: string } {
+  if (!isPlainRecord(payload)) return {};
+  const response = isPlainRecord(payload.response) ? payload.response : undefined;
+  const error = isPlainRecord(response?.error)
+    ? response.error
+    : isPlainRecord(payload.error)
+      ? payload.error
+      : payload;
+  return {
+    ...(sanitizeDiagnosticToken(error?.code) ? { code: sanitizeDiagnosticToken(error?.code) } : {}),
+    ...(sanitizeDiagnosticToken(error?.param)
+      ? { param: sanitizeDiagnosticToken(error?.param) }
+      : {}),
+  };
+}
+
+function responseIncompleteReason(payload: unknown): string | undefined {
+  if (!isPlainRecord(payload)) return undefined;
+  const response = isPlainRecord(payload.response) ? payload.response : undefined;
+  const details = isPlainRecord(response?.incomplete_details)
+    ? response.incomplete_details
+    : isPlainRecord(payload.incomplete_details)
+      ? payload.incomplete_details
+      : undefined;
+  return sanitizeDiagnosticToken(details?.reason);
+}
+
+function classifyResponsesErrorCode(code?: string, param?: string): string {
+  switch (code) {
+    case "subscription_sharing_user_not_eligible":
+      return "account_not_eligible";
+    case "subscription_sharing_usage_limit_exceeded":
+      return "quota_or_rate_limit";
+    case "subscription_sharing_usage_unavailable":
+    case "subscription_sharing_user_unavailable":
+      return "service_unavailable";
+    case "subscription_sharing_unsupported_capability":
+      return "unsupported_capability";
+    case "subscription_sharing_route_not_supported":
+      return "route_not_supported";
+    case "subscription_sharing_invalid_user":
+      return "session_expired";
+    case "chatpass_v2_scope_not_authorized":
+    case "chatpass_v2_invalid_authorization_context":
+      return "plan_use_not_admitted";
+    case "server_error":
+    case "api_error":
+    case "upstream_error":
+      return "service_unavailable";
+    default:
+      if (code?.includes("unsupported") || param?.startsWith("text.format")) {
+        return "unsupported_capability";
+      }
+      return "request_rejected";
+  }
+}
+
+async function readResponsesHttpError(
+  response: Response,
+  timeoutMs: number,
+): Promise<{ code?: string; param?: string }> {
+  try {
+    const body = await readJsonResponse(response, 64 * 1_024, timeoutMs);
+    return responseFailureDetails(body);
+  } catch {
+    return {};
+  }
+}
+
+function classifyResponsesHttpError(
+  statusCode: number,
+  upstreamError: { code?: string; param?: string },
+): string {
+  if (upstreamError.code)
+    return classifyResponsesErrorCode(upstreamError.code, upstreamError.param);
+  return classifyHttpStatus(statusCode);
+}
+
+function responsesHttpDiagnostic(
+  model: string,
+  httpStatus: number,
+  category: string,
+  upstreamError: { code?: string; param?: string },
+): ResponsesDiagnostic {
+  return {
+    model: sanitizeDiagnosticModel(model),
+    stage: "http",
+    outcome: "http_error",
+    httpStatus,
+    ...(category ? { errorCode: sanitizeDiagnosticToken(upstreamError.code) ?? category } : {}),
+    ...(sanitizeDiagnosticToken(upstreamError.param)
+      ? { errorParam: sanitizeDiagnosticToken(upstreamError.param) }
+      : {}),
+  };
+}
+
+function responsesTransportDiagnostic(
+  model: string,
+  _category: string,
+  outcome: ResponsesDiagnosticOutcome,
+  errorCode?: string,
+  timeoutKind?: TimeoutKind,
+): ResponsesDiagnostic {
+  return {
+    model: sanitizeDiagnosticModel(model),
+    stage: "http",
+    outcome,
+    ...(sanitizeDiagnosticToken(errorCode)
+      ? { errorCode: sanitizeDiagnosticToken(errorCode) }
+      : {}),
+    ...(timeoutKind ? { timeoutKind } : {}),
+  };
 }
 
 async function readJsonResponse(
@@ -2176,13 +2927,14 @@ async function readResponseText(
 async function readChunkWithTimeout<T>(
   reader: ReadableStreamDefaultReader<T>,
   timeoutMs: number,
+  timeoutMessage = "request_timed_out",
 ): Promise<StreamReadResult<T>> {
   let timer: ReturnType<typeof setNodeTimeout> | undefined;
   try {
     return (await Promise.race([
       reader.read(),
       new Promise<never>((_, reject) => {
-        timer = setNodeTimeout(() => reject(new Error("request_timed_out")), timeoutMs);
+        timer = setNodeTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
       }),
     ])) as StreamReadResult<T>;
   } catch (error) {

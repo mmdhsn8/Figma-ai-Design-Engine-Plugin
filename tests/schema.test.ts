@@ -4,7 +4,6 @@ import storefront from "../src/samples/phase-2-storefront.json";
 import {
   DESIGN_SCHEMA_VERSION,
   MAX_NESTING_DEPTH,
-  MAX_NODE_COUNT,
   orderComponentDefinitions,
   parseDesignText,
   parseDesignValue,
@@ -95,21 +94,22 @@ describe("design schema", () => {
     if (!result.success) expect(result.errors.join(" ")).toContain("maximum nesting depth");
   });
 
-  it("enforces the total node limit before recursive parsing", () => {
+  it("accepts complete documents above the former node and JSON byte limits", () => {
     const design = emptyDesign();
-    design.document.children = [
-      frameNode(
-        "Large A",
-        Array.from({ length: 250 }, (_, index) => textNode(`A ${index}`)),
-      ),
-      frameNode(
-        "Large B",
-        Array.from({ length: 250 }, (_, index) => textNode(`B ${index}`)),
-      ),
-    ];
-    const result = parseDesignValue(design);
-    expect(result.success).toBe(false);
-    if (!result.success) expect(result.errors.join(" ")).toContain(`${MAX_NODE_COUNT}`);
+    design.document.children = Array.from({ length: 6_000 }, (_, index) =>
+      textNode(`Text ${index} ${"large-copy-".repeat(12)}`, index, 0),
+    );
+    design.document.components = Array.from({ length: 60 }, (_, index) => ({
+      type: "component" as const,
+      id: `component-${index}`,
+      name: `Component ${index}`,
+      width: 100,
+      height: 100,
+      children: [],
+    }));
+    const source = JSON.stringify(design);
+    expect(source.length).toBeGreaterThan(1_000_000);
+    expect(parseDesignText(source).success).toBe(true);
   });
 
   it("accepts nested Auto Layout and rejects incompatible sizing and alignment", () => {

@@ -6,8 +6,6 @@ import {
   DesignNodeSchema,
   DesignSystemSchema,
   LayoutSchema,
-  MAX_COMPONENT_COUNT,
-  MAX_JSON_LENGTH,
   findDuplicateJsonKeys,
   parseDesignValue,
   type ComponentDefinitionSpec,
@@ -17,9 +15,6 @@ import {
   countDesignNodes,
 } from "./schema";
 import { VisualAssetSchema, type VisualAsset } from "./visual-schema";
-
-export const MAX_MULTI_SCREEN_COUNT = 100;
-export const MAX_MULTI_SCREEN_NODE_COUNT = 5_000;
 
 const nameSchema = z
   .string()
@@ -63,7 +58,7 @@ export const MultiScreenItemSchema = z
     height: dimensionSchema,
     background: TokenColorValueSchema.optional(),
     layout: LayoutSchema.optional(),
-    children: z.array(DesignNodeSchema).max(250),
+    children: z.array(DesignNodeSchema),
     metadata: metadataSchema,
   })
   .strict();
@@ -74,9 +69,9 @@ export const MultiScreenSpecSchema = z
     id: idSchema,
     name: nameSchema,
     designSystem: DesignSystemSchema.optional(),
-    components: z.array(ComponentDefinitionSchema).max(MAX_COMPONENT_COUNT).optional(),
+    components: z.array(ComponentDefinitionSchema).optional(),
     assets: z.array(VisualAssetSchema).max(20).optional(),
-    screens: z.array(MultiScreenItemSchema).min(1).max(MAX_MULTI_SCREEN_COUNT),
+    screens: z.array(MultiScreenItemSchema).min(1),
   })
   .strict();
 
@@ -222,12 +217,6 @@ export function parseMultiScreenValue(value: unknown): MultiScreenParseResult {
 
   // Shared component masters are counted once for the batch instead of once per screen.
   nodeCount += sharedNodes;
-  if (nodeCount > MAX_MULTI_SCREEN_NODE_COUNT) {
-    errors.push(
-      `The batch contains ${nodeCount} nodes; the limit is ${MAX_MULTI_SCREEN_NODE_COUNT}. Reduce screens or layers before generating.`,
-    );
-  }
-
   const uniqueErrors = [...new Set(errors)].slice(0, 100);
   if (uniqueErrors.length) return { success: false, errors: uniqueErrors };
   return {
@@ -238,9 +227,6 @@ export function parseMultiScreenValue(value: unknown): MultiScreenParseResult {
 }
 
 export function parseMultiScreenText(source: string): MultiScreenParseResult {
-  if (source.length > MAX_JSON_LENGTH) {
-    return { success: false, errors: [`JSON is larger than ${MAX_JSON_LENGTH} characters.`] };
-  }
   let value: unknown;
   try {
     value = JSON.parse(source) as unknown;

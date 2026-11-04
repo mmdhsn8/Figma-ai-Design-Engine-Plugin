@@ -4,8 +4,6 @@ import phase2 from "../src/samples/phase-2-storefront.json";
 import phase3 from "../src/samples/phase-3-design-system.json";
 import phase4 from "../src/samples/phase-4-multi-screen.json";
 import {
-  MAX_MULTI_SCREEN_COUNT,
-  MAX_MULTI_SCREEN_NODE_COUNT,
   orderMultiScreenItems,
   parseMultiScreenText,
   parseMultiScreenValue,
@@ -71,17 +69,17 @@ describe("multi-screen schema", () => {
     expect(parseMultiScreenValue(invalidSize).success).toBe(false);
   });
 
-  it("guards excessive screen and aggregate node counts before generation", () => {
-    const tooManyScreens = structuredClone(phase4) as MultiScreenSpec;
-    const template = tooManyScreens.screens[0];
-    tooManyScreens.screens = Array.from({ length: MAX_MULTI_SCREEN_COUNT + 1 }, (_, index) => ({
+  it("keeps all screens and nodes above the former aggregate limits", () => {
+    const largeBatch = structuredClone(phase4) as MultiScreenSpec;
+    const template = largeBatch.screens[0];
+    largeBatch.screens = Array.from({ length: 101 }, (_, index) => ({
       ...structuredClone(template),
       id: `screen-${index}`,
       name: `Screen ${index}`,
     }));
-    expect(parseMultiScreenValue(tooManyScreens).success).toBe(false);
+    expect(parseMultiScreenValue(largeBatch).success).toBe(true);
 
-    const tooManyNodes: MultiScreenSpec = {
+    const manyNodes: MultiScreenSpec = {
       schemaVersion: "1.0.0",
       id: "large-batch",
       name: "Large Batch",
@@ -100,11 +98,9 @@ describe("multi-screen schema", () => {
         })),
       })),
     };
-    const countResult = parseMultiScreenValue(tooManyNodes);
-    expect(countResult.success).toBe(false);
-    if (!countResult.success) {
-      expect(countResult.errors.join(" ")).toContain(String(MAX_MULTI_SCREEN_NODE_COUNT));
-    }
+    const countResult = parseMultiScreenValue(manyNodes);
+    expect(countResult.success).toBe(true);
+    if (countResult.success) expect(countResult.nodeCount).toBeGreaterThan(5_000);
   });
 
   it("rejects duplicate JSON keys in pasted multi-screen source", () => {

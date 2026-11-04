@@ -14,6 +14,8 @@ import {
 } from "../src/plugin/renderer";
 import { boundsIntersectWithGap, DEFAULT_MIN_CANVAS_GAP } from "../src/plugin/canvas-placement";
 import { parseDesignValue, type DesignSpec } from "../src/shared/schema";
+import { createDesignPlan } from "../src/shared/design-generation";
+import { prepareGeneratedDesign } from "../src/ui/design-generation";
 
 interface MockNode {
   type: string;
@@ -724,6 +726,142 @@ describe("renderDesign", () => {
         DEFAULT_MIN_CANVAS_GAP,
       ),
     ).toBe(false);
+  });
+
+  it("hands generated designs with large screen child lists to the native renderer", async () => {
+    const plan = createDesignPlan({
+      prompt: "Create a storefront with a home and cart screen.",
+      target: "mobile",
+      screenCount: 2,
+      screenNames: ["Home", "Cart"],
+      language: "en",
+      style: "",
+      projectType: "storefront",
+      theme: "auto",
+    });
+    expect(plan.success).toBe(true);
+    if (!plan.success) return;
+    const response = {
+      projectName: "Large Storefront",
+      palette: {
+        brand: "#263A36",
+        accent: "#B97755",
+        page: "#F6F3EE",
+        surface: "#FFFFFF",
+        text: "#1E2926",
+        muted: "#68736F",
+        border: "#D9DED9",
+      },
+      screens: plan.data.screens.map(({ id }) => ({
+        id,
+        children: Array.from({ length: 300 }, (_, index) => ({
+          type: "text",
+          name: `Label ${index}`,
+          text: `Editable screen content ${index}`,
+          palette: "text",
+          width: 300,
+          height: 48,
+          fontSize: 16,
+          fontStyle: "Regular",
+          textAlign: "left",
+          cornerRadius: 0,
+          elevation: "none",
+          layout: "none",
+          gap: 0,
+          padding: 0,
+          qualityRole: "body",
+          children: [],
+        })),
+      })),
+    };
+    const prepared = prepareGeneratedDesign(JSON.stringify(response), plan.data);
+    expect(prepared.success).toBe(true);
+    if (!prepared.success) return;
+
+    const result = await renderMultiScreenDesign(mock.api, prepared.data.batch);
+    expect(result.failedScreens).toBe(0);
+    expect(result.generatedScreens).toBe(2);
+    expect(result.createdNodeCount).toBeGreaterThan(600);
+  });
+
+  it("renders normalized RTL touch targets as editable native frames and text", async () => {
+    const plan = createDesignPlan({
+      prompt: "یک برنامه فارسی با صفحه خانه و جزئیات طراحی کن.",
+      target: "mobile",
+      screenCount: 2,
+      screenNames: ["Home", "Detail"],
+      language: "fa",
+      style: "",
+    });
+    if (!plan.success) throw new Error(plan.errors.join(" "));
+    const label = {
+      type: "text",
+      name: "Editable Persian label",
+      text: "خرید",
+      palette: "text",
+      width: 40,
+      height: 20,
+      fontSize: 16,
+      fontStyle: "Regular",
+      textAlign: "right",
+      cornerRadius: 0,
+      elevation: "none",
+      layout: "none",
+      gap: 0,
+      padding: 0,
+      qualityRole: "body",
+      children: [],
+    };
+    const prepared = prepareGeneratedDesign(
+      JSON.stringify({
+        projectName: "RTL touch repair",
+        palette: {
+          brand: "#223344",
+          accent: "#CC7744",
+          page: "#F7F5F0",
+          surface: "#FFFFFF",
+          text: "#17212B",
+          muted: "#647080",
+          border: "#D8DEE6",
+        },
+        screens: plan.data.screens.map(({ id }) => ({
+          id,
+          children: [
+            {
+              ...label,
+              type: "frame",
+              name: `${id} button`,
+              text: null,
+              palette: "brand",
+              qualityRole: "button",
+              width: 40,
+              height: 32,
+              layout: "vertical",
+              padding: 2,
+              children: [{ ...label }],
+            },
+          ],
+        })),
+      }),
+      plan.data,
+    );
+    if (!prepared.success) throw new Error(prepared.errors.join(" "));
+    const result = await renderMultiScreenDesign(mock.api, prepared.data.batch);
+    expect(result).toMatchObject({ generatedScreens: 2, failedScreens: 0 });
+    expect(mock.find("detail button")).toMatchObject({
+      type: "FRAME",
+      width: 44,
+      height: 44,
+      layoutMode: "VERTICAL",
+      layoutSizingHorizontal: "FILL",
+      layoutSizingVertical: "FIXED",
+      paddingLeft: 2,
+    });
+    expect(mock.find("Editable Persian label")).toMatchObject({
+      type: "TEXT",
+      characters: "خرید",
+      textAlignHorizontal: "RIGHT",
+    });
   });
 
   it("creates a new named batch on repeat and reuses shared design-system assets", async () => {

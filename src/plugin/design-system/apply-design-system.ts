@@ -1,5 +1,4 @@
 import type { DesignSpec } from "../../shared/schema";
-import { MAX_DESIGN_SYSTEM_TOKEN_COUNT } from "../../shared/design-system-schema";
 
 export interface DesignSystemDryRun {
   namespace: string;
@@ -45,6 +44,6 @@ export function planDesignSystemApply(spec: DesignSpec): DesignSystemDryRun | un
     plannedTextStyles: typography,
     plannedMasters: components,
     fallbacks,
-    message: `Dry run: up to ${colors} paint styles, ${typography} text styles, and ${components} component masters (${tokenCount}/${MAX_DESIGN_SYSTEM_TOKEN_COUNT} tokens). Existing owned assets will be reused; only explicit safe style updates are applied.`,
+    message: `Dry run: up to ${colors} paint styles, ${typography} text styles, and ${components} component masters (${tokenCount} tokens). Existing owned assets will be reused; only explicit safe style updates are applied.`,
   };
 }

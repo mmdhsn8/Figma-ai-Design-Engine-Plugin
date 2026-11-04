@@ -1,5 +1,8 @@
 import { generateKeyPairSync, randomBytes, sign } from "node:crypto";
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMPANION_BIND_ADDRESSES } from "../src/companion/config.js";
 import {
@@ -734,6 +737,382 @@ describe("loopback companion", () => {
     expect(new Headers(sent.headers).get("authorization")).toBe("Bearer access-secret");
   });
 
+  it("parses completed SSE events when CRLF delimiters and JSON are split across chunks and binds the exact selected model", async () => {
+    const harness = await createHarness({
+      accountModel: "gpt-5.6-luna",
+      responseChunks: [
+        "event: response.output_text.delta\r",
+        '\ndata: {"type":"response.output_text.delta","delta":"O"}\r',
+        "\n\r",
+        '\ndata: {"type":"response.output_text.delta","delta":"K"}\r\n\r\n',
+        'event: response.completed\r\ndata: {"completed":true}',
+      ],
+    });
+    const token = await authorizeAndDiscover(harness);
+    const smoke = await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "gpt-5.6-luna" },
+    });
+    expect(smoke.status).toBe(200);
+    expect(await smoke.json()).toMatchObject({
+      success: true,
+      completed: true,
+      text: "OK",
+      status: { auth: "ready", inferenceVerifiedModel: "gpt-5.6-luna" },
+      diagnostic: {
+        model: "gpt-5.6-luna",
+        stage: "stream",
+        outcome: "completed",
+        terminalEvent: "response.completed",
+        lastEvent: "response.completed",
+        eventCount: 3,
+      },
+    });
+    const sent = harness.responsesRequest as { body: string };
+    expect(JSON.parse(sent.body)).toMatchObject({
+      model: "gpt-5.6-luna",
+      store: false,
+      stream: true,
+    });
+  });
+
+  it("rejects a normally ended stream with partial output but no response.completed", async () => {
+    const harness = await createHarness({
+      responseChunks: [
+        'data: {"type":"response.output_text.delta","delta":"partial private output"}\n\n',
+      ],
+    });
+    const token = await authorizeAndDiscover(harness);
+    const response = await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    expect(response.status).toBe(502);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      error: "response_incomplete",
+      diagnostic: {
+        model: "account-model",
+        stage: "stream",
+        outcome: "stream_ended_without_terminal",
+        lastEvent: "response.output_text.delta",
+        eventCount: 1,
+      },
+    });
+    expect(JSON.stringify(body)).not.toContain("partial private output");
+    expect(await (await request(harness.handle, "/v1/status", { token })).json()).toMatchObject({
+      auth: "scope_granted",
+    });
+  });
+
+  it("classifies event-name-only failures and explicit incomplete events without exposing upstream text", async () => {
+    const failedHarness = await createHarness({
+      responseChunks: [
+        'event: error\r\ndata: {"error":{"code":"subscription_sharing_unsupported_capability","param":"text.format","message":"do not expose this response text"}}\r\n\r\n',
+      ],
+    });
+    const failedToken = await authorizeAndDiscover(failedHarness);
+    const failed = await request(failedHarness.handle, "/v1/smoke", {
+      token: failedToken,
+      body: { model: "account-model" },
+    });
+    expect(failed.status).toBe(502);
+    const failedBody = await failed.json();
+    expect(failedBody).toMatchObject({
+      error: "unsupported_capability",
+      diagnostic: {
+        model: "account-model",
+        outcome: "failed",
+        lastEvent: "error",
+        errorCode: "subscription_sharing_unsupported_capability",
+        errorParam: "text.format",
+      },
+    });
+    expect(JSON.stringify(failedBody)).not.toContain("do not expose this response text");
+
+    const incompleteHarness = await createHarness({
+      responseChunks: [
+        'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+      ],
+    });
+    const incompleteToken = await authorizeAndDiscover(incompleteHarness);
+    const incomplete = await request(incompleteHarness.handle, "/v1/smoke", {
+      token: incompleteToken,
+      body: { model: "account-model" },
+    });
+    expect(incomplete.status).toBe(502);
+    expect(await incomplete.json()).toMatchObject({
+      error: "response_incomplete",
+      diagnostic: {
+        outcome: "incomplete",
+        lastEvent: "response.incomplete",
+        incompleteReason: "max_output_tokens",
+      },
+    });
+  });
+
+  it("reports a stream timeout separately and leaves the selected model unverified", async () => {
+    const harness = await createHarness({
+      stalledStream: true,
+      requestTimeoutMs: 500,
+      streamIdleTimeoutMs: 25,
+      streamOverallTimeoutMs: 500,
+    });
+    const token = await authorizeAndDiscover(harness);
+    const response = await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({
+      error: "request_timed_out",
+      diagnostic: {
+        model: "account-model",
+        stage: "stream",
+        outcome: "timed_out",
+        timeoutKind: "idle",
+        elapsedMs: expect.any(Number),
+        idleMs: expect.any(Number),
+        eventCount: 0,
+      },
+    });
+    expect(await (await request(harness.handle, "/v1/status", { token })).json()).toMatchObject({
+      auth: "scope_granted",
+    });
+  });
+
+  it("reports an overall stream deadline when output deltas keep arriving", async () => {
+    const harness = await createHarness({
+      progressingGeneratedStream: true,
+      streamIdleTimeoutMs: 2_000,
+      streamOverallTimeoutMs: 1_000,
+    });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const response = await request(harness.handle, "/v1/design", {
+      token,
+      body: {
+        requestId: "req-active-overall-timeout",
+        model: "account-model",
+        request: {
+          prompt: "Create a polished mobile storefront with home and cart screens.",
+          target: "mobile",
+          screenCount: 2,
+          screenNames: ["Home", "Cart"],
+          language: "en",
+          style: "",
+        },
+      },
+    });
+
+    expect(response.status).toBe(502);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      error: "request_timed_out",
+      diagnostic: {
+        stage: "stream",
+        outcome: "timed_out",
+        timeoutKind: "overall",
+        generatedBytes: expect.any(Number),
+        elapsedMs: expect.any(Number),
+        idleMs: expect.any(Number),
+        lastDeltaAgeMs: expect.any(Number),
+      },
+    });
+    expect(body.diagnostic.generatedBytes).toBeGreaterThan(0);
+    expect(body.diagnostic.idleMs).toBeLessThan(2_000);
+    expect(body.diagnostic.lastDeltaAgeMs).toBeLessThan(2_000);
+  }, 20_000);
+
+  it("identifies an overall timeout while waiting for design response headers", async () => {
+    const harness = await createHarness({
+      stallDesignHeaders: true,
+      streamOverallTimeoutMs: 25,
+    });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const response = await request(harness.handle, "/v1/design", {
+      token,
+      body: {
+        requestId: "req-header-overall-timeout",
+        model: "account-model",
+        request: {
+          prompt: "Create a polished mobile storefront with home and cart screens.",
+          target: "mobile",
+          screenCount: 2,
+          screenNames: ["Home", "Cart"],
+          language: "en",
+          style: "",
+        },
+      },
+    });
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({
+      error: "request_timed_out",
+      diagnostic: {
+        stage: "http",
+        outcome: "timed_out",
+        timeoutKind: "overall",
+      },
+    });
+  }, 20_000);
+
+  it("retries a timed-out screen once with the same ID, then blocks duplicate generation", async () => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "fad-timeout-retry-test-"));
+    const generatedOutput = JSON.stringify({
+      projectName: "Timed Store",
+      palette: { brand: "#223344" },
+      screens: [{ id: "home", children: [] }],
+    });
+    const harness = await createHarness({
+      generatedOutput,
+      timeoutGeneratedStreams: 1,
+      streamIdleTimeoutMs: 25,
+      streamOverallTimeoutMs: 500,
+      temporaryDirectory,
+    });
+    try {
+      const token = await authorizeAndDiscover(harness);
+      await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+      const body = {
+        requestId: "req-screen-timeout-retry",
+        model: "account-model",
+        request: {
+          prompt: "Create a polished mobile storefront with home and cart screens.",
+          target: "mobile",
+          screenCount: 2,
+          screenNames: ["Home", "Cart"],
+          language: "en",
+          style: "",
+        },
+        screenIds: ["home"],
+      };
+
+      const incomplete = await request(harness.handle, "/v1/design", { token, body });
+      expect(incomplete.status).toBe(502);
+      const errorBody = await incomplete.json();
+      expect(errorBody).toMatchObject({
+        error: "request_timed_out",
+        diagnostic: {
+          outcome: "timed_out",
+          timeoutKind: "idle",
+          generatedBytes: Buffer.byteLength(generatedOutput),
+        },
+      });
+      expect(JSON.stringify(errorBody)).not.toContain(generatedOutput);
+
+      const retried = await request(harness.handle, "/v1/design", { token, body });
+      expect(retried.status).toBe(200);
+      expect(await retried.text()).toBe(generatedOutput);
+      expect(retried.headers.get("x-fad-request-id")).toBe(body.requestId);
+      const duplicate = await request(harness.handle, "/v1/design", { token, body });
+      expect(duplicate.status).toBe(409);
+      expect(await duplicate.json()).toMatchObject({ error: "generation_retry_limit" });
+      await vi.waitFor(async () => expect(await readdir(temporaryDirectory)).toEqual([]));
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("classifies documented HTTP entitlement and unsupported-capability errors by safe code and status", async () => {
+    const unsupported = await createHarness({
+      responsesHttpError: {
+        status: 400,
+        body: {
+          error: {
+            code: "subscription_sharing_unsupported_capability",
+            param: "text.format",
+            message: "private upstream detail",
+          },
+        },
+      },
+    });
+    const token = await authorizeAndDiscover(unsupported);
+    const response = await request(unsupported.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      error: "unsupported_capability",
+      diagnostic: {
+        model: "account-model",
+        stage: "http",
+        outcome: "http_error",
+        httpStatus: 400,
+        errorCode: "subscription_sharing_unsupported_capability",
+        errorParam: "text.format",
+      },
+    });
+    expect(JSON.stringify(body)).not.toContain("private upstream detail");
+
+    const unavailable = await createHarness({
+      responsesHttpError: {
+        status: 503,
+        body: { detail: "private transient routing detail" },
+      },
+    });
+    const unavailableToken = await authorizeAndDiscover(unavailable);
+    const transient = await request(unavailable.handle, "/v1/smoke", {
+      token: unavailableToken,
+      body: { model: "account-model" },
+    });
+    expect(transient.status).toBe(503);
+    const transientBody = await transient.json();
+    expect(transientBody).toMatchObject({
+      error: "service_unavailable",
+      diagnostic: {
+        model: "account-model",
+        stage: "http",
+        outcome: "http_error",
+        httpStatus: 503,
+      },
+    });
+    expect(JSON.stringify(transientBody)).not.toContain("private transient routing detail");
+
+    const ineligible = await createHarness({
+      responsesHttpError: {
+        status: 403,
+        body: {
+          error: {
+            code: "subscription_sharing_user_not_eligible",
+            message: "private policy detail",
+          },
+        },
+      },
+    });
+    const ineligibleToken = await authorizeAndDiscover(ineligible);
+    const denied = await request(ineligible.handle, "/v1/smoke", {
+      token: ineligibleToken,
+      body: { model: "account-model" },
+    });
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toMatchObject({
+      error: "account_not_eligible",
+      diagnostic: { httpStatus: 403, errorCode: "subscription_sharing_user_not_eligible" },
+    });
+
+    const interrupted = await createHarness({ responsesFetchFailure: true });
+    const interruptedToken = await authorizeAndDiscover(interrupted);
+    const interruptedResponse = await request(interrupted.handle, "/v1/smoke", {
+      token: interruptedToken,
+      body: { model: "account-model" },
+    });
+    expect(interruptedResponse.status).toBe(502);
+    const interruptedBody = await interruptedResponse.json();
+    expect(interruptedBody).toMatchObject({
+      error: "responses_transport_error",
+      diagnostic: {
+        model: "account-model",
+        stage: "http",
+        outcome: "transport_error",
+      },
+    });
+    expect(JSON.stringify(interruptedBody)).not.toContain("private transport failure text");
+  });
+
   it("requires a model-specific real smoke test before design generation and streams a strict JSON schema request", async () => {
     const design = {
       projectName: "Generated Storefront",
@@ -780,10 +1159,13 @@ describe("loopback companion", () => {
     expect(smoke.status).toBe(200);
     const response = await request(harness.handle, "/v1/design", { token, body: requestBody });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      requestId: "req-design-test",
-      design: JSON.stringify(design),
-    });
+    expect(await response.text()).toBe(JSON.stringify(design));
+    expect(response.headers.get("x-fad-request-id")).toBe("req-design-test");
+    expect(response.headers.get("x-fad-model")).toBe("account-model");
+    expect(response.headers.get("x-fad-completed")).toBe("response.completed");
+    expect(response.headers.get("x-fad-response-bytes")).toBe(
+      String(Buffer.byteLength(JSON.stringify(design))),
+    );
 
     const sent = harness.responsesRequest as { body: string; headers: HeadersInit };
     const payload = JSON.parse(sent.body) as Record<string, unknown>;
@@ -799,11 +1181,15 @@ describe("loopback companion", () => {
     expect(JSON.stringify(payload)).not.toContain('"role":"system"');
     expect(new Headers(sent.headers).get("authorization")).toBe("Bearer access-secret");
 
+    const repairIssue =
+      "screens.products.children[0].children[0] button is below the 44 px minimum tap target.";
     const repeated = await request(harness.handle, "/v1/design", {
       token,
-      body: { ...requestBody, repairIssues: ["screens[1] was missing a title"] },
+      body: { ...requestBody, repairIssues: [repairIssue] },
     });
     expect(repeated.status).toBe(200);
+    await repeated.text();
+    expect(JSON.parse(harness.responsesRequest!.body).instructions).toContain(repairIssue);
     const tooManyRepairs = await request(harness.handle, "/v1/design", {
       token,
       body: { ...requestBody, repairIssues: ["one repair was already used"] },
@@ -811,6 +1197,262 @@ describe("loopback companion", () => {
     expect(tooManyRepairs.status).toBe(409);
     expect(await tooManyRepairs.json()).toMatchObject({ error: "generation_retry_limit" });
   });
+
+  it("accepts a long Persian brief for two mobile screens and explains validation failures", async () => {
+    const design = {
+      projectName: "فروشگاه فارسی",
+      palette: {
+        brand: "#223344",
+        accent: "#CC7744",
+        page: "#F7F5F0",
+        surface: "#FFFFFF",
+        text: "#17212B",
+        muted: "#647080",
+        border: "#D8DEE6",
+      },
+      screens: [{ id: "screen-1", children: [] }],
+    };
+    const harness = await createHarness({ generatedOutput: JSON.stringify(design) });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+
+    const invalid = await request(harness.handle, "/v1/design", {
+      token,
+      body: {
+        requestId: "req-specific-validation",
+        model: "account-model",
+        request: {
+          prompt: "Create a Persian storefront with two screens.",
+          target: "mobile",
+          screenCount: 2,
+          screenNames: ["خانه"],
+          language: "fa",
+          style: "",
+        },
+      },
+    });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({
+      error: "invalid_design_request",
+      issues: ["screenNames: Enter the same number of screen names as the selected screen count."],
+    });
+
+    const prompt = `یک فروشگاه اینترنتی فارسی برای موبایل با دو صفحه خانه و جزئیات محصول طراحی کن. ${"تجربهٔ خرید روان، متن فارسی خوانا و چیدمان راست‌چین داشته باشد. ".repeat(50)}`;
+    expect(prompt.length).toBeGreaterThan(2_000);
+    const accepted = await request(harness.handle, "/v1/design", {
+      token,
+      body: {
+        requestId: "req-persian-two-screen",
+        model: "account-model",
+        request: {
+          prompt,
+          target: "mobile",
+          screenCount: 2,
+          screenNames: ["خانه", "جزئیات"],
+          language: "auto",
+          style: "",
+        },
+        screenIds: ["screen-1"],
+      },
+    });
+    expect(accepted.status).toBe(200);
+    expect(await accepted.text()).toBe(JSON.stringify(design));
+    const payload = JSON.parse((harness.responsesRequest as { body: string }).body);
+    expect(payload.input[0].content).toContain(prompt.slice(0, 100));
+
+    const tooLarge = await request(harness.handle, "/v1/design", {
+      token,
+      body: {
+        requestId: "req-body-limit",
+        model: "account-model",
+        request: { prompt: "x".repeat(16_384) },
+      },
+    });
+    expect(tooLarge.status).toBe(400);
+    expect(await tooLarge.json()).toMatchObject({
+      error: "invalid_design_request",
+      issues: [
+        "The request exceeds the companion's 16 KiB safety limit. Shorten the brief or screen names.",
+      ],
+    });
+  });
+
+  it("streams multi-megabyte completed output from a temporary spool and cleans it up", async () => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "fad-spool-test-"));
+    const children = Array.from({ length: 2_600 }, (_, index) => ({
+      id: `node-${index}`,
+      text: "Product description ".repeat(24),
+    }));
+    const generatedOutput = JSON.stringify({
+      projectName: "Large Storefront",
+      palette: { brand: "#223344" },
+      screens: [
+        { id: "home", children },
+        { id: "products", children },
+      ],
+    });
+    expect(generatedOutput.length).toBeGreaterThan(2 * 1_024 * 1_024);
+    const harness = await createHarness({ generatedOutput, temporaryDirectory });
+    try {
+      const token = await authorizeAndDiscover(harness);
+      await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+      const response = await request(harness.handle, "/v1/design", {
+        token,
+        body: {
+          requestId: "req-multi-megabyte",
+          model: "account-model",
+          request: {
+            prompt: "Create a polished storefront with a home and product screen.",
+            target: "mobile",
+            screenCount: 2,
+            screenNames: ["Home", "Products"],
+            language: "en",
+            style: "",
+          },
+        },
+      });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe(generatedOutput);
+      expect(response.headers.get("x-fad-response-bytes")).toBe(
+        String(Buffer.byteLength(generatedOutput)),
+      );
+      await vi.waitFor(async () => expect(await readdir(temporaryDirectory)).toEqual([]));
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("rejects a design stream EOF, cleans the partial spool, and permits one same-screen retry", async () => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "fad-eof-retry-test-"));
+    const generatedOutput = JSON.stringify({
+      projectName: "Resumable Store",
+      palette: { brand: "#223344" },
+      screens: [{ id: "screen-home", children: [] }],
+    });
+    const harness = await createHarness({
+      generatedOutput,
+      incompleteGeneratedStreams: 1,
+      temporaryDirectory,
+    });
+    try {
+      const token = await authorizeAndDiscover(harness);
+      await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+      const body = {
+        requestId: "req-screen-eof-retry",
+        model: "account-model",
+        request: {
+          prompt: "Create a polished mobile storefront with home and cart screens.",
+          target: "mobile",
+          screenCount: 2,
+          screenNames: ["Home", "Cart"],
+          language: "en",
+          style: "",
+        },
+      };
+
+      const incomplete = await request(harness.handle, "/v1/design", { token, body });
+      expect(incomplete.status).toBe(502);
+      const errorBody = await incomplete.json();
+      expect(errorBody).toMatchObject({
+        error: "response_incomplete",
+        diagnostic: {
+          outcome: "stream_ended_without_terminal",
+          lastEvent: "response.output_text.delta",
+          generatedBytes: Buffer.byteLength(generatedOutput),
+        },
+      });
+      expect(JSON.stringify(errorBody)).not.toContain(generatedOutput);
+
+      // Retry as soon as the 502 is received; the active-generation lock must already be released.
+      const retried = await request(harness.handle, "/v1/design", { token, body });
+      expect(retried.status).toBe(200);
+      expect(await retried.text()).toBe(generatedOutput);
+      expect(retried.headers.get("x-fad-request-id")).toBe(body.requestId);
+      await vi.waitFor(async () => expect(await readdir(temporaryDirectory)).toEqual([]));
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("blocks a third same-phase request after the single clean-EOF retry is exhausted", async () => {
+    const harness = await createHarness({
+      generatedOutput: '{"screens":[]}',
+      incompleteGeneratedStreams: 2,
+    });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const body = {
+      requestId: "req-screen-eof-limit",
+      model: "account-model",
+      request: {
+        prompt: "Create a polished mobile storefront with home and cart screens.",
+        target: "mobile",
+        screenCount: 2,
+        screenNames: ["Home", "Cart"],
+        language: "en",
+        style: "",
+      },
+    };
+
+    const first = await request(harness.handle, "/v1/design", { token, body });
+    expect(first.status).toBe(502);
+    expect((await first.json()).diagnostic).toMatchObject({
+      outcome: "stream_ended_without_terminal",
+    });
+    const retry = await request(harness.handle, "/v1/design", { token, body });
+    expect(retry.status).toBe(502);
+    expect((await retry.json()).diagnostic).toMatchObject({
+      outcome: "stream_ended_without_terminal",
+    });
+
+    const third = await request(harness.handle, "/v1/design", { token, body });
+    expect(third.status).toBe(409);
+    expect(await third.json()).toMatchObject({ error: "generation_retry_limit" });
+  }, 20_000);
+
+  it("cancels an in-progress large spool and removes its partial output", async () => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "fad-cancel-spool-test-"));
+    const generatedOutput = JSON.stringify({ content: "Large output ".repeat(100_000) });
+    const harness = await createHarness({
+      generatedOutput,
+      temporaryDirectory,
+      stallAfterGeneratedDelta: true,
+    });
+    try {
+      const token = await authorizeAndDiscover(harness);
+      await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+      const controller = new AbortController();
+      const pending = request(harness.handle, "/v1/design", {
+        token,
+        signal: controller.signal,
+        body: {
+          requestId: "req-cancel-large-spool",
+          model: "account-model",
+          request: {
+            prompt: "Create a polished storefront with a home and cart screen.",
+            target: "mobile",
+            screenCount: 2,
+            screenNames: ["Home", "Cart"],
+            language: "en",
+            style: "",
+          },
+        },
+      });
+      await harness.waitForResponseStream();
+      await vi.waitFor(async () => {
+        const directories = await readdir(temporaryDirectory);
+        expect(directories).toHaveLength(1);
+        const spoolPath = join(temporaryDirectory, directories[0]!, "design.json");
+        expect((await stat(spoolPath)).size).toBeGreaterThan(0);
+      });
+      controller.abort();
+      await expect(pending).rejects.toBeDefined();
+      await vi.waitFor(() => expect(harness.wasResponseStreamCancelled()).toBe(true));
+      await vi.waitFor(async () => expect(await readdir(temporaryDirectory)).toEqual([]));
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it("cancels an in-flight design stream when the paired UI aborts", async () => {
     const harness = await createHarness();
@@ -1162,8 +1804,21 @@ async function createHarness(
     modelsUnauthorized?: boolean;
     usageFailure?: boolean;
     stalledStream?: boolean;
+    stallAfterGeneratedDelta?: boolean;
+    timeoutGeneratedStreams?: number;
+    progressingGeneratedStream?: boolean;
+    stallDesignHeaders?: boolean;
+    incompleteGeneratedStreams?: number;
     generatedOutput?: string;
+    responseChunks?: string[];
+    responsesHttpError?: { status: number; body: unknown };
+    responsesFetchFailure?: boolean;
+    accountModel?: string;
+    requestTimeoutMs?: number;
+    streamIdleTimeoutMs?: number;
+    streamOverallTimeoutMs?: number;
     oauthBrowserFailures?: number;
+    temporaryDirectory?: string;
   } = {},
 ) {
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -1257,13 +1912,27 @@ async function createHarness(
       }
       return Response.json({
         models: [
-          { slug: "account-model", display_name: "Account Model", visibility: "list" },
+          {
+            slug: options.accountModel ?? "account-model",
+            display_name: options.accountModel ?? "Account Model",
+            visibility: "list",
+          },
           { slug: "hidden-model", display_name: "Hidden Model", visibility: "private" },
         ],
       });
     }
     if (url === "https://api.openai.com/v1/responses") {
       responsesRequest = { body: String(init?.body ?? ""), headers: init?.headers ?? {} };
+      if (options.responsesFetchFailure) throw new TypeError("private transport failure text");
+      if (options.stallDesignHeaders && JSON.parse(String(init?.body ?? "")).text) {
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      }
       if (options.stalledStream || stallNextResponses) {
         stallNextResponses = false;
         return new Response(
@@ -1278,6 +1947,11 @@ async function createHarness(
           { status: 200, headers: { "Content-Type": "text/event-stream" } },
         );
       }
+      if (options.responsesHttpError) {
+        return Response.json(options.responsesHttpError.body, {
+          status: options.responsesHttpError.status,
+        });
+      }
       if (options.usageFailure || nextResponsesUsageFailure) {
         nextResponsesUsageFailure = false;
         return new Response(
@@ -1288,8 +1962,78 @@ async function createHarness(
           { status: 200, headers: { "Content-Type": "text/event-stream" } },
         );
       }
+      if (options.responseChunks) {
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              for (const chunk of options.responseChunks ?? []) {
+                controller.enqueue(encoder.encode(chunk));
+              }
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        );
+      }
       const responsePayload = JSON.parse(String(init?.body ?? "")) as { text?: unknown };
       const outputText = responsePayload.text ? (options.generatedOutput ?? "{}") : "OK";
+      if ((options.incompleteGeneratedStreams ?? 0) > 0 && responsePayload.text) {
+        options.incompleteGeneratedStreams = (options.incompleteGeneratedStreams ?? 0) - 1;
+        return new Response(
+          `data: ${JSON.stringify({ type: "response.output_text.delta", delta: outputText })}\n\n`,
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        );
+      }
+      if (options.progressingGeneratedStream && responsePayload.text) {
+        const encoder = new TextEncoder();
+        let interval: ReturnType<typeof setInterval> | undefined;
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              const enqueueDelta = () =>
+                controller.enqueue(
+                  encoder.encode(
+                    `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "x" })}\n\n`,
+                  ),
+                );
+              enqueueDelta();
+              interval = setInterval(enqueueDelta, 20);
+              markResponseStreamStarted();
+            },
+            cancel() {
+              if (interval) clearInterval(interval);
+              responseStreamCancelled = true;
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        );
+      }
+      if (
+        ((options.timeoutGeneratedStreams ?? 0) > 0 || options.stallAfterGeneratedDelta) &&
+        responsePayload.text
+      ) {
+        if ((options.timeoutGeneratedStreams ?? 0) > 0) {
+          options.timeoutGeneratedStreams = (options.timeoutGeneratedStreams ?? 0) - 1;
+        }
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ type: "response.output_text.delta", delta: outputText })}\n\n`,
+                ),
+              );
+              markResponseStreamStarted();
+            },
+            cancel() {
+              responseStreamCancelled = true;
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        );
+      }
       return new Response(
         [
           `data: ${JSON.stringify({ type: "response.output_text.delta", delta: outputText })}\n\n`,
@@ -1307,6 +2051,14 @@ async function createHarness(
       installationStore: store,
       credentialStore,
       now: () => currentTime,
+      ...(options.temporaryDirectory ? { temporaryDirectory: options.temporaryDirectory } : {}),
+      ...(options.requestTimeoutMs ? { requestTimeoutMs: options.requestTimeoutMs } : {}),
+      ...(options.streamIdleTimeoutMs !== undefined
+        ? { streamIdleTimeoutMs: options.streamIdleTimeoutMs }
+        : {}),
+      ...(options.streamOverallTimeoutMs !== undefined
+        ? { streamOverallTimeoutMs: options.streamOverallTimeoutMs }
+        : {}),
       openBrowser: async (url) => {
         openedUrl = url;
         const parsedUrl = new URL(url);
@@ -1399,6 +2151,17 @@ async function createHarness(
 
 async function completeLogin(harness: Awaited<ReturnType<typeof createHarness>>) {
   await harness.completeLogin(harness);
+}
+
+async function authorizeAndDiscover(
+  harness: Awaited<ReturnType<typeof createHarness>>,
+): Promise<string> {
+  const token = await harness.pair();
+  await request(harness.handle, "/v1/auth/start", { token, body: {} });
+  await completeLogin(harness);
+  const models = await request(harness.handle, "/v1/models", { token, body: {} });
+  expect(models.status).toBe(200);
+  return token;
 }
 
 async function request(

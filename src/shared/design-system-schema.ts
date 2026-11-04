@@ -1,7 +1,5 @@
 import { z } from "zod";
 
-export const MAX_DESIGN_SYSTEM_TOKEN_COUNT = 200;
-
 export interface TokenReference {
   token: string;
 }
@@ -57,14 +55,14 @@ const typographyTokenSchema = z
 
 const spacingSchema = z
   .object({
-    scale: z.array(z.number().finite().min(0).max(1_000)).max(64),
+    scale: z.array(z.number().finite().min(0).max(1_000)),
     aliases: z.record(tokenNameSchema, spacingValueSchema).default({}),
   })
   .strict();
 
 const radiiSchema = z
   .object({
-    scale: z.array(z.number().finite().min(0).max(5_000)).max(64),
+    scale: z.array(z.number().finite().min(0).max(5_000)),
     aliases: z.record(tokenNameSchema, radiusValueSchema).default({}),
   })
   .strict();
@@ -88,24 +86,7 @@ export const DesignSystemTokensSchema = z
     radii: radiiSchema.optional(),
     borders: z.record(tokenNameSchema, borderSchema).default({}),
   })
-  .strict()
-  .superRefine((value, context) => {
-    const tokenCount =
-      Object.keys(value.colors).length +
-      Object.keys(value.typography).length +
-      (value.spacing?.scale.length ?? 0) +
-      Object.keys(value.spacing?.aliases ?? {}).length +
-      (value.radii?.scale.length ?? 0) +
-      Object.keys(value.radii?.aliases ?? {}).length +
-      Object.keys(value.borders).length;
-    if (tokenCount > MAX_DESIGN_SYSTEM_TOKEN_COUNT) {
-      context.addIssue({
-        code: "custom",
-        message: `Design system has ${tokenCount} tokens; the limit is ${MAX_DESIGN_SYSTEM_TOKEN_COUNT}.`,
-        path: [],
-      });
-    }
-  });
+  .strict();
 
 export type DesignSystemTokens = z.infer<typeof DesignSystemTokensSchema>;
 

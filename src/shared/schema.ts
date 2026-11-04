@@ -18,10 +18,7 @@ import {
 import { isFigmaPathData } from "./visual-assets";
 
 export const DESIGN_SCHEMA_VERSION = "1.0.0";
-export const MAX_JSON_LENGTH = 1_000_000;
 export const MAX_NESTING_DEPTH = 8;
-export const MAX_NODE_COUNT = 500;
-export const MAX_COMPONENT_COUNT = 50;
 
 export type SizingMode = "fixed" | "hug" | "fill";
 export type AxisSizing = { width: SizingMode; height: SizingMode };
@@ -437,7 +434,7 @@ const FrameNodeSchema = z
     stroke: strokeSchema.optional(),
     cornerRadius: radiusValueSchema.optional(),
     cornerRadii: cornerRadiiSchema.optional(),
-    children: z.array(DesignNodeSchema).max(250),
+    children: z.array(DesignNodeSchema),
     layout: LayoutSchema.optional(),
     sizing: sizingSchema.optional(),
   })
@@ -462,14 +459,14 @@ export const ComponentDefinitionSchema: z.ZodType<ComponentDefinitionSpec> = z
     stroke: strokeSchema.optional(),
     cornerRadius: radiusValueSchema.optional(),
     cornerRadii: cornerRadiiSchema.optional(),
-    children: z.array(DesignNodeSchema).max(250),
+    children: z.array(DesignNodeSchema),
     layout: LayoutSchema.optional(),
     sizing: sizingSchema.optional(),
   })
   .strict();
 
 export const DesignSystemSchema = DesignSystemTokensSchema.extend({
-  components: z.array(ComponentDefinitionSchema).max(MAX_COMPONENT_COUNT).optional(),
+  components: z.array(ComponentDefinitionSchema).optional(),
 });
 
 export const DesignSchema: z.ZodType<DesignSpec> = z
@@ -483,9 +480,9 @@ export const DesignSchema: z.ZodType<DesignSpec> = z
         width: dimensionSchema,
         height: dimensionSchema,
         background: nodeColorSchema,
-        children: z.array(DesignNodeSchema).max(250),
+        children: z.array(DesignNodeSchema),
         layout: LayoutSchema.optional(),
-        components: z.array(ComponentDefinitionSchema).max(MAX_COMPONENT_COUNT).optional(),
+        components: z.array(ComponentDefinitionSchema).optional(),
       })
       .strict(),
   })
@@ -829,8 +826,6 @@ function validateSemantics(spec: DesignSpec): string[] {
   ];
   const componentById = new Map(components.map((component) => [component.id, component]));
   const ids = new Set<string>();
-  let nodeCount = 1;
-
   const checkLayout = (layout: LayoutSpec | undefined, path: string) => {
     if (layout?.counterAxisAlign === "baseline" && layout.mode !== "horizontal") {
       errors.push(`${path}.counterAxisAlign baseline is supported only for horizontal layouts.`);
@@ -847,7 +842,6 @@ function validateSemantics(spec: DesignSpec): string[] {
     for (let index = 0; index < nodes.length; index++) {
       const node = nodes[index];
       const nodePath = `${path}[${index}]`;
-      nodeCount++;
       if (depth > MAX_NESTING_DEPTH) {
         errors.push(`${nodePath} exceeds the maximum nesting depth of ${MAX_NESTING_DEPTH}.`);
       }
@@ -943,12 +937,8 @@ function validateSemantics(spec: DesignSpec): string[] {
     "document.children",
   );
 
-  if (components.length > MAX_COMPONENT_COUNT) {
-    errors.push(`document.components may contain at most ${MAX_COMPONENT_COUNT} definitions.`);
-  }
   for (let index = 0; index < components.length; index++) {
     const component = components[index];
-    nodeCount++;
     const legacyComponentCount = spec.document.components?.length ?? 0;
     const path =
       index < legacyComponentCount
@@ -1039,9 +1029,6 @@ function validateSemantics(spec: DesignSpec): string[] {
       const nodePath = `${path}[${index}]`;
       if (node.type === "image" && !assetById.has(node.assetId)) {
         errors.push(`${nodePath}.assetId references missing asset “${node.assetId}”.`);
-      } else if (node.type === "image" && assetById.get(node.assetId)?.kind === "svg-paths") {
-        nodeCount += (assetById.get(node.assetId) as Extract<VisualAsset, { kind: "svg-paths" }>)
-          .paths.length;
       }
       if (node.type === "frame") checkAssetRefs(node.children, `${nodePath}.children`);
     });
@@ -1056,11 +1043,6 @@ function validateSemantics(spec: DesignSpec): string[] {
     checkAssetRefs(component.children, path);
   }
 
-  if (nodeCount > MAX_NODE_COUNT) {
-    errors.push(
-      `The design contains ${nodeCount} nodes; Phase 2 allows at most ${MAX_NODE_COUNT}.`,
-    );
-  }
   errors.push(...validateDesignSystemReferences(spec));
   return [...new Set(errors)].slice(0, 100);
 }
@@ -1119,75 +1101,57 @@ function checkRawTreeLimits(value: unknown): string[] {
   const document = (value as Record<string, unknown>).document;
   if (typeof document !== "object" || document === null || Array.isArray(document)) return [];
   const record = document as Record<string, unknown>;
-  const stack: Array<{ node: unknown; depth: number; path: string }> = [];
   const rawDesignSystem = (value as Record<string, unknown>).designSystem;
   const systemComponents =
     typeof rawDesignSystem === "object" && rawDesignSystem !== null
       ? (rawDesignSystem as Record<string, unknown>).components
       : undefined;
-  const components = [
-    ...(Array.isArray(record.components) ? record.components : []),
-    ...(Array.isArray(systemComponents) ? systemComponents : []),
-  ];
-  let count = 1;
   const seen = new WeakSet<object>();
   const errors: string[] = [];
-  const addChildren = (nodes: unknown, depth: number, path: string) => {
+  const visit = (nodes: unknown, depth: number, path: string) => {
     if (!Array.isArray(nodes)) return;
-    for (let index = nodes.length - 1; index >= 0; index--) {
-      stack.push({ node: nodes[index], depth, path: `${path}[${index}]` });
+    for (let index = 0; index < nodes.length; index++) {
+      const node = nodes[index];
+      const nodePath = `${path}[${index}]`;
+      if (depth > MAX_NESTING_DEPTH) {
+        if (errors.length < 100) {
+          errors.push(`${nodePath} exceeds the maximum nesting depth of ${MAX_NESTING_DEPTH}.`);
+        }
+        continue;
+      }
+      if (typeof node !== "object" || node === null || Array.isArray(node)) continue;
+      if (seen.has(node)) {
+        if (errors.length < 100) {
+          errors.push(
+            `${nodePath} reuses a node object; design trees must not contain cycles or shared node objects.`,
+          );
+        }
+        continue;
+      }
+      seen.add(node);
+      if ((node as Record<string, unknown>).type === "frame") {
+        visit((node as Record<string, unknown>).children, depth + 1, `${nodePath}.children`);
+      }
     }
   };
 
-  addChildren(record.children, 1, "document.children");
-  for (let index = components.length - 1; index >= 0; index--) {
-    const component = components[index];
-    count++;
-    if (typeof component === "object" && component !== null && !Array.isArray(component)) {
-      const componentRecord = component as Record<string, unknown>;
-      const source =
-        index < (Array.isArray(record.components) ? record.components.length : 0)
-          ? "document.components"
-          : "designSystem.components";
-      addChildren(componentRecord.children, 1, `${source}[${index}].children`);
+  visit(record.children, 1, "document.children");
+  for (const [source, definitions] of [
+    ["document.components", record.components],
+    ["designSystem.components", systemComponents],
+  ] as const) {
+    if (!Array.isArray(definitions)) continue;
+    for (let index = 0; index < definitions.length; index++) {
+      const component = definitions[index];
+      if (typeof component === "object" && component !== null && !Array.isArray(component)) {
+        visit((component as Record<string, unknown>).children, 1, `${source}[${index}].children`);
+      }
     }
   }
-
-  while (stack.length && count <= MAX_NODE_COUNT) {
-    const item = stack.pop()!;
-    if (item.depth > MAX_NESTING_DEPTH) {
-      errors.push(`${item.path} exceeds the maximum nesting depth of ${MAX_NESTING_DEPTH}.`);
-      continue;
-    }
-    if (typeof item.node !== "object" || item.node === null || Array.isArray(item.node)) continue;
-    if (seen.has(item.node)) {
-      errors.push(
-        `${item.path} reuses a node object; design trees must not contain cycles or shared node objects.`,
-      );
-      continue;
-    }
-    seen.add(item.node);
-    count++;
-    const node = item.node as Record<string, unknown>;
-    if (node.type === "frame") addChildren(node.children, item.depth + 1, `${item.path}.children`);
-  }
-  if (count > MAX_NODE_COUNT) {
-    errors.push(
-      `The design contains more than ${MAX_NODE_COUNT} nodes; Phase 2 allows at most ${MAX_NODE_COUNT}.`,
-    );
-  }
-  return [...new Set(errors)].slice(0, 100);
+  return [...new Set(errors)];
 }
 
 export function parseDesignText(source: string): DesignParseResult {
-  if (source.length > MAX_JSON_LENGTH) {
-    return {
-      success: false,
-      errors: [
-        `JSON is larger than ${MAX_JSON_LENGTH.toLocaleString()} characters. Reduce the document size and try again.`,
-      ],
-    };
-  }
   let value: unknown;
   try {
     value = JSON.parse(source) as unknown;

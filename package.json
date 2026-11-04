@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "companion": "tsc -p tsconfig.companion.json && node dist-companion/main.js",
+    "companion": "tsc -p tsconfig.companion.json && node dist-companion/companion/main.js",
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0",

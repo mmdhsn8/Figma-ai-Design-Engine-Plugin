@@ -1,11 +1,29 @@
 import { spawn } from "node:child_process";
-import { COMPANION_HOSTNAME, COMPANION_PORT } from "./config.js";
+import {
+  COMPANION_HOSTNAME,
+  COMPANION_PORT,
+  configuredTimeoutMs,
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  DEFAULT_STREAM_OVERALL_TIMEOUT_MS,
+  MAX_STREAM_IDLE_TIMEOUT_MS,
+  MAX_STREAM_OVERALL_TIMEOUT_MS,
+} from "./config.js";
 import { createCredentialStore } from "./credential-store.js";
 import { createInstallationStore } from "./installation-store.js";
 import { createCompanionServer } from "./server.js";
 
 const companion = createCompanionServer({
   port: COMPANION_PORT,
+  streamIdleTimeoutMs: configuredTimeoutMs(
+    process.env.FAD_STREAM_IDLE_TIMEOUT_MS,
+    DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    MAX_STREAM_IDLE_TIMEOUT_MS,
+  ),
+  streamOverallTimeoutMs: configuredTimeoutMs(
+    process.env.FAD_STREAM_OVERALL_TIMEOUT_MS,
+    DEFAULT_STREAM_OVERALL_TIMEOUT_MS,
+    MAX_STREAM_OVERALL_TIMEOUT_MS,
+  ),
   installationStore: createInstallationStore(),
   credentialStore: createCredentialStore(),
   openBrowser: openSystemBrowser,
