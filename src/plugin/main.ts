@@ -5,9 +5,11 @@ import type { DesignSpec } from "../shared/schema";
 import type { MultiScreenSpec } from "../shared/multi-screen-schema";
 import { renderDesign, renderMultiScreenDesign } from "./renderer";
 import { collectFontRequirements, unavailableFontWarnings } from "./font-preflight";
+import { createGenerationController } from "./generation-controller";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
 const COMPANION_RESTORE_TICKET_KEY = "companion-restore-ticket-v1";
+const generationController = createGenerationController(figma);
 
 function send(message: PluginToUIMessage): void {
   figma.ui.postMessage(message);
@@ -34,6 +36,15 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       type: "protocol-error",
       message: "The plugin received an invalid request. Reload the plugin and try again.",
     });
+    return;
+  }
+  if (
+    message.data.type === "generation-context" ||
+    message.data.type === "generation-remember" ||
+    message.data.type === "generation-render" ||
+    message.data.type === "generation-select"
+  ) {
+    send(await generationController(message.data));
     return;
   }
 

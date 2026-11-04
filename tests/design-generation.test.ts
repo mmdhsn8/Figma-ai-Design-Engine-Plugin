@@ -5,6 +5,8 @@ import {
   createDesignPlan,
   createDesignInstructions,
   normalizeGeneratedDesignResponse,
+  generationRepairTargets,
+  applyGenerationRepair,
   validateGeneratedDesignResponse,
   type DesignGenerationRequest,
   type GeneratedDesign,
@@ -386,13 +388,13 @@ describe("brief planner and constrained design generation", () => {
     expect(completed[0]).toBe(saved[0]);
   });
 
-  it("does not normalize invalid schemas, desktop controls, or unsafe text targets", () => {
+  it("does not normalize invalid schemas or desktop controls", () => {
     const plan = planFor(request({ screenNames: ["Home", "Detail"] }));
     const generated = generatedResponse(plan.screens.map(({ id }) => id));
     generated.screens[0]!.children = [
       { ...textNode("خرید"), width: 20, height: 20, qualityRole: "button" },
     ];
-    expect(normalizeGeneratedDesignResponse(JSON.stringify(generated), plan).success).toBe(false);
+    expect(normalizeGeneratedDesignResponse(JSON.stringify(generated), plan).success).toBe(true);
     expect(
       normalizeGeneratedDesignResponse(JSON.stringify({ ...generated, script: "bad" }), plan)
         .success,
@@ -402,6 +404,44 @@ describe("brief planner and constrained design generation", () => {
       false,
     );
   });
+
+  it.each([1, 2, 3, 4, 5, 6])(
+    "repairs a text button at nesting depth %i without changing Persian copy",
+    (depth) => {
+      const plan = planFor(request({ screenNames: ["Home", "Detail"], language: "fa" }));
+      const generated = generatedResponse(plan.screens.map(({ id }) => id));
+      let control: GeneratedDesignNode = {
+        ...textNode("خرید"),
+        name: "خرید",
+        width: 24,
+        height: 24,
+        qualityRole: "button",
+        textAlign: "right",
+      };
+      for (let index = 0; index < depth; index++)
+        control = {
+          ...control,
+          type: "frame",
+          text: null,
+          qualityRole: "decorative",
+          layout: index % 2 ? "horizontal" : "vertical",
+          width: 200,
+          height: 200,
+          padding: 0,
+          gap: 8,
+          children: [control],
+        };
+      generated.screens[1]!.children = [control];
+      const normalized = normalizeGeneratedDesignResponse(JSON.stringify(generated), plan);
+      expect(normalized.success).toBe(true);
+      if (!normalized.success) return;
+      expect(
+        normalizeGeneratedDesignResponse(JSON.stringify(normalized.data.design), plan),
+      ).toEqual(normalized);
+      const prepared = prepareGeneratedDesign(JSON.stringify(normalized.data.design), plan);
+      expect(prepared.success).toBe(true);
+    },
+  );
 
   it("rejects controls whose nominal size is safe but parent stretch shrinks the touch target", () => {
     const plan = planFor(request({ screenNames: ["Home", "Detail"] }));
@@ -433,6 +473,74 @@ describe("brief planner and constrained design generation", () => {
       errors: [
         "screens.detail.children[0].children[0] button is below the 44 px minimum tap target.",
       ],
+    });
+  });
+
+  it("applies only exact targeted replacements and refuses role removal or copy changes", () => {
+    const plan = planFor(request({ screenNames: ["Home", "Detail"] }));
+    const generated = generatedResponse(plan.screens.map(({ id }) => id));
+    const target = { ...textNode("خرید"), width: 20, height: 20, qualityRole: "button" as const };
+    generated.screens[1]!.children = [target];
+    const raw = JSON.stringify(generated);
+    const targets = generationRepairTargets(raw, [
+      "screens.detail.children[0] button is below the 44 px minimum tap target.",
+    ]);
+    expect(targets).toHaveLength(1);
+    const repaired = JSON.parse(
+      applyGenerationRepair(
+        raw,
+        targets,
+        JSON.stringify({ nodes: [{ ...target, width: 44, height: 44 }] }),
+      ),
+    );
+    expect(repaired.screens[0]).toEqual(generated.screens[0]);
+    expect(repaired.screens[1].children[0]).toMatchObject({
+      width: 44,
+      height: 44,
+      text: "خرید",
+      qualityRole: "button",
+    });
+    expect(() =>
+      applyGenerationRepair(
+        raw,
+        targets,
+        JSON.stringify({ nodes: [{ ...target, qualityRole: "decorative" }] }),
+      ),
+    ).toThrow("semantics");
+    expect(() =>
+      applyGenerationRepair(
+        raw,
+        targets,
+        JSON.stringify({ nodes: [{ ...target, text: "changed" }] }),
+      ),
+    ).toThrow("copy");
+  });
+
+  it("does not hide depth-limit failures when a text target needs a hit-area wrapper", () => {
+    const plan = planFor(request({ screenNames: ["Home", "Detail"] }));
+    const generated = generatedResponse(plan.screens.map(({ id }) => id));
+    let node: GeneratedDesignNode = {
+      ...textNode("خرید"),
+      width: 20,
+      height: 20,
+      qualityRole: "button",
+    };
+    for (let depth = 0; depth < 7; depth++)
+      node = {
+        ...node,
+        type: "frame",
+        text: null,
+        qualityRole: "decorative",
+        layout: "vertical",
+        width: 200,
+        height: 200,
+        padding: 0,
+        children: [node],
+      };
+    generated.screens[1]!.children = [node];
+    expect(normalizeGeneratedDesignResponse(JSON.stringify(generated), plan)).toMatchObject({
+      success: false,
+      errors: [expect.stringContaining("eight-level nesting limit")],
     });
   });
 

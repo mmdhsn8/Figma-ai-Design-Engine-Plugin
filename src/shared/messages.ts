@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DraftIdentitySchema, DraftManifestSchema } from "./generation-draft";
 
 const RequestSchema = z.object({
   requestId: z.string().min(1).max(100),
@@ -60,6 +61,7 @@ const MultiScreenCountsSchema = z
   .strict();
 
 const MultiScreenResultScreenSchema = MultiScreenPreviewScreenSchema.extend({
+  nodeId: z.string().optional(),
   status: z.enum(["generated", "failed"]),
   frameName: z.string().optional(),
   counts: CountsSchema,
@@ -102,6 +104,29 @@ const MultiScreenRenderResultSchema = z
   .strict();
 
 export const UIToPluginSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("generation-select"),
+      requestId: z.string().max(100),
+      generationId: DraftIdentitySchema,
+    })
+    .strict(),
+  z.object({ type: z.literal("generation-context"), requestId: z.string().max(100) }).strict(),
+  z
+    .object({
+      type: z.literal("generation-remember"),
+      requestId: z.string().max(100),
+      generationId: DraftIdentitySchema.nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("generation-render"),
+      requestId: z.string().max(100),
+      manifest: DraftManifestSchema,
+      design: z.unknown(),
+    })
+    .strict(),
   z.object({ type: z.literal("load-companion-restore-ticket") }).strict(),
   z
     .object({
@@ -128,6 +153,19 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
 ]);
 
 export const PluginToUISchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("generation-result"),
+      warnings: z.array(z.string().max(500)).max(8).optional(),
+      requestId: z.string(),
+      success: z.boolean(),
+      documentId: z.string().optional(),
+      generationId: z.string().nullable().optional(),
+      nodeId: z.string().optional(),
+      elapsedMs: z.number().nonnegative().optional(),
+      error: z.string().max(500).optional(),
+    })
+    .strict(),
   z
     .object({
       type: z.literal("companion-restore-ticket"),

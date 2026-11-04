@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { COMPANION_BASE_URL } from "../companion/config";
-import type { DesignGenerationRequest } from "../shared/design-generation";
+import { MAX_SCREEN_BYTES } from "../shared/generation-limits";
+import type { DesignGenerationRequest, GenerationRepairTarget } from "../shared/design-generation";
 
 export const COMPANION_URL = COMPANION_BASE_URL;
 
@@ -81,6 +82,8 @@ export const InferenceDiagnosticSchema = z
     generatedBytes: z.number().int().nonnegative().optional(),
     timeoutKind: z.enum(["headers", "idle", "overall"]).optional(),
     elapsedMs: z.number().int().nonnegative().optional(),
+    headersMs: z.number().int().nonnegative().optional(),
+    firstDeltaMs: z.number().int().nonnegative().optional(),
     idleMs: z.number().int().nonnegative().optional(),
     lastEventAgeMs: z.number().int().nonnegative().optional(),
     lastDeltaAgeMs: z.number().int().nonnegative().optional(),
@@ -348,46 +351,115 @@ export async function generateAuthorizedDesign(
   signal?: AbortSignal,
   screenIds?: string[],
   onIncompleteStreamRetry?: () => void,
+  repairTargets?: GenerationRepairTarget[],
+  onMetrics?: (metrics: Record<string, number>) => void,
+  onLiveProgress?: (diagnostic: InferenceDiagnostic) => void,
 ): Promise<string> {
   let retriedIncompleteStream = false;
-  while (true) {
-    if (signal?.aborted) throw new CompanionClientError("request_cancelled");
-    try {
-      const response = await fetchResponse(
-        "/v1/design",
-        token,
-        {
-          requestId,
-          model,
-          request: designRequest,
-          ...(repairIssues.length ? { repairIssues } : {}),
-          ...(screenIds ? { screenIds } : {}),
-        },
-        fetcher,
-        signal,
-      );
-      if (!response.ok) throwResponseError(await readLimitedJson(response, signal));
-      const declaredBytes = Number(response.headers.get("x-fad-response-bytes"));
-      if (
-        response.headers.get("x-fad-request-id") !== requestId ||
-        response.headers.get("x-fad-model") !== model ||
-        response.headers.get("x-fad-completed") !== "response.completed" ||
-        !Number.isSafeInteger(declaredBytes) ||
-        declaredBytes < 1 ||
-        !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")
-      ) {
-        await response.body?.cancel().catch(() => undefined);
-        throw new CompanionClientError("response_incomplete");
-      }
-      return await readGeneratedDesignText(response, declaredBytes, signal);
-    } catch (error) {
-      if (retriedIncompleteStream || signal?.aborted || !isRetryableStreamInterruption(error)) {
-        throw error;
-      }
-      retriedIncompleteStream = true;
-      onIncompleteStreamRetry?.();
+  let polling = true;
+  let pollBusy = false;
+  const timer = onLiveProgress
+    ? setInterval(() => {
+        if (pollBusy) return;
+        pollBusy = true;
+        void fetchResponse(
+          `/v1/progress?requestId=${encodeURIComponent(requestId)}`,
+          token,
+          undefined,
+          fetcher,
+          signal,
+        )
+          .then((response) => readLimitedJson(response, signal))
+          .then((body) => {
+            const parsed = InferenceDiagnosticSchema.safeParse(
+              isRecord(body) ? body.progress : undefined,
+            );
+            if (polling && parsed.success) onLiveProgress(parsed.data);
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            pollBusy = false;
+          });
+      }, 1000)
+    : undefined;
+  try {
+    while (true) {
       if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+      try {
+        const response = await fetchResponse(
+          "/v1/design",
+          token,
+          {
+            requestId,
+            model,
+            request: designRequest,
+            ...(repairIssues.length ? { repairIssues } : {}),
+            ...(screenIds ? { screenIds } : {}),
+            ...(repairTargets?.length ? { repairTargets } : {}),
+          },
+          fetcher,
+          signal,
+        );
+        if (!response.ok) throwResponseError(await readLimitedJson(response, signal));
+        const declaredBytes = Number(response.headers.get("x-fad-response-bytes"));
+        if (declaredBytes > MAX_SCREEN_BYTES) {
+          await response.body?.cancel().catch(() => undefined);
+          throw new CompanionClientError("response_too_large");
+        }
+        if (
+          response.headers.get("x-fad-request-id") !== requestId ||
+          response.headers.get("x-fad-model") !== model ||
+          response.headers.get("x-fad-completed") !== "response.completed" ||
+          !Number.isSafeInteger(declaredBytes) ||
+          declaredBytes < 1 ||
+          !response.headers.get("content-type")?.toLowerCase().startsWith("application/json")
+        ) {
+          await response.body?.cancel().catch(() => undefined);
+          throw new CompanionClientError("response_incomplete");
+        }
+        const text = await readGeneratedDesignText(response, declaredBytes, signal);
+        const metrics: Record<string, number> = {};
+        for (const [key, header] of Object.entries({
+          headersMs: "x-fad-headers-ms",
+          firstDeltaMs: "x-fad-first-delta-ms",
+          upstreamMs: "x-fad-inference-ms",
+          streamBytes: "x-fad-stream-bytes",
+          generatedBytes: "x-fad-response-bytes",
+        })) {
+          const value = response.headers.get(header);
+          if (value !== null && Number.isFinite(Number(value))) metrics[key] = Number(value);
+        }
+        if (metrics.upstreamMs && metrics.generatedBytes !== undefined)
+          metrics.generatedBytesPerSecond = Math.round(
+            (metrics.generatedBytes * 1000) / metrics.upstreamMs,
+          );
+        onMetrics?.(metrics);
+        return text;
+      } catch (error) {
+        if (retriedIncompleteStream || signal?.aborted || !isRetryableStreamInterruption(error)) {
+          throw error;
+        }
+        retriedIncompleteStream = true;
+        onIncompleteStreamRetry?.();
+        if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+        await new Promise<void>((resolve, reject) => {
+          const abort = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", abort);
+            reject(new CompanionClientError("request_cancelled"));
+          };
+          const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+          }, 250);
+          signal?.addEventListener("abort", abort, { once: true });
+          if (signal?.aborted) abort();
+        });
+      }
     }
+  } finally {
+    polling = false;
+    if (timer) clearInterval(timer);
   }
 }
 
@@ -399,7 +471,7 @@ function isRetryableStreamInterruption(error: unknown): error is CompanionClient
       error.diagnostic.outcome === "stream_ended_without_terminal") ||
     (error.category === "request_timed_out" &&
       error.diagnostic.outcome === "timed_out" &&
-      (error.diagnostic.timeoutKind === "idle" || error.diagnostic.timeoutKind === "overall"))
+      error.diagnostic.timeoutKind === "idle")
   );
 }
 

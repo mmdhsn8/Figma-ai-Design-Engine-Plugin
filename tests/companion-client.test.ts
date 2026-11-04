@@ -513,7 +513,7 @@ describe("Figma UI companion client", () => {
             stage: "stream",
             outcome: "timed_out",
             httpStatus: 200,
-            timeoutKind: "overall",
+            timeoutKind: "idle",
             elapsedMs: 300_000,
             idleMs: 15,
             lastDeltaAgeMs: 15,
@@ -622,31 +622,33 @@ describe("Figma UI companion client", () => {
     ).rejects.toMatchObject({ category: "request_cancelled" });
     expect(cancelledFetcher).toHaveBeenCalledOnce();
 
-    const headerTimeoutFetcher = vi.fn<typeof fetch>(async () =>
-      Response.json(
-        {
-          error: "request_timed_out",
-          diagnostic: {
-            model: "account-model",
-            stage: "http",
-            outcome: "timed_out",
-            timeoutKind: "overall",
+    for (const stage of ["http", "stream"]) {
+      const headerTimeoutFetcher = vi.fn<typeof fetch>(async () =>
+        Response.json(
+          {
+            error: "request_timed_out",
+            diagnostic: {
+              model: "account-model",
+              stage,
+              outcome: "timed_out",
+              timeoutKind: "overall",
+            },
           },
-        },
-        { status: 502 },
-      ),
-    );
-    await expect(
-      generateAuthorizedDesign(
-        "session-bearer",
-        "req-header-timeout",
-        "account-model",
-        designRequest,
-        [],
-        headerTimeoutFetcher,
-      ),
-    ).rejects.toMatchObject({ category: "request_timed_out" });
-    expect(headerTimeoutFetcher).toHaveBeenCalledOnce();
+          { status: 502 },
+        ),
+      );
+      await expect(
+        generateAuthorizedDesign(
+          "session-bearer",
+          "req-header-timeout",
+          "account-model",
+          designRequest,
+          [],
+          headerTimeoutFetcher,
+        ),
+      ).rejects.toMatchObject({ category: "request_timed_out" });
+      expect(headerTimeoutFetcher).toHaveBeenCalledOnce();
+    }
   });
 
   it("accepts multi-megabyte streamed JSON split at arbitrary byte boundaries", async () => {

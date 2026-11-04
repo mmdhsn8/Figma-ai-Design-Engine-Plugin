@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_PROJECT_BYTES, MAX_GENERATED_NODES, utf8Bytes } from "./generation-limits.js";
 
 export const GENERATED_NODE_ROLES = [
   "brand",
@@ -15,7 +16,11 @@ export const DesignGenerationRequestSchema = z
   .object({
     prompt: z.string().trim().min(10),
     target: z.enum(["mobile", "desktop", "both"]),
-    screenCount: z.number().int().min(2),
+    screenCount: z
+      .number()
+      .int()
+      .min(2)
+      .max(200, "A project supports at most 200 screen families; split larger work into projects."),
     screenNames: z.array(z.string().trim().min(1).max(100)).optional(),
     language: z.enum(["auto", "fa", "en"]),
     style: z.string().trim().max(160),
@@ -377,6 +382,71 @@ const GeneratedDesignSchema = z
   .strict();
 
 export type GeneratedDesign = z.infer<typeof GeneratedDesignSchema>;
+export type GenerationRepairTarget = { path: string; node: GeneratedDesignNode };
+
+export function generationRepairTargets(raw: string, errors: string[]): GenerationRepairTarget[] {
+  let design: GeneratedDesign;
+  try {
+    design = JSON.parse(raw) as GeneratedDesign;
+  } catch {
+    return [];
+  }
+  const targets: GenerationRepairTarget[] = [];
+  for (const error of errors.slice(0, 8)) {
+    const match =
+      /^(screens\.([a-z0-9._-]+)((?:\.children\[\d+\])+)) (?:button|input) (?:is below|does not fit)/u.exec(
+        error,
+      );
+    if (!match) continue;
+    let children = design.screens.find(({ id }) => id === match[2])?.children;
+    let node: GeneratedDesignNode | undefined;
+    for (const index of match[3]!.matchAll(/\[(\d+)\]/gu)) {
+      node = children?.[Number(index[1])];
+      children = node?.children;
+    }
+    if (node && !targets.some(({ path }) => path === match[1]))
+      targets.push({ path: match[1]!, node });
+  }
+  if (utf8Bytes(JSON.stringify(targets)) > 4096) return [];
+  return targets;
+}
+
+export function applyGenerationRepair(
+  raw: string,
+  targets: GenerationRepairTarget[],
+  repair: string,
+): string {
+  const value = JSON.parse(repair);
+  if (hasExcessiveGeneratedDepth({ screens: [{ children: value?.nodes }] }))
+    throw new Error("Targeted repair exceeds the nesting safety limit.");
+  const parsed = z
+    .object({ nodes: z.array(NodeSchema).length(targets.length) })
+    .strict()
+    .safeParse(value);
+  if (!parsed.success)
+    throw new Error(
+      "Targeted repair returned invalid replacement nodes; no saved screens changed.",
+    );
+  const design = JSON.parse(raw) as GeneratedDesign;
+  targets.forEach((target, targetIndex) => {
+    const preservesSemantics = (before: GeneratedDesignNode, after: GeneratedDesignNode): boolean =>
+      before.type === after.type &&
+      before.qualityRole === after.qualityRole &&
+      before.text === after.text &&
+      before.children.length === after.children.length &&
+      before.children.every((child, index) => preservesSemantics(child, after.children[index]!));
+    if (!preservesSemantics(target.node, parsed.data.nodes[targetIndex]!))
+      throw new Error("Targeted repair changed interactive semantics or copy; repair rejected.");
+    const match = /^screens\.([a-z0-9._-]+)((?:\.children\[\d+\])+)$/u.exec(target.path);
+    if (!match) throw new Error("Invalid repair path.");
+    let children = design.screens.find(({ id }) => id === match[1])?.children;
+    const indices = [...match[2]!.matchAll(/\[(\d+)\]/gu)].map((entry) => Number(entry[1]));
+    for (const index of indices.slice(0, -1)) children = children?.[index]?.children;
+    if (!children?.[indices[indices.length - 1]!]) throw new Error("Repair path is missing.");
+    children[indices[indices.length - 1]!] = parsed.data.nodes[targetIndex]!;
+  });
+  return JSON.stringify(design);
+}
 export type GeneratedDesignResult =
   | { success: true; data: { design: GeneratedDesign; nodeCount: number } }
   | { success: false; errors: string[] };
@@ -410,6 +480,11 @@ function parseGeneratedDesignResponse(
   plan: DesignPlan,
   normalize: boolean,
 ): GeneratedDesignResult {
+  if (raw.length > MAX_PROJECT_BYTES || utf8Bytes(raw) > MAX_PROJECT_BYTES)
+    return {
+      success: false,
+      errors: ["Generated JSON exceeds the 64 MiB project safety limit; split the project."],
+    };
   let value: unknown;
   try {
     value = JSON.parse(raw) as unknown;
@@ -461,7 +536,21 @@ function parseGeneratedDesignResponse(
         screen.children = repaired;
       }
     }
-    return validateGeneratedDesignResponse(JSON.stringify(generated), plan);
+    if (hasExcessiveGeneratedDepth(generated))
+      return {
+        success: false,
+        errors: [
+          "Touch-target repair would exceed the eight-level nesting limit. Simplify the affected screen's container hierarchy; no partial screen was saved.",
+        ],
+      };
+    const repairedSchema = GeneratedDesignSchema.safeParse(generated);
+    if (!repairedSchema.success)
+      return {
+        success: false,
+        errors: repairedSchema.error.issues
+          .slice(0, 8)
+          .map((issue) => `${issue.path.join(".")}: ${issue.message}`),
+      };
   }
 
   const issues: string[] = [];
@@ -484,6 +573,8 @@ function parseGeneratedDesignResponse(
       );
     }
   }
+  if (nodeCount > MAX_GENERATED_NODES)
+    issues.push("Generated project exceeds the 100,000-node work budget; split the project.");
   if (issues.length) return { success: false, errors: [...new Set(issues)].slice(0, 12) };
   return { success: true, data: { design: generated, nodeCount } };
 }
@@ -496,9 +587,23 @@ function repairTouchTargets(node: GeneratedDesignNode): GeneratedDesignNode {
   const children = node.children.map(repairTouchTargets);
   let width = node.width;
   let height = node.height;
-  if (isInteractive(node) && node.type !== "text") {
+  if (isInteractive(node)) {
     width = Math.max(44, width);
     height = Math.max(44, height);
+    if (node.type === "text") {
+      return {
+        ...node,
+        type: "frame",
+        text: null,
+        palette: "none",
+        layout: "vertical",
+        gap: 0,
+        padding: 0,
+        width,
+        height: Math.max(height, node.fontSize * 1.5),
+        children: [{ ...node, name: `${node.name} label`, qualityRole: "body", children: [] }],
+      };
+    }
   }
   if (node.type === "frame" && node.layout !== "none" && children.length) {
     const gap = node.gap * (children.length - 1);
@@ -571,6 +676,11 @@ function checkEffectiveTouchTargets(
     const childHeight = layout === "horizontal" ? height : child.height;
     if (isInteractive(child) && (childWidth < 44 || childHeight < 44)) {
       issues.push(`${childPath} ${child.qualityRole} is below the 44 px minimum tap target.`);
+    }
+    if (isInteractive(child) && (childWidth > width || childHeight > height)) {
+      issues.push(
+        `${childPath} ${child.qualityRole} does not fit its constrained parent; preserve the 44×44 px hit area and reflow the parent.`,
+      );
     }
     if (child.type === "frame" && child.layout !== "none") {
       checkEffectiveTouchTargets(
@@ -737,6 +847,7 @@ export function createDesignInstructions(plan: DesignPlan, repairIssues: string[
     `Copy language: ${plan.language === "fa" ? "natural Persian (Farsi)" : "English"}; direction: ${plan.direction.toUpperCase()}. For Persian, write real Persian UI copy (not generic English or transliteration), use culturally appropriate RTL composition, prefer Persian numerals where natural, and label Iranian sample prices in تومان. Keep Latin model names, SKUs, and email-like text readable in mixed direction.`,
     "Use a coherent palette with high contrast, a clear type hierarchy, generous spacing, realistic copy, meaningful screen-specific layouts, and at least 44×44 px button and input targets. Keep controls, padding, and gaps within their Auto Layout parents and screen bounds. Do not use URLs, external assets, fabricated product claims, HTML, code, or image descriptions presented as real photos. Use editable color surfaces and deliberate placeholders instead.",
     "Every requested screen ID must appear exactly once. Mobile and Desktop counterparts must preserve the same information architecture but adapt their composition to the given device. Use nested Auto Layout frames, varied sections, cards, navigation, forms, and realistic values; avoid repeating one generic card. Text layers should be concise and fit their width.",
+    "Return compact JSON without indentation. Prefer 3–5 levels of meaningful Auto Layout, concise layer names and normally 40–120 editable nodes per mobile screen; avoid redundant wrappers or filler. Mark actual interactive controls as button/input roles, including icon controls. These are composition guidelines, not permission to omit requested content.",
     `Project type: ${plan.projectType}. Theme: ${plan.request.theme}. Visual direction: ${plan.request.style || "professional, refined, contemporary product UI"}. Requested screen plan:\n${screens}`,
   ];
   if (repairIssues.length) {

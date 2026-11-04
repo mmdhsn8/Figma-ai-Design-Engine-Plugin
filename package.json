@@ -11,7 +11,9 @@
     "lint": "eslint . --max-warnings=0",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "verify:phase5": "node scripts/verify-phase5-build.mjs",
+    "bench:phase5": "node scripts/benchmark-phase5.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

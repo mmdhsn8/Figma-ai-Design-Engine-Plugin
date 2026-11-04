@@ -23,8 +23,18 @@ import { planDesignSystemApply } from "../plugin/design-system/apply-design-syst
 import { DEFAULT_MAX_ROW_WIDTH, DEFAULT_MIN_CANVAS_GAP } from "../plugin/canvas-placement";
 import { auditVisualQuality, type VisualQualityAudit } from "../shared/visual-quality";
 import {
+  generationBridge,
+  draftRequest,
+  loadSavedDraft,
+  importSavedDraft,
+} from "./generation-session";
+import type { DraftManifest, SavedDraft } from "../shared/generation-draft";
+import {
   createDesignPlan,
   normalizeGeneratedDesignResponse,
+  generationRepairTargets,
+  applyGenerationRepair,
+  type GenerationRepairTarget,
   type GeneratedDesign,
   type DesignGenerationRequest,
   type DesignPlan,
@@ -79,7 +89,7 @@ type GenerationPreview = {
 };
 
 type GenerationDraft = {
-  key: string;
+  manifest: DraftManifest;
   projectName?: string;
   palette?: GeneratedDesign["palette"];
   screens: GeneratedDesign["screens"];
@@ -104,6 +114,9 @@ type GenerationState =
   | "generating"
   | "validating"
   | "preparing"
+  | "saving"
+  | "rendering"
+  | "repairing"
   | "ready"
   | "failed"
   | "cancelled";
@@ -238,7 +251,13 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     total: 0,
     retrying: false,
   });
-  const generationDraft = useRef<GenerationDraft | null>(null);
+  const [documentId, setDocumentId] = useState<string | null>(null);
+  const [savedDraft, setSavedDraft] = useState<SavedDraft | null>(null);
+  const [draftNotice, setDraftNotice] = useState("");
+  const [screenStages, setScreenStages] = useState<Record<string, string>>({});
+  const [stageMetrics, setStageMetrics] = useState<Record<string, number>>({});
+  const [generationStarted, setGenerationStarted] = useState<number | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const generationAbort = useRef<AbortController | null>(null);
   const generationRequest = useRef<string | null>(null);
   const [modelDiscovery, setModelDiscovery] = useState<ModelDiscoveryState>("idle");
@@ -306,9 +325,15 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     () => createDesignPlan(designGenerationInput),
     [designGenerationInput],
   );
-  const generationInFlight = ["planning", "generating", "validating", "preparing"].includes(
-    generationState,
-  );
+  const generationInFlight = [
+    "planning",
+    "generating",
+    "validating",
+    "preparing",
+    "saving",
+    "rendering",
+    "repairing",
+  ].includes(generationState);
   const inferenceEligibility = getInferenceEligibility({
     companionConnected: Boolean(companionToken) && companionConnectionState === "connected",
     status: companionStatus,
@@ -366,6 +391,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       const result = PluginToUISchema.safeParse(raw);
       if (!result.success) return;
       const message = result.data;
+      if (message.type === "generation-result") return;
       if (message.type === "companion-restore-ticket") {
         setRestoreTicket(message.ticket);
         setRestoreTicketLoaded(true);
@@ -494,6 +520,53 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     postToPlugin({ type: "load-companion-restore-ticket" });
     return () => window.removeEventListener("message", handleMessage);
   }, []);
+
+  useEffect(() => {
+    void generationBridge({ type: "generation-context", requestId: "initial-generation-context" })
+      .then((context) => {
+        setDocumentId(context.documentId ?? null);
+        if (context.generationId)
+          setDraftNotice(
+            "Saved generation reference found. Connect the local companion to recover its validated content.",
+          );
+      })
+      .catch(() =>
+        setDraftNotice("Document identity unavailable; reload the plugin before generating."),
+      );
+  }, []);
+
+  useEffect(() => {
+    if (!generationStarted || !generationInFlight) return;
+    const timer = window.setInterval(
+      () => setElapsedSeconds(Math.floor((Date.now() - generationStarted) / 1000)),
+      1000,
+    );
+    return () => window.clearInterval(timer);
+  }, [generationStarted, generationInFlight]);
+
+  useEffect(() => {
+    if (!companionToken || !documentId) return;
+    let active = true;
+    void loadSavedDraft(companionToken, documentId)
+      .then((draft) => {
+        if (!active) return;
+        setSavedDraft(draft);
+        setDraftNotice(
+          draft
+            ? `${draft.screens.length} of ${draft.manifest.request.screenCount * (draft.manifest.request.target === "both" ? 2 : 1)} validated screens restored from durable local storage. Resume reconciles existing frames and generates only missing content.`
+            : "No saved draft for this document/page and account.",
+        );
+      })
+      .catch((error) => {
+        if (active) {
+          setSavedDraft(null);
+          setDraftNotice(error instanceof Error ? error.message : "Draft recovery failed.");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [companionToken, documentId, companionStatus?.auth]);
 
   const persistRestoreTicket = useCallback(
     (ticket: string | null): Promise<boolean> =>
@@ -957,6 +1030,9 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
   const cancelCompanionSmoke = () => smokeAbort.current?.abort();
 
   const clearConnectedAccountDetails = () => {
+    setSavedDraft(null);
+    setScreenStages({});
+    setGenerationPreview(null);
     if (generationAbort.current) {
       generationAbort.current.abort();
       setGenerationPreview(null);
@@ -1052,14 +1128,24 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       setGenerationErrors([generationBlockReason ?? "Connect the authorized companion first."]);
       return;
     }
+    if (!documentId) {
+      setGenerationErrors(["Wait for document identity before generating."]);
+      setGenerationState("failed");
+      return;
+    }
 
     const requestId = nextRequestId();
     const controller = new AbortController();
+    const totalStartedAt = performance.now();
     generationRequest.current = requestId;
     generationAbort.current = controller;
     setGenerationPreview(null);
     setGenerationErrors([]);
     setGenerationState("planning");
+    setGenerationStarted(Date.now());
+    setElapsedSeconds(0);
+    setStageMetrics({});
+    setScreenStages({});
     await new Promise((resolve) => window.setTimeout(resolve, 0));
     if (controller.signal.aborted) {
       generationRequest.current = null;
@@ -1073,28 +1159,113 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       model: selectedCompanionModel,
       request: planResult.data.request,
     });
-    let draft: GenerationDraft =
-      generationDraft.current?.key === draftKey
-        ? generationDraft.current
-        : { key: draftKey, screens: [] };
-    generationDraft.current = draft;
+    let draft: GenerationDraft = {
+      screens: [],
+      manifest: {
+        version: 1,
+        documentId,
+        generationId: `generation-${nextRequestId()}`,
+        model: selectedCompanionModel,
+        request: planResult.data.request,
+        createdAt: Date.now(),
+      },
+    };
     setGenerationScreenProgress({
       completed: draft.screens.length,
       total: planResult.data.screens.length,
       retrying: false,
     });
 
+    const nativeWarnings: string[] = [];
     try {
+      const activeContext = await generationBridge({
+        type: "generation-context",
+        requestId: nextRequestId(),
+      });
+      if (activeContext.documentId !== documentId)
+        throw new Error(
+          "Figma page changed; reopen the plugin in the intended page before resuming.",
+        );
+      const recovered = await loadSavedDraft(companionToken, documentId);
+      if (recovered) {
+        if (
+          JSON.stringify({
+            model: recovered.manifest.model,
+            request: recovered.manifest.request,
+          }) !== draftKey
+        )
+          throw new Error(
+            "A different saved draft exists for this document/page. Resume it or explicitly clear its checkpoint before starting another project.",
+          );
+        draft = {
+          manifest: recovered.manifest,
+          screens: recovered.screens.flatMap(({ design }) => design.screens),
+          projectName: recovered.screens[0]?.design.projectName,
+          palette: recovered.screens[0]?.design.palette,
+        };
+      } else
+        await draftRequest(
+          companionToken,
+          documentId,
+          "start",
+          { manifest: draft.manifest },
+          controller.signal,
+        );
+      await generationBridge({
+        type: "generation-remember",
+        requestId: nextRequestId(),
+        generationId: draft.manifest.generationId,
+      });
+      setGenerationScreenProgress({
+        completed: draft.screens.length,
+        total: planResult.data.screens.length,
+        retrying: false,
+      });
+      const mark = (id: string, stage: string) =>
+        setScreenStages((current) => ({ ...current, [id]: stage }));
+      const renderSaved = async (screen: GeneratedDesign["screens"][number]) => {
+        if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
+        const design = {
+          projectName: draft.projectName!,
+          palette: draft.palette!,
+          screens: [screen],
+        };
+        mark(screen.id, "rendering");
+        setGenerationState("rendering");
+        const started = performance.now();
+        const rendered = await generationBridge({
+          type: "generation-render",
+          requestId: nextRequestId(),
+          manifest: draft.manifest,
+          design,
+        });
+        nativeWarnings.push(...(rendered.warnings ?? []));
+        setStageMetrics((metrics) => ({
+          ...metrics,
+          [`${screen.id}.renderMs`]: Math.round(performance.now() - started),
+        }));
+        await draftRequest(companionToken, documentId, "save-screen", {
+          generationId: draft.manifest.generationId,
+          design,
+          nodeId: rendered.nodeId,
+        });
+        mark(screen.id, "rendered");
+      };
+      for (const screen of draft.screens) await renderSaved(screen);
       let repairAttempts = 0;
       for (const screen of pendingGenerationScreens(planResult.data, draft.screens)) {
         const screenPlan = { ...planResult.data, screens: [screen] };
         const screenRequestId = nextRequestId();
         let repairIssues: string[] = [];
+        let repairTargets: GenerationRepairTarget[] = [];
+        let failedRaw = "";
         let completedScreen: GeneratedDesign["screens"][number] | undefined;
 
         for (let attempt = 0; attempt <= 1; attempt += 1) {
-          setGenerationState("generating");
-          const raw = await generateAuthorizedDesign(
+          mark(screen.id, attempt ? "repairing" : "generating");
+          setGenerationState(attempt ? "repairing" : "generating");
+          const inferenceStarted = performance.now();
+          let raw = await generateAuthorizedDesign(
             companionToken,
             screenRequestId,
             selectedCompanionModel,
@@ -1106,54 +1277,112 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
             () => {
               setGenerationScreenProgress((progress) => ({ ...progress, retrying: true }));
             },
+            repairTargets,
+            (metrics) =>
+              setStageMetrics((current) => ({
+                ...current,
+                ...Object.fromEntries(
+                  Object.entries(metrics).map(([key, value]) => [`${screen.id}.${key}`, value]),
+                ),
+              })),
+            (diagnostic) => {
+              mark(
+                screen.id,
+                diagnostic.stage === "http"
+                  ? "waiting for response headers"
+                  : diagnostic.generatedBytes
+                    ? "receiving model text"
+                    : "stream active; waiting for model text",
+              );
+              setStageMetrics((metrics) => ({
+                ...metrics,
+                [`${screen.id}.activeElapsedMs`]: diagnostic.elapsedMs ?? 0,
+                [`${screen.id}.idleMs`]: diagnostic.idleMs ?? 0,
+                [`${screen.id}.events`]: diagnostic.eventCount ?? 0,
+                [`${screen.id}.generatedBytes`]: diagnostic.generatedBytes ?? 0,
+              }));
+            },
           );
-          if (controller.signal.aborted || generationRequest.current !== requestId) return;
+          if (repairTargets.length) raw = applyGenerationRepair(failedRaw, repairTargets, raw);
+          setStageMetrics((metrics) => ({
+            ...metrics,
+            [`${screen.id}.${attempt ? "repair" : "inference"}Ms`]: Math.round(
+              performance.now() - inferenceStarted,
+            ),
+          }));
+          if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
+          if (generationRequest.current !== requestId) return;
           setGenerationState("validating");
+          mark(screen.id, "validating");
           await new Promise((resolve) => window.setTimeout(resolve, 0));
-          if (controller.signal.aborted || generationRequest.current !== requestId) return;
+          if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
+          if (generationRequest.current !== requestId) return;
+          const validationStarted = performance.now();
           const validated = normalizeGeneratedDesignResponse(raw, screenPlan);
+          setStageMetrics((metrics) => ({
+            ...metrics,
+            [`${screen.id}.validationMs`]: Math.round(performance.now() - validationStarted),
+          }));
           if (!validated.success) {
             if (attempt === 0) {
               repairIssues = validated.errors.slice(0, 8);
+              failedRaw = raw;
+              repairTargets = generationRepairTargets(raw, validated.errors);
+              if (
+                validated.errors.every((issue) =>
+                  /minimum tap target|does not fit its constrained parent/u.test(issue),
+                ) &&
+                !repairTargets.length
+              )
+                throw new Error(
+                  `Accessibility repair exceeds the bounded subtree budget. ${validated.errors.join(" ")}`,
+                );
               setGenerationErrors(validated.errors);
               repairAttempts += 1;
               continue;
             }
-            throw new Error(validated.errors.join(" "));
+            throw new Error(
+              `Automatic normalization and the single model repair could not satisfy the layout/accessibility contract. No further inference was attempted. ${validated.errors.join(" ")}`,
+            );
           }
 
-          const generated = validated.data.design;
-          if (
-            draft.projectName !== undefined &&
-            (draft.projectName !== generated.projectName ||
-              JSON.stringify(Object.entries(draft.palette ?? {}).sort()) !==
-                JSON.stringify(Object.entries(generated.palette).sort()))
-          ) {
-            repairIssues = [
-              `Use the exact project name “${draft.projectName}” and palette ${JSON.stringify(draft.palette)} established by the first screen.`,
-            ];
-            if (attempt === 0) {
-              repairAttempts += 1;
-              continue;
-            }
-            throw new Error("A screen did not preserve the shared project name and palette.");
-          }
+          // Nodes reference palette roles, so reuse the first screen's tokens without another inference.
+          const generated = {
+            ...validated.data.design,
+            projectName: draft.projectName ?? validated.data.design.projectName,
+            palette: draft.palette ?? validated.data.design.palette,
+          };
 
           completedScreen = generated.screens[0];
           if (!completedScreen)
             throw new Error("The response did not include its requested screen.");
+          setGenerationState("saving");
+          mark(screen.id, "saving");
+          const saveStarted = performance.now();
+          await draftRequest(
+            companionToken,
+            documentId,
+            "save-screen",
+            { generationId: draft.manifest.generationId, design: generated },
+            controller.signal,
+          );
+          setStageMetrics((metrics) => ({
+            ...metrics,
+            [`${screen.id}.persistenceMs`]: Math.round(performance.now() - saveStarted),
+          }));
           draft = {
             ...draft,
             projectName: draft.projectName ?? generated.projectName,
             palette: draft.palette ?? generated.palette,
             screens: retainGeneratedScreen(draft.screens, completedScreen),
           };
-          generationDraft.current = draft;
           setGenerationScreenProgress({
             completed: draft.screens.length,
             total: planResult.data.screens.length,
             retrying: false,
           });
+          mark(screen.id, "saved");
+          await renderSaved(completedScreen);
           break;
         }
         if (!completedScreen) throw new Error("The requested screen could not be completed.");
@@ -1179,15 +1408,23 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
         palette: draft.palette,
         screens: completeScreens,
       } satisfies GeneratedDesign);
+      await generationBridge({
+        type: "generation-select",
+        requestId: nextRequestId(),
+        generationId: draft.manifest.generationId,
+      });
       setGenerationState("preparing");
       await new Promise((resolve) => window.setTimeout(resolve, 0));
-      if (controller.signal.aborted || generationRequest.current !== requestId) return;
+      if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
+      if (generationRequest.current !== requestId) return;
       const prepared = prepareGeneratedDesign(raw, planResult.data);
       if (!prepared.success) throw new Error(prepared.errors.join(" "));
-      if (controller.signal.aborted || generationRequest.current !== requestId) return;
+      if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
+      if (generationRequest.current !== requestId) return;
       setGenerationState("preparing");
       const audit = auditVisualQuality(prepared.data.batch);
       const warnings = [
+        ...nativeWarnings,
         "No image assets were generated or downloaded. Import licensed local assets or keep editable placeholders.",
         "Check font availability, Persian shaping, text wrapping, and visual balance in Figma Desktop.",
         ...audit.diagnostics.slice(0, 6).map((item) => `${item.code}: ${item.message}`),
@@ -1201,7 +1438,10 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
         warnings: [...new Set(warnings)],
       });
       setGenerationState("ready");
-      generationDraft.current = null;
+      setDraftNotice(
+        `${draft.screens.length} screens durably saved and rendered. Resume reconciles native frames without duplicates.`,
+      );
+      setSavedDraft(await loadSavedDraft(companionToken, documentId));
     } catch (error) {
       if (generationRequest.current !== requestId) return;
       const resumeMessage = draft.screens.length
@@ -1213,10 +1453,18 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       ) {
         setGenerationState("cancelled");
         setGenerationErrors([
-          `Generation was cancelled. No Figma layers were created.${resumeMessage}`,
+          `Generation was cancelled. Already saved or rendered screens are retained.${resumeMessage}`,
         ]);
       } else {
         setGenerationState("failed");
+        setScreenStages((stages) =>
+          Object.fromEntries(
+            Object.entries(stages).map(([id, stage]) => [
+              id,
+              stage === "rendered" ? stage : `${stage} interrupted; resumable`,
+            ]),
+          ),
+        );
         const errorMessage =
           error instanceof CompanionClientError
             ? companionErrorText(error)
@@ -1233,6 +1481,11 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
         }
       }
     } finally {
+      if (generationRequest.current === requestId)
+        setStageMetrics((metrics) => ({
+          ...metrics,
+          totalMs: Math.round(performance.now() - totalStartedAt),
+        }));
       if (generationRequest.current === requestId) generationRequest.current = null;
       if (generationAbort.current === controller) generationAbort.current = null;
     }
@@ -1577,6 +1830,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                 <input
                   type="number"
                   min={2}
+                  max={200}
                   step={1}
                   value={generationScreenCount}
                   onChange={(event) => {
@@ -1729,13 +1983,140 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
           </button>
           <p className="generation-help" id="generation-help">
             {generationBlockReason ??
-              "Generation creates a validated JSON plan only; review it in the existing JSON tab before rendering."}
+              "Each validated screen is saved locally, rendered as editable Figma layers, then selected and zoomed. JSON review remains optional."}
           </p>
+          <section className="generation-result" aria-label="Durable generation draft">
+            <p>{draftNotice || "Checking document-scoped recovery…"}</p>
+            {savedDraft && (
+              <button
+                type="button"
+                disabled={generationInFlight}
+                onClick={() => {
+                  const request = savedDraft.manifest.request;
+                  setPrompt(request.prompt);
+                  setGenerationTarget(request.target);
+                  setGenerationScreenCount(request.screenCount);
+                  setGenerationScreenNames(request.screenNames?.join(", ") ?? "");
+                  setGenerationLanguage(request.language);
+                  setGenerationStyle(request.style);
+                  setGenerationProjectType(request.projectType);
+                  setGenerationTheme(request.theme);
+                  setSelectedCompanionModel(savedDraft.manifest.model);
+                  setDraftNotice(
+                    `Restored ${savedDraft.screens.length} saved screens. Verify the exact selected model if needed, then press Generate to resume.`,
+                  );
+                }}
+              >
+                Restore saved project ({savedDraft.screens.length} saved)
+              </button>
+            )}
+            <button
+              type="button"
+              disabled={generationInFlight || !companionToken || !documentId}
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    "Delete this document/page's local draft? Existing Figma frames will not be deleted.",
+                  )
+                )
+                  return;
+                void draftRequest(companionToken!, documentId!, "clear")
+                  .then(() => {
+                    setSavedDraft(null);
+                    setScreenStages({});
+                    setDraftNotice("Local draft deleted; existing Figma frames preserved.");
+                    return generationBridge({
+                      type: "generation-remember",
+                      requestId: nextRequestId(),
+                      generationId: null,
+                    });
+                  })
+                  .catch((error) => setDraftNotice(error.message));
+              }}
+            >
+              Delete local draft
+            </button>
+            <button
+              type="button"
+              disabled={generationInFlight || !companionToken || !documentId}
+              onClick={() => {
+                void loadSavedDraft(companionToken!, documentId!)
+                  .then((draft) => {
+                    if (!draft) throw new Error("No saved draft to export.");
+                    const url = URL.createObjectURL(
+                      new Blob([JSON.stringify(draft)], { type: "application/json" }),
+                    );
+                    const link = document.createElement("a");
+                    link.href = url;
+                    link.download = "figma-generation-recovery.json";
+                    link.click();
+                    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+                  })
+                  .catch((error) => setDraftNotice(error.message));
+              }}
+            >
+              Export recovery JSON
+            </button>
+            <label>
+              Import recovery JSON (contains your brief and copy)
+              <input
+                type="file"
+                accept=".json,application/json"
+                disabled={generationInFlight || !companionToken || !documentId}
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (!file) return;
+                  if (file.size > 64 * 1024 * 1024) {
+                    setDraftNotice("Recovery file exceeds 64 MiB.");
+                    return;
+                  }
+                  const controller = new AbortController();
+                  generationAbort.current = controller;
+                  setGenerationState("saving");
+                  setGenerationStarted(Date.now());
+                  setElapsedSeconds(0);
+                  void file
+                    .text()
+                    .then((text) =>
+                      importSavedDraft(
+                        companionToken!,
+                        documentId!,
+                        JSON.parse(text),
+                        controller.signal,
+                      ),
+                    )
+                    .then(() => loadSavedDraft(companionToken!, documentId!))
+                    .then((draft) => {
+                      setSavedDraft(draft);
+                      setDraftNotice(
+                        "Recovery imported; restore and resume to reconcile canvas frames.",
+                      );
+                      setGenerationState("idle");
+                    })
+                    .catch((error) => {
+                      setDraftNotice(
+                        error instanceof Error
+                          ? error.message
+                          : "Recovery import failed; committed screens remain saved.",
+                      );
+                      setGenerationState(controller.signal.aborted ? "cancelled" : "failed");
+                    })
+                    .finally(() => {
+                      if (generationAbort.current === controller) generationAbort.current = null;
+                    });
+                }}
+              />
+            </label>
+          </section>
 
           {generationInFlight && (
             <div className="generation-progress" role="status" aria-live="polite">
               <span className="spinner" aria-hidden="true" />
               <span>
+                {elapsedSeconds}s elapsed · {generationState} · {generationScreenProgress.completed}{" "}
+                saved · {Object.values(screenStages).filter((stage) => stage === "rendered").length}{" "}
+                rendered ·{" "}
                 {generationScreenProgress.retrying
                   ? `Retrying screen ${generationScreenProgress.completed + 1} of ${generationScreenProgress.total}; incomplete output was discarded.`
                   : generationScreenProgress.total
@@ -1753,7 +2134,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
               <strong>
                 {generationState === "cancelled"
                   ? "Generation cancelled"
-                  : "Generation needs attention"}
+                  : "Generation paused — saved screens are resumable"}
               </strong>
               <ErrorList errors={generationErrors} />
             </section>
@@ -1771,6 +2152,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                     <strong>{screen.name}</strong>
                     <span>
                       {screen.width} × {screen.height} · {screen.devicePreset}
+                      {` · ${screenStages[screen.id] ?? "queued"}`}
                     </span>
                   </li>
                 ))}
@@ -1781,8 +2163,8 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
           {generationState === "ready" && generationPreview && (
             <section className="generation-result" aria-labelledby="generation-result-title">
               <div className="section-title-row">
-                <h2 id="generation-result-title">Design plan ready</h2>
-                <span className="section-caption">NOT RENDERED</span>
+                <h2 id="generation-result-title">Design saved and rendered</h2>
+                <span className="section-caption">EDITABLE FIGMA LAYERS</span>
               </div>
               <p className="generation-summary">
                 <strong>{generationPreview.projectName}</strong> ·{" "}
@@ -1807,9 +2189,21 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                 <ErrorList errors={generationPreview.warnings} />
               </details>
               <button className="secondary-action" type="button" onClick={inspectGeneratedJson}>
-                Review JSON before rendering
+                Inspect or export generated JSON
               </button>
             </section>
+          )}
+          {Object.keys(stageMetrics).length > 0 && (
+            <details>
+              <summary>Sanitized stage timings and counts (Ms, Bytes, events)</summary>
+              <ul>
+                {Object.entries(stageMetrics).map(([stage, value]) => (
+                  <li key={stage}>
+                    {stage}: {value}
+                  </li>
+                ))}
+              </ul>
+            </details>
           )}
 
           <section className="offline-fixtures" aria-label="Offline design fixtures">
@@ -2740,7 +3134,8 @@ function companionErrorText(error: unknown): string {
       "The companion received an invalid SSE event. No partial output was accepted; retry once and share only the safe diagnostic.",
     resource_exhausted:
       "The companion ran out of available memory or temporary disk space while processing the design. Free local resources, then rerun; completed screens are retained for resuming.",
-    response_too_large: "A small companion control response exceeded its safety limit.",
+    response_too_large:
+      "The response exceeded a bounded safety limit (8 MiB generated screen / 32 MiB SSE stream). Simplify that screen or split the project; earlier saved screens remain recoverable.",
     registration_clear_failed:
       "The local session was cleared, but the saved account registration could not be removed. Close the companion before trying again.",
     secure_storage_unavailable:
@@ -2828,6 +3223,9 @@ function generationProgressText(state: GenerationState): string {
       generating: "Generating a structured design with the selected account model…",
       validating: "Validating the response against the native design schema…",
       preparing: "Preparing the JSON review and quality warnings…",
+      saving: "Committing validated screen to durable local storage…",
+      rendering: "Rendering editable native Figma layers…",
+      repairing: "One targeted repair of the failed screen/subtree…",
       ready: "Ready for review",
       failed: "Generation failed",
       cancelled: "Generation cancelled",

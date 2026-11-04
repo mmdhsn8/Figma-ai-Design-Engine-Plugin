@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { createDraftStore } from "./draft-store.js";
 import {
   COMPANION_HOSTNAME,
   COMPANION_PORT,
@@ -13,6 +16,13 @@ import { createInstallationStore } from "./installation-store.js";
 import { createCompanionServer } from "./server.js";
 
 const companion = createCompanionServer({
+  draftStore: createDraftStore(
+    join(
+      process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"),
+      "Figma AI Design Engine",
+      "drafts-v1",
+    ),
+  ),
   port: COMPANION_PORT,
   streamIdleTimeoutMs: configuredTimeoutMs(
     process.env.FAD_STREAM_IDLE_TIMEOUT_MS,

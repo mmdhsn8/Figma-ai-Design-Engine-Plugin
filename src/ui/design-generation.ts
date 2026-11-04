@@ -125,6 +125,29 @@ function mapNode(
         }
       : undefined;
   if (node.type === "text") {
+    if (interactive) {
+      return {
+        type: "frame",
+        name: node.name,
+        width: node.width,
+        height: node.height,
+        ...touchSizing,
+        qualityRole: node.qualityRole,
+        layout: {
+          mode: "vertical",
+          gap: 0,
+          padding: { top: 0, right: 0, bottom: 0, left: 0 },
+          counterAxisAlign: "stretch",
+        },
+        children: [
+          mapNode(
+            { ...node, qualityRole: "body", name: `${node.name} label` },
+            direction,
+            "vertical",
+          ),
+        ],
+      };
+    }
     return {
       type: "text",
       name: node.name,
@@ -141,9 +164,8 @@ function mapNode(
               ? "right"
               : "left",
       width: node.width,
-      ...(interactive ? { height: node.height } : {}),
-      sizing: interactive ? touchSizing.sizing : { width: "fill", height: "hug" },
-      textAutoResize: interactive ? "truncate" : "height",
+      sizing: { width: "fill", height: "hug" },
+      textAutoResize: "height",
       qualityRole: node.qualityRole,
       ...(visual ? { visual } : {}),
     };

@@ -102,6 +102,7 @@ export interface MultiScreenProgress {
 }
 
 export interface MultiScreenResult {
+  nodeId?: string;
   id: string;
   name: string;
   width: number;
@@ -133,9 +134,24 @@ export interface MultiScreenRenderResult {
 }
 
 export interface MultiScreenRenderOptions {
+  beforeScreen?: () => void;
+  resume?: boolean;
+  verifyTouchTargets?: boolean;
   gap?: number;
   maxRowWidth?: number;
   onProgress?: (progress: MultiScreenProgress) => void;
+}
+
+function verifyNativeTouchTargets(root: FrameNode): void {
+  const targets: SceneNode[] = [...root.children];
+  while (targets.length) {
+    const target = targets.pop()!;
+    if (target.getPluginData("fad.touch-target") && (target.width < 43.99 || target.height < 43.99))
+      throw new DesignRenderError(
+        `Rendered interactive layer “${target.name}” is below 44×44 px after native Auto Layout. Saved JSON retained; fix the edited frame or delete it and resume.`,
+      );
+    if ("children" in target) for (const child of target.children) targets.push(child);
+  }
 }
 
 export class DesignRenderError extends Error {
@@ -755,6 +771,8 @@ function appendDesignNode(
   }
 
   parent.appendChild(node);
+  if ("qualityRole" in spec && (spec.qualityRole === "button" || spec.qualityRole === "input"))
+    node.setPluginData("fad.touch-target", spec.qualityRole);
   if (parentLayout) {
     applyChildSizing(node, effectiveSizing(spec, parentLayout), parentLayout);
   } else {
@@ -833,9 +851,11 @@ function createDocumentFrame(
   context: BuildContext,
   parent?: FrameNode,
   position?: Pick<CanvasBounds, "x" | "y">,
+  onCreated?: (frame: FrameNode) => void,
 ): FrameNode {
   const frame = api.createFrame();
   context.tracker.track(frame, "frames");
+  onCreated?.(frame);
   frame.name = name;
   frame.resize(spec.document.width, spec.document.height);
   frame.x = position?.x ?? 0;
@@ -1578,7 +1598,41 @@ export async function renderMultiScreenDesign(
     };
 
     for (let index = 0; index < orderedScreens.length; index++) {
+      options.beforeScreen?.();
       const screen = orderedScreens[index];
+      if (options.resume) {
+        const existing = api.currentPage.findAll(
+          (node) =>
+            node.getPluginData(MULTI_SCREEN_BATCH_KEY) === batch.id &&
+            node.getPluginData(MULTI_SCREEN_ID_KEY) === screen.id,
+        );
+        if (existing.length > 1)
+          throw new DesignRenderError(
+            "Duplicate generation identity found; inspect the existing frames before resuming.",
+          );
+        const root = existing[0];
+        if (root?.type === "FRAME" && root.getPluginData("fad.generation.commit") === "complete") {
+          if (options.verifyTouchTargets) verifyNativeTouchTargets(root);
+          successfulRoots.push(root);
+          screenResults.push({
+            id: screen.id,
+            name: screen.name,
+            width: screen.width,
+            height: screen.height,
+            status: "generated",
+            counts: emptyDesignCounts(),
+            warnings: ["Reused existing rendered screen without moving it."],
+            frameName: root.name,
+            nodeId: root.id,
+          });
+          continue;
+        }
+        if (root?.getPluginData("fad.generation.commit") === "pending") root.remove();
+        else if (root)
+          throw new DesignRenderError(
+            "Existing generation frame has no completion marker; inspect it before resuming.",
+          );
+      }
       const screenSpec = resolvedSpecs[index];
       const placementId = screenPlacementId(screen.id);
       let plannedScreen = placementById.get(placementId);
@@ -1589,7 +1643,7 @@ export async function renderMultiScreenDesign(
       if (!plannedScreen)
         throw new DesignRenderError(`No placement was planned for “${screen.id}”.`);
 
-      const displayName = `${String(index + 1).padStart(2, "0")} — ${screen.name}`;
+      const displayName = `${String((options.resume ? (screen.order ?? index) : index) + 1).padStart(2, "0")} — ${screen.name}`;
       safeProgress(options.onProgress, {
         index: index + 1,
         total: orderedScreens.length,
@@ -1614,9 +1668,17 @@ export async function renderMultiScreenDesign(
           context,
           undefined,
           plannedScreen,
+          options.resume
+            ? (frame) => {
+                frame.setPluginData(MULTI_SCREEN_BATCH_KEY, batch.id);
+                frame.setPluginData(MULTI_SCREEN_ID_KEY, screen.id);
+                frame.setPluginData("fad.generation.commit", "pending");
+              }
+            : undefined,
         );
         root.setPluginData(MULTI_SCREEN_BATCH_KEY, batch.id);
         root.setPluginData(MULTI_SCREEN_ID_KEY, screen.id);
+        if (options.resume) root.setPluginData("fad.generation.commit", "pending");
         root.setPluginData(
           MULTI_SCREEN_META_KEY,
           JSON.stringify({
@@ -1627,6 +1689,7 @@ export async function renderMultiScreenDesign(
           }),
         );
         if (styleBindings) await applyNativeStyleBindings(root, styleBindings);
+        if (options.verifyTouchTargets) verifyNativeTouchTargets(root);
         const measuredBounds = getCanvasNodeBounds(root);
         let actualPlacement = plannedScreen;
         if (
@@ -1650,6 +1713,7 @@ export async function renderMultiScreenDesign(
           actualPlacement = placementById.get(placementId) ?? plannedScreen;
         }
         placeTopLevelNode(root, measuredBounds, actualPlacement);
+        if (options.resume) root.setPluginData("fad.generation.commit", "complete");
         successfulRoots.push(root);
         const screenWarnings = styleBindings?.report.warnings.slice(warningsBeforeScreen) ?? [];
         screenResults.push({
@@ -1661,6 +1725,7 @@ export async function renderMultiScreenDesign(
           devicePreset: screen.devicePreset,
           status: "generated",
           frameName,
+          nodeId: root.id,
           counts: screenTracker.counts,
           warnings: screenWarnings,
         });
@@ -1711,6 +1776,7 @@ export async function renderMultiScreenDesign(
           break;
         }
       }
+      if (options.resume) await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
 
     const generatedScreens = screenResults.filter((screen) => screen.status === "generated").length;

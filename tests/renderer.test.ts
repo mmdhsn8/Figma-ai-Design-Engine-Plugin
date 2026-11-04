@@ -16,8 +16,12 @@ import { boundsIntersectWithGap, DEFAULT_MIN_CANVAS_GAP } from "../src/plugin/ca
 import { parseDesignValue, type DesignSpec } from "../src/shared/schema";
 import { createDesignPlan } from "../src/shared/design-generation";
 import { prepareGeneratedDesign } from "../src/ui/design-generation";
+import { createGenerationController } from "../src/plugin/generation-controller";
+import { UIToPluginSchema, PluginToUISchema } from "../src/shared/messages";
+import { draftFixture } from "./generation-fixture";
 
 interface MockNode {
+  id: string;
   type: string;
   name: string;
   x: number;
@@ -64,6 +68,7 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
   };
   const makeNode = (type: string): MockNode => {
     const node: MockNode = {
+      id: `node:${allCreated.length + 1}`,
       type,
       name: "",
       x: 0,
@@ -846,7 +851,10 @@ describe("renderDesign", () => {
       plan.data,
     );
     if (!prepared.success) throw new Error(prepared.errors.join(" "));
-    const result = await renderMultiScreenDesign(mock.api, prepared.data.batch);
+    const result = await renderMultiScreenDesign(mock.api, prepared.data.batch, {
+      resume: true,
+      verifyTouchTargets: true,
+    });
     expect(result).toMatchObject({ generatedScreens: 2, failedScreens: 0 });
     expect(mock.find("detail button")).toMatchObject({
       type: "FRAME",
@@ -862,6 +870,109 @@ describe("renderDesign", () => {
       characters: "خرید",
       textAlignHorizontal: "RIGHT",
     });
+    const roots = mock.roots.filter(
+      (node) => node.getPluginData("fad.multi-screen.batch-id") === prepared.data.batch.id,
+    );
+    expect(roots).toHaveLength(2);
+    const created = mock.allCreated.length;
+    roots[0]!.x = 12345;
+    const repeated = await renderMultiScreenDesign(mock.api, prepared.data.batch, {
+      resume: true,
+      verifyTouchTargets: true,
+    });
+    expect(repeated.generatedScreens).toBe(2);
+    expect(mock.allCreated).toHaveLength(created);
+    expect(roots[0]!.x).toBe(12345);
+    roots[1]!.remove();
+    const restored = await renderMultiScreenDesign(mock.api, prepared.data.batch, {
+      resume: true,
+      verifyTouchTargets: true,
+    });
+    expect(restored.generatedScreens).toBe(2);
+    expect(
+      mock.roots.filter(
+        (node) => node.getPluginData("fad.multi-screen.batch-id") === prepared.data.batch.id,
+      ),
+    ).toHaveLength(2);
+    const unsafe = structuredClone(prepared.data.batch);
+    unsafe.id = "unsafe-native-hit-area";
+    for (const screen of unsafe.screens) {
+      const button = screen.children[0]!;
+      if (button.type === "frame") button.height = 20;
+    }
+    const failed = await renderMultiScreenDesign(mock.api, unsafe, {
+      resume: true,
+      verifyTouchTargets: true,
+    });
+    expect(failed.generatedScreens).toBe(0);
+    expect(failed.failedScreens).toBe(2);
+    expect(
+      mock.roots.some((node) => node.getPluginData("fad.multi-screen.batch-id") === unsafe.id),
+    ).toBe(false);
+    expect(mock.unrelated.removed).toBe(false);
+  });
+
+  it("carries a saved design through the typed bridge, reconciles restarts, and selects the cluster", async () => {
+    const storage = new Map<string, unknown>();
+    const metadata = new Map<string, string>();
+    const api = {
+      ...mock.api,
+      fileKey: "test-file-key",
+      root: {
+        getPluginData: (key: string) => metadata.get(key) ?? "",
+        setPluginData: (key: string, value: string) => metadata.set(key, value),
+      },
+      clientStorage: {
+        getAsync: async (key: string) => storage.get(key),
+        setAsync: async (key: string, value: unknown) => {
+          storage.set(key, value);
+        },
+        deleteAsync: async (key: string) => {
+          storage.delete(key);
+        },
+      },
+    } as unknown as PluginAPI;
+    Object.assign(api.currentPage, { id: "0:1" });
+    let controller = createGenerationController(api);
+    const context = await controller({ type: "generation-context", requestId: "context" });
+    expect(PluginToUISchema.safeParse(context).success).toBe(true);
+    if (context.type !== "generation-result" || !context.documentId)
+      throw new Error("context missing");
+    const { manifest, design } = draftFixture();
+    manifest.documentId = context.documentId;
+    const request = { type: "generation-render" as const, requestId: "render", manifest, design };
+    expect(UIToPluginSchema.safeParse(request).success).toBe(true);
+    expect(await controller(request)).toMatchObject({ success: true });
+    const created = mock.allCreated.length;
+    await controller({
+      type: "generation-remember",
+      requestId: "remember",
+      generationId: manifest.generationId,
+    });
+    controller = createGenerationController(api);
+    expect(await controller({ type: "generation-context", requestId: "reload" })).toMatchObject({
+      generationId: manifest.generationId,
+    });
+    expect(await controller(request)).toMatchObject({ success: true });
+    expect(mock.allCreated).toHaveLength(created);
+    expect(
+      await controller({
+        ...request,
+        requestId: "render-detail",
+        design: { ...design, screens: [{ id: "detail", children: [] }] },
+      }),
+    ).toMatchObject({ success: true });
+    expect(mock.find("02 — Detail")?.type).toBe("FRAME");
+    expect(
+      await controller({ ...request, manifest: { ...manifest, documentId: "another-document" } }),
+    ).toMatchObject({ success: false });
+    await controller({
+      type: "generation-select",
+      requestId: "select",
+      generationId: manifest.generationId,
+    });
+    expect(mock.api.currentPage.selection).toHaveLength(2);
+    expect(mock.raw.viewport.scrollAndZoomIntoView).toHaveBeenCalled();
   });
 
   it("creates a new named batch on repeat and reuses shared design-system assets", async () => {

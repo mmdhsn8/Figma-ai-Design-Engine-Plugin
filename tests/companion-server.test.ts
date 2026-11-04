@@ -13,6 +13,8 @@ import {
 } from "../src/companion/oauth.js";
 import { createMemoryCredentialStore } from "../src/companion/credential-store.js";
 import { createCompanionServer, type CompanionServerHandle } from "../src/companion/server.js";
+import { createDraftStore, type DraftStore } from "../src/companion/draft-store.js";
+import { draftFixture } from "./generation-fixture";
 
 const discovery: OidcDiscovery = {
   issuer: OIDC_ISSUER,
@@ -35,6 +37,46 @@ afterEach(async () => {
 });
 
 describe("loopback companion", () => {
+  it("protects durable checkpoints behind pairing and restores them after companion restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "fad-route-draft-test-"));
+    try {
+      const harness = await createHarness({ draftStore: createDraftStore(directory) });
+      const { manifest, design } = draftFixture();
+      const denied = await request(harness.handle, "/v1/draft", {
+        body: { action: "load", documentId: manifest.documentId },
+      });
+      expect(denied.status).toBe(401);
+      let token = await authorizeAndDiscover(harness);
+      const started = await request(harness.handle, "/v1/draft", {
+        token,
+        body: { action: "start", documentId: manifest.documentId, manifest },
+      });
+      expect(started.status).toBe(200);
+      const saved = await request(harness.handle, "/v1/draft", {
+        token,
+        body: {
+          action: "save-screen",
+          documentId: manifest.documentId,
+          generationId: manifest.generationId,
+          design,
+        },
+      });
+      expect(saved.status).toBe(200);
+      const restarted = await harness.restart();
+      token = await harness.pair();
+      const loaded = await request(restarted, "/v1/draft", {
+        token,
+        body: { action: "load", documentId: manifest.documentId },
+      });
+      expect(loaded.status).toBe(200);
+      const recovered = await loaded.json();
+      expect(recovered.draft.screens).toHaveLength(1);
+      expect(recovered.draft.screens[0].design).toEqual(design);
+      expect(JSON.stringify(recovered)).not.toContain("access-secret");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
   it("serves localhost on both resolved loopback address families", async () => {
     const harness = await createHarness();
     expect(COMPANION_BIND_ADDRESSES).toEqual(["127.0.0.1", "::1"]);
@@ -1185,11 +1227,25 @@ describe("loopback companion", () => {
       "screens.products.children[0].children[0] button is below the 44 px minimum tap target.";
     const repeated = await request(harness.handle, "/v1/design", {
       token,
-      body: { ...requestBody, repairIssues: [repairIssue] },
+      body: {
+        ...requestBody,
+        repairIssues: [repairIssue],
+        repairTargets: [
+          {
+            path: "screens.products.children[0].children[0]",
+            node: { type: "rectangle", qualityRole: "button", width: 20, height: 20 },
+          },
+        ],
+      },
     });
     expect(repeated.status).toBe(200);
     await repeated.text();
     expect(JSON.parse(harness.responsesRequest!.body).instructions).toContain(repairIssue);
+    const repairPayload = JSON.parse(harness.responsesRequest!.body);
+    expect(repairPayload.input[0].content).not.toContain(requestBody.request.prompt);
+    expect(repairPayload.text.format.schema.properties).toHaveProperty("nodes");
+    expect(repairPayload.text.format.schema.properties).not.toHaveProperty("screens");
+    expect(repairPayload).toMatchObject({ stream: true, store: false });
     const tooManyRepairs = await request(harness.handle, "/v1/design", {
       token,
       body: { ...requestBody, repairIssues: ["one repair was already used"] },
@@ -1797,6 +1853,7 @@ describe("loopback companion", () => {
 
 async function createHarness(
   options: {
+    draftStore?: DraftStore;
     scope?: string;
     expiresIn?: number;
     refresh?: boolean;
@@ -2048,6 +2105,7 @@ async function createHarness(
     createCompanionServer({
       port: 0,
       fetchImpl,
+      draftStore: options.draftStore,
       installationStore: store,
       credentialStore,
       now: () => currentTime,
