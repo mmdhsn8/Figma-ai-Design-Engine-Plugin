@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createDraftStore } from "../src/companion/draft-store";
 import { DraftManifestSchema } from "../src/shared/generation-draft";
-import { draftFixture } from "./generation-fixture";
+import { createGenerationTransaction } from "../src/shared/generation-transaction";
+import { draftFixture, sectionDesignFixture } from "./generation-fixture";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -19,6 +20,122 @@ async function setup() {
 }
 
 describe("durable per-screen draft checkpoints", () => {
+  it("commits ordered section transactions before render, survives restart, and composes legacy screen views", async () => {
+    const { manifest } = draftFixture();
+    const { directory, store } = await setup();
+    await store.start("owner", manifest);
+    const identityDesign = sectionDesignFixture("home", "هویت");
+    const identity = createGenerationTransaction({
+      generationId: manifest.generationId,
+      documentScope: manifest.documentId,
+      screenId: "home",
+      sectionId: "identity",
+      transactionId: "transaction-test-1",
+      design: identityDesign,
+    });
+    const primaryDesign = sectionDesignFixture("home", "محتوای اصلی");
+    const primary = createGenerationTransaction({
+      generationId: manifest.generationId,
+      documentScope: manifest.documentId,
+      screenId: "home",
+      sectionId: "primary",
+      transactionId: "transaction-test-2",
+      design: primaryDesign,
+    });
+
+    await expect(
+      store.saveSection(
+        "owner",
+        manifest.documentId,
+        manifest.generationId,
+        primary,
+        primaryDesign,
+      ),
+    ).rejects.toThrow("draft_section_sequence_gap");
+    await store.saveSection(
+      "owner",
+      manifest.documentId,
+      manifest.generationId,
+      identity,
+      identityDesign,
+    );
+    await store.saveSection(
+      "owner",
+      manifest.documentId,
+      manifest.generationId,
+      identity,
+      identityDesign,
+    );
+    await store.markSectionApplied(
+      "owner",
+      manifest.documentId,
+      manifest.generationId,
+      identity,
+      "native:screen-home",
+    );
+    await store.saveSection(
+      "owner",
+      manifest.documentId,
+      manifest.generationId,
+      primary,
+      primaryDesign,
+    );
+
+    const recovered = await createDraftStore(directory).load("owner", manifest.documentId);
+    expect(recovered?.transactions).toHaveLength(2);
+    expect(recovered?.transactions.map(({ transaction }) => transaction.sequence)).toEqual([0, 1]);
+    expect(recovered?.transactions[0]).toMatchObject({
+      rendered: true,
+      nodeId: "native:screen-home",
+    });
+    expect(recovered?.screens[0]?.design.screens[0]?.children.map(({ name }) => name)).toEqual([
+      "هویت",
+      "محتوای اصلی",
+    ]);
+    expect(recovered?.screens[0]?.rendered).toBe(false);
+
+    const supportingDesign = sectionDesignFixture("home", "بخش‌های تکمیلی");
+    const supporting = createGenerationTransaction({
+      generationId: manifest.generationId,
+      documentScope: manifest.documentId,
+      screenId: "home",
+      sectionId: "supporting",
+      transactionId: "transaction-test-3",
+      design: supportingDesign,
+    });
+    const projectDirectory = join(
+      directory,
+      createHash("sha256").update(`owner:${manifest.documentId}`).digest("hex"),
+    );
+    await writeFile(join(projectDirectory, "section-home-2.json"), "{broken section");
+    const corruptLoad = await store.load("owner", manifest.documentId);
+    expect(corruptLoad?.transactions).toHaveLength(2);
+    expect(corruptLoad?.warnings.join(" ")).toContain("section-home-2.json");
+    await store.saveSection(
+      "owner",
+      manifest.documentId,
+      manifest.generationId,
+      supporting,
+      supportingDesign,
+    );
+    expect(await readFile(join(projectDirectory, "section-home-2.json.corrupt"), "utf8")).toBe(
+      "{broken section",
+    );
+    expect(
+      (await createDraftStore(directory).load("owner", manifest.documentId))?.transactions,
+    ).toHaveLength(3);
+
+    await expect(
+      createDraftStore(directory).saveSection(
+        "owner",
+        manifest.documentId,
+        manifest.generationId,
+        { ...primary, sequence: 2 },
+        primaryDesign,
+      ),
+    ).rejects.toThrow();
+  });
+
   it("survives restart, replays writes without duplicates, and binds account/document/generation", async () => {
     const { manifest, design } = draftFixture();
     const { directory, store } = await setup();
@@ -111,6 +228,43 @@ describe("durable per-screen draft checkpoints", () => {
       (await readdir(join(directory, project))).filter((name) => name.endsWith(".tmp")),
     ).toEqual([]);
   }, 30_000);
+
+  it("persists and recovers 500 ordered section records across a 167-screen plan", async () => {
+    const { manifest } = draftFixture();
+    manifest.request.screenCount = 167;
+    manifest.request.screenNames = Array.from({ length: 167 }, (_, index) => `Screen ${index}`);
+    const { directory, store } = await setup();
+    await store.start("owner", manifest);
+    const sectionIds = ["identity", "primary", "supporting"] as const;
+    for (let screenIndex = 0; screenIndex < 167; screenIndex++) {
+      const screenId = `screen-${screenIndex}`;
+      const sectionCount = screenIndex < 166 ? 3 : 2;
+      for (const sectionId of sectionIds.slice(0, sectionCount)) {
+        const design = sectionDesignFixture(screenId, `${screenId} ${sectionId}`);
+        const transaction = createGenerationTransaction({
+          generationId: manifest.generationId,
+          documentScope: manifest.documentId,
+          screenId,
+          sectionId,
+          transactionId: `transaction-${screenIndex}-${sectionId}`,
+          design,
+        });
+        await store.saveSection(
+          "owner",
+          manifest.documentId,
+          manifest.generationId,
+          transaction,
+          design,
+        );
+      }
+    }
+    const recovered = await createDraftStore(directory).load("owner", manifest.documentId);
+    expect(recovered?.transactions).toHaveLength(500);
+    expect(recovered?.screens).toHaveLength(167);
+    expect(recovered?.warnings).toEqual([]);
+    expect(recovered?.transactions[0]?.transaction.sequence).toBe(0);
+    expect(recovered?.transactions.at(-1)?.transaction.screen_id).toBe("screen-166");
+  }, 60_000);
 
   it("bounds retention without silently deleting old projects and rejects unsupported assets", async () => {
     const { manifest, design } = draftFixture();

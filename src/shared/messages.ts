@@ -1,5 +1,15 @@
 import { z } from "zod";
+import { ChatTaskSchema } from "./chat-task";
 import { DraftIdentitySchema, DraftManifestSchema } from "./generation-draft";
+import { GenerationTransactionSchema } from "./generation-transaction";
+import {
+  FigmaToolBatchSchema,
+  FigmaToolCancelSchema,
+  FigmaToolDeleteConsentSchema,
+  FigmaToolBatchResultSchema,
+  FigmaToolDeleteConsentResultSchema,
+  FigmaToolProgressSchema,
+} from "./figma-tools";
 
 const RequestSchema = z.object({
   requestId: z.string().min(1).max(100),
@@ -104,11 +114,28 @@ const MultiScreenRenderResultSchema = z
   .strict();
 
 export const UIToPluginSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("chat-task-load"), requestId: z.string().min(1).max(100) }).strict(),
+  z
+    .object({
+      type: z.literal("chat-task-save"),
+      requestId: z.string().min(1).max(100),
+      documentId: z.string().min(1).max(300),
+      task: ChatTaskSchema.nullable(),
+    })
+    .strict(),
+  FigmaToolBatchSchema,
+  FigmaToolCancelSchema,
+  FigmaToolDeleteConsentSchema,
   z
     .object({
       type: z.literal("generation-select"),
       requestId: z.string().max(100),
       generationId: DraftIdentitySchema,
+      screenId: z
+        .string()
+        .regex(/^[a-z0-9][a-z0-9._-]{0,79}$/u)
+        .optional(),
+      sectionId: z.enum(["identity", "primary", "supporting"]).optional(),
     })
     .strict(),
   z.object({ type: z.literal("generation-context"), requestId: z.string().max(100) }).strict(),
@@ -121,9 +148,30 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
+      type: z.literal("generation-prepare"),
+      requestId: z.string().max(100),
+      manifest: DraftManifestSchema,
+      screenIds: z
+        .array(z.string().regex(/^[a-z0-9][a-z0-9._-]{0,79}$/u))
+        .min(1)
+        .max(400),
+      focusInitial: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("generation-render"),
       requestId: z.string().max(100),
       manifest: DraftManifestSchema,
+      design: z.unknown(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("generation-apply-section"),
+      requestId: z.string().max(100),
+      manifest: DraftManifestSchema,
+      transaction: GenerationTransactionSchema,
       design: z.unknown(),
     })
     .strict(),
@@ -155,6 +203,19 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
 export const PluginToUISchema = z.discriminatedUnion("type", [
   z
     .object({
+      type: z.literal("chat-task-result"),
+      requestId: z.string().min(1).max(100),
+      success: z.boolean(),
+      documentId: z.string().max(300),
+      task: ChatTaskSchema.nullable().optional(),
+      error: z.string().max(500).optional(),
+    })
+    .strict(),
+  FigmaToolProgressSchema,
+  FigmaToolBatchResultSchema,
+  FigmaToolDeleteConsentResultSchema,
+  z
+    .object({
       type: z.literal("generation-result"),
       warnings: z.array(z.string().max(500)).max(8).optional(),
       requestId: z.string(),
@@ -164,6 +225,17 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       nodeId: z.string().optional(),
       elapsedMs: z.number().nonnegative().optional(),
       error: z.string().max(500).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("generation-node-progress"),
+      requestId: z.string().max(100),
+      transactionId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+      screenId: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,79}$/u),
+      sectionId: z.enum(["identity", "primary", "supporting"]),
+      nodeId: z.string().min(1).max(100),
+      elapsedMs: z.number().int().nonnegative(),
     })
     .strict(),
   z
@@ -215,7 +287,13 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       errors: z.array(z.string()).optional(),
     })
     .strict(),
-  z.object({ type: z.literal("protocol-error"), message: z.string() }).strict(),
+  z
+    .object({
+      type: z.literal("protocol-error"),
+      requestId: z.string().min(1).max(100).optional(),
+      message: z.string(),
+    })
+    .strict(),
   MultiScreenProgressSchema,
   MultiScreenRenderResultSchema,
 ]);

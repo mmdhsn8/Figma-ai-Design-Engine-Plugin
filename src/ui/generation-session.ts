@@ -2,6 +2,7 @@ import { PluginToUISchema, type UIToPluginMessage } from "../shared/messages";
 import {
   DraftManifestSchema,
   MAX_PROJECT_BYTES,
+  validateDraftSection,
   validateDraftScreen,
   type SavedDraft,
 } from "../shared/generation-draft";
@@ -12,9 +13,15 @@ export function generationBridge(
     UIToPluginMessage,
     {
       type:
-        "generation-context" | "generation-remember" | "generation-render" | "generation-select";
+        | "generation-context"
+        | "generation-remember"
+        | "generation-render"
+        | "generation-select"
+        | "generation-prepare"
+        | "generation-apply-section";
     }
   >,
+  onNodeProgress?: (nodeId: string, elapsedMs: number) => void,
 ) {
   return new Promise<
     Extract<import("../shared/messages").PluginToUIMessage, { type: "generation-result" }>
@@ -25,11 +32,13 @@ export function generationBridge(
     };
     const receive = (event: MessageEvent) => {
       const parsed = PluginToUISchema.safeParse(event.data?.pluginMessage);
-      if (
-        !parsed.success ||
-        parsed.data.type !== "generation-result" ||
-        parsed.data.requestId !== message.requestId
-      )
+      if (!parsed.success) return;
+      if (parsed.data.type === "generation-node-progress") {
+        if (parsed.data.requestId !== message.requestId) return;
+        onNodeProgress?.(parsed.data.nodeId, parsed.data.elapsedMs);
+        return;
+      }
+      if (parsed.data.type !== "generation-result" || parsed.data.requestId !== message.requestId)
         return;
       finish();
       if (!parsed.data.success)
@@ -135,6 +144,10 @@ export async function loadSavedDraft(
       ...record,
       design: validateDraftScreen(manifest, record.design),
     })),
+    transactions: (result.draft.transactions ?? []).map((record) => ({
+      ...record,
+      ...validateDraftSection(manifest, record.transaction, record.design),
+    })),
     warnings: result.draft.warnings,
   };
 }
@@ -147,17 +160,35 @@ export async function importSavedDraft(
 ): Promise<void> {
   const value = input as SavedDraft;
   const manifest = DraftManifestSchema.parse(value.manifest);
+  const transactions = Array.isArray(value.transactions) ? value.transactions : [];
   if (
     manifest.documentId !== documentId ||
     !Array.isArray(value.screens) ||
-    value.screens.length > 400
+    value.screens.length > 400 ||
+    transactions.length > 1_200
   )
     throw new Error(
       "Recovery file belongs to another document/page or has an invalid screen count.",
     );
   const designs = value.screens.map((record) => validateDraftScreen(manifest, record.design));
+  const sections = transactions.map((record) =>
+    validateDraftSection(manifest, record.transaction, record.design),
+  );
   await draftRequest(token, documentId, "start", { manifest }, signal);
-  for (const design of designs)
+  const sectionScreenIds = new Set(sections.map(({ transaction }) => transaction.screen_id));
+  for (const section of sections)
+    await draftRequest(
+      token,
+      documentId,
+      "save-section",
+      {
+        generationId: manifest.generationId,
+        transaction: section.transaction,
+        design: section.design,
+      },
+      signal,
+    );
+  for (const design of designs.filter((item) => !sectionScreenIds.has(item.screens[0]!.id)))
     await draftRequest(
       token,
       documentId,

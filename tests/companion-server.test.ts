@@ -33,10 +33,348 @@ const TEST_HOST_ID = "urn:uuid:123e4567-e89b-42d3-a456-426614174000";
 const openHandles: CompanionServerHandle[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(openHandles.splice(0).map((handle) => handle.close()));
 });
 
 describe("loopback companion", () => {
+  it("streams allowlisted chat calls and accepts their function outputs for continuation", async () => {
+    const call = {
+      type: "function_call",
+      call_id: "call_frame_123456",
+      name: "create_frame",
+      arguments: JSON.stringify({
+        ref: "home",
+        name: "Home",
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+      }),
+    };
+    const harness = await createHarness({
+      chatResponses: [
+        { outputItems: [call], omitCompletedOutput: true },
+        { text: "Your frame is ready.", outputItems: [] },
+      ],
+    });
+    const token = await authorizeAndDiscover(harness);
+    const unauthenticated = await request(harness.handle, "/v1/chat", {
+      body: {
+        requestId: "chat-test-0000",
+        model: "account-model",
+        input: [{ role: "user", content: "Hi" }],
+      },
+    });
+    expect(unauthenticated.status).toBe(401);
+    const unverified = await request(harness.handle, "/v1/chat", {
+      token,
+      body: {
+        requestId: "chat-test-0000",
+        model: "account-model",
+        input: [{ role: "user", content: "Hi" }],
+      },
+    });
+    expect(unverified.status).toBe(403);
+    expect(harness.responsesCallCount).toBe(0);
+    const smoke = await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    expect(smoke.status).toBe(200);
+
+    const diagnostics = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const userItem = { role: "user", content: "Create a home frame." };
+    const first = await request(harness.handle, "/v1/chat", {
+      token,
+      body: { requestId: "chat-test-0001", model: "account-model", input: [userItem] },
+    });
+    expect(first.status).toBe(200);
+    expect(first.headers.get("x-fad-request-id")).toBe("chat-test-0001");
+    const firstEvents = await first.text();
+    expect(firstEvents).toContain("event: tool_calls");
+    const toolFrame = firstEvents
+      .split(/\r?\n\r?\n/u)
+      .find((frame) => frame.includes("event: tool_calls"));
+    const toolEvent = toolFrame
+      ?.split("\n")
+      .find((line) => line.startsWith("data: "))
+      ?.slice("data: ".length);
+    expect(JSON.parse(toolEvent ?? "{}")).toMatchObject({
+      requestId: "chat-test-0001",
+      calls: [{ callId: "call_frame_123456", action: { tool: "create_frame", ref: "home" } }],
+      functionCallItems: [call],
+    });
+
+    const toolOutput = {
+      type: "function_call_output",
+      call_id: call.call_id,
+      output: JSON.stringify({ success: true, logicalRef: "home" }),
+    };
+    const second = await request(harness.handle, "/v1/chat", {
+      token,
+      body: {
+        requestId: "chat-test-0002",
+        model: "account-model",
+        input: [userItem, call, toolOutput],
+      },
+    });
+    expect(second.status).toBe(200);
+    expect(await second.text()).toContain("Your frame is ready.");
+    const diagnosticRecords = diagnostics.mock.calls
+      .filter(([label]) => label === "[FAD_CHAT_DIAGNOSTIC]")
+      .map(([, value]) => JSON.parse(String(value)) as Record<string, unknown>);
+    expect(diagnosticRecords).toHaveLength(2);
+    expect(diagnosticRecords[0]).toMatchObject({
+      requestId: "chat-test-0001",
+      httpStatus: 200,
+      responseStatus: "completed",
+      outputItemTypes: ["function_call"],
+      functionCallCount: 1,
+      continuationState: "initial",
+      chatState: "tool_calls",
+    });
+    expect(diagnosticRecords[1]).toMatchObject({
+      requestId: "chat-test-0002",
+      continuationState: "continuation",
+      chatState: "text",
+    });
+    expect(JSON.stringify(diagnosticRecords)).not.toContain("Home");
+    expect(JSON.stringify(diagnosticRecords)).not.toContain("arguments");
+    const sent = JSON.parse(harness.responsesRequest!.body) as {
+      input: unknown[];
+      tools: Array<{ name: string }>;
+      store: boolean;
+      parallel_tool_calls: boolean;
+    };
+    expect(sent).toMatchObject({
+      store: false,
+      input: [userItem, call, toolOutput],
+    });
+    expect(sent.tools.map(({ name }) => name)).toContain("create_frame");
+    expect(sent.tools.map(({ name }) => name)).not.toContain("delete_node");
+    expect(sent.parallel_tool_calls).toBe(true);
+  }, 20_000);
+
+  it("continues multiple Persian design calls across rounds until it returns user-facing text", async () => {
+    const frameCall = {
+      type: "function_call",
+      call_id: "call_frame_123456",
+      name: "create_frame",
+      arguments: JSON.stringify({
+        ref: "storefront",
+        name: "خانه فروشگاه",
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+      }),
+    };
+    const textCall = {
+      type: "function_call",
+      call_id: "call_title_123456",
+      name: "create_text",
+      arguments: JSON.stringify({
+        ref: "title",
+        name: "عنوان",
+        parent: { kind: "node", ref: "storefront" },
+        text: "فروشگاه شما",
+        size: { width: 342, height: 40 },
+        direction: "RTL",
+        align: "RIGHT",
+      }),
+    };
+    const colorCall = {
+      type: "function_call",
+      call_id: "call_color_123456",
+      name: "set_properties",
+      arguments: JSON.stringify({ ref: "title", properties: { color: "#6841D8" } }),
+    };
+    const harness = await createHarness({
+      chatResponses: [
+        { outputItems: [frameCall, textCall] },
+        { outputItems: [colorCall] },
+        { text: "صفحهٔ فروشگاه آماده است.", outputItems: [] },
+      ],
+    });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const user = { role: "user", content: "salam, yek safhe baraye home shop tarahi kon" };
+    const first = await request(harness.handle, "/v1/chat", {
+      token,
+      body: { requestId: "chat-round-0001", model: "account-model", input: [user] },
+    });
+    const firstEvents = await first.text();
+    expect(firstEvents).toContain('"callId":"call_frame_123456"');
+    expect(firstEvents).toContain('"callId":"call_title_123456"');
+    const firstRequest = JSON.parse(harness.responsesRequest!.body) as { input: unknown[] };
+    expect(firstRequest.input).toEqual([user]);
+
+    const outputs = [
+      {
+        type: "function_call_output",
+        call_id: frameCall.call_id,
+        output: JSON.stringify({ success: true, logicalRef: "storefront" }),
+      },
+      {
+        type: "function_call_output",
+        call_id: textCall.call_id,
+        output: JSON.stringify({ success: true, logicalRef: "title" }),
+      },
+    ];
+    const secondInput = [user, frameCall, textCall, ...outputs];
+    const second = await request(harness.handle, "/v1/chat", {
+      token,
+      body: { requestId: "chat-round-0002", model: "account-model", input: secondInput },
+    });
+    expect(await second.text()).toContain('"callId":"call_color_123456"');
+    expect(JSON.parse(harness.responsesRequest!.body).input).toEqual(secondInput);
+
+    const finalInput = [
+      ...secondInput,
+      colorCall,
+      {
+        type: "function_call_output",
+        call_id: colorCall.call_id,
+        output: JSON.stringify({ success: true, logicalRef: "title" }),
+      },
+    ];
+    const final = await request(harness.handle, "/v1/chat", {
+      token,
+      body: { requestId: "chat-round-0003", model: "account-model", input: finalInput },
+    });
+    expect(await final.text()).toContain("صفحهٔ فروشگاه آماده است.");
+    expect(JSON.parse(harness.responsesRequest!.body).input).toEqual(finalInput);
+  }, 20_000);
+
+  it("uses completed message text, displays refusals, and reports truly empty completed output", async () => {
+    const messageCases = [
+      {
+        chatResponses: [
+          {
+            outputItems: [{ type: "message", content: [{ type: "output_text", text: "Ready." }] }],
+          },
+        ],
+        expected: "Ready.",
+      },
+      {
+        chatResponses: [
+          {
+            outputItems: [
+              { type: "message", content: [{ type: "refusal", refusal: "I can’t do that." }] },
+            ],
+          },
+        ],
+        expected: "I can’t do that.",
+      },
+    ];
+    for (const [index, testCase] of messageCases.entries()) {
+      const harness = await createHarness(testCase);
+      const token = await authorizeAndDiscover(harness);
+      await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+      const response = await request(harness.handle, "/v1/chat", {
+        token,
+        body: {
+          requestId: `chat-content-${index}01`,
+          model: "account-model",
+          input: [{ role: "user", content: "Reply." }],
+        },
+      });
+      expect(await response.text()).toContain(testCase.expected);
+    }
+
+    const emptyHarness = await createHarness({ chatResponses: [{ outputItems: [] }] });
+    const token = await authorizeAndDiscover(emptyHarness);
+    await request(emptyHarness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const empty = await request(emptyHarness.handle, "/v1/chat", {
+      token,
+      body: {
+        requestId: "chat-empty-0001",
+        model: "account-model",
+        input: [{ role: "user", content: "Make a shop page." }],
+      },
+    });
+    expect(await empty.text()).toMatch(/event: error[\s\S]*empty_response/u);
+  }, 20_000);
+
+  it("reports token-budget exhaustion and rejects malformed function arguments without echoing them", async () => {
+    const incompleteHarness = await createHarness({
+      chatResponses: [{ incompleteReason: "max_output_tokens" }],
+    });
+    const incompleteToken = await authorizeAndDiscover(incompleteHarness);
+    await request(incompleteHarness.handle, "/v1/smoke", {
+      token: incompleteToken,
+      body: { model: "account-model" },
+    });
+    const incomplete = await request(incompleteHarness.handle, "/v1/chat", {
+      token: incompleteToken,
+      body: {
+        requestId: "chat-incomplete-01",
+        model: "account-model",
+        input: [{ role: "user", content: "Create a storefront." }],
+      },
+    });
+    const incompleteBody = await incomplete.text();
+    expect(incompleteBody).toContain("max_output_tokens");
+    expect(incompleteBody).toContain('"responseStatus":"incomplete"');
+    expect(incompleteBody).toContain('"functionCallCount":0');
+
+    const malformed = {
+      type: "function_call",
+      call_id: "call_badargs_123",
+      name: "create_frame",
+      arguments: '{"private":"must not be echoed"}',
+    };
+    const malformedHarness = await createHarness({ chatResponses: [{ outputItems: [malformed] }] });
+    const malformedToken = await authorizeAndDiscover(malformedHarness);
+    await request(malformedHarness.handle, "/v1/smoke", {
+      token: malformedToken,
+      body: { model: "account-model" },
+    });
+    const rejected = await request(malformedHarness.handle, "/v1/chat", {
+      token: malformedToken,
+      body: {
+        requestId: "chat-malformed-01",
+        model: "account-model",
+        input: [{ role: "user", content: "Create a storefront." }],
+      },
+    });
+    const safeError = await rejected.text();
+    expect(safeError).toContain("response_invalid");
+    expect(safeError).not.toContain("must not be echoed");
+    expect(safeError).not.toContain(malformed.arguments);
+  }, 20_000);
+
+  it("aborts the upstream Responses stream when the chat client stops", async () => {
+    const harness = await createHarness();
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    harness.stallNextResponse();
+    const controller = new AbortController();
+    const pending = request(harness.handle, "/v1/chat", {
+      token,
+      signal: controller.signal,
+      body: {
+        requestId: "chat-cancel-0001",
+        model: "account-model",
+        input: [{ role: "user", content: "Create a frame." }],
+      },
+    });
+    await harness.waitForResponseStream();
+    await harness.waitForResponseStream();
+    const duplicate = await request(harness.handle, "/v1/chat", {
+      token,
+      body: {
+        requestId: "chat-cancel-0002",
+        model: "account-model",
+        input: [{ role: "user", content: "Create another frame." }],
+      },
+    });
+    expect(duplicate.status).toBe(409);
+    controller.abort();
+    await expect(pending).rejects.toBeDefined();
+    await vi.waitFor(() => expect(harness.wasResponseStreamCancelled()).toBe(true));
+  }, 20_000);
+
   it("protects durable checkpoints behind pairing and restores them after companion restart", async () => {
     const directory = await mkdtemp(join(tmpdir(), "fad-route-draft-test-"));
     try {
@@ -758,7 +1096,7 @@ describe("loopback companion", () => {
     expect(await smokeResponse.json()).toMatchObject({
       success: true,
       completed: true,
-      text: "OK",
+      text: "Authenticated Responses function calling passed.",
       status: { auth: "ready", inferenceVerifiedModel: "account-model" },
     });
     const liveStatus = await request(harness.handle, "/v1/status", { token });
@@ -770,10 +1108,14 @@ describe("loopback companion", () => {
     const sent = harness.responsesRequest as { body: string; headers: HeadersInit };
     const payload = JSON.parse(sent.body) as Record<string, unknown>;
     expect(payload).toMatchObject({
-      input: [{ role: "user", content: "Reply with exactly OK." }],
+      input: [{ role: "user", content: "Call get_document_context with no arguments." }],
+      tool_choice: { type: "function", name: "get_document_context" },
       store: false,
       stream: true,
     });
+    expect((payload.tools as Array<{ name: string }>).map(({ name }) => name)).toEqual([
+      "get_document_context",
+    ]);
     expect(payload).not.toHaveProperty("max_output_tokens");
     expect(payload.model).toBe("account-model");
     expect(new Headers(sent.headers).get("authorization")).toBe("Bearer access-secret");
@@ -787,7 +1129,29 @@ describe("loopback companion", () => {
         '\ndata: {"type":"response.output_text.delta","delta":"O"}\r',
         "\n\r",
         '\ndata: {"type":"response.output_text.delta","delta":"K"}\r\n\r\n',
-        'event: response.completed\r\ndata: {"completed":true}',
+        `event: response.output_item.done\r\ndata: ${JSON.stringify({
+          type: "response.output_item.done",
+          item: {
+            type: "function_call",
+            call_id: "smoke_call_123456",
+            name: "get_document_context",
+            arguments: "{}",
+          },
+        })}\r\n\r\n`,
+        `event: response.completed\r\ndata: ${JSON.stringify({
+          type: "response.completed",
+          response: {
+            status: "completed",
+            output: [
+              {
+                type: "function_call",
+                call_id: "smoke_call_123456",
+                name: "get_document_context",
+                arguments: "{}",
+              },
+            ],
+          },
+        })}`,
       ],
     });
     const token = await authorizeAndDiscover(harness);
@@ -799,7 +1163,7 @@ describe("loopback companion", () => {
     expect(await smoke.json()).toMatchObject({
       success: true,
       completed: true,
-      text: "OK",
+      text: "Authenticated Responses function calling passed.",
       status: { auth: "ready", inferenceVerifiedModel: "gpt-5.6-luna" },
       diagnostic: {
         model: "gpt-5.6-luna",
@@ -807,14 +1171,84 @@ describe("loopback companion", () => {
         outcome: "completed",
         terminalEvent: "response.completed",
         lastEvent: "response.completed",
-        eventCount: 3,
+        eventCount: 4,
+        responseStatus: "completed",
+        outputItemTypes: ["function_call"],
+        outputItemCount: 1,
+        functionCallCount: 1,
       },
     });
     const sent = harness.responsesRequest as { body: string };
     expect(JSON.parse(sent.body)).toMatchObject({
       model: "gpt-5.6-luna",
+      input: [{ role: "user", content: "Call get_document_context with no arguments." }],
+      tool_choice: { type: "function", name: "get_document_context" },
       store: false,
       stream: true,
+    });
+    expect(JSON.parse(sent.body).tools.map(({ name }: { name: string }) => name)).toEqual([
+      "get_document_context",
+    ]);
+  });
+
+  it("verifies function calling with a forced no-side-effect smoke tool", async () => {
+    const call = {
+      type: "function_call",
+      id: "fc_123",
+      call_id: "call_12345678",
+      name: "get_document_context",
+      arguments: "{}",
+    };
+    const harness = await createHarness({
+      responseChunks: [
+        `data: ${JSON.stringify({ type: "response.output_item.done", item: call })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [call] } })}\n\n`,
+      ],
+    });
+    const token = await authorizeAndDiscover(harness);
+    const response = await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      success: true,
+      completed: true,
+      text: "Authenticated Responses function calling passed.",
+    });
+    expect(harness.responsesCallCount).toBe(1);
+    const sent = JSON.parse((harness.responsesRequest as { body: string }).body);
+    expect(sent.tool_choice).toEqual({ type: "function", name: "get_document_context" });
+    expect(sent.tools).toMatchObject([{ type: "function", name: "get_document_context" }]);
+    expect(sent.input).toEqual([
+      { role: "user", content: "Call get_document_context with no arguments." },
+    ]);
+  });
+
+  it("does not mark a model ready when its forced function-call smoke result is missing", async () => {
+    const harness = await createHarness({
+      responseChunks: [
+        `data: ${JSON.stringify({
+          type: "response.completed",
+          response: {
+            status: "completed",
+            output: [{ type: "message", content: [{ type: "output_text", text: "OK" }] }],
+          },
+        })}\n\n`,
+      ],
+    });
+    const token = await authorizeAndDiscover(harness);
+    const response = await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({
+      error: "unsupported_capability",
+      diagnostic: { errorCode: "function_call_smoke_failed", functionCallCount: 0 },
+    });
+    expect(await (await request(harness.handle, "/v1/status", { token })).json()).toMatchObject({
+      auth: "scope_granted",
     });
   });
 
@@ -1252,6 +1686,61 @@ describe("loopback companion", () => {
     });
     expect(tooManyRepairs.status).toBe(409);
     expect(await tooManyRepairs.json()).toMatchObject({ error: "generation_retry_limit" });
+  });
+
+  it("serves one bounded planned section per authorized completed Responses request", async () => {
+    const design = {
+      projectName: "فروشگاه فارسی",
+      palette: {
+        brand: "#223344",
+        accent: "#CC7744",
+        page: "#F7F5F0",
+        surface: "#FFFFFF",
+        text: "#17212B",
+        muted: "#647080",
+        border: "#D8DEE6",
+      },
+      screens: [{ id: "home", children: [] }],
+    };
+    const harness = await createHarness({ generatedOutput: JSON.stringify(design) });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const body = {
+      requestId: "req-section-identity",
+      model: "account-model",
+      request: {
+        prompt: "یک فروشگاه فارسی با صفحه خانه و جزئیات محصول طراحی کن.",
+        target: "mobile",
+        screenCount: 2,
+        screenNames: ["Home", "Detail"],
+        language: "fa",
+        style: "",
+      },
+      screenIds: ["home"],
+      section: { id: "identity", sequence: 0 },
+    };
+    const response = await request(harness.handle, "/v1/design", { token, body });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(JSON.stringify(design));
+    expect(response.headers.get("x-fad-completed")).toBe("response.completed");
+    const payload = JSON.parse((harness.responsesRequest as { body: string }).body);
+    expect(payload).toMatchObject({ store: false, stream: true });
+    expect(payload.input[0].content).toContain("section_id: identity");
+    expect(payload.instructions).toContain("Section 1/3");
+    expect(payload.instructions).toContain("natural Persian");
+    expect(payload.text.format).toMatchObject({ type: "json_schema", strict: true });
+    const completedRequest = harness.responsesRequest;
+
+    const invalidSelector = await request(harness.handle, "/v1/design", {
+      token,
+      body: {
+        ...body,
+        requestId: "req-section-invalid-sequence",
+        section: { id: "primary", sequence: 0 },
+      },
+    });
+    expect(invalidSelector.status).toBe(400);
+    expect(harness.responsesRequest).toBe(completedRequest);
   });
 
   it("accepts a long Persian brief for two mobile screens and explains validation failures", async () => {
@@ -1867,6 +2356,12 @@ async function createHarness(
     stallDesignHeaders?: boolean;
     incompleteGeneratedStreams?: number;
     generatedOutput?: string;
+    chatResponses?: Array<{
+      text?: string;
+      outputItems?: unknown[];
+      incompleteReason?: string;
+      omitCompletedOutput?: boolean;
+    }>;
     responseChunks?: string[];
     responsesHttpError?: { status: number; body: unknown };
     responsesFetchFailure?: boolean;
@@ -1892,6 +2387,7 @@ async function createHarness(
   };
   let openedUrl: string | undefined;
   let responsesRequest: { body: string; headers: HeadersInit } | undefined;
+  let responsesCallCount = 0;
   let refreshRequest: string | undefined;
   let codeExchange: string | undefined;
   let markResponseStreamStarted = () => {};
@@ -1979,7 +2475,13 @@ async function createHarness(
       });
     }
     if (url === "https://api.openai.com/v1/responses") {
+      responsesCallCount++;
       responsesRequest = { body: String(init?.body ?? ""), headers: init?.headers ?? {} };
+      const responsePayload = JSON.parse(String(init?.body ?? "")) as {
+        text?: unknown;
+        tools?: unknown;
+        tool_choice?: unknown;
+      };
       if (options.responsesFetchFailure) throw new TypeError("private transport failure text");
       if (options.stallDesignHeaders && JSON.parse(String(init?.body ?? "")).text) {
         return await new Promise<Response>((_resolve, reject) => {
@@ -2033,7 +2535,69 @@ async function createHarness(
           { status: 200, headers: { "Content-Type": "text/event-stream" } },
         );
       }
-      const responsePayload = JSON.parse(String(init?.body ?? "")) as { text?: unknown };
+      if (Array.isArray(responsePayload.tools)) {
+        if (
+          typeof responsePayload.tool_choice === "object" &&
+          responsePayload.tool_choice !== null
+        ) {
+          const call = {
+            type: "function_call",
+            call_id: "smoke_call_123456",
+            name: "get_document_context",
+            arguments: "{}",
+          };
+          return new Response(
+            `data: ${JSON.stringify({
+              type: "response.completed",
+              response: { status: "completed", output: [call] },
+            })}\n\n`,
+            { status: 200, headers: { "Content-Type": "text/event-stream" } },
+          );
+        }
+        const chatResponse = options.chatResponses?.shift() ?? { text: "OK", outputItems: [] };
+        if (chatResponse.incompleteReason) {
+          return new Response(
+            `data: ${JSON.stringify({
+              type: "response.incomplete",
+              response: {
+                status: "incomplete",
+                output: [],
+                incomplete_details: { reason: chatResponse.incompleteReason },
+              },
+            })}\n\n`,
+            { status: 200, headers: { "Content-Type": "text/event-stream" } },
+          );
+        }
+        return new Response(
+          [
+            ...(chatResponse.text
+              ? [
+                  `data: ${JSON.stringify({ type: "response.output_text.delta", delta: chatResponse.text })}\n\n`,
+                ]
+              : []),
+            ...(chatResponse.outputItems ?? [])
+              .filter(
+                (item) =>
+                  typeof item === "object" &&
+                  item !== null &&
+                  "type" in item &&
+                  item.type === "function_call",
+              )
+              .map(
+                (item) =>
+                  `data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\n`,
+              ),
+            `data: ${JSON.stringify({
+              type: "response.completed",
+              response: {
+                status: "completed",
+                output: chatResponse.omitCompletedOutput ? [] : (chatResponse.outputItems ?? []),
+              },
+            })}\n\n`,
+          ].join(""),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        );
+      }
       const outputText = responsePayload.text ? (options.generatedOutput ?? "{}") : "OK";
       if ((options.incompleteGeneratedStreams ?? 0) > 0 && responsePayload.text) {
         options.incompleteGeneratedStreams = (options.incompleteGeneratedStreams ?? 0) - 1;
@@ -2141,6 +2705,9 @@ async function createHarness(
     },
     get responsesRequest() {
       return responsesRequest;
+    },
+    get responsesCallCount() {
+      return responsesCallCount;
     },
     get refreshRequest() {
       return refreshRequest;

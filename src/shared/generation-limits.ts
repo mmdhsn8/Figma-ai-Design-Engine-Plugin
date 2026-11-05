@@ -1,4 +1,6 @@
 export const MAX_SCREEN_BYTES = 8 * 1024 * 1024;
+export const MAX_SECTION_BYTES = 1024 * 1024;
+export const MAX_SECTION_NODES = 250;
 export const MAX_PROJECT_BYTES = 64 * 1024 * 1024;
 export const MAX_GENERATED_NODES = 100_000;
 

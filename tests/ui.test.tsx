@@ -27,14 +27,32 @@ function status(auth: CompanionStatus["auth"]): CompanionStatus {
 }
 
 describe("plugin UI navigation and capability states", () => {
-  it("starts on Design and exposes all five keyboard reachable navigation buttons", () => {
+  it("keeps Design selected on its explicit route and exposes all six navigation buttons", () => {
     const html = render();
 
     expect(html).toContain('<nav class="primary-nav" aria-label="Plugin sections">');
     expect(html).toContain('aria-current="page">Design</button>');
-    for (const label of ["JSON", "Assets", "System", "Quality"]) {
+    for (const label of ["AI Chat", "JSON", "Assets", "System", "Quality"]) {
       expect(html).toContain(`>${label}</button>`);
     }
+  });
+
+  it("provides the bilingual AI Chat composer and a collapsed native developer harness", () => {
+    const html = render("chat");
+    expect(html).toContain("AI Chat");
+    expect(html).toContain('id="chat-input"');
+    expect(html).toContain("Shift+Enter for a new line");
+    expect(html).toContain(">Send</button>");
+    expect(html).toContain('role="log"');
+    expect(html).toContain('<details class="tool-harness">');
+    expect(html).not.toContain('<details class="tool-harness" open="">');
+    expect(html).not.toContain("function_call");
+    expect(html).not.toContain("tool-execute");
+    expect(html).toContain("Native operation harness");
+    expect(html).toContain("Create 390 × 844 frame");
+    expect(html).toContain("Change button color only");
+    expect(html).toContain("Safe invalid-layout check");
+    expect(html).not.toContain('id="json-input"');
   });
 
   it("switches between areas and Settings without losing the selected area", () => {
@@ -120,10 +138,10 @@ describe("plugin UI navigation and capability states", () => {
     expect(render("quality")).not.toContain("Asset source / license");
   });
 
-  it("defines a compact five-item navigation and removes the plugin minimum width", () => {
+  it("defines compact six-item navigation and removes the plugin minimum width", () => {
     const css = readFileSync("src/ui/styles.css", "utf8");
 
-    expect(css).toContain("grid-template-columns: repeat(5, minmax(0, 1fr))");
+    expect(css).toContain("grid-template-columns: repeat(6, minmax(0, 1fr))");
     expect(css).toContain("@media (max-width: 420px)");
     expect(css).toContain("@media (max-width: 340px)");
     expect(css).toContain("min-width: 0;");

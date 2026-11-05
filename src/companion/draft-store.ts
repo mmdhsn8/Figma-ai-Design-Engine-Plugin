@@ -2,18 +2,22 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { createDesignPlan } from "../shared/design-generation.js";
+import { GenerationTransactionSchema } from "../shared/generation-transaction.js";
 import {
   DraftManifestSchema,
   MAX_PROJECT_BYTES,
   MAX_SCREEN_BYTES,
+  validateDraftSection,
   validateDraftScreen,
   type DraftManifest,
   type SavedDraft,
+  type SavedSection,
 } from "../shared/generation-draft.js";
 
 // A file per screen makes commits incremental; rename never overwrites the last good record in place.
 export function createDraftStore(directory: string) {
   const sizeIndexes = new Map<string, Map<string, number>>();
+  const sizeTotals = new Map<string, number>();
   let queue: Promise<unknown> = Promise.resolve();
   let pending = 0;
   const serial = <T>(work: () => Promise<T>): Promise<T> => {
@@ -24,18 +28,22 @@ export function createDraftStore(directory: string) {
     });
     queue = next.catch(() => {
       sizeIndexes.clear();
+      sizeTotals.clear();
     });
     return next;
   };
   const projectPath = (owner: string, documentId: string) =>
     join(directory, createHash("sha256").update(`${owner}:${documentId}`).digest("hex"));
-  const atomic = async (path: string, data: unknown) => {
+  const envelopeFor = (data: unknown) => {
     const text = JSON.stringify(data);
-    const envelope = JSON.stringify({
+    return JSON.stringify({
       version: 1,
       checksum: createHash("sha256").update(text).digest("hex"),
       data,
     });
+  };
+  const atomic = async (path: string, data: unknown) => {
+    const envelope = envelopeFor(data);
     const temporary = `${path}.${randomUUID()}.tmp`;
     try {
       const file = await open(temporary, "wx", 0o600);
@@ -72,8 +80,23 @@ export function createDraftStore(directory: string) {
         ),
       );
       sizeIndexes.set(path, sizes);
+      sizeTotals.set(
+        path,
+        [...sizes.values()].reduce((sum, bytes) => sum + bytes, 0),
+      );
     }
     return sizes;
+  };
+  const setIndexedSize = (
+    path: string,
+    sizes: Map<string, number>,
+    name: string,
+    bytes?: number,
+  ) => {
+    const oldSize = sizes.get(name) ?? 0;
+    if (bytes === undefined) sizes.delete(name);
+    else sizes.set(name, bytes);
+    sizeTotals.set(path, (sizeTotals.get(path) ?? 0) + (bytes ?? 0) - oldSize);
   };
   return {
     start: (owner: string, input: DraftManifest) =>
@@ -103,6 +126,7 @@ export function createDraftStore(directory: string) {
         }
         await atomic(join(path, "manifest.json"), manifest);
         sizeIndexes.delete(path);
+        sizeTotals.delete(path);
       }),
     saveScreen: (
       owner: string,
@@ -120,10 +144,7 @@ export function createDraftStore(directory: string) {
         const fileName = `screen-${screenId}.json`;
         const filePath = join(path, fileName);
         const sizes = await sizesAt(path);
-        let used = [...sizes].reduce(
-          (sum, [name, bytes]) => sum + (name === fileName ? 0 : bytes),
-          0,
-        );
+        let used = (sizeTotals.get(path) ?? 0) - (sizes.get(fileName) ?? 0);
         const sibling = [...sizes.keys()].find(
           (entry) =>
             entry.startsWith("screen-") &&
@@ -147,7 +168,7 @@ export function createDraftStore(directory: string) {
           }
         }
         const record = { design, rendered: Boolean(nodeId), ...(nodeId ? { nodeId } : {}) };
-        const recordBytes = Buffer.byteLength(JSON.stringify(record)) + 128;
+        const recordBytes = Buffer.byteLength(envelopeFor(record));
         if (used + recordBytes > MAX_PROJECT_BYTES) throw new Error("draft_project_64MiB_limit");
         // Replayed writes cannot silently replace a validated screen with different content.
         try {
@@ -162,19 +183,110 @@ export function createDraftStore(directory: string) {
             await rename(filePath, `${filePath}.corrupt`);
             const bytes = (await stat(`${filePath}.corrupt`)).size;
             used += bytes;
-            sizes.delete(fileName);
-            sizes.set(`${fileName}.corrupt`, bytes);
+            setIndexedSize(path, sizes, fileName);
+            setIndexedSize(path, sizes, `${fileName}.corrupt`, bytes);
           } else if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
         if (used + recordBytes > MAX_PROJECT_BYTES) throw new Error("draft_project_64MiB_limit");
         await atomic(filePath, record);
-        sizes.set(fileName, (await stat(filePath)).size);
+        setIndexedSize(path, sizes, fileName, (await stat(filePath)).size);
+      }),
+    saveSection: (
+      owner: string,
+      documentId: string,
+      generationId: string,
+      transactionValue: unknown,
+      value: unknown,
+    ) =>
+      serial(async () => {
+        const path = projectPath(owner, documentId);
+        const manifest = await manifestAt(path);
+        if (manifest.generationId !== generationId) throw new Error("draft_generation_mismatch");
+        const { transaction, design } = validateDraftSection(manifest, transactionValue, value);
+        const fileName = `section-${transaction.screen_id}-${transaction.sequence}.json`;
+        const filePath = join(path, fileName);
+        const sizes = await sizesAt(path);
+        const previousFile = transaction.sequence
+          ? join(path, `section-${transaction.screen_id}-${transaction.sequence - 1}.json`)
+          : undefined;
+        if (previousFile) {
+          try {
+            const previous = await read(previousFile);
+            if (previous.transaction.idempotency_key !== transaction.dependencies[0])
+              throw new Error("draft_section_dependency_mismatch");
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT")
+              throw new Error("draft_section_sequence_gap", { cause: error });
+            throw error;
+          }
+        }
+        const record = { transaction, design, rendered: false };
+        const recordBytes = Buffer.byteLength(envelopeFor(record));
+        let used = (sizeTotals.get(path) ?? 0) - (sizes.get(fileName) ?? 0);
+        try {
+          const previous = await read(filePath);
+          if (
+            JSON.stringify(previous.transaction) !== JSON.stringify(transaction) ||
+            JSON.stringify(previous.design) !== JSON.stringify(design)
+          )
+            throw new Error("draft_section_conflict");
+          return;
+        } catch (error) {
+          if (
+            error instanceof SyntaxError ||
+            (error instanceof Error && error.message === "draft_corrupt_or_unsupported_version")
+          ) {
+            await rename(filePath, `${filePath}.corrupt`);
+            const bytes = (await stat(`${filePath}.corrupt`)).size;
+            used += bytes;
+            setIndexedSize(path, sizes, fileName);
+            setIndexedSize(path, sizes, `${fileName}.corrupt`, bytes);
+          } else if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        if (used + recordBytes > MAX_PROJECT_BYTES) throw new Error("draft_project_64MiB_limit");
+        await atomic(filePath, record);
+        setIndexedSize(path, sizes, fileName, (await stat(filePath)).size);
+      }),
+    markSectionApplied: (
+      owner: string,
+      documentId: string,
+      generationId: string,
+      transactionValue: unknown,
+      nodeId: string,
+    ) =>
+      serial(async () => {
+        const transactionInput = GenerationTransactionSchema.parse(transactionValue);
+        const path = projectPath(owner, documentId);
+        const manifest = await manifestAt(path);
+        if (manifest.generationId !== generationId) throw new Error("draft_generation_mismatch");
+        const recordValue = await read(
+          join(path, `section-${transactionInput.screen_id}-${transactionInput.sequence}.json`),
+        );
+        const { transaction, design } = validateDraftSection(
+          manifest,
+          transactionInput,
+          recordValue.design,
+        );
+        if (JSON.stringify(transaction) !== JSON.stringify(recordValue.transaction))
+          throw new Error("draft_section_conflict");
+        const fileName = `section-${transaction.screen_id}-${transaction.sequence}.json`;
+        const filePath = join(path, fileName);
+        const sizes = await sizesAt(path);
+        if (!/^[A-Za-z0-9:_-]{1,100}$/u.test(nodeId))
+          throw new Error("draft_node_identity_invalid");
+        const updated = { transaction, design, rendered: true, nodeId };
+        const recordBytes = Buffer.byteLength(envelopeFor(updated));
+        const used = (sizeTotals.get(path) ?? 0) - (sizes.get(fileName) ?? 0);
+        if (used + recordBytes > MAX_PROJECT_BYTES) throw new Error("draft_project_64MiB_limit");
+        await atomic(filePath, updated);
+        setIndexedSize(path, sizes, fileName, (await stat(filePath)).size);
       }),
     load: (owner: string, documentId: string): Promise<SavedDraft | null> =>
       serial(async () => {
         const path = projectPath(owner, documentId);
         // Recovery refreshes disk accounting, including externally changed/corrupt staging files.
         sizeIndexes.delete(path);
+        sizeTotals.delete(path);
         let manifest: DraftManifest;
         try {
           manifest = await manifestAt(path);
@@ -183,6 +295,7 @@ export function createDraftStore(directory: string) {
           throw error;
         }
         const screens: SavedDraft["screens"] = [];
+        const transactions: SavedSection[] = [];
         const warnings: string[] = [];
         let used = 0;
         for (const [entry, bytes] of await sizesAt(path)) {
@@ -191,6 +304,22 @@ export function createDraftStore(directory: string) {
           if (!entry.endsWith(".json") || entry === "manifest.json") continue;
           try {
             const record = await read(join(path, entry));
+            if (entry.startsWith("section-")) {
+              const { transaction, design } = validateDraftSection(
+                manifest,
+                record.transaction,
+                record.design,
+              );
+              if (entry !== `section-${transaction.screen_id}-${transaction.sequence}.json`)
+                throw new Error("draft_section_identity_mismatch");
+              transactions.push({
+                transaction,
+                design,
+                rendered: record.rendered === true,
+                ...(typeof record.nodeId === "string" ? { nodeId: record.nodeId } : {}),
+              });
+              continue;
+            }
             const design = validateDraftScreen(manifest, record.design);
             if (entry !== `screen-${design.screens[0]!.id}.json`)
               throw new Error("draft_screen_identity_mismatch");
@@ -208,15 +337,63 @@ export function createDraftStore(directory: string) {
         const plan = createDesignPlan(manifest.request);
         if (!plan.success) throw new Error("draft_plan_invalid");
         const order = new Map(plan.data.screens.map((screen) => [screen.id, screen.order]));
+        transactions.sort(
+          (a, b) =>
+            (order.get(a.transaction.screen_id) ?? Number.MAX_SAFE_INTEGER) -
+              (order.get(b.transaction.screen_id) ?? Number.MAX_SAFE_INTEGER) ||
+            a.transaction.sequence - b.transaction.sequence,
+        );
+        const completeTransactions: SavedSection[] = [];
+        const lastTransactionByScreen = new Map<string, SavedSection>();
+        for (const transaction of transactions) {
+          const previous = lastTransactionByScreen.get(transaction.transaction.screen_id);
+          if (
+            transaction.transaction.sequence !==
+              (previous ? previous.transaction.sequence + 1 : 0) ||
+            (previous &&
+              transaction.transaction.dependencies[0] !== previous.transaction.idempotency_key)
+          ) {
+            warnings.push(
+              `Section checkpoint ${transaction.transaction.screen_id}/${transaction.transaction.section_id} has a missing or conflicting dependency; later sections were not resumed.`,
+            );
+            continue;
+          }
+          completeTransactions.push(transaction);
+          lastTransactionByScreen.set(transaction.transaction.screen_id, transaction);
+        }
+        const transactionsByScreen = new Map<string, SavedSection[]>();
+        for (const transaction of completeTransactions) {
+          const group = transactionsByScreen.get(transaction.transaction.screen_id) ?? [];
+          group.push(transaction);
+          transactionsByScreen.set(transaction.transaction.screen_id, group);
+        }
+        for (const [screenId, group] of transactionsByScreen) {
+          if (screens.some(({ design }) => design.screens[0]!.id === screenId)) continue;
+          const first = group[0]!;
+          screens.push({
+            design: {
+              ...first.design,
+              screens: [
+                {
+                  ...first.design.screens[0]!,
+                  children: group.flatMap((item) => item.design.screens[0]!.children),
+                },
+              ],
+            },
+            rendered: group.every(({ rendered }) => rendered),
+            ...(group.at(-1)?.nodeId ? { nodeId: group.at(-1)!.nodeId } : {}),
+          });
+        }
         screens.sort(
           (a, b) => order.get(a.design.screens[0]!.id)! - order.get(b.design.screens[0]!.id)!,
         );
-        return { manifest, screens, warnings };
+        return { manifest, screens, transactions: completeTransactions, warnings };
       }),
     clear: (owner: string, documentId: string) =>
       serial(() => {
         const path = projectPath(owner, documentId);
         sizeIndexes.delete(path);
+        sizeTotals.delete(path);
         return rm(path, { recursive: true, force: true });
       }),
   };

@@ -11,8 +11,14 @@ import {
   PluginToUISchema,
   type MultiScreenProgressMessage,
   type MultiScreenRenderResultMessage,
+  type PluginToUIMessage,
   type UIToPluginMessage,
 } from "../shared/messages";
+import { FigmaToolOperationSchema, type FigmaToolOperation } from "../shared/figma-tools";
+import { type ChatInputItem } from "../shared/chat-tools";
+import { type ChatTask, chatTaskProgress } from "../shared/chat-task";
+import { runChatTask, chatTaskInput } from "./chat-task";
+import { chatTaskBridge } from "./chat-task-bridge";
 import { isMultiScreenInput, parseMultiScreenText } from "../shared/multi-screen-schema";
 import {
   createMultiScreenPreview,
@@ -28,22 +34,21 @@ import {
   loadSavedDraft,
   importSavedDraft,
 } from "./generation-session";
-import type { DraftManifest, SavedDraft } from "../shared/generation-draft";
+import {
+  validateDraftSection,
+  type DraftManifest,
+  type SavedDraft,
+} from "../shared/generation-draft";
 import {
   createDesignPlan,
+  createDesignSections,
   normalizeGeneratedDesignResponse,
-  generationRepairTargets,
-  applyGenerationRepair,
-  type GenerationRepairTarget,
   type GeneratedDesign,
   type DesignGenerationRequest,
   type DesignPlan,
 } from "../shared/design-generation";
-import {
-  pendingGenerationScreens,
-  prepareGeneratedDesign,
-  retainGeneratedScreen,
-} from "./design-generation";
+import { createGenerationTransaction } from "../shared/generation-transaction";
+import { prepareGeneratedDesign } from "./design-generation";
 import {
   getInferenceEligibility,
   getInferenceStatusLabel,
@@ -66,6 +71,7 @@ import {
   requestLocalPairing,
   restoreLocalCompanionSession,
   runSmokeRequest,
+  streamAuthorizedChat,
   startChatGPTSignIn,
   switchChatGPTAccount,
   type CompanionModel,
@@ -93,7 +99,35 @@ type GenerationDraft = {
   projectName?: string;
   palette?: GeneratedDesign["palette"];
   screens: GeneratedDesign["screens"];
+  transactions: SavedDraft["transactions"];
 };
+
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  error?: string;
+};
+
+type ChatToolResult = Extract<PluginToUIMessage, { type: "tool-result" }>;
+
+function safeChatProse(text: string): string {
+  if (/```|^\s*[[{]|"(?:tool|arguments|call_id|properties)"\s*:/mu.test(text))
+    return "Internal structured output was hidden. See task progress for confirmed canvas changes.";
+  return text;
+}
+
+type SectionStage =
+  | "queued"
+  | "generating"
+  | "validating"
+  | "saving"
+  | "applying"
+  | "saved"
+  | "completed"
+  | "needs-repair"
+  | "paused"
+  | "failed";
 
 export type CompanionConnectionState =
   | "discovering"
@@ -104,7 +138,7 @@ export type CompanionConnectionState =
   | "pairing"
   | "connected";
 
-export type PluginView = "design" | "json" | "assets" | "system" | "quality";
+export type PluginView = "chat" | "design" | "json" | "assets" | "system" | "quality";
 export type ModelDiscoveryState = "idle" | "loading" | "loaded" | "empty" | "error";
 type GenerationTarget = DesignGenerationRequest["target"];
 type GenerationLanguage = DesignGenerationRequest["language"];
@@ -117,6 +151,7 @@ type GenerationState =
   | "saving"
   | "rendering"
   | "repairing"
+  | "paused"
   | "ready"
   | "failed"
   | "cancelled";
@@ -183,8 +218,13 @@ export function getModelAvailabilityMessage(
   return "Models have not been loaded from this account yet.";
 }
 
-function postToPlugin(message: UIToPluginMessage): void {
-  parent.postMessage({ pluginMessage: message }, "*");
+function postToPlugin(message: UIToPluginMessage): boolean {
+  try {
+    parent.postMessage({ pluginMessage: message }, "*");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function ErrorList({ errors }: { errors: string[] }) {
@@ -228,7 +268,121 @@ function createPairingVerifier(): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
-export default function App({ initialView = "design" }: { initialView?: PluginView } = {}) {
+function developerToolOperation(operationId: string, action: unknown): FigmaToolOperation {
+  return FigmaToolOperationSchema.parse({
+    operationId,
+    idempotencyKey: `phase56:${operationId}`,
+    action,
+  });
+}
+
+const PHASE56_FRAME_REF = "phase56-mobile";
+const PHASE56_TITLE_REF = "phase56-title";
+const PHASE56_INPUT_REF = "phase56-input";
+const PHASE56_INPUT_TEXT_REF = "phase56-input-hint";
+const PHASE56_BUTTON_REF = "phase56-button";
+const PHASE56_BUTTON_TEXT_REF = "phase56-button-label";
+const TOOL_RESPONSE_TIMEOUT_MS = 45_000;
+
+function phase56FixtureOperations() {
+  return [
+    developerToolOperation("phase56-frame-0001", {
+      tool: "create_frame",
+      ref: PHASE56_FRAME_REF,
+      name: "Phase 5.6 · Persian mobile fixture",
+      parent: { kind: "page" },
+      size: { width: 390, height: 844 },
+      fill: "#F8FAFC",
+      cornerRadius: 28,
+      autoLayout: {
+        direction: "vertical",
+        gap: 20,
+        padding: { top: 32, right: 24, bottom: 24, left: 24 },
+        counterAlign: "MIN",
+      },
+    }),
+    developerToolOperation("phase56-title-0001", {
+      tool: "create_text",
+      ref: PHASE56_TITLE_REF,
+      name: "عنوان فارسی",
+      parent: { kind: "node", ref: PHASE56_FRAME_REF },
+      text: "فروشگاه شما",
+      size: { width: 342, height: 40 },
+      direction: "RTL",
+      font: { family: "Inter", style: "Regular" },
+      fontSize: 24,
+      horizontalSizing: "FILL",
+      verticalSizing: "HUG",
+    }),
+    developerToolOperation("phase56-input-0001", {
+      tool: "create_frame",
+      ref: PHASE56_INPUT_REF,
+      name: "فیلد جست‌وجو",
+      parent: { kind: "node", ref: PHASE56_FRAME_REF },
+      size: { width: 342, height: 54 },
+      fill: "#FFFFFF",
+      stroke: "#CBD5E1",
+      cornerRadius: 12,
+      autoLayout: {
+        direction: "horizontal",
+        gap: 8,
+        padding: { top: 8, right: 14, bottom: 8, left: 14 },
+        counterAlign: "CENTER",
+      },
+    }),
+    developerToolOperation("phase56-hint-0001", {
+      tool: "create_text",
+      ref: PHASE56_INPUT_TEXT_REF,
+      name: "متن راهنمای ورودی",
+      parent: { kind: "node", ref: PHASE56_INPUT_REF },
+      text: "جست‌وجوی محصول",
+      size: { width: 290, height: 24 },
+      direction: "RTL",
+      align: "RIGHT",
+      fontSize: 14,
+      color: "#64748B",
+      horizontalSizing: "FILL",
+      verticalSizing: "HUG",
+    }),
+    developerToolOperation("phase56-button-0001", {
+      tool: "create_frame",
+      ref: PHASE56_BUTTON_REF,
+      name: "دکمه جست‌وجو",
+      parent: { kind: "node", ref: PHASE56_FRAME_REF },
+      size: { width: 342, height: 52 },
+      fill: "#6841D8",
+      cornerRadius: 12,
+      autoLayout: {
+        direction: "horizontal",
+        gap: 8,
+        padding: { top: 8, right: 16, bottom: 8, left: 16 },
+        primaryAlign: "CENTER",
+        counterAlign: "CENTER",
+      },
+    }),
+    developerToolOperation("phase56-label-0001", {
+      tool: "create_text",
+      ref: PHASE56_BUTTON_TEXT_REF,
+      name: "برچسب دکمه",
+      parent: { kind: "node", ref: PHASE56_BUTTON_REF },
+      text: "جست‌وجو",
+      size: { width: 120, height: 24 },
+      direction: "RTL",
+      align: "CENTER",
+      fontSize: 16,
+      color: "#FFFFFF",
+      horizontalSizing: "HUG",
+      verticalSizing: "HUG",
+    }),
+    developerToolOperation("phase56-color-0001", {
+      tool: "set_properties",
+      ref: PHASE56_BUTTON_REF,
+      properties: { fill: "#0F766E" },
+    }),
+  ];
+}
+
+export default function App({ initialView = "chat" }: { initialView?: PluginView } = {}) {
   const [navigation, dispatchNavigation] = useReducer(navigationReducer, {
     activeView: initialView,
     settingsOpen: false,
@@ -255,11 +409,25 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
   const [savedDraft, setSavedDraft] = useState<SavedDraft | null>(null);
   const [draftNotice, setDraftNotice] = useState("");
   const [screenStages, setScreenStages] = useState<Record<string, string>>({});
+  const [sectionStages, setSectionStages] = useState<Record<string, SectionStage>>({});
+  const [currentSection, setCurrentSection] = useState<{
+    screenId: string;
+    sectionId: "identity" | "primary" | "supporting";
+  } | null>(null);
+  const [activeGenerationId, setActiveGenerationId] = useState<string | null>(null);
+  const [followGeneration, setFollowGeneration] = useState(false);
+  const followGenerationRef = useRef(false);
+  const [lastProgressAt, setLastProgressAt] = useState<number | null>(null);
+  const [secondsSinceProgress, setSecondsSinceProgress] = useState(0);
+  const [pauseRequested, setPauseRequested] = useState(false);
+  const [generationPaused, setGenerationPaused] = useState(false);
   const [stageMetrics, setStageMetrics] = useState<Record<string, number>>({});
   const [generationStarted, setGenerationStarted] = useState<number | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const generationAbort = useRef<AbortController | null>(null);
   const generationRequest = useRef<string | null>(null);
+  const generationPauseRequested = useRef(false);
+  const generationResume = useRef<(() => void) | null>(null);
   const [modelDiscovery, setModelDiscovery] = useState<ModelDiscoveryState>("idle");
   const [json, setJson] = useState(phase1Sample.trim());
   const [notice, setNotice] = useState<Notice>({
@@ -296,6 +464,29 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
   );
   const [multiProgress, setMultiProgress] = useState<MultiScreenProgressMessage | null>(null);
   const [multiReport, setMultiReport] = useState<MultiScreenRenderResultMessage | null>(null);
+  const [toolBusy, setToolBusy] = useState(false);
+  const [toolStatus, setToolStatus] = useState("Ready to run a local native-operation check.");
+  const [lastToolOperation, setLastToolOperation] = useState<FigmaToolOperation | null>(null);
+  const toolBatchId = useRef<string | null>(null);
+  const toolWatchdog = useRef<number | null>(null);
+  const toolCompletion = useRef<{
+    batchId: string;
+    onResult: (message: ChatToolResult) => void;
+    onFailure: (message: string) => void;
+  } | null>(null);
+  const [chatInput, setChatInput] = useState("");
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatActivity, setChatActivity] = useState("");
+  const [chatPendingTool, setChatPendingTool] = useState(false);
+  const [chatRetryMessageId, setChatRetryMessageId] = useState<string | null>(null);
+  const chatAbort = useRef<AbortController | null>(null);
+  const chatModelInput = useRef<ChatInputItem[]>([]);
+  const chatTask = useRef<ChatTask | null>(null);
+  const [chatTaskSnapshot, setChatTaskSnapshot] = useState<ChatTask | null>(null);
+  const [chatTaskLoaded, setChatTaskLoaded] = useState(false);
+  const chatRunning = useRef(false);
+  const chatStopRequested = useRef(false);
   const currentRequest = useRef<string | null>(null);
   const designGenerationInput = useMemo<DesignGenerationRequest>(
     () => ({
@@ -333,6 +524,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     "saving",
     "rendering",
     "repairing",
+    "paused",
   ].includes(generationState);
   const inferenceEligibility = getInferenceEligibility({
     companionConnected: Boolean(companionToken) && companionConnectionState === "connected",
@@ -341,6 +533,48 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     selectedModel: selectedCompanionModel,
     smokeInFlight,
   });
+  const chatReady =
+    inferenceEligibility.eligible && Boolean(companionToken && selectedCompanionModel);
+
+  useEffect(() => {
+    let active = true;
+    void chatTaskBridge({ type: "chat-task-load", requestId: `chat-load-${Date.now()}` })
+      .then((result) => {
+        if (!active) return;
+        const task = result.task ?? null;
+        chatTask.current = task;
+        setChatTaskSnapshot(task);
+        setChatTaskLoaded(true);
+        if (!task) return;
+        if (task.status === "completed")
+          chatModelInput.current = chatTaskInput({ ...task, recent: [] }).filter(
+            (item) => "role" in item,
+          );
+        setChatPendingTool(task.status !== "completed");
+        setChatRetryMessageId(task.status === "completed" ? null : task.id);
+        setChatMessages([
+          { id: `${task.id}-user`, role: "user", content: task.prompt },
+          {
+            id: task.id,
+            role: "assistant",
+            content: task.status === "completed" ? safeChatProse(task.text) : "",
+            ...(task.status !== "completed"
+              ? {
+                  error:
+                    task.error ??
+                    "Saved task restored. Resume reconciles native operations before continuing.",
+                }
+              : {}),
+          },
+        ]);
+      })
+      .catch((error: Error) => {
+        if (active) setChatActivity(error.message);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
   const generationBlockReason = getDesignGenerationBlockReason({
     prompt,
     planValid: generationPlan.success,
@@ -377,10 +611,31 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     rowWidth >= 390 &&
     rowWidth <= 20_000;
 
+  const failToolBatch = (batchId: string, message: string, cancel = true) => {
+    if (toolBatchId.current !== batchId) return;
+    const completion = toolCompletion.current;
+    if (completion?.batchId === batchId) {
+      toolCompletion.current = null;
+      completion.onFailure(message);
+    }
+    if (toolWatchdog.current !== null) window.clearTimeout(toolWatchdog.current);
+    toolWatchdog.current = null;
+    toolBatchId.current = null;
+    if (cancel) postToPlugin({ type: "tool-cancel", protocolVersion: 1, batchId });
+    setToolBusy(false);
+    setToolStatus(message);
+  };
+
   useEffect(
     () => () => {
       generationRequest.current = null;
       generationAbort.current?.abort();
+      chatAbort.current?.abort();
+      const activeBatchId = toolBatchId.current;
+      if (activeBatchId)
+        postToPlugin({ type: "tool-cancel", protocolVersion: 1, batchId: activeBatchId });
+      toolCompletion.current = null;
+      if (toolWatchdog.current !== null) window.clearTimeout(toolWatchdog.current);
     },
     [],
   );
@@ -389,9 +644,61 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     const handleMessage = (event: MessageEvent<unknown>) => {
       const raw = (event.data as { pluginMessage?: unknown } | null)?.pluginMessage;
       const result = PluginToUISchema.safeParse(raw);
-      if (!result.success) return;
+      if (!result.success) {
+        if (
+          raw &&
+          typeof raw === "object" &&
+          (raw as { type?: unknown }).type === "tool-result" &&
+          typeof (raw as { batchId?: unknown }).batchId === "string" &&
+          (raw as { batchId: string }).batchId === toolBatchId.current
+        )
+          failToolBatch(
+            (raw as { batchId: string }).batchId,
+            "The plugin returned an invalid tool result. The operation stopped; inspect the canvas before retrying.",
+          );
+        return;
+      }
       const message = result.data;
-      if (message.type === "generation-result") return;
+      if (
+        message.type === "generation-result" ||
+        message.type === "generation-node-progress" ||
+        message.type === "chat-task-result"
+      )
+        return;
+      if (message.type === "tool-progress") {
+        if (toolBatchId.current === message.batchId) {
+          setToolStatus(`${message.index + 1}/${message.total} · ${message.message}`);
+          if (chatRunning.current) setChatActivity(message.message);
+        }
+        return;
+      }
+      if (message.type === "tool-result") {
+        if (toolBatchId.current === message.batchId) {
+          if (toolWatchdog.current !== null) window.clearTimeout(toolWatchdog.current);
+          toolWatchdog.current = null;
+          toolBatchId.current = null;
+          setToolBusy(false);
+          const last = message.results.at(-1);
+          const replayCount = message.results.filter(({ replayed }) => replayed).length;
+          setToolStatus(
+            message.cancelled
+              ? `Cancelled between operations. ${message.committedOperationIds.length} operation(s) remain committed.`
+              : message.success
+                ? `${message.results.length} operation(s) completed; ${replayCount} idempotent replay(s), with no duplicate nodes.`
+                : `${last?.error ?? "The operation failed."}${message.committedOperationIds.length ? ` ${message.committedOperationIds.length} earlier operation(s) remain committed.` : ""}${message.partialOperationIds.length ? ` Inspect possible partial change(s): ${message.partialOperationIds.join(", ")}.` : ""}`,
+          );
+          const completion = toolCompletion.current;
+          if (completion?.batchId === message.batchId) {
+            toolCompletion.current = null;
+            completion.onResult(message);
+          }
+        }
+        return;
+      }
+      if (message.type === "tool-delete-consent-result") {
+        setToolStatus(message.message);
+        return;
+      }
       if (message.type === "companion-restore-ticket") {
         setRestoreTicket(message.ticket);
         setRestoreTicketLoaded(true);
@@ -408,6 +715,14 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
         return;
       }
       if (message.type === "protocol-error") {
+        if (
+          toolBatchId.current &&
+          (!message.requestId || message.requestId === toolBatchId.current)
+        ) {
+          failToolBatch(message.requestId ?? toolBatchId.current, message.message, false);
+          return;
+        }
+        if (message.requestId && message.requestId !== currentRequest.current) return;
         currentRequest.current = null;
         setBusy(false);
         setNotice({ tone: "error", title: message.message });
@@ -537,12 +852,13 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
 
   useEffect(() => {
     if (!generationStarted || !generationInFlight) return;
-    const timer = window.setInterval(
-      () => setElapsedSeconds(Math.floor((Date.now() - generationStarted) / 1000)),
-      1000,
-    );
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      setElapsedSeconds(Math.floor((now - generationStarted) / 1000));
+      setSecondsSinceProgress(lastProgressAt ? Math.floor((now - lastProgressAt) / 1000) : 0);
+    }, 1000);
     return () => window.clearInterval(timer);
-  }, [generationStarted, generationInFlight]);
+  }, [generationStarted, generationInFlight, lastProgressAt]);
 
   useEffect(() => {
     if (!companionToken || !documentId) return;
@@ -710,6 +1026,232 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
   }, [companionStatus?.auth, companionStatus?.safeMessage, companionToken]);
 
   const nextRequestId = () => `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  const runToolOperations = (
+    operations: FigmaToolOperation[],
+    completion?: {
+      onResult: (message: ChatToolResult) => void;
+      onFailure: (message: string) => void;
+    },
+  ) => {
+    if (!operations.length) {
+      completion?.onFailure("The operation list was empty.");
+      return;
+    }
+    if (toolBatchId.current) {
+      completion?.onFailure("Another native operation is still running. Wait before retrying.");
+      return;
+    }
+    const batchId = `phase56-batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    toolBatchId.current = batchId;
+    if (completion) toolCompletion.current = { batchId, ...completion };
+    setToolBusy(true);
+    if (!completion) setLastToolOperation(operations.at(-1) ?? null);
+    setToolStatus(`Starting ${operations.length} local operation(s)…`);
+    toolWatchdog.current = window.setTimeout(() => {
+      failToolBatch(
+        batchId,
+        "No plugin response arrived within 45 seconds. Cancellation was requested; inspect the canvas before retrying. Retrying reuses operation IDs to prevent duplicates.",
+      );
+    }, TOOL_RESPONSE_TIMEOUT_MS);
+    if (!postToPlugin({ type: "tool-execute", protocolVersion: 1, batchId, operations }))
+      failToolBatch(
+        batchId,
+        "Could not send the operation to the Figma plugin. Reload the plugin and retry.",
+        false,
+      );
+  };
+
+  const sendChatMessage = async (retry = false) => {
+    if (chatRunning.current || toolBatchId.current || !chatTaskLoaded) return;
+    if (!companionToken || !selectedCompanionModel || !chatReady) return;
+    if (!retry && chatTask.current && chatTask.current.status !== "completed") return;
+    const text = chatInput.trim();
+    if (!retry && !text) return;
+    chatStopRequested.current = false;
+    chatRunning.current = true;
+    setChatBusy(true);
+    const controller = new AbortController();
+    chatAbort.current = controller;
+    let assistantId = chatTask.current?.id ?? "";
+    try {
+      if (!retry) {
+        const loaded = await chatTaskBridge({ type: "chat-task-load", requestId: nextRequestId() });
+        if (loaded.task && loaded.task.status !== "completed")
+          throw new Error(
+            "A saved task is pending on this page. Reload the plugin to restore it rather than overwrite its checkpoint.",
+          );
+        const id = `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        assistantId = id;
+        chatTask.current = {
+          version: 1,
+          id,
+          documentId: loaded.documentId,
+          prompt: text,
+          context:
+            chatTask.current?.documentId === loaded.documentId
+              ? chatModelInput.current
+              : loaded.task
+                ? chatTaskInput(loaded.task).filter((item) => "role" in item)
+                : [],
+          stages: [],
+          ledger: [],
+          pending: [],
+          recent: [],
+          starts: chatTask.current?.starts ?? [],
+          rounds: 0,
+          batches: 0,
+          lastResponseCalls: 0,
+          status: "ready",
+          text: "",
+        };
+        setChatMessages((messages) => [
+          ...messages,
+          { id: `${id}-user`, role: "user", content: text },
+          { id, role: "assistant", content: "" },
+        ]);
+        setChatInput("");
+      }
+      const task = chatTask.current;
+      if (!task) return;
+      setChatRetryMessageId(null);
+      setChatPendingTool(true);
+      setChatMessages((messages) =>
+        messages.map((message) =>
+          message.id === assistantId ? { ...message, error: undefined } : message,
+        ),
+      );
+      await runChatTask(task, {
+        signal: controller.signal,
+        save: async (checkpoint) => {
+          await chatTaskBridge({
+            type: "chat-task-save",
+            requestId: nextRequestId(),
+            documentId: checkpoint.documentId,
+            task: checkpoint,
+          });
+          setChatTaskSnapshot(structuredClone(checkpoint));
+        },
+        progress: setChatActivity,
+        model: (input) =>
+          streamAuthorizedChat(
+            companionToken,
+            nextRequestId(),
+            selectedCompanionModel,
+            input,
+            fetch,
+            controller.signal,
+            () => setChatActivity("Receiving the next bounded stage…"),
+            (elapsedMs) => setChatActivity(`Model is working · ${Math.ceil(elapsedMs / 1_000)}s`),
+          ),
+        execute: (operations) =>
+          new Promise<ChatToolResult>((resolve, reject) =>
+            runToolOperations(operations, {
+              onResult: resolve,
+              onFailure: (message) => reject(new Error(message)),
+            }),
+          ),
+      });
+      chatModelInput.current = chatTaskInput({ ...task, recent: [] }).filter(
+        (item) => "role" in item,
+      );
+      setChatPendingTool(false);
+      setChatRetryMessageId(null);
+      setChatMessages((messages) =>
+        messages.map((message) =>
+          message.id === assistantId
+            ? { ...message, content: safeChatProse(task.text), error: undefined }
+            : message,
+        ),
+      );
+      setChatActivity(chatTaskProgress(task));
+    } catch (error) {
+      if (chatTask.current) setChatTaskSnapshot(structuredClone(chatTask.current));
+      const stopped = chatStopRequested.current || controller.signal.aborted;
+      const message = stopped
+        ? "Stopped. Confirmed changes remain on Canvas. Resume reconciles in-flight operation IDs before continuing."
+        : error instanceof CompanionClientError && error.safeMessage
+          ? error.safeMessage
+          : error instanceof Error && error.message !== "chat_stopped"
+            ? error.message
+            : companionErrorText(error);
+      setChatMessages((messages) =>
+        messages.map((item) => (item.id === assistantId ? { ...item, error: message } : item)),
+      );
+      setChatRetryMessageId(
+        chatTask.current && chatTask.current.status !== "completed" ? assistantId : null,
+      );
+      setChatActivity(stopped ? "Stopped" : message);
+    } finally {
+      if (chatAbort.current === controller) chatAbort.current = null;
+      chatRunning.current = false;
+      setChatBusy(false);
+    }
+  };
+
+  const stopChat = () => {
+    chatStopRequested.current = true;
+    chatAbort.current?.abort();
+    if (toolBatchId.current) cancelToolBatch();
+    setChatActivity("Stopping; the current native operation will finish or time out…");
+  };
+
+  const clearChat = () => {
+    if (chatBusy || toolBusy) return;
+    const documentId = chatTask.current?.documentId;
+    if (
+      chatTask.current &&
+      chatTask.current.status !== "completed" &&
+      !window.confirm(
+        "Discard the saved task? Existing canvas changes will remain, but this task will no longer be resumable.",
+      )
+    )
+      return;
+    if (documentId)
+      void chatTaskBridge({
+        type: "chat-task-save",
+        requestId: nextRequestId(),
+        documentId,
+        task: null,
+      })
+        .then(() => {
+          chatTask.current = null;
+          setChatTaskSnapshot(null);
+          setChatPendingTool(false);
+          setChatMessages([]);
+          chatModelInput.current = [];
+          setChatRetryMessageId(null);
+          setChatActivity("");
+        })
+        .catch((error: Error) => setChatActivity(error.message));
+    else {
+      chatModelInput.current = [];
+      setChatMessages([]);
+      setChatActivity("");
+    }
+  };
+
+  const runFixtureStep = (start: number, end: number) =>
+    runToolOperations(phase56FixtureOperations().slice(start, end));
+
+  const replayLastToolOperation = () => {
+    if (!lastToolOperation) return;
+    runToolOperations([lastToolOperation]);
+  };
+
+  const cancelToolBatch = () => {
+    const batchId = toolBatchId.current;
+    if (!batchId) return;
+    setToolStatus(
+      "Cancellation requested; the active native operation will finish or time out before the batch stops.",
+    );
+    if (!postToPlugin({ type: "tool-cancel", protocolVersion: 1, batchId }))
+      failToolBatch(
+        batchId,
+        "Could not send cancellation. Waiting for the bounded operation timeout.",
+        false,
+      );
+  };
 
   const validate = () => {
     if (batchMode && !batchParsed?.success) {
@@ -1139,19 +1681,27 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     const totalStartedAt = performance.now();
     generationRequest.current = requestId;
     generationAbort.current = controller;
+    generationPauseRequested.current = false;
+    setPauseRequested(false);
+    setGenerationPaused(false);
     setGenerationPreview(null);
     setGenerationErrors([]);
     setGenerationState("planning");
     setGenerationStarted(Date.now());
+    setLastProgressAt(Date.now());
     setElapsedSeconds(0);
     setStageMetrics({});
     setScreenStages({});
+    setSectionStages({});
+    setCurrentSection(null);
     await new Promise((resolve) => window.setTimeout(resolve, 0));
     if (controller.signal.aborted) {
       generationRequest.current = null;
       generationAbort.current = null;
       setGenerationState("cancelled");
-      setGenerationErrors(["Generation was cancelled. No Figma layers were created."]);
+      setGenerationErrors([
+        "Generation was cancelled. No model-generated Figma content was created.",
+      ]);
       return;
     }
 
@@ -1161,6 +1711,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
     });
     let draft: GenerationDraft = {
       screens: [],
+      transactions: [],
       manifest: {
         version: 1,
         documentId,
@@ -1171,12 +1722,139 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       },
     };
     setGenerationScreenProgress({
-      completed: draft.screens.length,
+      completed: 0,
       total: planResult.data.screens.length,
       retrying: false,
     });
-
     const nativeWarnings: string[] = [];
+    let activeSectionKey: string | undefined;
+    let legacyScreenIds = new Set<string>();
+    let firstSectionRecorded = false;
+    let firstNativeNodeRecorded = false;
+    let repairAttempts = 0;
+
+    const sectionKey = (screenId: string, sectionId: string) => `${screenId}:${sectionId}`;
+    const markSection = (screenId: string, sectionId: string, stage: SectionStage) => {
+      setSectionStages((current) => ({ ...current, [sectionKey(screenId, sectionId)]: stage }));
+      setLastProgressAt(Date.now());
+    };
+    const composeScreens = (): GeneratedDesign["screens"] => {
+      const groups = new Map<string, GenerationDraft["transactions"]>();
+      for (const transaction of draft.transactions) {
+        const id = transaction.transaction.screen_id;
+        const group = groups.get(id) ?? [];
+        group.push(transaction);
+        groups.set(id, group);
+      }
+      return planResult.data.screens.flatMap((screen) => {
+        const group = [...(groups.get(screen.id) ?? [])].sort(
+          (a, b) => a.transaction.sequence - b.transaction.sequence,
+        );
+        if (group?.length)
+          return [
+            {
+              id: screen.id,
+              children: group.flatMap((item) => item.design.screens[0]!.children),
+            },
+          ];
+        const legacy = draft.screens.find(({ id }) => id === screen.id);
+        return legacy ? [legacy] : [];
+      });
+    };
+    const updateScreenProgress = () => {
+      const complete = planResult.data.screens.filter(
+        (screen) =>
+          legacyScreenIds.has(screen.id) ||
+          draft.transactions.some(
+            (item) => item.transaction.screen_id === screen.id && item.transaction.screen_completed,
+          ),
+      ).length;
+      setGenerationScreenProgress({
+        completed: complete,
+        total: planResult.data.screens.length,
+        retrying: false,
+      });
+    };
+    const waitForResume = async (screenId: string, sectionId: string) => {
+      while (generationPauseRequested.current) {
+        setGenerationPaused(true);
+        setGenerationState("paused");
+        markSection(screenId, sectionId, "paused");
+        await new Promise<void>((resolve, reject) => {
+          const cleanup = () => controller.signal.removeEventListener("abort", abort);
+          const abort = () => {
+            generationResume.current = null;
+            cleanup();
+            reject(new CompanionClientError("request_cancelled"));
+          };
+          generationResume.current = () => {
+            generationResume.current = null;
+            cleanup();
+            resolve();
+          };
+          controller.signal.addEventListener("abort", abort, { once: true });
+          if (controller.signal.aborted) abort();
+        });
+      }
+      setGenerationPaused(false);
+      if (generationRequest.current === requestId) setGenerationState("generating");
+    };
+    const onNativeSectionVisible =
+      (screenId: string, sectionId: string) => (_nodeId: string, pluginElapsedMs: number) => {
+        const totalMs = Math.round(performance.now() - totalStartedAt);
+        setStageMetrics((metrics) => ({
+          ...metrics,
+          [`${screenId}.${sectionId}.pluginRenderMs`]: pluginElapsedMs,
+          ...(!firstNativeNodeRecorded ? { firstNativeNodeMs: totalMs } : {}),
+        }));
+        firstNativeNodeRecorded = true;
+        setLastProgressAt(Date.now());
+      };
+    const renderSection = async (saved: SavedDraft["transactions"][number]) => {
+      const transaction = saved.transaction;
+      const key = sectionKey(transaction.screen_id, transaction.section_id);
+      markSection(transaction.screen_id, transaction.section_id, "applying");
+      setGenerationState("rendering");
+      const started = performance.now();
+      const rendered = await generationBridge(
+        {
+          type: "generation-apply-section",
+          requestId: nextRequestId(),
+          manifest: draft.manifest,
+          transaction,
+          design: saved.design,
+        },
+        onNativeSectionVisible(transaction.screen_id, transaction.section_id),
+      );
+      if (!rendered.nodeId) throw new Error("Figma did not acknowledge the section root.");
+      nativeWarnings.push(...(rendered.warnings ?? []));
+      setStageMetrics((metrics) => ({
+        ...metrics,
+        [`${key}.renderMs`]: Math.round(performance.now() - started),
+      }));
+      // Render may already have committed when cancellation arrives; reconcile its durable marker before stopping.
+      await draftRequest(companionToken!, documentId!, "mark-section-applied", {
+        generationId: draft.manifest.generationId,
+        transaction,
+        nodeId: rendered.nodeId,
+      });
+      draft.transactions = draft.transactions.map((item) =>
+        item.transaction.idempotency_key === transaction.idempotency_key
+          ? { ...item, rendered: true, nodeId: rendered.nodeId }
+          : item,
+      );
+      markSection(transaction.screen_id, transaction.section_id, "completed");
+      if (followGenerationRef.current)
+        await generationBridge({
+          type: "generation-select",
+          requestId: nextRequestId(),
+          generationId: draft.manifest.generationId,
+          screenId: transaction.screen_id,
+          sectionId: transaction.section_id,
+        });
+      if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
+    };
+
     try {
       const activeContext = await generationBridge({
         type: "generation-context",
@@ -1200,10 +1878,11 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
         draft = {
           manifest: recovered.manifest,
           screens: recovered.screens.flatMap(({ design }) => design.screens),
+          transactions: recovered.transactions,
           projectName: recovered.screens[0]?.design.projectName,
           palette: recovered.screens[0]?.design.palette,
         };
-      } else
+      } else {
         await draftRequest(
           companionToken,
           documentId,
@@ -1211,220 +1890,287 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
           { manifest: draft.manifest },
           controller.signal,
         );
+      }
       await generationBridge({
         type: "generation-remember",
         requestId: nextRequestId(),
         generationId: draft.manifest.generationId,
       });
-      setGenerationScreenProgress({
-        completed: draft.screens.length,
-        total: planResult.data.screens.length,
-        retrying: false,
-      });
-      const mark = (id: string, stage: string) =>
-        setScreenStages((current) => ({ ...current, [id]: stage }));
-      const renderSaved = async (screen: GeneratedDesign["screens"][number]) => {
-        if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
-        const design = {
+      setActiveGenerationId(draft.manifest.generationId);
+
+      const transactionScreenIds = new Set(
+        draft.transactions.map(({ transaction }) => transaction.screen_id),
+      );
+      legacyScreenIds = new Set(
+        draft.screens.map(({ id }) => id).filter((id) => !transactionScreenIds.has(id)),
+      );
+      for (const screen of draft.screens) {
+        if (!legacyScreenIds.has(screen.id)) continue;
+        const savedDesign = {
           projectName: draft.projectName!,
           palette: draft.palette!,
           screens: [screen],
         };
-        mark(screen.id, "rendering");
-        setGenerationState("rendering");
         const started = performance.now();
         const rendered = await generationBridge({
           type: "generation-render",
           requestId: nextRequestId(),
           manifest: draft.manifest,
-          design,
+          design: savedDesign,
         });
-        nativeWarnings.push(...(rendered.warnings ?? []));
+        if (!rendered.nodeId) throw new Error("Figma did not acknowledge the saved screen.");
+        await draftRequest(
+          companionToken,
+          documentId,
+          "save-screen",
+          {
+            generationId: draft.manifest.generationId,
+            design: savedDesign,
+            nodeId: rendered.nodeId,
+          },
+          controller.signal,
+        );
         setStageMetrics((metrics) => ({
           ...metrics,
-          [`${screen.id}.renderMs`]: Math.round(performance.now() - started),
+          [`${screen.id}.legacyRenderMs`]: Math.round(performance.now() - started),
         }));
-        await draftRequest(companionToken, documentId, "save-screen", {
-          generationId: draft.manifest.generationId,
-          design,
-          nodeId: rendered.nodeId,
+        setScreenStages((stages) => ({
+          ...stages,
+          [screen.id]: "rendered from saved screen checkpoint",
+        }));
+      }
+      updateScreenProgress();
+
+      const skeletonScreenIds = planResult.data.screens
+        .filter((screen) => !legacyScreenIds.has(screen.id))
+        .map(({ id }) => id);
+      if (skeletonScreenIds.length) {
+        setGenerationState("generating");
+        await generationBridge({
+          type: "generation-prepare",
+          requestId: nextRequestId(),
+          manifest: draft.manifest,
+          screenIds: skeletonScreenIds,
+          focusInitial: !recovered,
         });
-        mark(screen.id, "rendered");
-      };
-      for (const screen of draft.screens) await renderSaved(screen);
-      let repairAttempts = 0;
-      for (const screen of pendingGenerationScreens(planResult.data, draft.screens)) {
+      }
+
+      for (const screen of planResult.data.screens) {
+        if (legacyScreenIds.has(screen.id)) continue;
         const screenPlan = { ...planResult.data, screens: [screen] };
-        const screenRequestId = nextRequestId();
-        let repairIssues: string[] = [];
-        let repairTargets: GenerationRepairTarget[] = [];
-        let failedRaw = "";
-        let completedScreen: GeneratedDesign["screens"][number] | undefined;
-
-        for (let attempt = 0; attempt <= 1; attempt += 1) {
-          mark(screen.id, attempt ? "repairing" : "generating");
-          setGenerationState(attempt ? "repairing" : "generating");
-          const inferenceStarted = performance.now();
-          let raw = await generateAuthorizedDesign(
-            companionToken,
-            screenRequestId,
-            selectedCompanionModel,
-            planResult.data.request,
-            repairIssues,
-            fetch,
-            controller.signal,
-            [screen.id],
-            () => {
-              setGenerationScreenProgress((progress) => ({ ...progress, retrying: true }));
-            },
-            repairTargets,
-            (metrics) =>
-              setStageMetrics((current) => ({
-                ...current,
-                ...Object.fromEntries(
-                  Object.entries(metrics).map(([key, value]) => [`${screen.id}.${key}`, value]),
-                ),
-              })),
-            (diagnostic) => {
-              mark(
-                screen.id,
-                diagnostic.stage === "http"
-                  ? "waiting for response headers"
-                  : diagnostic.generatedBytes
-                    ? "receiving model text"
-                    : "stream active; waiting for model text",
-              );
-              setStageMetrics((metrics) => ({
-                ...metrics,
-                [`${screen.id}.activeElapsedMs`]: diagnostic.elapsedMs ?? 0,
-                [`${screen.id}.idleMs`]: diagnostic.idleMs ?? 0,
-                [`${screen.id}.events`]: diagnostic.eventCount ?? 0,
-                [`${screen.id}.generatedBytes`]: diagnostic.generatedBytes ?? 0,
-              }));
-            },
+        const sections = createDesignSections(planResult.data);
+        setScreenStages((stages) => ({ ...stages, [screen.id]: "generating sections" }));
+        for (const section of sections) {
+          activeSectionKey = sectionKey(screen.id, section.id);
+          setCurrentSection({ screenId: screen.id, sectionId: section.id });
+          const persisted = draft.transactions.find(
+            (item) =>
+              item.transaction.idempotency_key ===
+              `fad:v1:${draft.manifest.generationId}:${screen.id}:${section.id}`,
           );
-          if (repairTargets.length) raw = applyGenerationRepair(failedRaw, repairTargets, raw);
-          setStageMetrics((metrics) => ({
-            ...metrics,
-            [`${screen.id}.${attempt ? "repair" : "inference"}Ms`]: Math.round(
-              performance.now() - inferenceStarted,
-            ),
-          }));
-          if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
-          if (generationRequest.current !== requestId) return;
-          setGenerationState("validating");
-          mark(screen.id, "validating");
-          await new Promise((resolve) => window.setTimeout(resolve, 0));
-          if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
-          if (generationRequest.current !== requestId) return;
-          const validationStarted = performance.now();
-          const validated = normalizeGeneratedDesignResponse(raw, screenPlan);
-          setStageMetrics((metrics) => ({
-            ...metrics,
-            [`${screen.id}.validationMs`]: Math.round(performance.now() - validationStarted),
-          }));
-          if (!validated.success) {
-            if (attempt === 0) {
-              repairIssues = validated.errors.slice(0, 8);
-              failedRaw = raw;
-              repairTargets = generationRepairTargets(raw, validated.errors);
-              if (
-                validated.errors.every((issue) =>
-                  /minimum tap target|does not fit its constrained parent/u.test(issue),
-                ) &&
-                !repairTargets.length
-              )
-                throw new Error(
-                  `Accessibility repair exceeds the bounded subtree budget. ${validated.errors.join(" ")}`,
-                );
-              setGenerationErrors(validated.errors);
-              repairAttempts += 1;
-              continue;
-            }
-            throw new Error(
-              `Automatic normalization and the single model repair could not satisfy the layout/accessibility contract. No further inference was attempted. ${validated.errors.join(" ")}`,
-            );
+          await waitForResume(screen.id, section.id);
+          if (persisted) {
+            await renderSection(persisted);
+            continue;
           }
+          if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
 
-          // Nodes reference palette roles, so reuse the first screen's tokens without another inference.
-          const generated = {
-            ...validated.data.design,
-            projectName: draft.projectName ?? validated.data.design.projectName,
-            palette: draft.palette ?? validated.data.design.palette,
-          };
+          const screenRequestId = nextRequestId();
+          let repairIssues: string[] = [];
+          let completed:
+            | {
+                design: GeneratedDesign;
+                transaction: ReturnType<typeof createGenerationTransaction>;
+              }
+            | undefined;
+          for (let attempt = 0; attempt <= 1; attempt++) {
+            markSection(screen.id, section.id, attempt ? "needs-repair" : "generating");
+            setGenerationState(attempt ? "repairing" : "generating");
+            const inferenceStarted = performance.now();
+            const raw = await generateAuthorizedDesign(
+              companionToken,
+              screenRequestId,
+              selectedCompanionModel,
+              planResult.data.request,
+              repairIssues,
+              fetch,
+              controller.signal,
+              [screen.id],
+              () => setGenerationScreenProgress((progress) => ({ ...progress, retrying: true })),
+              [],
+              (metrics) =>
+                setStageMetrics((current) => ({
+                  ...current,
+                  ...Object.fromEntries(
+                    Object.entries(metrics).map(([key, value]) => [
+                      `${screen.id}.${section.id}.${key}`,
+                      value,
+                    ]),
+                  ),
+                })),
+              (diagnostic) => {
+                setGenerationState("generating");
+                markSection(screen.id, section.id, "generating");
+                setStageMetrics((metrics) => ({
+                  ...metrics,
+                  [`${screen.id}.${section.id}.activeElapsedMs`]: diagnostic.elapsedMs ?? 0,
+                  [`${screen.id}.${section.id}.idleMs`]: diagnostic.idleMs ?? 0,
+                  [`${screen.id}.${section.id}.events`]: diagnostic.eventCount ?? 0,
+                  [`${screen.id}.${section.id}.generatedBytes`]: diagnostic.generatedBytes ?? 0,
+                }));
+              },
+              { id: section.id, sequence: section.sequence },
+            );
+            setStageMetrics((metrics) => ({
+              ...metrics,
+              [`${screen.id}.${section.id}.${attempt ? "repair" : "inference"}Ms`]: Math.round(
+                performance.now() - inferenceStarted,
+              ),
+            }));
+            setGenerationScreenProgress((progress) => ({ ...progress, retrying: false }));
+            if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
+            if (generationRequest.current !== requestId) return;
+            setGenerationState("validating");
+            markSection(screen.id, section.id, "validating");
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+            if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
+            if (generationRequest.current !== requestId) return;
 
-          completedScreen = generated.screens[0];
-          if (!completedScreen)
-            throw new Error("The response did not include its requested screen.");
-          setGenerationState("saving");
-          mark(screen.id, "saving");
+            const validationStarted = performance.now();
+            const validated = normalizeGeneratedDesignResponse(raw, screenPlan);
+            const issues = validated.success ? [] : validated.errors;
+            if (validated.success) {
+              const generated = {
+                ...validated.data.design,
+                projectName: draft.projectName ?? validated.data.design.projectName,
+                palette: draft.palette ?? validated.data.design.palette,
+              };
+              const sectionRoot = generated.screens[0]?.children[0];
+              if (
+                generated.screens[0]?.children.length !== 1 ||
+                sectionRoot?.type !== "frame" ||
+                sectionRoot.width > screen.width - 40 ||
+                sectionRoot.height > (screen.devicePreset === "mobile" ? 210 : 240) ||
+                sectionRoot.layout === "none"
+              ) {
+                issues.push(
+                  "The section must contain one bounded Auto Layout frame with all content inside it.",
+                );
+              } else {
+                try {
+                  const transaction = createGenerationTransaction({
+                    generationId: draft.manifest.generationId,
+                    documentScope: documentId,
+                    screenId: screen.id,
+                    sectionId: section.id,
+                    transactionId: screenRequestId,
+                    design: generated,
+                  });
+                  validateDraftSection(draft.manifest, transaction, generated);
+                  completed = { design: generated, transaction };
+                  if (!firstSectionRecorded) {
+                    setStageMetrics((metrics) => ({
+                      ...metrics,
+                      firstCompleteSectionMs: Math.round(performance.now() - totalStartedAt),
+                    }));
+                    firstSectionRecorded = true;
+                  }
+                } catch {
+                  issues.push(
+                    "The section failed its bounded transaction, size, nesting, or node-count contract.",
+                  );
+                }
+              }
+            }
+            setStageMetrics((metrics) => ({
+              ...metrics,
+              [`${screen.id}.${section.id}.validationMs`]: Math.round(
+                performance.now() - validationStarted,
+              ),
+            }));
+            if (!completed) {
+              if (attempt === 0) {
+                repairIssues = issues.slice(0, 8);
+                // A section retry requests the complete bounded section, not an untyped subtree patch.
+                repairAttempts++;
+                setGenerationErrors(repairIssues);
+                markSection(screen.id, section.id, "needs-repair");
+                continue;
+              }
+              throw new Error(
+                `Section ${section.title} failed validation after one bounded repair: ${issues.join(" ")}`,
+              );
+            }
+            break;
+          }
+          if (!completed)
+            throw new Error(
+              `Section ${section.title} did not produce a complete validated transaction.`,
+            );
+          setGenerationErrors([]);
+          if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
+
+          draft.projectName ??= completed.design.projectName;
+          draft.palette ??= completed.design.palette;
+          markSection(screen.id, section.id, "saving");
           const saveStarted = performance.now();
           await draftRequest(
             companionToken,
             documentId,
-            "save-screen",
-            { generationId: draft.manifest.generationId, design: generated },
+            "save-section",
+            {
+              generationId: draft.manifest.generationId,
+              transaction: completed.transaction,
+              design: completed.design,
+            },
             controller.signal,
           );
+          draft.transactions = [
+            ...draft.transactions,
+            {
+              transaction: completed.transaction,
+              design: completed.design,
+              rendered: false,
+            },
+          ];
+          draft.screens = composeScreens();
           setStageMetrics((metrics) => ({
             ...metrics,
-            [`${screen.id}.persistenceMs`]: Math.round(performance.now() - saveStarted),
+            [`${screen.id}.${section.id}.persistenceMs`]: Math.round(
+              performance.now() - saveStarted,
+            ),
           }));
-          draft = {
-            ...draft,
-            projectName: draft.projectName ?? generated.projectName,
-            palette: draft.palette ?? generated.palette,
-            screens: retainGeneratedScreen(draft.screens, completedScreen),
-          };
-          setGenerationScreenProgress({
-            completed: draft.screens.length,
-            total: planResult.data.screens.length,
-            retrying: false,
-          });
-          mark(screen.id, "saved");
-          await renderSaved(completedScreen);
-          break;
+          markSection(screen.id, section.id, "saved");
+          if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
+          await renderSection(draft.transactions[draft.transactions.length - 1]!);
+          updateScreenProgress();
         }
-        if (!completedScreen) throw new Error("The requested screen could not be completed.");
+        setScreenStages((stages) => ({ ...stages, [screen.id]: "completed" }));
       }
 
-      const orderedScreens = planResult.data.screens.map((screen) =>
-        draft.screens.find((generated) => generated.id === screen.id),
-      );
+      const completeScreens = composeScreens();
       if (
-        orderedScreens.some((screen) => screen === undefined) ||
+        completeScreens.length !== planResult.data.screens.length ||
         !draft.projectName ||
         !draft.palette
-      ) {
+      )
         throw new Error(
-          "Some requested screens are still missing; run generation again to resume.",
+          "Some requested sections are still missing; run Generate Design again to resume only unfinished work.",
         );
-      }
-      const completeScreens = orderedScreens.filter(
-        (screen): screen is GeneratedDesign["screens"][number] => screen !== undefined,
-      );
       const raw = JSON.stringify({
         projectName: draft.projectName,
         palette: draft.palette,
         screens: completeScreens,
       } satisfies GeneratedDesign);
-      await generationBridge({
-        type: "generation-select",
-        requestId: nextRequestId(),
-        generationId: draft.manifest.generationId,
-      });
-      setGenerationState("preparing");
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-      if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
-      if (generationRequest.current !== requestId) return;
       const prepared = prepareGeneratedDesign(raw, planResult.data);
-      if (!prepared.success) throw new Error(prepared.errors.join(" "));
-      if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
-      if (generationRequest.current !== requestId) return;
-      setGenerationState("preparing");
+      if (!prepared.success)
+        throw new Error(
+          `Saved sections did not compose into a valid complete design. ${prepared.errors.join(" ")}`,
+        );
       const audit = auditVisualQuality(prepared.data.batch);
       const warnings = [
         ...nativeWarnings,
+        "Sections are independent completed Responses requests; actual provider latency depends on account/model availability.",
         "No image assets were generated or downloaded. Import licensed local assets or keep editable placeholders.",
         "Check font availability, Persian shaping, text wrapping, and visual balance in Figma Desktop.",
         ...audit.diagnostics.slice(0, 6).map((item) => `${item.code}: ${item.message}`),
@@ -1439,13 +2185,13 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       });
       setGenerationState("ready");
       setDraftNotice(
-        `${draft.screens.length} screens durably saved and rendered. Resume reconciles native frames without duplicates.`,
+        `${draft.transactions.length} section transactions are durably saved and reconciled. Reopen resumes from the first unfinished section.`,
       );
       setSavedDraft(await loadSavedDraft(companionToken, documentId));
     } catch (error) {
       if (generationRequest.current !== requestId) return;
-      const resumeMessage = draft.screens.length
-        ? ` ${draft.screens.length} of ${planResult.data.screens.length} screens are saved; run Generate Design again to resume.`
+      const resumeMessage = draft.transactions.length
+        ? ` ${draft.transactions.length} section transactions are checkpointed; Generate Design resumes without repeating them.`
         : "";
       if (
         controller.signal.aborted ||
@@ -1453,18 +2199,24 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
       ) {
         setGenerationState("cancelled");
         setGenerationErrors([
-          `Generation was cancelled. Already saved or rendered screens are retained.${resumeMessage}`,
+          `Generation cancelled. Completed section transactions are retained.${resumeMessage}`,
         ]);
+        if (activeSectionKey) {
+          const failedKey = activeSectionKey;
+          const saved = draft.transactions.some(
+            (item) => `${item.transaction.screen_id}:${item.transaction.section_id}` === failedKey,
+          );
+          setSectionStages((stages) => ({
+            ...stages,
+            [failedKey]: saved ? "saved" : "paused",
+          }));
+        }
       } else {
         setGenerationState("failed");
-        setScreenStages((stages) =>
-          Object.fromEntries(
-            Object.entries(stages).map(([id, stage]) => [
-              id,
-              stage === "rendered" ? stage : `${stage} interrupted; resumable`,
-            ]),
-          ),
-        );
+        if (activeSectionKey) {
+          const failedKey = activeSectionKey;
+          setSectionStages((stages) => ({ ...stages, [failedKey]: "failed" }));
+        }
         const errorMessage =
           error instanceof CompanionClientError
             ? companionErrorText(error)
@@ -1476,7 +2228,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
           try {
             setCompanionStatus(await getCompanionStatus(companionToken));
           } catch {
-            // Keep the original sanitized failure if the companion is now offline.
+            /* Keep the sanitized failure. */
           }
         }
       }
@@ -1488,9 +2240,24 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
         }));
       if (generationRequest.current === requestId) generationRequest.current = null;
       if (generationAbort.current === controller) generationAbort.current = null;
+      generationPauseRequested.current = false;
+      generationResume.current = null;
+      setPauseRequested(false);
+      setGenerationPaused(false);
     }
   };
 
+  const pauseDesignGeneration = () => {
+    generationPauseRequested.current = true;
+    setPauseRequested(true);
+  };
+
+  const resumeDesignGeneration = () => {
+    generationPauseRequested.current = false;
+    setPauseRequested(false);
+    setGenerationPaused(false);
+    generationResume.current?.();
+  };
   const cancelDesignGeneration = () => generationAbort.current?.abort();
 
   const inspectGeneratedJson = () => {
@@ -1661,6 +2428,8 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
   };
 
   const connectionSummary = getConnectionSummary(companionConnectionState, companionStatus);
+  const developerToolsBusy = toolBusy || chatBusy;
+  const chatCanSubmit = chatReady && chatTaskLoaded && !toolBusy && !chatPendingTool;
 
   return (
     <main className="app-shell">
@@ -1675,6 +2444,16 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
           <div className="brand-title">Figma AI Design Engine</div>
           <div className="brand-subtitle">Structured, editable design workflows</div>
         </div>
+        {chatBusy && (
+          <button className="text-button muted" type="button" onClick={stopChat}>
+            Stop chat
+          </button>
+        )}
+        {toolBusy && !chatBusy && (
+          <button className="text-button muted" type="button" onClick={cancelToolBatch}>
+            Cancel operation
+          </button>
+        )}
         <span
           className={`connection-chip ${companionToken ? "is-connected" : ""} ${
             companionConnectionState === "offline"
@@ -1709,6 +2488,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
         <nav className="primary-nav" aria-label="Plugin sections">
           {(
             [
+              ["chat", "AI Chat"],
               ["design", "Design"],
               ["json", "JSON"],
               ["assets", "Assets"],
@@ -1741,6 +2521,245 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
           </div>
           <p className="page-description">
             Manage local pairing, ChatGPT access, account-visible models, and developer diagnostics.
+          </p>
+        </section>
+      ) : activeView === "chat" ? (
+        <section className="chat-home" aria-labelledby="chat-title">
+          <div className="page-heading">
+            <div>
+              <span className="page-eyebrow">AUTHENTICATED · NATIVE FIGMA TOOLS</span>
+              <h1 id="chat-title">AI Chat</h1>
+              <p className="page-description">
+                Describe a change in Persian or English. Canvas operations are validated locally
+                before they run.
+              </p>
+            </div>
+            <button
+              className="text-button muted"
+              type="button"
+              disabled={chatBusy || toolBusy || !chatMessages.length}
+              onClick={clearChat}
+            >
+              New chat
+            </button>
+          </div>
+          <div
+            className="chat-transcript"
+            role="log"
+            aria-live="polite"
+            aria-relevant="additions text"
+          >
+            {!chatMessages.length ? (
+              <div className="chat-welcome">
+                <span className="section-kicker">YOUR DESIGN ASSISTANT</span>
+                <h2>What would you like to make?</h2>
+                <p>
+                  Try “Create a mobile storefront frame” or “Make the title on my selected frame
+                  right-aligned.”
+                </p>
+              </div>
+            ) : (
+              chatMessages.map((message) => (
+                <article className={`chat-message is-${message.role}`} key={message.id}>
+                  <span className="chat-message-role">
+                    {message.role === "user" ? "You" : "Assistant"}
+                  </span>
+                  {message.content && <p dir="auto">{message.content}</p>}
+                  {message.error && (
+                    <div className="chat-message-error" role="alert">
+                      <p>{safeChatProse(message.error)}</p>
+                      {chatRetryMessageId === message.id && (
+                        <button
+                          type="button"
+                          className="secondary-action"
+                          disabled={chatBusy || toolBusy}
+                          onClick={() => void sendChatMessage(true)}
+                        >
+                          {chatTaskSnapshot?.status === "failed" ? "Retry Failed Stage" : "Resume"}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </article>
+              ))
+            )}
+          </div>
+          {chatTaskSnapshot && (
+            <section className="chat-task-progress" aria-label="Canvas task progress">
+              <p role="status">{chatTaskProgress(chatTaskSnapshot)}</p>
+              <ol>
+                {chatTaskSnapshot.stages.map((stage, index) => (
+                  <li key={`${index}-${stage.title}`}>
+                    {stage.completed ? "✓" : "○"} {stage.title}
+                  </li>
+                ))}
+              </ol>
+              <small>
+                Task {chatTaskSnapshot.id} · {chatTaskSnapshot.rounds} model rounds ·{" "}
+                {chatTaskSnapshot.batches} batches · {chatTaskSnapshot.lastResponseCalls} calls in
+                last response · {chatTaskSnapshot.ledger.length} scheduled operations
+              </small>
+              {chatBusy && (
+                <button type="button" className="secondary-action" onClick={stopChat}>
+                  Stop
+                </button>
+              )}
+            </section>
+          )}
+          {chatActivity && (
+            <div className="chat-activity" role="status" aria-live="polite">
+              <span
+                className={chatBusy ? "chat-activity-dot is-active" : "chat-activity-dot"}
+                aria-hidden="true"
+              />
+              <span>{safeChatProse(chatActivity)}</span>
+            </div>
+          )}
+          <form
+            className="chat-composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void sendChatMessage();
+            }}
+          >
+            <label htmlFor="chat-input">Message</label>
+            <textarea
+              id="chat-input"
+              value={chatInput}
+              maxLength={8_000}
+              rows={3}
+              dir={/[\u0600-\u06ff]/u.test(chatInput) ? "rtl" : "auto"}
+              placeholder="Describe a design or change… / تغییر موردنظرت را توضیح بده…"
+              disabled={chatBusy}
+              onChange={(event) => setChatInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  void sendChatMessage();
+                }
+              }}
+              aria-describedby="chat-help"
+            />
+            <div className="chat-composer-footer">
+              <span id="chat-help">
+                Enter to send · Shift+Enter for a new line
+                {!chatReady &&
+                  ` · ${inferenceEligibility.eligible ? "Select an authenticated model in Settings." : inferenceEligibility.message}`}
+                {toolBusy && " · Wait for the active native operation to finish."}
+              </span>
+              <button
+                type="submit"
+                className="primary-action"
+                disabled={!chatInput.trim() || !chatCanSubmit || chatBusy}
+              >
+                Send
+              </button>
+            </div>
+          </form>
+          <details className="tool-harness">
+            <summary className="tool-harness-summary">
+              <span>
+                <span className="section-kicker">DEVELOPER ONLY</span>
+                <strong id="tool-harness-title">Native operation harness</strong>
+              </span>
+              <span className={`system-status ${toolBusy ? "" : "is-ready"}`}>
+                {toolBusy ? "Running" : "Ready"}
+              </span>
+            </summary>
+            <p className="tool-harness-copy">
+              Direct local executor checks. These buttons bypass the model and do not require JSON.
+            </p>
+            <div className="tool-harness-grid">
+              <button
+                type="button"
+                disabled={developerToolsBusy}
+                onClick={() => runFixtureStep(0, 1)}
+              >
+                1 · Create 390 × 844 frame
+              </button>
+              <button
+                type="button"
+                disabled={developerToolsBusy}
+                onClick={() => runFixtureStep(1, 2)}
+              >
+                2 · Add Persian title
+              </button>
+              <button
+                type="button"
+                disabled={developerToolsBusy}
+                onClick={() => runFixtureStep(2, 4)}
+              >
+                3 · Add editable input
+              </button>
+              <button
+                type="button"
+                disabled={developerToolsBusy}
+                onClick={() => runFixtureStep(4, 6)}
+              >
+                4 · Add button
+              </button>
+              <button
+                type="button"
+                disabled={developerToolsBusy}
+                onClick={() => runFixtureStep(6, 7)}
+              >
+                5 · Change button color only
+              </button>
+              <button
+                type="button"
+                disabled={developerToolsBusy}
+                onClick={() =>
+                  runToolOperations([
+                    developerToolOperation("phase56-invalid-layout", {
+                      tool: "set_auto_layout",
+                      ref: PHASE56_TITLE_REF,
+                      layout: { direction: "vertical" },
+                    }),
+                  ])
+                }
+              >
+                Safe invalid-layout check
+              </button>
+            </div>
+            <div className="tool-harness-actions">
+              <button
+                className="secondary-action"
+                type="button"
+                disabled={developerToolsBusy || !lastToolOperation}
+                onClick={replayLastToolOperation}
+              >
+                Replay last operation
+              </button>
+              <button
+                className="text-button muted"
+                type="button"
+                disabled={!toolBusy}
+                onClick={cancelToolBatch}
+              >
+                Cancel between operations
+              </button>
+              <button
+                className="text-button muted"
+                type="button"
+                disabled={developerToolsBusy}
+                onClick={() =>
+                  runToolOperations([
+                    developerToolOperation(`phase56-context-${Date.now()}`, {
+                      tool: "get_document_context",
+                    }),
+                  ])
+                }
+              >
+                Inspect page context
+              </button>
+            </div>
+            <p className="tool-harness-status" role="status" aria-live="polite">
+              {toolStatus}
+            </p>
+          </details>
+          <p className="tool-safety-note">
+            Existing layers are never replaced by this fixture. Delete and broad-replacement tools
+            require separate, scoped user consent and are not exposed here.
           </p>
         </section>
       ) : activeView === "design" ? (
@@ -2115,17 +3134,73 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
               <span className="spinner" aria-hidden="true" />
               <span>
                 {elapsedSeconds}s elapsed · {generationState} · {generationScreenProgress.completed}{" "}
-                saved · {Object.values(screenStages).filter((stage) => stage === "rendered").length}{" "}
+                saved ·{" "}
+                {
+                  Object.values(screenStages).filter(
+                    (stage) => stage === "completed" || stage.startsWith("rendered"),
+                  ).length
+                }{" "}
                 rendered ·{" "}
+                {Object.values(sectionStages).filter((stage) => stage === "completed").length}{" "}
+                sections completed · last progress {secondsSinceProgress}s ago ·{" "}
                 {generationScreenProgress.retrying
                   ? `Retrying screen ${generationScreenProgress.completed + 1} of ${generationScreenProgress.total}; incomplete output was discarded.`
                   : generationScreenProgress.total
                     ? `${generationProgressText(generationState)} Screen ${generationScreenProgress.completed + (generationState === "generating" ? 1 : 0)} of ${generationScreenProgress.total}.`
                     : generationProgressText(generationState)}
               </span>
+              {generationPaused ? (
+                <button className="text-button" type="button" onClick={resumeDesignGeneration}>
+                  Resume
+                </button>
+              ) : (
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={pauseRequested}
+                  onClick={pauseDesignGeneration}
+                >
+                  {pauseRequested ? "Pausing after this section…" : "Pause after section"}
+                </button>
+              )}
               <button className="text-button" type="button" onClick={cancelDesignGeneration}>
                 Cancel
               </button>
+              <label className="inline-toggle">
+                <input
+                  type="checkbox"
+                  checked={followGeneration}
+                  onChange={(event) => {
+                    followGenerationRef.current = event.currentTarget.checked;
+                    setFollowGeneration(event.currentTarget.checked);
+                  }}
+                />
+                Follow generation
+              </label>
+              {currentSection && (
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() =>
+                    void generationBridge({
+                      type: "generation-select",
+                      requestId: nextRequestId(),
+                      generationId:
+                        activeGenerationId ??
+                        savedDraft?.manifest.generationId ??
+                        "generation-pending",
+                      screenId: currentSection.screenId,
+                      sectionId: currentSection.sectionId,
+                    }).catch(() =>
+                      setDraftNotice(
+                        "Could not focus the current section; the canvas is unchanged.",
+                      ),
+                    )
+                  }
+                >
+                  Jump to current section
+                </button>
+              )}
             </div>
           )}
 
@@ -2134,7 +3209,7 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
               <strong>
                 {generationState === "cancelled"
                   ? "Generation cancelled"
-                  : "Generation paused — saved screens are resumable"}
+                  : "Generation stopped — section checkpoints are resumable"}
               </strong>
               <ErrorList errors={generationErrors} />
             </section>
@@ -2154,6 +3229,29 @@ export default function App({ initialView = "design" }: { initialView?: PluginVi
                       {screen.width} × {screen.height} · {screen.devicePreset}
                       {` · ${screenStages[screen.id] ?? "queued"}`}
                     </span>
+                    <ul
+                      className="planned-section-list"
+                      aria-label={`${screen.name} section timeline`}
+                    >
+                      {createDesignSections(generationPlan.data).map((section) => {
+                        const status =
+                          sectionStages[`${screen.id}:${section.id}`] ??
+                          (savedDraft?.transactions.some(
+                            (item) =>
+                              item.transaction.screen_id === screen.id &&
+                              item.transaction.section_id === section.id &&
+                              item.rendered,
+                          )
+                            ? "completed"
+                            : "queued");
+                        return (
+                          <li key={section.id}>
+                            <span>{section.title}</span>
+                            <span>{status}</span>
+                          </li>
+                        );
+                      })}
+                    </ul>
                   </li>
                 ))}
               </ul>
@@ -3100,7 +4198,7 @@ function companionErrorText(error: unknown): string {
     account_not_eligible:
       "This ChatGPT account or workspace is not eligible for plan inference. Check account/workspace policy; do not retry the same request as a workaround.",
     unsupported_capability:
-      "The selected model or account rejected a Responses capability in this request. The smoke test proves basic inference only; check the sanitized parameter/code below and try another account-visible supported model.",
+      "The selected model or account did not complete the function-calling smoke test. Check the sanitized diagnostic below or choose another supported account-visible model.",
     route_not_supported:
       "The plan-use service does not support this Responses route for the account. Confirm the current official integration requirements.",
     responses_transport_error:
@@ -3136,6 +4234,8 @@ function companionErrorText(error: unknown): string {
       "The companion ran out of available memory or temporary disk space while processing the design. Free local resources, then rerun; completed screens are retained for resuming.",
     response_too_large:
       "The response exceeded a bounded safety limit (8 MiB generated screen / 32 MiB SSE stream). Simplify that screen or split the project; earlier saved screens remain recoverable.",
+    empty_response:
+      "The model completed without a text reply or canvas action. Retry or rephrase the request.",
     registration_clear_failed:
       "The local session was cleared, but the saved account registration could not be removed. Close the companion before trying again.",
     secure_storage_unavailable:
@@ -3190,6 +4290,17 @@ function formatInferenceDiagnostic(diagnostic: InferenceDiagnostic): string {
     ...(diagnostic.errorCode ? [`upstream_code=${diagnostic.errorCode}`] : []),
     ...(diagnostic.errorParam ? [`upstream_param=${diagnostic.errorParam}`] : []),
     ...(diagnostic.incompleteReason ? [`incomplete_reason=${diagnostic.incompleteReason}`] : []),
+    ...(diagnostic.responseStatus ? [`response_status=${diagnostic.responseStatus}`] : []),
+    ...(diagnostic.outputItemTypes?.length
+      ? [`output_types=${diagnostic.outputItemTypes.join(",")}`]
+      : []),
+    ...(diagnostic.outputItemCount !== undefined
+      ? [`output_items=${diagnostic.outputItemCount}`]
+      : []),
+    ...(diagnostic.functionCallCount !== undefined
+      ? [`function_calls=${diagnostic.functionCallCount}`]
+      : []),
+    ...(diagnostic.chatState ? [`chat_state=${diagnostic.chatState}`] : []),
   ];
   return `Safe diagnostic: ${details.join("; ")}.`;
 }
@@ -3220,12 +4331,13 @@ function generationProgressText(state: GenerationState): string {
     {
       idle: "Waiting",
       planning: "Planning the screen inventory…",
-      generating: "Generating a structured design with the selected account model…",
-      validating: "Validating the response against the native design schema…",
-      preparing: "Preparing the JSON review and quality warnings…",
-      saving: "Committing validated screen to durable local storage…",
-      rendering: "Rendering editable native Figma layers…",
-      repairing: "One targeted repair of the failed screen/subtree…",
+      generating: "Generating the current section with the selected account model…",
+      validating: "Validating the completed section transaction…",
+      preparing: "Preparing the screen plan and working frames…",
+      saving: "Persisting the validated section before native apply…",
+      rendering: "Applying the section as editable native Figma layers…",
+      repairing: "One bounded repair of the failed section only…",
+      paused: "Paused at a section boundary; committed work is preserved.",
       ready: "Ready for review",
       failed: "Generation failed",
       cancelled: "Generation cancelled",

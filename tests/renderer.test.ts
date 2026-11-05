@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import phase1Sample from "../src/samples/sample-design.json";
 import storefront from "../src/samples/phase-2-storefront.json";
 import phase3Sample from "../src/samples/phase-3-design-system.json";
@@ -8,17 +11,23 @@ import { ONE_PIXEL_PNG } from "./visual-fixtures";
 import {
   mapLayoutSpec,
   mapSizingMode,
+  createGenerationSkeletons,
   renderDesign,
   renderMultiScreenDesign,
   type RendererFigmaApi,
 } from "../src/plugin/renderer";
 import { boundsIntersectWithGap, DEFAULT_MIN_CANVAS_GAP } from "../src/plugin/canvas-placement";
 import { parseDesignValue, type DesignSpec } from "../src/shared/schema";
-import { createDesignPlan } from "../src/shared/design-generation";
+import {
+  createDesignPlan,
+  normalizeGeneratedDesignResponse,
+} from "../src/shared/design-generation";
 import { prepareGeneratedDesign } from "../src/ui/design-generation";
 import { createGenerationController } from "../src/plugin/generation-controller";
 import { UIToPluginSchema, PluginToUISchema } from "../src/shared/messages";
-import { draftFixture } from "./generation-fixture";
+import { createGenerationTransaction } from "../src/shared/generation-transaction";
+import { draftFixture, sectionDesignFixture } from "./generation-fixture";
+import { createDraftStore } from "../src/companion/draft-store";
 
 interface MockNode {
   id: string;
@@ -973,6 +982,282 @@ describe("renderDesign", () => {
     });
     expect(mock.api.currentPage.selection).toHaveLength(2);
     expect(mock.raw.viewport.scrollAndZoomIntoView).toHaveBeenCalled();
+  });
+
+  it("applies completed Persian sections in order and makes native retries idempotent", async () => {
+    const { manifest } = draftFixture();
+    const plan = createDesignPlan(manifest.request);
+    expect(plan.success).toBe(true);
+    if (!plan.success) return;
+    const screen = plan.data.screens.find(({ id }) => id === "home")!;
+    createGenerationSkeletons(mock.api, manifest.generationId, plan.data, [screen.id], true);
+    const applySection = async (
+      sectionId: "identity" | "primary" | "supporting",
+      transactionId: string,
+      sectionName: string,
+      expectedSuccess = true,
+    ) => {
+      const design = sectionDesignFixture(screen.id, sectionName);
+      const transaction = createGenerationTransaction({
+        generationId: manifest.generationId,
+        documentScope: manifest.documentId,
+        screenId: screen.id,
+        sectionId,
+        transactionId,
+        design,
+      });
+      const prepared = prepareGeneratedDesign(JSON.stringify(design), {
+        ...plan.data,
+        screens: [screen],
+      });
+      expect(prepared.success).toBe(true);
+      if (!prepared.success) throw new Error(prepared.errors.join(" "));
+      prepared.data.batch.id = manifest.generationId;
+      const result = await renderMultiScreenDesign(mock.api, prepared.data.batch, {
+        resume: true,
+        verifyTouchTargets: true,
+        transaction,
+      });
+      if (expectedSuccess) {
+        expect(result.screens[0]?.error).toBeUndefined();
+        expect(result).toMatchObject({ generatedScreens: 1, failedScreens: 0 });
+      } else {
+        expect(result).toMatchObject({ generatedScreens: 0, failedScreens: 1 });
+      }
+      return { result, transaction };
+    };
+
+    const first = await applySection("identity", "transaction-test-1", "هویت و سربرگ");
+    const root = mock.roots.find(
+      (node) =>
+        node.getPluginData("fad.multi-screen.batch-id") === manifest.generationId &&
+        node.getPluginData("fad.multi-screen.screen-id") === screen.id,
+    )!;
+    expect(root.getPluginData("fad.generation.commit")).toBe("streaming");
+    expect(root.children[0]?.getPluginData("fad.generation.semantic-id")).toBe(
+      "section:home:identity",
+    );
+    expect(mock.find("عنوان فارسی") && (mock.find("عنوان فارسی") as MockNode).type).toBe("TEXT");
+    const countAfterFirst = mock.allCreated.length;
+    const sectionMarker = root.children[0]!.getPluginData("fad.generation.transaction.key");
+    root.children[0]!.setPluginData("fad.generation.transaction.key", "");
+    const missingMarker = await applySection(
+      "identity",
+      "transaction-test-1",
+      "هویت و سربرگ",
+      false,
+    );
+    expect(missingMarker.result.screens[0]?.error).toContain(
+      "ledger is committed but its section marker is missing",
+    );
+    expect(root.children).toHaveLength(1);
+    root.children[0]!.setPluginData("fad.generation.transaction.key", sectionMarker);
+    root.setPluginData("fad.generation.transaction-ledger", "[]");
+    root.setPluginData("fad.generation.sequence", "-1");
+    root.setPluginData("fad.generation.last-idempotency-key", "");
+    const replay = await applySection("identity", "transaction-test-1", "هویت و سربرگ");
+    expect(replay.result.generatedScreens).toBe(1);
+    expect(mock.allCreated).toHaveLength(countAfterFirst);
+    expect(root.children).toHaveLength(1);
+    expect(root.getPluginData("fad.generation.sequence")).toBe("0");
+
+    const outOfOrder = await applySection(
+      "supporting",
+      "transaction-test-3",
+      "بخش‌های تکمیلی",
+      false,
+    );
+    expect(outOfOrder.result.failedScreens).toBe(1);
+    expect(root.children).toHaveLength(1);
+
+    const second = await applySection("primary", "transaction-test-2", "محتوای اصلی");
+    expect(second.transaction.dependencies).toEqual([first.transaction.idempotency_key]);
+    expect(root.children.map((node) => node.name)).toEqual(["هویت و سربرگ", "محتوای اصلی"]);
+    expect(root.getPluginData("fad.generation.sequence")).toBe("1");
+    expect(root.getPluginData("fad.generation.commit")).toBe("streaming");
+
+    const interrupted = mock.api.createFrame() as unknown as MockNode;
+    interrupted.setPluginData(
+      "fad.generation.transaction.pending",
+      "fad:v1:generation-test-01:home:supporting",
+    );
+    root.appendChild(interrupted);
+    const blockedResume = await applySection(
+      "supporting",
+      "transaction-test-3",
+      "بخش‌های تکمیلی",
+      false,
+    );
+    expect(blockedResume.result.screens[0]?.error).toContain("interrupted native section");
+    expect(interrupted.removed).toBe(false);
+    interrupted.remove();
+    const third = await applySection("supporting", "transaction-test-3", "بخش‌های تکمیلی");
+    expect(third.result.generatedScreens).toBe(1);
+    expect(root.children).toHaveLength(3);
+    expect(root.getPluginData("fad.generation.commit")).toBe("complete");
+  });
+
+  it("runs the offline Persian save/bridge/native pipeline before beginning the next section", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "fad-section-pipeline-"));
+    try {
+      const { manifest } = draftFixture();
+      manifest.documentId = "test-file-key-0_1";
+      const store = createDraftStore(directory);
+      await store.start("offline-account", manifest);
+      const storage = new Map<string, unknown>();
+      const metadata = new Map<string, string>();
+      const api = {
+        ...mock.api,
+        fileKey: "test-file-key",
+        root: {
+          getPluginData: (key: string) => metadata.get(key) ?? "",
+          setPluginData: (key: string, value: string) => metadata.set(key, value),
+        },
+        clientStorage: {
+          getAsync: async (key: string) => storage.get(key),
+          setAsync: async (key: string, value: unknown) => void storage.set(key, value),
+          deleteAsync: async (key: string) => void storage.delete(key),
+        },
+      } as unknown as PluginAPI;
+      Object.assign(api.currentPage, { id: "0:1" });
+      const events: string[] = [];
+      const controller = createGenerationController(api, (message) => {
+        expect(PluginToUISchema.safeParse(message).success).toBe(true);
+        events.push(`visible:${message.sectionId}`);
+      });
+      const plan = createDesignPlan(manifest.request);
+      expect(plan.success).toBe(true);
+      if (!plan.success) return;
+      expect(
+        await controller({
+          type: "generation-prepare",
+          requestId: "prepare-sections",
+          manifest,
+          screenIds: ["home"],
+          focusInitial: true,
+        }),
+      ).toMatchObject({ success: true });
+
+      const sections = ["identity", "primary", "supporting"] as const;
+      for (const [sequence, sectionId] of sections.entries()) {
+        if (sequence > 0) expect(events).toContain(`visible:${sections[sequence - 1]}`);
+        if (sectionId === "primary") {
+          events.push("request:primary-failed");
+          const createdBeforeResume = mock.allCreated.length;
+          const checkpoint = await store.load("offline-account", manifest.documentId);
+          expect(checkpoint?.transactions).toHaveLength(1);
+          const resumedIdentity = checkpoint!.transactions[0]!;
+          const replay = await controller({
+            type: "generation-apply-section",
+            requestId: "resume-identity-before-primary",
+            manifest,
+            transaction: resumedIdentity.transaction,
+            design: resumedIdentity.design,
+          });
+          expect(replay).toMatchObject({ success: true });
+          expect(mock.allCreated).toHaveLength(createdBeforeResume);
+          expect(
+            mock.roots.find((node) => node.getPluginData("fad.multi-screen.screen-id") === "home")
+              ?.children,
+          ).toHaveLength(1);
+          events.push("resume:identity");
+        }
+        events.push(`request:${sectionId}`);
+        const rawDesign = sectionDesignFixture("home", `بخش ${sequence + 1}`);
+        const sectionRoot = rawDesign.screens[0]!.children[0]!;
+        const nested = {
+          ...sectionRoot,
+          name: `ظرف تو در تو ${sequence + 1}`,
+          width: 334,
+          height: 64,
+          padding: 0,
+          gap: 4,
+          layout: "none" as const,
+          children: sectionRoot.children,
+        };
+        sectionRoot.layout = "none";
+        sectionRoot.children = [nested];
+        const normalized = normalizeGeneratedDesignResponse(JSON.stringify(rawDesign), {
+          ...plan.data,
+          screens: [plan.data.screens.find(({ id }) => id === "home")!],
+        });
+        expect(normalized.success).toBe(true);
+        if (!normalized.success) throw new Error(normalized.errors.join(" "));
+        const design = normalized.data.design;
+        expect(design.screens[0]!.children[0]!.layout).toBe("vertical");
+        expect(design.screens[0]!.children[0]!.children[0]!.layout).toBe("vertical");
+        const transaction = createGenerationTransaction({
+          generationId: manifest.generationId,
+          documentScope: manifest.documentId,
+          screenId: "home",
+          sectionId,
+          transactionId: `transaction-test-${sequence + 1}`,
+          design,
+        });
+        await store.saveSection(
+          "offline-account",
+          manifest.documentId,
+          manifest.generationId,
+          transaction,
+          design,
+        );
+        expect(
+          (await store.load("offline-account", manifest.documentId))?.transactions,
+        ).toHaveLength(sequence + 1);
+        const result = await controller({
+          type: "generation-apply-section",
+          requestId: `apply-section-${sequence}`,
+          manifest,
+          transaction,
+          design,
+        });
+        expect(result).toMatchObject({ success: true, nodeId: expect.any(String) });
+        if (result.type !== "generation-result" || !result.nodeId)
+          throw new Error("The offline native section transaction was not acknowledged.");
+        await store.markSectionApplied(
+          "offline-account",
+          manifest.documentId,
+          manifest.generationId,
+          transaction,
+          result.nodeId,
+        );
+        expect(events.at(-1)).toBe(`visible:${sectionId}`);
+      }
+      expect(events).toEqual([
+        "request:identity",
+        "visible:identity",
+        "request:primary-failed",
+        "resume:identity",
+        "request:primary",
+        "visible:primary",
+        "request:supporting",
+        "visible:supporting",
+      ]);
+      expect((await store.load("offline-account", manifest.documentId))?.transactions).toHaveLength(
+        3,
+      );
+      expect(
+        mock.roots
+          .find((node) => node.getPluginData("fad.multi-screen.screen-id") === "home")
+          ?.getPluginData("fad.generation.commit"),
+      ).toBe("complete");
+      const createdNodeCount = mock.allCreated.length;
+      const recovered = await store.load("offline-account", manifest.documentId);
+      expect(recovered?.transactions).toHaveLength(3);
+      for (const saved of recovered!.transactions) {
+        const replay = await controller({
+          type: "generation-apply-section",
+          requestId: `resume-${saved.transaction.section_id}`,
+          manifest,
+          transaction: saved.transaction,
+          design: saved.design,
+        });
+        expect(replay).toMatchObject({ success: true });
+      }
+      expect(mock.allCreated).toHaveLength(createdNodeCount);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("creates a new named batch on repeat and reuses shared design-system assets", async () => {

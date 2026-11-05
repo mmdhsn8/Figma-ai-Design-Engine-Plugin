@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { MAX_SECTION_BYTES } from "../src/shared/generation-limits";
 import {
   CompanionClientError,
   disconnectLocalSession,
@@ -13,6 +14,7 @@ import {
   restoreLocalSession,
   requestLocalPairing,
   runSmokeRequest,
+  streamAuthorizedChat,
 } from "../src/ui/companion-client";
 
 describe("Figma UI companion client", () => {
@@ -300,6 +302,11 @@ describe("Figma UI companion client", () => {
         fetcher,
         undefined,
         ["home"],
+        undefined,
+        [],
+        undefined,
+        undefined,
+        { id: "identity", sequence: 0 },
       ),
     ).resolves.toBe(designText);
     const [url, options] = fetcher.mock.calls[0]!;
@@ -311,7 +318,38 @@ describe("Figma UI companion client", () => {
       model: "account-model",
       request: designRequest,
       screenIds: ["home"],
+      section: { id: "identity", sequence: 0 },
     });
+
+    const oversizedSection = vi.fn<typeof fetch>(
+      async () =>
+        new Response("{}", {
+          headers: {
+            "Content-Type": "application/json",
+            "X-FAD-Request-Id": "req-section-large",
+            "X-FAD-Model": "account-model",
+            "X-FAD-Completed": "response.completed",
+            "X-FAD-Response-Bytes": String(MAX_SECTION_BYTES + 1),
+          },
+        }),
+    );
+    await expect(
+      generateAuthorizedDesign(
+        "session-bearer",
+        "req-section-large",
+        "account-model",
+        designRequest,
+        [],
+        oversizedSection,
+        undefined,
+        ["home"],
+        undefined,
+        [],
+        undefined,
+        undefined,
+        { id: "identity", sequence: 0 },
+      ),
+    ).rejects.toMatchObject({ category: "response_too_large" });
 
     const mismatched = vi.fn<typeof fetch>(
       async () =>
@@ -717,6 +755,224 @@ describe("Figma UI companion client", () => {
     const pending = runSmokeRequest("x".repeat(40), "account-model", fetcher, controller.signal);
     controller.abort();
     await expect(pending).rejects.toMatchObject({ category: "request_cancelled" });
+  });
+
+  it("streams a validated function call with the trusted logical action and preserves continuation items", async () => {
+    const requestId = "chat-request-123";
+    const callId = "call_12345678";
+    const functionCall = {
+      type: "function_call" as const,
+      call_id: callId,
+      name: "create_frame" as const,
+      arguments: JSON.stringify({
+        ref: "home",
+        name: "Home",
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+      }),
+    };
+    const call = {
+      callId,
+      name: functionCall.name,
+      action: {
+        tool: "create_frame",
+        ref: "home",
+        name: "Home",
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+        cornerRadius: 0,
+      },
+      functionCall,
+    };
+    const functionCallOutput = {
+      type: "function_call_output",
+      call_id: callId,
+      output: JSON.stringify({ success: true, logicalRef: "home" }),
+    };
+    const encoder = new TextEncoder();
+    const frames = [
+      `event: delta\ndata: ${JSON.stringify({ requestId, delta: "Creating a frame…" })}\n\n`,
+      `event: tool_calls\ndata: ${JSON.stringify({ requestId, calls: [call], functionCallItems: [functionCall] })}\n\n`,
+    ];
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const bytes = encoder.encode(frames.join(""));
+        controller.enqueue(bytes.slice(0, 43));
+        controller.enqueue(bytes.slice(43));
+        controller.close();
+      },
+    });
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response(stream, {
+          headers: {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "X-FAD-Request-Id": requestId,
+            "X-FAD-Model": "account-model",
+          },
+        }),
+    );
+    const deltas: string[] = [];
+    const input = [{ role: "user" as const, content: "Create a home frame." }];
+
+    await expect(
+      streamAuthorizedChat(
+        "session-bearer",
+        requestId,
+        "account-model",
+        input,
+        fetcher,
+        undefined,
+        (delta) => deltas.push(delta),
+      ),
+    ).resolves.toEqual({
+      kind: "tool_calls",
+      calls: [call],
+      functionCallItems: [functionCall],
+      text: "",
+    });
+    expect(deltas).toEqual(["Creating a frame…"]);
+    const options = fetcher.mock.calls[0]?.[1];
+    expect(new Headers(options?.headers).get("authorization")).toBe("Bearer session-bearer");
+    expect(JSON.parse(String(options?.body))).toMatchObject({
+      requestId,
+      model: "account-model",
+      input,
+    });
+    expect(JSON.parse(JSON.stringify([...input, functionCall, functionCallOutput])).at(-1)).toEqual(
+      functionCallOutput,
+    );
+  });
+
+  it("rejects a streamed function call whose continuation identity does not match", async () => {
+    const requestId = "chat-request-mismatch";
+    const functionCall = {
+      type: "function_call" as const,
+      call_id: "call_12345678",
+      name: "get_document_context" as const,
+      arguments: "{}",
+    };
+    const call = {
+      callId: functionCall.call_id,
+      name: functionCall.name,
+      action: { tool: "get_document_context" },
+      functionCall,
+    };
+    const payload = {
+      requestId,
+      calls: [call],
+      functionCallItems: [{ ...functionCall, call_id: "call_87654321" }],
+    };
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response(`event: tool_calls\ndata: ${JSON.stringify(payload)}\n\n`, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "X-FAD-Request-Id": requestId,
+            "X-FAD-Model": "account-model",
+          },
+        }),
+    );
+
+    await expect(
+      streamAuthorizedChat(
+        "session-bearer",
+        requestId,
+        "account-model",
+        [{ role: "user", content: "Inspect" }],
+        fetcher,
+      ),
+    ).rejects.toMatchObject({ category: "response_invalid" });
+  });
+
+  it("returns completed conversational text and reports actual model progress", async () => {
+    const requestId = "chat-request-done";
+    const frames = [
+      `event: progress\ndata: ${JSON.stringify({ requestId, elapsedMs: 150, eventCount: 2 })}\n\n`,
+      `event: delta\ndata: ${JSON.stringify({ requestId, delta: "Hello from the model." })}\n\n`,
+      `event: done\ndata: ${JSON.stringify({ requestId, text: "Hello from the model." })}\n\n`,
+    ];
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response(frames.join(""), {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "X-FAD-Request-Id": requestId,
+            "X-FAD-Model": "account-model",
+          },
+        }),
+    );
+    const progress: number[] = [];
+    const deltas: string[] = [];
+
+    await expect(
+      streamAuthorizedChat(
+        "session-bearer",
+        requestId,
+        "account-model",
+        [{ role: "user", content: "Say hello" }],
+        fetcher,
+        undefined,
+        (delta) => deltas.push(delta),
+        (elapsedMs) => progress.push(elapsedMs),
+      ),
+    ).resolves.toEqual({ kind: "done", text: "Hello from the model." });
+    expect(deltas.join("")).toBe("Hello from the model.");
+    expect(progress).toEqual([150]);
+  });
+
+  it("preserves safe correlated terminal diagnostics for an incomplete chat response", async () => {
+    const requestId = "chat-request-incomplete";
+    const diagnostic = {
+      model: "account-model",
+      stage: "stream",
+      outcome: "incomplete",
+      httpStatus: 200,
+      lastEvent: "response.incomplete",
+      eventCount: 3,
+      incompleteReason: "max_output_tokens",
+      responseStatus: "incomplete",
+      outputItemTypes: ["message"],
+      outputItemCount: 1,
+      functionCallCount: 0,
+      chatState: "incomplete",
+    } as const;
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response(
+          `event: error\ndata: ${JSON.stringify({
+            requestId,
+            error: "response_incomplete",
+            message: "The model hit its output-token limit before finishing.",
+            diagnostic,
+          })}\n\n`,
+          {
+            headers: {
+              "Content-Type": "text/event-stream",
+              "X-FAD-Request-Id": requestId,
+              "X-FAD-Model": "account-model",
+            },
+          },
+        ),
+    );
+    await expect(
+      streamAuthorizedChat(
+        "session-bearer",
+        requestId,
+        "account-model",
+        [{ role: "user", content: "Create a page." }],
+        fetcher,
+      ),
+    ).rejects.toMatchObject({
+      category: "response_incomplete",
+      diagnostic: {
+        incompleteReason: "max_output_tokens",
+        responseStatus: "incomplete",
+        outputItemTypes: ["message"],
+        functionCallCount: 0,
+        chatState: "incomplete",
+      },
+    });
   });
 
   it("rejects oversized local companion responses before parsing them", async () => {

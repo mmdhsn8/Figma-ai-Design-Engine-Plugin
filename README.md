@@ -2,7 +2,7 @@
 
 Figma AI Design Engine is a local plugin for Figma Desktop. It reads a structured JSON design and creates editable native Figma layers from it. You can start with one of the included examples or write/import your own JSON, validate it, generate the design, and keep editing it in Figma.
 
-The plugin can render JSON fully offline. Phase 5 adds prompt → validate/repair → durable local checkpoint → native editable Figma rendering through the optional companion, with optional JSON inspection. Generation stays disabled until the exact selected account-visible model passes a real Responses smoke test. Live account access and Figma Desktop acceptance remain unverified; offline JSON import does not depend on AI access.
+The plugin can render JSON fully offline. Phase 5.5 adds incremental prompt → validate → durable section checkpoint → native editable Figma rendering through the optional companion, with optional JSON inspection. Generation stays disabled until the exact selected account-visible model passes a real Responses smoke test. Live account access and Figma Desktop acceptance remain unverified; offline JSON import does not depend on AI access.
 
 ## What the plugin can do
 
@@ -15,7 +15,7 @@ The plugin can render JSON fully offline. Phase 5 adds prompt → validate/repai
 - Preserve existing page content and place each new design in a clear canvas area.
 - Keep Persian and other Unicode text editable in Figma text layers. Font availability and complex right-to-left shaping depend on the local Figma environment.
 - Phase 4.6/4.7.1: official browser sign-in, plan-use permission checks, model discovery, fixed smoke test, local pairing, and DPAPI-protected session restoration.
-- Phase 5 stabilization: Persian/English multi-screen planning, Mobile/Desktop counterparts, strict validation, recursive mobile touch-target repair, bounded node-only model repair, durable per-screen resume and automatic native rendering. Phase 5 acceptance remains pending.
+- Phase 5.5: Persian/English multi-screen planning, bounded `identity` → `primary` → `supporting` section requests, strict validation, 44×44 touch-target checks, durable per-section resume, idempotent native append, and pause/resume/cancel controls. Every model section still requires a completed Responses event before validation; the next request waits for the current section's checkpoint and Figma acknowledgment. Live/Desktop acceptance remains pending.
 
 The **Phase 1 sample**, **Phase 2 demo**, and **Phase 3 demo** buttons are examples in the same plugin, not separate programs. Phase 1 demonstrates a coordinate-based design. Phase 2 shows nested Auto Layout and linked components. Phase 3 adds an optional design-system section to schema 1.0.0.
 
@@ -356,7 +356,7 @@ The button **Visual demo** loads `src/samples/phase-4.5-visual-design.json`, whi
 8. Run the Phase 1–4 examples, confirm horizontal-first placement with the 120 px gap and 6,000 px default row width, and verify unrelated content stays in place.
 9. Confirm the local Starter/Desktop environment can create and edit these native shapes, image fills and effects. Plugin API mocks are not proof of account-specific Figma behavior.
 
-The prior Phase 2.2, Phase 3, Phase 4 and Phase 4.5 Desktop acceptance gates remain pending unless the user reports their results. Phase 4.5 is implemented in code; product acceptance is pending this manual review. Phase 5 is implemented as a runtime-gated MVP; live inference and Figma Desktop acceptance are still pending.
+The prior Phase 2.2, Phase 3, Phase 4 and Phase 4.5 Desktop acceptance gates remain pending unless the user reports their results. Phase 4.5 is implemented in code; product acceptance is pending this manual review. Phase 5.5 is implemented as a runtime-gated incremental flow; live inference and Figma Desktop acceptance are still pending.
 
 ## Phase 4.6 ChatGPT connection proof of concept
 
@@ -430,17 +430,17 @@ For `invalid_authorize_request` naming `ext_agent_host_id`, the old companion bu
 
 The loopback repair regression tests compare the UI endpoint, both listener addresses, and the manifest development entry, and reject the previously failing IPv4-literal manifest value. They also exercise requests against both loopback families. These tests cannot establish Figma Desktop's own manifest or iframe policy; perform the manual checklist above.
 
-## Phase 5 prompt-to-design MVP
+## Phase 5.5 incremental prompt-to-design
 
-Press **Generate Design** for a deterministic Persian/English screen plan, per-screen streaming, recursive touch-target normalization, strict validation, local durable save, and automatic native editable rendering. Exact-model smoke verification remains required. A control that cannot be safely repaired locally gets one bounded node-only model repair; complete screens are reused, not regenerated. The JSON tab remains available for optional inspection, editing, export and manual imports.
+Press **Generate Design** for a deterministic Persian/English screen plan. The plugin creates working screen frames, then requests three bounded sections per screen (`identity`, `primary`, `supporting`) sequentially. Each section is accepted only after its Responses request ends with `response.completed`, passes strict local validation and 44×44 target checks, is durably saved, and is acknowledged by the native Figma renderer before the next request starts. One failed section can receive one complete-section repair; already committed sections are not regenerated. The timeline supports pause at a section boundary, resume, cancel, follow, and jump-to-current-section. Native layers remain editable, including Persian text and Auto Layout. The JSON tab remains available for optional inspection, editing, export and manual imports.
 
-Drafts survive UI and companion restarts in `%LOCALAPPDATA%\Figma AI Design Engine\drafts-v1`; Figma stores only a small document/page reference. Reconnect, **Restore saved project**, verify the same model if needed, and press Generate to resume. Complete canvas identities are reused (including manually moved frames); deleted frames can be restored from checkpoints without inference. **Delete local draft** preserves Figma frames. Recovery export/import contains private brief/design copy but no credentials. Storage is account/document/page-scoped, versioned and checksummed, with 8 MiB per screen, 64 MiB per project and eight retained project scopes; quotas require explicit deletion, not silent cleanup. When the companion is unavailable, existing layers and offline import work, but full saved JSON cannot be recovered from the small plugin reference alone.
+Drafts survive UI and companion restarts in `%LOCALAPPDATA%\Figma AI Design Engine\drafts-v1`; Figma stores only a small document/page reference. Reconnect, **Restore saved project**, verify the same model if needed, and press Generate to resume from the first unfinished section. Native transaction markers reconcile a completed render whose acknowledgment was interrupted, without duplicating layers or moving prior frames. If a partial native append is detected, resume stops for inspection rather than deleting potentially user-edited nodes. User edits to committed layers are not replaced. Legacy v1 per-screen checkpoints remain readable. **Delete local draft** preserves Figma frames. Recovery export/import contains private brief/design copy but no credentials. Storage is account/document/page-scoped, versioned and checksummed, with 8 MiB per legacy screen, 1 MiB and 250 nodes per section, 64 MiB per project and eight retained project scopes; quotas require explicit deletion, not silent cleanup. When the companion is unavailable, existing layers and offline import work, but full saved JSON cannot be recovered from the small plugin reference alone.
 
-After changes: stop the old companion with Ctrl+C, run `npm run build`, `npx tsc -p tsconfig.companion.json`, `npm run verify:phase5`, then `npm run companion`; reload the freshly built root-manifest development plugin. The runtime is `dist-companion/companion/main.js`. `npm run bench:phase5` measures the deterministic local normalization fixture, **not live model or Desktop latency**. Progress distinguishes header wait/stream activity, validation, repair, saving and native rendering, with sanitized stage timings.
+After changes: stop the old companion with Ctrl+C, run `npm run build`, `npx tsc -p tsconfig.companion.json`, `npm run verify:phase5`, then `npm run companion`; reload the freshly built root-manifest development plugin. The runtime is `dist-companion/companion/main.js`. `npm run bench:phase5` measures the deterministic local normalization fixture, **not live model or Desktop latency**. Section and native-render timings are local diagnostics; they are not provider first-visible latency until measured with the exact authorized model in Figma Desktop.
 
-The **Persian storefront · 10 screens** and **English dashboard · 2 screens** buttons load deterministic local JSON fixtures and work with the companion offline. Detailed request flow, limits, security boundaries, fixture inventory, and the manual Figma acceptance checklist are in [`docs/phase-5-design-generation.md`](docs/phase-5-design-generation.md).
+The **Persian storefront · 10 screens** and **English dashboard · 2 screens** buttons load deterministic local JSON fixtures and work with the companion offline. Detailed request flow, transaction/recovery contract, limits, security boundaries, and the manual Figma acceptance checklist are in [`docs/phase-5-5-live-canvas-generation.md`](docs/phase-5-5-live-canvas-generation.md) and [`docs/phase-5-design-generation.md`](docs/phase-5-design-generation.md).
 
-**Phase 5 acceptance is pending:** no live authorized design request, editable Figma Desktop render, or screenshots have been produced in this environment.
+**Phase 5.5 live acceptance is pending:** no live authorized section request, first-visible-native-node timing, Figma Desktop render, or screenshots have been produced in this environment.
 
 ## Limitations
 

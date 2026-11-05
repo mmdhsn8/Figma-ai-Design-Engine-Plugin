@@ -7,6 +7,8 @@ import type {
 } from "../shared/schema";
 import { orderComponentDefinitions, parseDesignValue } from "../shared/schema";
 import type { FontSelection } from "../shared/messages";
+import type { GenerationTransaction } from "../shared/generation-transaction";
+import type { DesignPlan } from "../shared/design-generation";
 import {
   DEFAULT_MAX_ROW_WIDTH,
   DEFAULT_MIN_CANVAS_GAP,
@@ -135,6 +137,8 @@ export interface MultiScreenRenderResult {
 
 export interface MultiScreenRenderOptions {
   beforeScreen?: () => void;
+  transaction?: GenerationTransaction;
+  onSectionVisible?: (nodeId: string) => void;
   resume?: boolean;
   verifyTouchTargets?: boolean;
   gap?: number;
@@ -174,6 +178,11 @@ const MULTI_SCREEN_BATCH_KEY = "fad.multi-screen.batch-id";
 const MULTI_SCREEN_ID_KEY = "fad.multi-screen.screen-id";
 const MULTI_SCREEN_META_KEY = "fad.multi-screen.metadata";
 const COMPONENT_AREA_BATCH_KEY = "fad.multi-screen.components-batch";
+const SECTION_TRANSACTION_KEY = "fad.generation.transaction.key";
+const SECTION_TRANSACTION_PENDING_KEY = "fad.generation.transaction.pending";
+const SECTION_SEQUENCE_KEY = "fad.generation.transaction.sequence";
+const TRANSACTION_LEDGER_KEY = "fad.generation.transaction-ledger";
+const SEMANTIC_NODE_ID_KEY = "fad.generation.semantic-id";
 
 interface LayoutMapping {
   mode: "HORIZONTAL" | "VERTICAL";
@@ -236,6 +245,108 @@ function createTracker(): Tracker {
       }
     },
   };
+}
+
+export function createGenerationSkeletons(
+  api: RendererFigmaApi,
+  generationId: string,
+  plan: DesignPlan,
+  screenIds: string[],
+  focusInitial = false,
+): string[] {
+  const selected = plan.screens.filter(({ id }) => screenIds.includes(id));
+  if (selected.length !== screenIds.length || new Set(screenIds).size !== screenIds.length)
+    throw new DesignRenderError("Generation skeleton scope does not match the planned screens.");
+  const roots = selected.map((screen) => {
+    const matches = api.currentPage.findAll(
+      (node) =>
+        node.getPluginData(MULTI_SCREEN_BATCH_KEY) === generationId &&
+        node.getPluginData(MULTI_SCREEN_ID_KEY) === screen.id,
+    );
+    if (matches.length > 1)
+      throw new DesignRenderError(
+        "Duplicate generation screen identity; inspect the existing frames.",
+      );
+    const existing = matches[0];
+    if (existing) {
+      if (
+        existing.type !== "FRAME" ||
+        !["streaming", "complete"].includes(existing.getPluginData("fad.generation.commit"))
+      )
+        throw new DesignRenderError(
+          "Existing generation frame is incomplete; inspect it before resuming.",
+        );
+      return existing as FrameNode;
+    }
+    return undefined;
+  });
+  const missing = selected.filter((_, index) => !roots[index]);
+  if (!missing.length) return roots.map((root) => root!.id);
+
+  const placements = planCanvasPlacements(
+    missing.map((screen) => ({ id: screen.id, width: screen.width, height: screen.height })),
+    readTopLevelCanvasObstacles(api.currentPage),
+  );
+  const placementById = new Map(placements.map((placement) => [placement.id, placement]));
+  const tracker = createTracker();
+  const created: FrameNode[] = [];
+  try {
+    for (const screen of missing) {
+      const position = placementById.get(screen.id);
+      if (!position)
+        throw new DesignRenderError(`No skeleton placement was planned for ${screen.id}.`);
+      const frame = api.createFrame();
+      tracker.track(frame, "frames");
+      created.push(frame);
+      frame.name = uniqueName(api, `Generating — ${screen.name}`, new Set());
+      frame.resize(screen.width, screen.height);
+      frame.x = position.x;
+      frame.y = position.y;
+      frame.fills = [{ type: "SOLID", color: hexToRgb("#F7F5F0") }];
+      frame.strokes = [{ type: "SOLID", color: hexToRgb("#D8DEE6") }];
+      frame.strokeWeight = 1;
+      applyLayout(
+        frame,
+        {
+          mode: "vertical",
+          gap: screen.devicePreset === "mobile" ? 16 : 24,
+          padding:
+            screen.devicePreset === "mobile"
+              ? { top: 20, right: 20, bottom: 20, left: 20 }
+              : { top: 32, right: 32, bottom: 32, left: 32 },
+          counterAxisAlign: "stretch",
+        },
+        screen.width,
+        screen.height,
+      );
+      frame.primaryAxisSizingMode = "FIXED";
+      frame.counterAxisSizingMode = "FIXED";
+      frame.setPluginData(MULTI_SCREEN_BATCH_KEY, generationId);
+      frame.setPluginData(MULTI_SCREEN_ID_KEY, screen.id);
+      frame.setPluginData(SEMANTIC_NODE_ID_KEY, `screen:${screen.id}`);
+      frame.setPluginData("fad.generation.commit", "streaming");
+      frame.setPluginData("fad.generation.sequence", "-1");
+      frame.setPluginData("fad.generation.last-idempotency-key", "");
+      frame.setPluginData(TRANSACTION_LEDGER_KEY, "[]");
+      frame.setPluginData("fad.generation.skeleton", "1");
+      frame.setPluginData(
+        MULTI_SCREEN_META_KEY,
+        JSON.stringify({ devicePreset: screen.devicePreset, order: screen.order }),
+      );
+    }
+    if (focusInitial && created[0]) {
+      api.currentPage.selection = [created[0]];
+      api.viewport.scrollAndZoomIntoView([created[0]]);
+    }
+    return selected.map((_, index) => roots[index]?.id ?? created.shift()!.id);
+  } catch (error) {
+    tracker.cleanup();
+    throw error instanceof DesignRenderError
+      ? error
+      : new DesignRenderError("Figma could not create the working screen frames.", {
+          cause: error,
+        });
+  }
 }
 
 function collectImageReferences(nodes: DesignNode[], references: Set<string>): void {
@@ -665,6 +776,7 @@ function appendDesignNode(
   spec: ResolvedDesignNode,
   parentLayout: ResolvedLayoutSpec | undefined,
   context: BuildContext,
+  beforeAppend?: (node: LayoutChildNode) => void,
 ): LayoutChildNode {
   const { api, tracker } = context;
   let node: LayoutChildNode;
@@ -770,6 +882,7 @@ function appendDesignNode(
     node = instance;
   }
 
+  beforeAppend?.(node);
   parent.appendChild(node);
   if ("qualityRole" in spec && (spec.qualityRole === "button" || spec.qualityRole === "input"))
     node.setPluginData("fad.touch-target", spec.qualityRole);
@@ -852,6 +965,7 @@ function createDocumentFrame(
   parent?: FrameNode,
   position?: Pick<CanvasBounds, "x" | "y">,
   onCreated?: (frame: FrameNode) => void,
+  onChildCreated?: (node: LayoutChildNode, index: number) => void,
 ): FrameNode {
   const frame = api.createFrame();
   context.tracker.track(frame, "frames");
@@ -864,8 +978,10 @@ function createDocumentFrame(
   if (spec.document.layout)
     applyLayout(frame, spec.document.layout, spec.document.width, spec.document.height);
   parent?.appendChild(frame);
-  for (const child of spec.document.children) {
-    appendDesignNode(frame, child, spec.document.layout, context);
+  for (const [index, child] of spec.document.children.entries()) {
+    appendDesignNode(frame, child, spec.document.layout, context, (node) =>
+      onChildCreated?.(node, index),
+    );
   }
   return frame;
 }
@@ -1319,6 +1435,87 @@ function safeProgress(
   }
 }
 
+function safeSectionVisible(
+  callback: MultiScreenRenderOptions["onSectionVisible"],
+  nodeId: string,
+): void {
+  try {
+    callback?.(nodeId);
+  } catch {
+    // The UI diagnostic channel must not change native transaction outcome.
+  }
+}
+
+function readTransactionLedger(root: FrameNode): Array<{ sequence: number; key: string }> {
+  try {
+    const value: unknown = JSON.parse(root.getPluginData(TRANSACTION_LEDGER_KEY) || "[]");
+    if (
+      !Array.isArray(value) ||
+      value.some(
+        (item) =>
+          !item ||
+          !Number.isInteger(item.sequence) ||
+          typeof item.key !== "string" ||
+          item.key.length > 300,
+      ) ||
+      value.some(
+        (item, index) =>
+          item.sequence !== index ||
+          value.findIndex((candidate) => candidate.key === item.key) !== index,
+      )
+    )
+      throw new Error();
+    return value as Array<{ sequence: number; key: string }>;
+  } catch {
+    throw new DesignRenderError(
+      "The generation transaction ledger is corrupt; inspect this frame before resume.",
+    );
+  }
+}
+
+function markSectionNodeIds(
+  actual: SceneNode,
+  spec: ResolvedDesignNode,
+  ids: string[],
+  cursor: { value: number },
+): void {
+  const id = ids[cursor.value++];
+  if (!id)
+    throw new DesignRenderError("Section semantic node IDs do not match its validated tree.");
+  actual.setPluginData(SEMANTIC_NODE_ID_KEY, id);
+  if (spec.type === "frame" && actual.type === "FRAME") {
+    for (let index = 0; index < spec.children.length; index++) {
+      const child = actual.children[index];
+      if (!child) throw new DesignRenderError("A rendered section child is missing.");
+      markSectionNodeIds(child, spec.children[index]!, ids, cursor);
+    }
+  }
+}
+
+function commitSectionNode(
+  root: FrameNode,
+  node: SceneNode,
+  spec: ResolvedDesignNode,
+  transaction: GenerationTransaction,
+  restoring: boolean,
+): void {
+  if (node.type !== "FRAME")
+    throw new DesignRenderError("A generated section root must be an editable native frame.");
+  if (node.getPluginData(SECTION_TRANSACTION_PENDING_KEY) !== transaction.idempotency_key)
+    throw new DesignRenderError(
+      "The native section root is missing its pending transaction marker.",
+    );
+  const cursor = { value: 0 };
+  markSectionNodeIds(node, spec, transaction.operation.node_ids, cursor);
+  if (cursor.value !== transaction.operation.node_ids.length)
+    throw new DesignRenderError("Section semantic node ID count did not match the rendered tree.");
+  node.setPluginData(SECTION_TRANSACTION_KEY, transaction.idempotency_key);
+  node.setPluginData(SECTION_TRANSACTION_PENDING_KEY, "");
+  node.setPluginData(SECTION_SEQUENCE_KEY, String(transaction.sequence));
+  node.setPluginData("fad.generation.transaction-id", transaction.transaction_id);
+  if (restoring) root.insertChild(Math.min(transaction.sequence, root.children.length), node);
+}
+
 function failedMultiScreenResult(
   batch: MultiScreenSpec,
   message: string,
@@ -1366,6 +1563,19 @@ export async function renderMultiScreenDesign(
   const parsed = parseMultiScreenValue(input);
   if (!parsed.success) throw new DesignRenderError(parsed.errors.join("\n"));
   const batch = parsed.data;
+  const transaction = options.transaction;
+  if (
+    transaction &&
+    (batch.screens.length !== 1 ||
+      transaction.screen_id !== batch.screens[0]!.id ||
+      transaction.parent_node_id !== `screen:${transaction.screen_id}` ||
+      transaction.operation.node_id !==
+        `section:${transaction.screen_id}:${transaction.section_id}` ||
+      batch.screens[0]!.children.length !== 1)
+  )
+    throw new DesignRenderError(
+      "Section transaction does not match its single validated screen root.",
+    );
   const defaults = { gap: DEFAULT_MIN_CANVAS_GAP, maxRowWidth: DEFAULT_MAX_ROW_WIDTH };
   const normalized = normalizePlacementSettings({
     gap: options.gap ?? defaults.gap,
@@ -1600,6 +1810,7 @@ export async function renderMultiScreenDesign(
     for (let index = 0; index < orderedScreens.length; index++) {
       options.beforeScreen?.();
       const screen = orderedScreens[index];
+      let existingRoot: FrameNode | undefined;
       if (options.resume) {
         const existing = api.currentPage.findAll(
           (node) =>
@@ -1611,7 +1822,24 @@ export async function renderMultiScreenDesign(
             "Duplicate generation identity found; inspect the existing frames before resuming.",
           );
         const root = existing[0];
-        if (root?.type === "FRAME" && root.getPluginData("fad.generation.commit") === "complete") {
+        if (root?.type === "FRAME" && transaction) {
+          if (
+            !(["streaming", "complete"] as string[]).includes(
+              root.getPluginData("fad.generation.commit"),
+            )
+          )
+            throw new DesignRenderError(
+              "Existing generation frame is not a committed working root; inspect it before resuming.",
+            );
+          if (root.getPluginData(SEMANTIC_NODE_ID_KEY) !== transaction.parent_node_id)
+            throw new DesignRenderError(
+              "Section transaction parent does not match the native screen identity.",
+            );
+          existingRoot = root;
+        } else if (
+          root?.type === "FRAME" &&
+          root.getPluginData("fad.generation.commit") === "complete"
+        ) {
           if (options.verifyTouchTargets) verifyNativeTouchTargets(root);
           successfulRoots.push(root);
           screenResults.push({
@@ -1628,7 +1856,7 @@ export async function renderMultiScreenDesign(
           continue;
         }
         if (root?.getPluginData("fad.generation.commit") === "pending") root.remove();
-        else if (root)
+        else if (root && !existingRoot)
           throw new DesignRenderError(
             "Existing generation frame has no completion marker; inspect it before resuming.",
           );
@@ -1660,6 +1888,184 @@ export async function renderMultiScreenDesign(
       const warningsBeforeScreen = styleBindings?.report.warnings.length ?? 0;
       let requiresReplan = false;
       try {
+        if (transaction && existingRoot) {
+          const ledger = readTransactionLedger(existingRoot);
+          for (const node of existingRoot.children) {
+            const pendingKey = node.getPluginData(SECTION_TRANSACTION_PENDING_KEY);
+            if (!pendingKey) continue;
+            if (node.getPluginData(SECTION_TRANSACTION_KEY) === pendingKey) {
+              node.setPluginData(SECTION_TRANSACTION_PENDING_KEY, "");
+              continue;
+            }
+            throw new DesignRenderError(
+              "An interrupted native section is present. Its saved checkpoint is retained; inspect and remove only the incomplete marked section before resuming.",
+            );
+          }
+          const matchingNodes = existingRoot.children.filter(
+            (node) => node.getPluginData(SECTION_TRANSACTION_KEY) === transaction.idempotency_key,
+          );
+          if (matchingNodes.length > 1)
+            throw new DesignRenderError(
+              "Duplicate native section markers found; inspect this screen before resuming.",
+            );
+          const applied = matchingNodes[0];
+          const ledgerEntry = ledger.find(({ key }) => key === transaction.idempotency_key);
+          if (ledgerEntry && !applied)
+            throw new DesignRenderError(
+              "The native transaction ledger is committed but its section marker is missing; inspect this screen before resuming.",
+            );
+          if (ledgerEntry && ledgerEntry.sequence !== transaction.sequence)
+            throw new DesignRenderError(
+              "Native transaction ledger conflicts with the saved section sequence.",
+            );
+          const lastCommitted = ledger.at(-1);
+          const metadataSequence = Number(
+            existingRoot.getPluginData("fad.generation.sequence") || -1,
+          );
+          if (
+            !Number.isInteger(metadataSequence) ||
+            metadataSequence < -1 ||
+            metadataSequence > (lastCommitted?.sequence ?? -1) ||
+            (metadataSequence >= 0 &&
+              existingRoot.getPluginData("fad.generation.last-idempotency-key") !==
+                ledger[metadataSequence]?.key)
+          )
+            throw new DesignRenderError(
+              "Native transaction metadata is ahead of or conflicts with its ledger.",
+            );
+          if (lastCommitted) {
+            existingRoot.setPluginData("fad.generation.sequence", String(lastCommitted.sequence));
+            existingRoot.setPluginData("fad.generation.last-idempotency-key", lastCommitted.key);
+          }
+          if (applied) {
+            if (!ledgerEntry) {
+              if (
+                transaction.sequence !== (lastCommitted?.sequence ?? -1) + 1 ||
+                (lastCommitted && transaction.dependencies[0] !== lastCommitted.key)
+              )
+                throw new DesignRenderError(
+                  "Applied section marker cannot be reconciled with its transaction dependency.",
+                );
+              ledger.push({ sequence: transaction.sequence, key: transaction.idempotency_key });
+              existingRoot.setPluginData(TRANSACTION_LEDGER_KEY, JSON.stringify(ledger));
+              existingRoot.setPluginData("fad.generation.sequence", String(transaction.sequence));
+              existingRoot.setPluginData(
+                "fad.generation.last-idempotency-key",
+                transaction.idempotency_key,
+              );
+            }
+            existingRoot.setPluginData(
+              "fad.generation.commit",
+              transaction.screen_completed ||
+                existingRoot.getPluginData("fad.generation.commit") === "complete"
+                ? "complete"
+                : "streaming",
+            );
+            successfulRoots.push(existingRoot);
+            screenResults.push({
+              id: screen.id,
+              name: screen.name,
+              width: screen.width,
+              height: screen.height,
+              status: "generated",
+              counts: emptyDesignCounts(),
+              warnings: [
+                "Reconciled an already-applied section transaction without modifying its nodes.",
+              ],
+              frameName: existingRoot.name,
+              nodeId: existingRoot.id,
+            });
+            safeProgress(options.onProgress, {
+              index: index + 1,
+              total: orderedScreens.length,
+              screenId: screen.id,
+              screenName: screen.name,
+              status: "generated",
+            });
+            continue;
+          }
+          const wasCommitted = Boolean(ledgerEntry);
+          const lastSequence = lastCommitted?.sequence ?? -1;
+          if (
+            !wasCommitted &&
+            (transaction.sequence !== lastSequence + 1 ||
+              (lastCommitted && transaction.dependencies[0] !== lastCommitted.key))
+          )
+            throw new DesignRenderError(
+              "Section transaction is stale, out of order, or missing its dependency.",
+            );
+          if (existingRoot.getPluginData("fad.generation.commit") === "complete" && !wasCommitted)
+            throw new DesignRenderError(
+              "The screen is already complete; a new section was rejected.",
+            );
+
+          const created: SceneNode[] = [];
+          for (const [nodeIndex, childSpec] of screenSpec.document.children.entries()) {
+            const node = appendDesignNode(
+              existingRoot,
+              childSpec,
+              screenSpec.document.layout,
+              context,
+              (node) => {
+                node.setPluginData(SECTION_TRANSACTION_PENDING_KEY, transaction.idempotency_key);
+                node.setPluginData(SECTION_SEQUENCE_KEY, String(transaction.sequence));
+                node.setPluginData("fad.generation.transaction-id", transaction.transaction_id);
+              },
+            );
+            commitSectionNode(existingRoot, node, childSpec, transaction, wasCommitted);
+            if (nodeIndex !== 0)
+              throw new DesignRenderError(
+                "A section transaction may create exactly one root node.",
+              );
+            created.push(node);
+          }
+          const sectionRoot = created[0];
+          if (!sectionRoot || sectionRoot.type !== "FRAME")
+            throw new DesignRenderError(
+              "Section transaction did not create its native root frame.",
+            );
+          if (options.verifyTouchTargets) verifyNativeTouchTargets(sectionRoot);
+          if (!wasCommitted) {
+            ledger.push({ sequence: transaction.sequence, key: transaction.idempotency_key });
+            existingRoot.setPluginData(TRANSACTION_LEDGER_KEY, JSON.stringify(ledger));
+            existingRoot.setPluginData("fad.generation.sequence", String(transaction.sequence));
+            existingRoot.setPluginData(
+              "fad.generation.last-idempotency-key",
+              transaction.idempotency_key,
+            );
+          }
+          existingRoot.setPluginData(
+            "fad.generation.commit",
+            transaction.screen_completed ||
+              existingRoot.getPluginData("fad.generation.commit") === "complete"
+              ? "complete"
+              : "streaming",
+          );
+          safeSectionVisible(options.onSectionVisible, sectionRoot.id);
+          successfulRoots.push(existingRoot);
+          screenResults.push({
+            id: screen.id,
+            name: screen.name,
+            width: screen.width,
+            height: screen.height,
+            status: "generated",
+            counts: screenTracker.counts,
+            warnings: [],
+            frameName: existingRoot.name,
+            nodeId: existingRoot.id,
+          });
+          addDesignCounts(counts, screenTracker.counts);
+          safeProgress(options.onProgress, {
+            index: index + 1,
+            total: orderedScreens.length,
+            screenId: screen.id,
+            screenName: screen.name,
+            status: "generated",
+          });
+          continue;
+        }
+        if (transaction && transaction.sequence !== 0)
+          throw new DesignRenderError("The first section must create the generation screen root.");
         const frameName = uniqueName(api, displayName, frameNames, existingNames);
         const root = createDocumentFrame(
           api,
@@ -1675,9 +2081,17 @@ export async function renderMultiScreenDesign(
                 frame.setPluginData("fad.generation.commit", "pending");
               }
             : undefined,
+          transaction
+            ? (node) => {
+                node.setPluginData(SECTION_TRANSACTION_PENDING_KEY, transaction.idempotency_key);
+                node.setPluginData(SECTION_SEQUENCE_KEY, String(transaction.sequence));
+                node.setPluginData("fad.generation.transaction-id", transaction.transaction_id);
+              }
+            : undefined,
         );
         root.setPluginData(MULTI_SCREEN_BATCH_KEY, batch.id);
         root.setPluginData(MULTI_SCREEN_ID_KEY, screen.id);
+        root.setPluginData(SEMANTIC_NODE_ID_KEY, `screen:${screen.id}`);
         if (options.resume) root.setPluginData("fad.generation.commit", "pending");
         root.setPluginData(
           MULTI_SCREEN_META_KEY,
@@ -1713,7 +2127,30 @@ export async function renderMultiScreenDesign(
           actualPlacement = placementById.get(placementId) ?? plannedScreen;
         }
         placeTopLevelNode(root, measuredBounds, actualPlacement);
-        if (options.resume) root.setPluginData("fad.generation.commit", "complete");
+        if (transaction) {
+          const sectionRoot = root.children[0];
+          if (!sectionRoot || sectionRoot.type !== "FRAME")
+            throw new DesignRenderError(
+              "Section transaction did not create its native root frame.",
+            );
+          const ledger: Array<{ sequence: number; key: string }> = [];
+          commitSectionNode(
+            root,
+            sectionRoot,
+            screenSpec.document.children[0]!,
+            transaction,
+            false,
+          );
+          ledger.push({ sequence: transaction.sequence, key: transaction.idempotency_key });
+          root.setPluginData(TRANSACTION_LEDGER_KEY, JSON.stringify(ledger));
+          root.setPluginData("fad.generation.sequence", String(transaction.sequence));
+          root.setPluginData("fad.generation.last-idempotency-key", transaction.idempotency_key);
+          root.setPluginData(
+            "fad.generation.commit",
+            transaction.screen_completed ? "complete" : "streaming",
+          );
+          safeSectionVisible(options.onSectionVisible, sectionRoot.id);
+        } else if (options.resume) root.setPluginData("fad.generation.commit", "complete");
         successfulRoots.push(root);
         const screenWarnings = styleBindings?.report.warnings.slice(warningsBeforeScreen) ?? [];
         screenResults.push({
@@ -1797,7 +2234,7 @@ export async function renderMultiScreenDesign(
       } catch {
         // Preserve the batch report if the original selection is no longer writable.
       }
-    } else {
+    } else if (!transaction) {
       addDesignCounts(counts, sharedTracker.counts);
       try {
         api.currentPage.selection = [successfulRoots[0]];

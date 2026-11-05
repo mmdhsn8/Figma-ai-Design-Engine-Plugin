@@ -332,6 +332,214 @@ describe("brief planner and constrained design generation", () => {
     }
   });
 
+  it("normalizes missing directions in a nested Persian product card before strict validation", () => {
+    const plan = planFor(
+      request({
+        prompt: "یک فروشگاه فارسی با کارت محصول، قیمت و دکمه خرید طراحی کن.",
+        screenNames: ["خانه", "محصول"],
+        language: "fa",
+        projectType: "storefront",
+      }),
+    );
+    const productScreen = plan.screens[1]!;
+    const generated = generatedResponse(plan.screens.map(({ id }) => id));
+    const text = (
+      name: string,
+      content: string,
+      width: number,
+      height: number,
+    ): GeneratedDesignNode => ({
+      ...textNode(content),
+      name,
+      width,
+      height,
+      textAlign: "right",
+    });
+    const button: GeneratedDesignNode = {
+      ...text("افزودن به سبد", "افزودن به سبد", 90, 36),
+      palette: "brand",
+      qualityRole: "button",
+    };
+    const actions: GeneratedDesignNode = {
+      ...generated.screens[1]!.children[0]!,
+      name: "اقدام‌ها",
+      width: 164,
+      height: 60,
+      padding: 4,
+      gap: 8,
+      layout: "none",
+      children: [
+        button,
+        {
+          ...button,
+          type: "ellipse",
+          text: null,
+          name: "علاقه‌مندی",
+          palette: "accent",
+          qualityRole: "decorative",
+          width: 44,
+          height: 44,
+        },
+      ],
+    };
+    const details: GeneratedDesignNode = {
+      ...generated.screens[1]!.children[0]!,
+      name: "جزئیات محصول",
+      width: 180,
+      height: 220,
+      padding: 8,
+      gap: 8,
+      layout: "none",
+      children: [
+        text("نام محصول", "مانتو لینن", 148, 32),
+        text("قیمت", "۱٬۲۵۰٬۰۰۰ تومان", 120, 24),
+        actions,
+      ],
+    };
+    const card: GeneratedDesignNode = {
+      ...generated.screens[1]!.children[0]!,
+      name: "کارت محصول",
+      width: 318,
+      height: 280,
+      padding: 12,
+      gap: 12,
+      layout: "none",
+      children: [
+        {
+          ...button,
+          type: "rectangle",
+          text: null,
+          name: "تصویر محصول",
+          palette: "surface",
+          qualityRole: "image",
+          width: 100,
+          height: 220,
+        },
+        details,
+      ],
+    };
+    generated.screens[1]!.children[0]!.children = [card];
+    const screenPlan = { ...plan, screens: [productScreen] };
+    const raw = JSON.stringify({ ...generated, screens: [generated.screens[1]!] });
+
+    const beforeNormalization = validateGeneratedDesignResponse(raw, screenPlan);
+    expect(beforeNormalization.success).toBe(false);
+    if (!beforeNormalization.success) {
+      expect(beforeNormalization.errors).toContain(
+        `screens.${productScreen.id}.children[0].children[0] needs an Auto Layout direction because it has children.`,
+      );
+      expect(beforeNormalization.errors).toContain(
+        `screens.${productScreen.id}.children[0].children[0].children[1] needs an Auto Layout direction because it has children.`,
+      );
+      expect(beforeNormalization.errors).toContain(
+        `screens.${productScreen.id}.children[0].children[0].children[1].children[2] needs an Auto Layout direction because it has children.`,
+      );
+    }
+
+    const normalized = normalizeGeneratedDesignResponse(raw, screenPlan);
+    if (!normalized.success) throw new Error(normalized.errors.join("\n"));
+    expect(normalized.success).toBe(true);
+    const normalizedCard = normalized.data.design.screens[0]!.children[0]!.children[0]!;
+    const normalizedDetails = normalizedCard.children[1]!;
+    const normalizedActions = normalizedDetails.children[2]!;
+    expect([normalizedCard.layout, normalizedDetails.layout, normalizedActions.layout]).toEqual([
+      "horizontal",
+      "vertical",
+      "horizontal",
+    ]);
+    expect(normalizedCard).toMatchObject({ width: 318, height: 280, padding: 12, gap: 12 });
+    expect(normalizedDetails).toMatchObject({ width: 180, height: 220, padding: 8, gap: 8 });
+    expect(normalizedActions).toMatchObject({ width: 164, height: 60, padding: 4, gap: 8 });
+    expect(normalizedDetails.children.map(({ name }) => name)).toEqual([
+      "نام محصول",
+      "قیمت",
+      "اقدام‌ها",
+    ]);
+    expect(normalizedDetails.children[0]).toMatchObject({
+      text: "مانتو لینن",
+      textAlign: "right",
+    });
+    expect(
+      validateGeneratedDesignResponse(JSON.stringify(normalized.data.design), screenPlan),
+    ).toMatchObject({ success: true });
+    expect(
+      normalizeGeneratedDesignResponse(JSON.stringify(normalized.data.design), screenPlan),
+    ).toEqual(normalized);
+    const prepared = prepareGeneratedDesign(JSON.stringify(normalized.data.design), screenPlan);
+    if (!prepared.success) throw new Error(prepared.errors.join("\n"));
+    expect(prepared.success).toBe(true);
+    const sectionRoot = prepared.data.batch.screens[0]!.children[0]!;
+    const preparedCard = sectionRoot.type === "frame" ? sectionRoot.children[0]! : undefined;
+    const preparedDetails = preparedCard?.type === "frame" ? preparedCard.children[1]! : undefined;
+    const preparedActions =
+      preparedDetails?.type === "frame" ? preparedDetails.children[2]! : undefined;
+    expect(preparedCard).toMatchObject({ type: "frame", layout: { mode: "horizontal" } });
+    expect(preparedDetails).toMatchObject({ type: "frame", layout: { mode: "vertical" } });
+    expect(preparedActions).toMatchObject({ type: "frame", layout: { mode: "horizontal" } });
+    if (preparedActions?.type === "frame")
+      expect(preparedActions.children[0]).toMatchObject({
+        type: "frame",
+        sizing: { width: "fixed", height: "fill" },
+      });
+    if (preparedActions?.type === "frame" && preparedActions.children[0]?.type === "frame")
+      expect(preparedActions.children[0].children[0]).toMatchObject({
+        type: "text",
+        text: "افزودن به سبد",
+        textAlign: "right",
+      });
+  });
+
+  it.each([1, 4, 7])(
+    "normalizes missing Auto Layout directions through valid nesting depth %i",
+    (depth) => {
+      const plan = planFor(request({ screenNames: ["Home", "Product"], language: "fa" }));
+      const generated = generatedResponse(plan.screens.map(({ id }) => id));
+      let child = textNode("عنوان محصول");
+      for (let index = depth - 1; index >= 0; index--) {
+        child = {
+          ...generated.screens[1]!.children[0]!,
+          name: `تو در تو ${index}`,
+          width: 350,
+          height: 600,
+          layout: "none",
+          children: [child],
+        };
+      }
+      generated.screens[1]!.children = [child];
+      const normalized = normalizeGeneratedDesignResponse(JSON.stringify(generated), plan);
+      expect(normalized.success).toBe(true);
+      if (!normalized.success) return;
+      let current = normalized.data.design.screens[1]!.children[0]!;
+      for (let index = 0; index < depth; index++) {
+        expect(current.layout).toBe("vertical");
+        current = current.children[0]!;
+      }
+      expect(current.text).toBe("عنوان محصول");
+    },
+  );
+
+  it("normalizes nested containers on desktop while retaining strict validation", () => {
+    const plan = planFor(
+      request({ target: "desktop", screenNames: ["Home", "Product"], language: "fa" }),
+    );
+    const generated = generatedResponse(plan.screens.map(({ id }) => id));
+    const container = generated.screens[1]!.children[0]!;
+    container.layout = "none";
+    const raw = JSON.stringify(generated);
+    expect(validateGeneratedDesignResponse(raw, plan)).toMatchObject({
+      success: false,
+      errors: [expect.stringContaining("needs an Auto Layout direction")],
+    });
+    const normalized = normalizeGeneratedDesignResponse(raw, plan);
+    expect(normalized.success).toBe(true);
+    if (normalized.success) {
+      expect(normalized.data.design.screens[1]!.children[0]!.layout).toBe("vertical");
+      expect(
+        validateGeneratedDesignResponse(JSON.stringify(normalized.data.design), plan),
+      ).toMatchObject({ success: true });
+    }
+  });
+
   it("keeps exact paths for impossible repairs and resumes only the failed screen", () => {
     const plan = planFor(request({ screenNames: ["Home", "Detail"], language: "fa" }));
     const generated = generatedResponse(plan.screens.map(({ id }) => id));

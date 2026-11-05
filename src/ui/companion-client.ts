@@ -2,6 +2,14 @@ import { z } from "zod";
 import { COMPANION_BASE_URL } from "../companion/config";
 import { MAX_SCREEN_BYTES } from "../shared/generation-limits";
 import type { DesignGenerationRequest, GenerationRepairTarget } from "../shared/design-generation";
+import type { DesignSection } from "../shared/design-generation";
+import { MAX_SECTION_BYTES } from "../shared/generation-limits";
+import {
+  ChatFunctionCallSchema,
+  ChatInputItemSchema,
+  type ChatFunctionCall,
+  type ChatInputItem,
+} from "../shared/chat-tools";
 
 export const COMPANION_URL = COMPANION_BASE_URL;
 
@@ -99,6 +107,27 @@ export const InferenceDiagnosticSchema = z
       .string()
       .regex(/^[A-Za-z0-9_.:-]{1,100}$/u)
       .optional(),
+    responseStatus: z
+      .string()
+      .regex(/^[A-Za-z0-9_.:/-]{1,200}$/u)
+      .optional(),
+    outputItemTypes: z
+      .array(z.string().regex(/^[A-Za-z0-9_.-]{1,80}$/u))
+      .max(20)
+      .optional(),
+    outputItemCount: z.number().int().nonnegative().optional(),
+    functionCallCount: z.number().int().nonnegative().optional(),
+    chatState: z
+      .enum([
+        "tool_calls",
+        "text",
+        "refusal",
+        "empty",
+        "incomplete",
+        "failed",
+        "invalid_tool_calls",
+      ])
+      .optional(),
   })
   .strict();
 const SmokeSchema = z
@@ -146,6 +175,7 @@ export type CompanionErrorCategory =
   | "responses_transport_error"
   | "inference_not_verified"
   | "inference_busy"
+  | "chat_request_invalid"
   | "generation_busy"
   | "generation_retry_limit"
   | "invalid_design_request"
@@ -165,6 +195,7 @@ export type CompanionErrorCategory =
   | "response_invalid"
   | "resource_exhausted"
   | "response_too_large"
+  | "empty_response"
   | "request_rejected"
   | "registration_clear_failed"
   | "host_id_invalid"
@@ -179,11 +210,21 @@ export class CompanionClientError extends Error {
     readonly category: CompanionErrorCategory,
     readonly diagnostic?: InferenceDiagnostic,
     readonly validationIssues?: string[],
+    readonly safeMessage?: string,
   ) {
     super(category);
     this.name = "CompanionClientError";
   }
 }
+
+export type AuthorizedChatTurn =
+  | { kind: "done"; text: string }
+  | {
+      kind: "tool_calls";
+      calls: ChatFunctionCall[];
+      functionCallItems: Extract<ChatInputItem, { type: "function_call" }>[];
+      text: string;
+    };
 
 type Fetcher = typeof fetch;
 
@@ -354,6 +395,7 @@ export async function generateAuthorizedDesign(
   repairTargets?: GenerationRepairTarget[],
   onMetrics?: (metrics: Record<string, number>) => void,
   onLiveProgress?: (diagnostic: InferenceDiagnostic) => void,
+  section?: Pick<DesignSection, "id" | "sequence">,
 ): Promise<string> {
   let retriedIncompleteStream = false;
   let polling = true;
@@ -396,13 +438,14 @@ export async function generateAuthorizedDesign(
             ...(repairIssues.length ? { repairIssues } : {}),
             ...(screenIds ? { screenIds } : {}),
             ...(repairTargets?.length ? { repairTargets } : {}),
+            ...(section ? { section } : {}),
           },
           fetcher,
           signal,
         );
         if (!response.ok) throwResponseError(await readLimitedJson(response, signal));
         const declaredBytes = Number(response.headers.get("x-fad-response-bytes"));
-        if (declaredBytes > MAX_SCREEN_BYTES) {
+        if (declaredBytes > (section ? MAX_SECTION_BYTES : MAX_SCREEN_BYTES)) {
           await response.body?.cancel().catch(() => undefined);
           throw new CompanionClientError("response_too_large");
         }
@@ -460,6 +503,200 @@ export async function generateAuthorizedDesign(
   } finally {
     polling = false;
     if (timer) clearInterval(timer);
+  }
+}
+
+export async function streamAuthorizedChat(
+  token: string,
+  requestId: string,
+  model: string,
+  input: ChatInputItem[],
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+  onDelta?: (delta: string) => void,
+  onProgress?: (elapsedMs: number) => void,
+): Promise<AuthorizedChatTurn> {
+  const response = await fetchResponse(
+    "/v1/chat",
+    token,
+    { requestId, model, input },
+    fetcher,
+    signal,
+  );
+  if (!response.ok) {
+    const body = await readLimitedJson(response, signal);
+    throwResponseError(body);
+  }
+  if (
+    response.headers.get("x-fad-request-id") !== requestId ||
+    response.headers.get("x-fad-model") !== model ||
+    !response.headers.get("content-type")?.toLowerCase().startsWith("text/event-stream")
+  ) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new CompanionClientError("response_incomplete");
+  }
+  return readAuthorizedChatStream(response, requestId, signal, onDelta, onProgress);
+}
+
+async function readAuthorizedChatStream(
+  response: Response,
+  requestId: string,
+  signal?: AbortSignal,
+  onDelta?: (delta: string) => void,
+  onProgress?: (elapsedMs: number) => void,
+): Promise<AuthorizedChatTurn> {
+  if (!response.body) throw new CompanionClientError("response_incomplete");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const cancelReader = () => void reader.cancel().catch(() => undefined);
+  signal?.addEventListener("abort", cancelReader, { once: true });
+  let buffer = "";
+  let bytes = 0;
+  const processFrame = (frame: string): AuthorizedChatTurn | undefined => {
+    let eventName = "message";
+    const data: string[] = [];
+    for (const line of frame.split(/\r?\n/u)) {
+      if (!line || line.startsWith(":")) continue;
+      const separator = line.indexOf(":");
+      const field = separator < 0 ? line : line.slice(0, separator);
+      const value = separator < 0 ? "" : line.slice(separator + 1).replace(/^ /u, "");
+      if (field === "event") eventName = value;
+      else if (field === "data") data.push(value);
+    }
+    if (!data.length) return undefined;
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data.join("\n")) as unknown;
+    } catch {
+      throw new CompanionClientError("response_invalid");
+    }
+    if (!isRecord(payload) || payload.requestId !== requestId)
+      throw new CompanionClientError("response_incomplete");
+    if (eventName === "delta") {
+      const parsed = z
+        .object({ requestId: z.string(), delta: z.string().max(16_000) })
+        .strict()
+        .safeParse(payload);
+      if (!parsed.success) throw new CompanionClientError("response_invalid");
+      onDelta?.(parsed.data.delta);
+      return undefined;
+    }
+    if (eventName === "progress") {
+      const parsed = z
+        .object({
+          requestId: z.string(),
+          elapsedMs: z.number().int().nonnegative(),
+          eventCount: z.number().int().nonnegative(),
+        })
+        .strict()
+        .safeParse(payload);
+      if (!parsed.success) throw new CompanionClientError("response_invalid");
+      onProgress?.(parsed.data.elapsedMs);
+      return undefined;
+    }
+    if (eventName === "tool_calls") {
+      const parsed = z
+        .object({
+          requestId: z.string(),
+          calls: z.array(ChatFunctionCallSchema).min(1).max(10),
+          functionCallItems: z.array(ChatInputItemSchema).min(1).max(10),
+          text: z
+            .string()
+            .max(256 * 1024)
+            .optional(),
+        })
+        .strict()
+        .safeParse(payload);
+      if (
+        !parsed.success ||
+        parsed.data.functionCallItems.some(
+          (item) => !("type" in item) || item.type !== "function_call",
+        ) ||
+        parsed.data.calls.length !== parsed.data.functionCallItems.length ||
+        parsed.data.calls.some((call, index) => {
+          const item = parsed.data.functionCallItems[index];
+          return (
+            !item ||
+            !("type" in item) ||
+            item.type !== "function_call" ||
+            item.call_id !== call.callId ||
+            item.name !== call.name ||
+            item.arguments !== call.functionCall.arguments
+          );
+        })
+      )
+        throw new CompanionClientError("response_invalid");
+      return {
+        kind: "tool_calls",
+        calls: parsed.data.calls,
+        functionCallItems: parsed.data.functionCallItems as Extract<
+          ChatInputItem,
+          { type: "function_call" }
+        >[],
+        text: parsed.data.text ?? "",
+      };
+    }
+    if (eventName === "done") {
+      const parsed = z
+        .object({ requestId: z.string(), text: z.string().max(256 * 1024) })
+        .strict()
+        .safeParse(payload);
+      if (!parsed.success) throw new CompanionClientError("response_invalid");
+      return { kind: "done", text: parsed.data.text };
+    }
+    if (eventName === "error") {
+      const parsed = z
+        .object({
+          requestId: z.string(),
+          error: z.string().max(100),
+          message: z.string().max(300),
+          diagnostic: InferenceDiagnosticSchema.optional(),
+        })
+        .strict()
+        .safeParse(payload);
+      if (!parsed.success) throw new CompanionClientError("response_invalid");
+      throw new CompanionClientError(
+        mapError(parsed.data.error),
+        parsed.data.diagnostic,
+        undefined,
+        parsed.data.message,
+      );
+    }
+    throw new CompanionClientError("response_invalid");
+  };
+  try {
+    while (true) {
+      if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 1024 * 1024) throw new CompanionClientError("response_too_large");
+      buffer += decoder.decode(value, { stream: true });
+      while (true) {
+        const delimiter = /\r?\n\r?\n/u.exec(buffer);
+        if (!delimiter || delimiter.index === undefined) break;
+        const frame = buffer.slice(0, delimiter.index);
+        buffer = buffer.slice(delimiter.index + delimiter[0].length);
+        const terminal = processFrame(frame);
+        if (terminal) return terminal;
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const terminal = processFrame(buffer);
+      if (terminal) return terminal;
+    }
+    if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+    throw new CompanionClientError("response_incomplete");
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    if (error instanceof CompanionClientError) throw error;
+    if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+    throw new CompanionClientError("response_incomplete");
+  } finally {
+    signal?.removeEventListener("abort", cancelReader);
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 }
 
@@ -543,6 +780,10 @@ async function fetchResponse(
 
 function throwResponseError(result: unknown): never {
   const error = isRecord(result) && typeof result.error === "string" ? result.error : "unknown";
+  const safeMessage =
+    isRecord(result) && typeof result.message === "string" && result.message.length <= 300
+      ? result.message
+      : undefined;
   const issues =
     isRecord(result) && result.issues !== undefined
       ? z.array(z.string().min(1).max(240)).max(8).safeParse(result.issues)
@@ -555,6 +796,7 @@ function throwResponseError(result: unknown): never {
     mapError(error),
     diagnostic?.success ? diagnostic.data : undefined,
     issues?.success ? issues.data : undefined,
+    safeMessage,
   );
 }
 
@@ -622,6 +864,7 @@ function mapError(value: string): CompanionErrorCategory {
     "responses_transport_error",
     "inference_not_verified",
     "inference_busy",
+    "chat_request_invalid",
     "generation_busy",
     "generation_retry_limit",
     "invalid_design_request",
@@ -641,6 +884,7 @@ function mapError(value: string): CompanionErrorCategory {
     "response_invalid",
     "resource_exhausted",
     "response_too_large",
+    "empty_response",
     "request_rejected",
     "registration_clear_failed",
     "host_id_invalid",
