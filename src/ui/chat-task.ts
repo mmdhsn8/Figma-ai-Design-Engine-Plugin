@@ -1,11 +1,25 @@
-import { ChatFunctionCallSchema, type ChatInputItem } from "../shared/chat-tools";
-import { FigmaToolBatchSchema, type FigmaToolOperation } from "../shared/figma-tools";
+import {
+  ChatFunctionCallSchema,
+  parseResponsesFunctionCalls,
+  modelPlanStages,
+  CHAT_PLAN_VERSION,
+  type ChatInputItem,
+} from "../shared/chat-tools";
+import {
+  FigmaToolBatchSchema,
+  INSPECT_NODES_LIMITS,
+  FigmaToolOperationSchema,
+  type FigmaToolOperation,
+} from "../shared/figma-tools";
 import { type PluginToUIMessage } from "../shared/messages";
 import { utf8Bytes } from "../shared/generation-limits";
+import { auditNativeSection, NativeVisualNodeSchema } from "../shared/native-visual-quality";
 import {
   CHAT_STAGE_MAX_OPERATIONS,
   CHAT_TASK_MAX_OPERATIONS,
+  CHAT_TASK_MAX_VALIDATION_CORRECTIONS,
   ChatTaskSchema,
+  chatTaskCommittedOperationCount,
   type ChatTask,
 } from "../shared/chat-task";
 import type { AuthorizedChatTurn } from "./companion-client";
@@ -48,12 +62,27 @@ export function chatTaskInput(task: ChatTask): ChatInputItem[] {
         status,
         stage,
         tool: action.tool,
+        ...(output ? { logicalRef: JSON.parse(output).logicalRef } : {}),
         ...("ref" in action ? { ref: action.ref } : {}),
         ...("name" in action ? { name: action.name } : {}),
         ...(status === "failed" ? { error: JSON.parse(output ?? "{}").error } : {}),
       };
     });
-  const state = JSON.stringify({ taskId: task.id, stages: task.stages, confirmed });
+  const state = JSON.stringify({
+    taskId: task.id,
+    brief: task.brief,
+    planVersion: CHAT_PLAN_VERSION,
+    stages: modelPlanStages(task.stages),
+    execution: {
+      completedStageIndexes: task.stages.flatMap((stage, index) =>
+        stage.completed ? [index] : [],
+      ),
+      activeStageIndex: task.stages.findIndex((stage) => !stage.completed),
+    },
+    confirmed,
+    referencePolicy:
+      "Creation refs are task-local aliases. Repeated creation of a confirmed alias reuses its node without applying new styling. Use set_properties for edits. For follow-up edits use the exact logicalRef returned by inspect_nodes or earlier results; never guess an alias from another task. Inspect selection when ownership is uncertain.",
+  });
   const summaries: ChatInputItem[] = [];
   for (let index = 0; index < state.length; index += 7_500)
     summaries.push({
@@ -64,6 +93,9 @@ export function chatTaskInput(task: ChatTask): ChatInputItem[] {
     ...task.context,
     { role: "user", content: task.prompt },
     ...summaries,
+    ...(task.validationFeedback
+      ? [{ role: "user" as const, content: task.validationFeedback }]
+      : []),
     ...task.recent,
   ];
   if (utf8Bytes(JSON.stringify(input)) > 56 * 1024) {
@@ -82,7 +114,15 @@ export function chatTaskInput(task: ChatTask): ChatInputItem[] {
           role: "assistant",
           content: `Confirmed tool results: ${results.slice(index, index + 7_500)}`,
         });
-      input = [...task.context, { role: "user", content: task.prompt }, ...summaries, ...compact];
+      input = [
+        ...task.context,
+        { role: "user", content: task.prompt },
+        ...summaries,
+        ...(task.validationFeedback
+          ? [{ role: "user" as const, content: task.validationFeedback }]
+          : []),
+        ...compact,
+      ];
     }
   }
   if (input.length > 40 || utf8Bytes(JSON.stringify(input)) > 56 * 1024)
@@ -95,8 +135,30 @@ export function chatTaskInput(task: ChatTask): ChatInputItem[] {
 export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<void> {
   const now = deps.now ?? Date.now;
   const wait = deps.wait ?? waitForChatCapacity;
+  const knownRef = (ref: string): string => {
+    const entry = task.ledger.find(
+      (item) =>
+        item.status === "completed" &&
+        "ref" in item.call.action &&
+        item.call.action.ref === ref &&
+        item.output,
+    );
+    const logicalRef: unknown = entry?.output ? JSON.parse(entry.output).logicalRef : undefined;
+    return typeof logicalRef === "string" ? logicalRef : ref;
+  };
   const check = () => {
     if (deps.signal.aborted) throw new Error("Stopped");
+  };
+  const guardRepeatedFailure = (signature: string) => {
+    signature = signature.slice(0, 2_000);
+    const progress =
+      chatTaskCommittedOperationCount(task) + task.stages.filter((stage) => stage.completed).length;
+    if (task.lastFailureSignature === signature && task.lastFailureProgress === progress)
+      throw new Error(
+        `no_progress_repeated_error: ${signature.slice(0, 260)}. The same failure repeated without a new canvas commit or completed stage. Inspect the safe diagnostic; automatic correction stopped.`,
+      );
+    task.lastFailureSignature = signature;
+    task.lastFailureProgress = progress;
   };
   const save = async () => {
     const parsed = ChatTaskSchema.safeParse(task);
@@ -113,14 +175,39 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
   });
   const wasRetry =
     task.status === "failed" || task.status === "stopped" || task.status === "running";
+  if (task.status === "failed") {
+    const stage = task.stages.find((item) => !item.completed);
+    if (stage) {
+      stage.qaAttempts = 0;
+      stage.verified = false;
+    }
+  }
   task.status = "running";
   delete task.error;
+  delete task.failure;
   await save();
   try {
     while (true) {
       check();
       if (task.pending.length) {
         const calls = task.pending;
+        if (
+          calls.some((call) => call.action.tool === "get_document_context") &&
+          calls.length !== 1
+        ) {
+          task.recent.push(
+            ...calls.map((call) =>
+              output(call.callId, {
+                success: false,
+                error:
+                  "Read document context alone before requesting more context or planning changes.",
+              }),
+            ),
+          );
+          task.pending = [];
+          await save();
+          continue;
+        }
         const planning = calls.filter(
           (call) =>
             call.action.tool === "plan_canvas_task" || call.action.tool === "complete_canvas_stage",
@@ -143,25 +230,40 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           const call = planning[0]!;
           const action = call.action;
           try {
+            if (action.tool === "plan_canvas_task" && task.stages.length)
+              guardRepeatedFailure("planning:plan_already_saved");
             if (action.tool === "plan_canvas_task") {
-              if (task.stages.length)
+              if (
+                !task.ledger.some(
+                  (entry) =>
+                    entry.call.action.tool === "get_document_context" &&
+                    entry.status === "completed",
+                )
+              )
                 throw new Error(
-                  "The model attempted to replace an existing plan. Committed work was preserved.",
+                  "Read the current document context and local styles before proposing a canvas plan. No canvas changes were made.",
                 );
-              task.stages = action.stages.map((title) => ({
-                title,
-                completed: false,
-                operations: 0,
-                rounds: 0,
-              }));
+              if (!task.stages.length) {
+                task.brief = action.brief;
+                task.stages = action.stages.map((planned) => ({
+                  ...planned,
+                  completed: false,
+                  operations: 0,
+                  rounds: 0,
+                  qaAttempts: 0,
+                  verificationOperations: 0,
+                  verified: false,
+                }));
+              }
             } else if (action.tool === "complete_canvas_stage") {
               const stage = task.stages.find((item) => !item.completed);
+              const stageIndex = stage ? task.stages.indexOf(stage) : -1;
               for (const operationId of action.resolvedOperationIds) {
                 const failedIndex = task.ledger.findIndex(
                   (entry) => entry.operationId === operationId && entry.status === "failed",
                 );
                 const failed = task.ledger[failedIndex];
-                if (!failed || !stage || failed.stage !== task.stages.indexOf(stage))
+                if (!failed || !stage || failed.stage !== stageIndex)
                   throw new Error("The repair references an unknown failed operation.");
                 const failedAction = failed.call.action;
                 const repair = task.ledger.slice(failedIndex + 1).some((entry) => {
@@ -174,7 +276,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                     return false;
                   if (
                     "ref" in failedAction &&
-                    (!("ref" in repairAction) || repairAction.ref !== failedAction.ref)
+                    (!("ref" in repairAction) ||
+                      knownRef(repairAction.ref) !== knownRef(failedAction.ref))
                   )
                     return false;
                   if (
@@ -200,7 +303,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 !stage ||
                 task.ledger.some(
                   (entry) =>
-                    entry.stage === task.stages.indexOf(stage) &&
+                    entry.stage === stageIndex &&
                     entry.status !== "completed" &&
                     entry.status !== "repaired",
                 )
@@ -212,16 +315,186 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 throw new Error(
                   "No native operations were confirmed for this stage; it cannot be marked complete.",
                 );
+              if (!stage.verified) {
+                if (stage.qaAttempts >= 3)
+                  throw new Error(
+                    "Structural quality still fails after three bounded checks. Retry the failed stage after reviewing its findings.",
+                  );
+                const attempt = stage.qaAttempts + 1;
+                const verificationNumber = stage.verificationOperations + 1;
+                const refs = stage.logicalRefs.length
+                  ? stage.logicalRefs
+                  : task.ledger
+                      .filter((entry) => entry.stage === stageIndex && "ref" in entry.call.action)
+                      .map((entry) => ("ref" in entry.call.action ? entry.call.action.ref : ""))
+                      .filter(Boolean)
+                      .slice(0, 20);
+                const inspection = parseResponsesFunctionCalls([
+                  {
+                    type: "function_call",
+                    call_id: `${task.id}_qa_${stageIndex + 1}_${verificationNumber}`,
+                    name: "inspect_nodes",
+                    arguments: JSON.stringify({ refs, selection: false, depth: 4, maxNodes: 25 }),
+                  },
+                ])[0]!;
+                let inspectionEntry = task.ledger.find(
+                  (entry) =>
+                    entry.stage === stageIndex &&
+                    entry.call.action.tool === "inspect_nodes" &&
+                    (entry.status === "pending" || entry.status === "running"),
+                );
+                if (!inspectionEntry) {
+                  if (
+                    task.ledger.length >= CHAT_TASK_MAX_OPERATIONS ||
+                    stage.operations + stage.verificationOperations >= CHAT_STAGE_MAX_OPERATIONS ||
+                    !refs.length
+                  )
+                    throw new Error(
+                      "No bounded logical refs are available for required stage verification; committed work remains. Inspect or retry the stage.",
+                    );
+                  inspectionEntry = {
+                    call: inspection,
+                    operationId: `${task.id}-qa-${stageIndex + 1}-${verificationNumber}`,
+                    stage: stageIndex,
+                    status: "pending",
+                  };
+                  task.ledger.push(inspectionEntry);
+                  stage.qaAttempts = attempt;
+                  stage.verificationOperations++;
+                }
+                const inspectionOperation = FigmaToolOperationSchema.parse({
+                  operationId: inspectionEntry.operationId,
+                  idempotencyKey: `chat:${inspectionEntry.operationId}`,
+                  ...(task.referenceScope ? { taskId: task.id } : {}),
+                  action: inspection.action,
+                });
+                let inspectionResult: Result;
+                let result: Result["results"][number] | undefined;
+                let rateRetries = 0;
+                while (true) {
+                  check();
+                  task.starts = task.starts.filter((started) => started > now() - 60_100);
+                  if (task.starts.length >= 36) {
+                    deps.progress(
+                      "Waiting for local canvas capacity; committed changes remain visible…",
+                    );
+                    await wait(Math.max(1, task.starts[0]! + 60_100 - now()), deps.signal);
+                    continue;
+                  }
+                  if (task.batches >= 1_000)
+                    throw new Error(
+                      "The saved batch limit was reached before section verification.",
+                    );
+                  inspectionEntry.status = "running";
+                  task.starts.push(now());
+                  task.batches++;
+                  await save();
+                  deps.progress(`Reviewing ${stage.title} geometry and editable layers…`);
+                  inspectionResult = await deps.execute([inspectionOperation]);
+                  result =
+                    inspectionResult.results.length === 1 &&
+                    inspectionResult.results[0]!.operationId === inspectionEntry.operationId
+                      ? inspectionResult.results[0]
+                      : undefined;
+                  if (
+                    !inspectionResult.success &&
+                    result &&
+                    !result.success &&
+                    /Local tool rate limit reached/u.test(result.error ?? "")
+                  ) {
+                    inspectionEntry.status = "pending";
+                    await save();
+                    if (++rateRetries > 2)
+                      throw new Error(
+                        "Local capacity is still busy. Resume after one minute; no confirmed work will be repeated.",
+                      );
+                    deps.progress(
+                      "Figma local rate limit reached; waiting one minute before retrying the same verification ID…",
+                    );
+                    await wait(60_100, deps.signal);
+                    continue;
+                  }
+                  break;
+                }
+                if (!inspectionResult.success || !result?.success) {
+                  inspectionEntry.status = "failed";
+                  inspectionEntry.output = JSON.stringify({
+                    success: false,
+                    error: result?.error ?? "Figma did not confirm the section inspection.",
+                  });
+                  await save();
+                  throw new Error(
+                    result?.error ??
+                      "Figma did not confirm the section inspection; committed changes remain.",
+                  );
+                }
+                const parsedNodes = NativeVisualNodeSchema.array()
+                  .max(25)
+                  .safeParse(result.data?.nodes);
+                if (!parsedNodes.success) {
+                  inspectionEntry.status = "failed";
+                  inspectionEntry.output = JSON.stringify({
+                    success: false,
+                    error: "The bounded inspection returned invalid geometry data.",
+                  });
+                  await save();
+                  throw new Error(
+                    "The bounded section inspection returned invalid geometry; committed changes remain.",
+                  );
+                }
+                const verifiedRefs = refs.map(knownRef);
+                const findings = auditNativeSection(parsedNodes.data, verifiedRefs);
+                inspectionEntry.status = "completed";
+                inspectionEntry.output = JSON.stringify({
+                  success: true,
+                  inspectedNodes: parsedNodes.data.length,
+                  findingCount: findings.length,
+                  findings: findings.slice(0, 12),
+                });
+                if (findings.length) {
+                  stage.verified = false;
+                  task.recent.push(
+                    output(call.callId, {
+                      success: false,
+                      stage: stage.title,
+                      inspectedNodes: parsedNodes.data.length,
+                      qualityFindings: findings
+                        .slice(0, 12)
+                        .map(({ code, ref, message }) => ({ code, ref, message })),
+                      instruction:
+                        "Repair only the listed existing logical refs. Do not recreate the stage. After corrections request complete_canvas_stage again.",
+                    }),
+                  );
+                  task.pending = [];
+                  await save();
+                  continue;
+                }
+                stage.verified = true;
+              }
               stage.completed = true;
             }
             task.recent.push(
               output(call.callId, {
                 success: true,
-                stages: task.stages,
+                ...(call.normalizedPlanningMetadata
+                  ? {
+                      normalization:
+                        "planning_runtime_metadata_ignored; runtime state is locally initialized",
+                    }
+                  : {}),
+                planVersion: CHAT_PLAN_VERSION,
+                stages: modelPlanStages(task.stages),
+                instruction:
+                  "The plan is saved. Do not replan. Execute only the next unfinished stage using native tools.",
                 nextStage: task.stages.find((stage) => !stage.completed)?.title ?? null,
               }),
             );
           } catch (error) {
+            if (error instanceof Error && error.message.startsWith("no_progress_repeated_error"))
+              throw error;
+            guardRepeatedFailure(
+              `planning:${error instanceof Error ? error.message : "stage_not_confirmed"}`,
+            );
             task.recent.push(
               output(call.callId, {
                 success: false,
@@ -235,7 +508,13 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         }
 
         const stageIndex = task.stages.findIndex((stage) => !stage.completed);
-        if (stageIndex < 0) {
+        const prePlanReadOnly =
+          stageIndex < 0 &&
+          calls.every(
+            (call) =>
+              call.action.tool === "get_document_context" || call.action.tool === "inspect_nodes",
+          );
+        if (stageIndex < 0 && !prePlanReadOnly) {
           task.recent.push(
             ...calls.map((call) =>
               output(call.callId, {
@@ -249,7 +528,19 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           await save();
           continue;
         }
-        const stage = task.stages[stageIndex]!;
+        const stage = stageIndex >= 0 ? task.stages[stageIndex] : undefined;
+        const newCalls = calls.filter(
+          (call) => !task.ledger.some((entry) => entry.call.callId === call.callId),
+        );
+        if (
+          task.ledger.length + newCalls.length > CHAT_TASK_MAX_OPERATIONS ||
+          (stage &&
+            stage.operations + stage.verificationOperations + newCalls.length >=
+              CHAT_STAGE_MAX_OPERATIONS)
+        )
+          throw new Error(
+            `Task capacity reached: ${task.ledger.length}/${CHAT_TASK_MAX_OPERATIONS} operations${stage ? `, stage ${stage.operations + stage.verificationOperations}/${CHAT_STAGE_MAX_OPERATIONS} including reserved verification` : " during pre-plan inspection"}. Confirmed work is retained; this stage needs a smaller plan.`,
+          );
         for (const call of calls) {
           const prior = task.ledger.find((entry) => entry.call.callId === call.callId);
           if (prior) {
@@ -257,23 +548,17 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               throw new Error("A reused call ID changed its action; execution was refused.");
             continue;
           }
-          if (
-            task.ledger.length >= CHAT_TASK_MAX_OPERATIONS ||
-            stage.operations >= CHAT_STAGE_MAX_OPERATIONS
-          )
-            throw new Error(
-              `Task capacity reached: ${task.ledger.length}/${CHAT_TASK_MAX_OPERATIONS} operations, stage ${stage.operations}/${CHAT_STAGE_MAX_OPERATIONS}. Confirmed work is retained; this stage needs a smaller plan.`,
-            );
           task.ledger.push({
             call,
             operationId: `${task.id}-op-${task.ledger.length + 1}`,
-            stage: stageIndex,
+            stage: Math.max(0, stageIndex),
             status: "pending",
           });
-          stage.operations++;
+          if (stage) stage.operations++;
         }
         await save();
         let rateRetries = 0;
+        let referenceCorrection = false;
         while (true) {
           check();
           const remaining = calls
@@ -282,11 +567,31 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           if (!remaining.length) break;
           let entries = remaining.slice(0, 3);
           const operationsFor = () =>
-            entries.map(({ call, operationId }) => ({
-              operationId,
-              idempotencyKey: `chat:${operationId}`,
-              action: call.action,
-            }));
+            entries.map(({ call, operationId }) => {
+              const ref = "ref" in call.action ? call.action.ref : undefined;
+              const original =
+                ref &&
+                ["create_frame", "create_text", "create_rectangle"].includes(call.action.tool)
+                  ? task.ledger.find(
+                      (entry) =>
+                        entry.operationId !== operationId &&
+                        entry.status === "completed" &&
+                        !entry.reused &&
+                        "ref" in entry.call.action &&
+                        entry.call.action.ref === ref &&
+                        ["create_frame", "create_text", "create_rectangle"].includes(
+                          entry.call.action.tool,
+                        ),
+                    )
+                  : undefined;
+              return {
+                operationId,
+                idempotencyKey: `chat:${operationId}`,
+                ...(task.referenceScope ? { taskId: task.id } : {}),
+                ...(original ? { expectedCreationOperationId: original.operationId } : {}),
+                action: call.action,
+              };
+            });
           while (
             entries.length > 1 &&
             utf8Bytes(
@@ -321,7 +626,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           task.batches++;
           await save();
           deps.progress(
-            `Applying ${stage.title} · ${task.ledger.filter((entry) => entry.status === "completed").length} operations confirmed…`,
+            `${stage ? `Applying ${stage.title}` : "Reading document styles and page context"} · ${chatTaskCommittedOperationCount(task)} canvas operations confirmed…`,
           );
           const result = await deps.execute(batch.operations);
           if (
@@ -358,6 +663,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               continue;
             }
             entry.status = item.success ? "completed" : "failed";
+            if (item.data?.reused === true) entry.reused = true;
             const payload = {
               success: item.success,
               logicalRef: item.logicalRef,
@@ -370,9 +676,16 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               entry.output = JSON.stringify({ ...payload, data: undefined });
             failed ||= !item.success;
           }
+          if (!failed && !limited) delete task.failure;
           await save();
           check();
           if (limited) {
+            task.failure = {
+              category: "rate_limit",
+              code: "local_tool_rate_limit",
+              committedOperations: chatTaskCommittedOperationCount(task),
+              operationId: entries[0]!.operationId,
+            };
             if (++rateRetries > 2)
               throw new Error(
                 "Local capacity is still busy. Resume after one minute; no confirmed work will be repeated.",
@@ -384,6 +697,39 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             continue;
           }
           if (failed) {
+            const failedResult = result.results.find((item) => !item.success);
+            task.failure = {
+              category: failedResult?.data?.referenceResolution
+                ? "ambiguous_recovery"
+                : /rate limit/iu.test(failedResult?.error ?? "")
+                  ? "rate_limit"
+                  : /timed out/iu.test(failedResult?.error ?? "")
+                    ? "timeout"
+                    : /interrupted|reconcil|unconfirmed/iu.test(failedResult?.error ?? "")
+                      ? "ambiguous_recovery"
+                      : result.committedOperationIds.length || chatTaskCommittedOperationCount(task)
+                        ? "partial_commit"
+                        : /invalid|safety limit|must be unique|does not support|can only|requires|must use/iu.test(
+                              failedResult?.error ?? "",
+                            )
+                          ? "executor_validation"
+                          : "figma_runtime",
+              code: failedResult?.data?.referenceResolution
+                ? "reference_resolution"
+                : "native_operation_failed",
+              committedOperations: chatTaskCommittedOperationCount(task),
+              ...(failedResult ? { operationId: failedResult.operationId } : {}),
+            };
+            task.failure.code = {
+              ambiguous_recovery: "inspection_required",
+              rate_limit: "local_tool_rate_limit",
+              timeout: "native_operation_timeout",
+              partial_commit: "native_batch_partial_commit",
+              executor_validation: "executor_contract_rejected",
+              figma_runtime: "native_api_failed",
+              planning: "planning_failed",
+              model_schema: "tool_arguments_invalid",
+            }[task.failure.category];
             for (const call of calls) {
               const entry = task.ledger.find((entry) => entry.call.callId === call.callId)!;
               if (entry.status === "pending") {
@@ -398,6 +744,19 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             }
             await save();
           }
+          if (
+            failed &&
+            task.referenceCorrections < 2 &&
+            result.results.some((item) => item.data?.referenceResolution)
+          ) {
+            guardRepeatedFailure(
+              `reference:${JSON.stringify(result.results.flatMap((item) => (item.data?.referenceResolution ? [item.data.referenceResolution] : [])))}`,
+            );
+            task.referenceCorrections++;
+            referenceCorrection = true;
+            await save();
+            break;
+          }
           if (failed || (!result.success && !result.cancelled))
             throw new Error(
               result.results.find((item) => !item.success)?.error ??
@@ -409,7 +768,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           (call) =>
             task.ledger.find((entry) => entry.call.callId === call.callId)?.status === "failed",
         );
-        if (failed && !wasRetry)
+        if (failed && !wasRetry && !referenceCorrection)
           throw new Error(
             "The current stage has a failed operation. Retry Failed Stage to inspect and repair it; earlier changes are retained.",
           );
@@ -421,6 +780,15 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             output: JSON.stringify({
               ...JSON.parse(entry.output ?? "{}"),
               operationId: entry.operationId,
+              ...(call.normalizedInspectionParameters && call.action.tool === "inspect_nodes"
+                ? {
+                    normalization: {
+                      maxNodes: call.action.maxNodes,
+                      depth: call.action.depth,
+                      note: "Read-only inspection bounds were clamped locally; the 25-node exposure limit is unchanged.",
+                    },
+                  }
+                : {}),
             }),
           });
         }
@@ -471,7 +839,100 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       check();
       task.rounds++;
       if (current) current.rounds++;
+      if (turn.kind === "tool_validation") {
+        const inspectionIssues = turn.issues.flatMap((issue) => {
+          if (issue.toolName !== "inspect_nodes" || !issue.callId) return [];
+          const field = issue.fieldPaths.includes("arguments.maxNodes")
+            ? ("maxNodes" as const)
+            : issue.fieldPaths.includes("arguments.depth")
+              ? ("depth" as const)
+              : undefined;
+          if (!field) return [];
+          const allowedErrorCodes = [
+            "too_big",
+            "too_small",
+            "invalid_type",
+            "invalid_format",
+            "custom",
+            "schema_validation",
+          ] as const;
+          const errorCode = allowedErrorCodes.includes(
+            issue.errorCode as (typeof allowedErrorCodes)[number],
+          )
+            ? (issue.errorCode as (typeof allowedErrorCodes)[number])
+            : "schema_validation";
+          return [
+            {
+              callId: issue.callId,
+              field,
+              errorCode,
+              ...(issue.receivedType ? { receivedType: issue.receivedType } : {}),
+              ...(issue.receivedNumber ? { receivedNumber: issue.receivedNumber } : {}),
+            },
+          ];
+        });
+        task.failure = {
+          category: "model_schema",
+          code: "tool_arguments_invalid",
+          committedOperations: chatTaskCommittedOperationCount(task),
+          ...(inspectionIssues.length ? { inspectionIssues: inspectionIssues.slice(0, 8) } : {}),
+        };
+        guardRepeatedFailure(
+          `model_schema:${JSON.stringify(turn.issues.map(({ toolName, stage, errorCode, fieldPaths }) => ({ toolName, stage, errorCode, fieldPaths })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))))}`,
+        );
+        const details = turn.issues
+          .slice(0, 8)
+          .map((issue) => {
+            const inspectionField =
+              issue.toolName === "inspect_nodes"
+                ? issue.fieldPaths.find(
+                    (path) => path === "arguments.maxNodes" || path === "arguments.depth",
+                  )
+                : undefined;
+            if (inspectionField) {
+              const isMaxNodes = inspectionField === "arguments.maxNodes";
+              const parameter = isMaxNodes ? "maxNodes" : "depth";
+              const bounds = isMaxNodes
+                ? INSPECT_NODES_LIMITS.maxNodes
+                : INSPECT_NODES_LIMITS.depth;
+              const received = issue.receivedType
+                ? ` Received type ${issue.receivedType}${issue.receivedNumber ? ` (${issue.receivedNumber})` : ""}; no type conversion is performed.`
+                : "";
+              return `inspect_nodes${issue.callId ? ` (${issue.callId})` : ""}: arguments.${parameter} must be an integer from ${bounds.min}–${bounds.max} (omitted defaults to ${bounds.default}); finite numeric values outside that range are clamped locally, while invalid types and in-range fractions are rejected.${received}`;
+            }
+            return `${issue.toolName ?? "unknown tool"}${issue.callId ? ` (${issue.callId})` : ""}: ${issue.stage}/${issue.errorCode} at ${issue.fieldPaths
+              .slice(0, 4)
+              .map((path) => path.slice(0, 100))
+              .join(", ")}`;
+          })
+          .join("; ");
+        task.lastResponseCalls = 0;
+        if (task.validationCorrections >= CHAT_TASK_MAX_VALIDATION_CORRECTIONS)
+          throw new Error(
+            `The model returned invalid canvas calls after ${CHAT_TASK_MAX_VALIDATION_CORRECTIONS} targeted corrections (${details.slice(0, 220)}). No calls from the rejected response were executed; ${retainedCanvasChanges(task)}.`,
+          );
+        task.validationCorrections++;
+        task.validationFeedback =
+          `The entire previous tool-call response was discarded before execution. Correct the listed fields and continue only the current unfinished stage from the saved checkpoint. Never regenerate a completed stage or repeat an operation already recorded as committed. Validation details: ${details}`.slice(
+            0,
+            7_500,
+          );
+        deps.progress(
+          `Rejected model tool call${turn.issues.length === 1 ? "" : "s"} (${turn.issues
+            .slice(0, 3)
+            .map(
+              ({ toolName, fieldPaths }) =>
+                `${toolName ?? "unknown"}: ${fieldPaths[0] ?? "arguments"}`,
+            )
+            .join(
+              "; ",
+            )}); none from this response executed. ${retainedCanvasChanges(task)} Requesting a bounded correction…`,
+        );
+        await save();
+        continue;
+      }
       if (turn.kind === "done") {
+        delete task.validationFeedback;
         task.lastResponseCalls = 0;
         if (task.stages.some((stage) => !stage.completed)) {
           task.recent = [
@@ -486,10 +947,13 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         }
         task.text = turn.text.slice(0, 8_000);
         task.status = "completed";
+        delete task.failure;
         task.recent = [];
         await save();
         return;
       }
+      delete task.validationFeedback;
+      delete task.failure;
       const calls = turn.calls.map((call) => ChatFunctionCallSchema.parse(call));
       if (!calls.length || calls.length > 10)
         throw new Error("The model returned an invalid bounded stage.");
@@ -503,7 +967,40 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     task.error = deps.signal.aborted
       ? "Stopped. Confirmed canvas changes are retained. Resume reconciles in-flight IDs before continuing."
       : (error instanceof Error ? error.message : "Stage failed safely.").slice(0, 500);
+    const transportCategory =
+      error && typeof error === "object" && "category" in error ? String(error.category) : "";
+    task.failure ??= {
+      category:
+        transportCategory === "quota_or_rate_limit" || transportCategory === "inference_busy"
+          ? "rate_limit"
+          : transportCategory === "request_timed_out" || /timed out|timeout/iu.test(task.error)
+            ? "timeout"
+            : transportCategory === "response_invalid"
+              ? "model_schema"
+              : /validation|Zod|bounded stage|invalid request/iu.test(task.error)
+                ? "executor_validation"
+                : /interrupted|reconcil|Lost.*result|Lost.*acknowledgement/iu.test(task.error)
+                  ? "ambiguous_recovery"
+                  : "planning",
+      code: /^[a-z_]{1,80}$/u.test(transportCategory)
+        ? transportCategory
+        : task.error.startsWith("no_progress_repeated_error")
+          ? "no_progress_repeated_error"
+          : task.error.startsWith("Stage planning budget reached")
+            ? "planning_budget_exhausted"
+            : "task_paused",
+      committedOperations: chatTaskCommittedOperationCount(task),
+    };
+    if (task.error.startsWith("no_progress_repeated_error"))
+      task.failure.code = "no_progress_repeated_error";
     await save();
     throw error;
   }
+}
+
+function retainedCanvasChanges(task: ChatTask): string {
+  const count = chatTaskCommittedOperationCount(task);
+  return count
+    ? `${count} previously committed canvas operation${count === 1 ? " is" : "s are"} retained.`
+    : "No canvas operations were committed before this response.";
 }

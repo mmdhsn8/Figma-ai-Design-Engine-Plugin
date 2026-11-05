@@ -5,9 +5,11 @@ import type { DesignGenerationRequest, GenerationRepairTarget } from "../shared/
 import type { DesignSection } from "../shared/design-generation";
 import { MAX_SECTION_BYTES } from "../shared/generation-limits";
 import {
+  ChatFunctionCallValidationIssueSchema,
   ChatFunctionCallSchema,
   ChatInputItemSchema,
   type ChatFunctionCall,
+  type ChatFunctionCallValidationIssue,
   type ChatInputItem,
 } from "../shared/chat-tools";
 
@@ -219,6 +221,7 @@ export class CompanionClientError extends Error {
 
 export type AuthorizedChatTurn =
   | { kind: "done"; text: string }
+  | { kind: "tool_validation"; issues: ChatFunctionCallValidationIssue[] }
   | {
       kind: "tool_calls";
       calls: ChatFunctionCall[];
@@ -593,6 +596,17 @@ async function readAuthorizedChatStream(
       if (!parsed.success) throw new CompanionClientError("response_invalid");
       onProgress?.(parsed.data.elapsedMs);
       return undefined;
+    }
+    if (eventName === "tool_validation") {
+      const parsed = z
+        .object({
+          requestId: z.string(),
+          issues: z.array(ChatFunctionCallValidationIssueSchema).min(1).max(8),
+        })
+        .strict()
+        .safeParse(payload);
+      if (!parsed.success) throw new CompanionClientError("response_invalid");
+      return { kind: "tool_validation", issues: parsed.data.issues };
     }
     if (eventName === "tool_calls") {
       const parsed = z

@@ -16,7 +16,7 @@ import {
 } from "../shared/messages";
 import { FigmaToolOperationSchema, type FigmaToolOperation } from "../shared/figma-tools";
 import { type ChatInputItem } from "../shared/chat-tools";
-import { type ChatTask, chatTaskProgress } from "../shared/chat-task";
+import { type ChatTask, chatTaskProgress, chatTaskSafeDiagnostic } from "../shared/chat-task";
 import { runChatTask, chatTaskInput } from "./chat-task";
 import { chatTaskBridge } from "./chat-task-bridge";
 import { isMultiScreenInput, parseMultiScreenText } from "../shared/multi-screen-schema";
@@ -1086,6 +1086,7 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
         chatTask.current = {
           version: 1,
           id,
+          referenceScope: "task-v1",
           documentId: loaded.documentId,
           prompt: text,
           context:
@@ -1102,6 +1103,8 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
           rounds: 0,
           batches: 0,
           lastResponseCalls: 0,
+          validationCorrections: 0,
+          referenceCorrections: 0,
           status: "ready",
           text: "",
         };
@@ -2599,6 +2602,41 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
                 {chatTaskSnapshot.batches} batches · {chatTaskSnapshot.lastResponseCalls} calls in
                 last response · {chatTaskSnapshot.ledger.length} scheduled operations
               </small>
+              {chatTaskSnapshot.failure && (
+                <>
+                  <p role="alert">
+                    Safe diagnostic: {chatTaskSnapshot.failure.category}/
+                    {chatTaskSnapshot.failure.code}
+                    {chatTaskSnapshot.failure.operationId
+                      ? ` · operation ${chatTaskSnapshot.failure.operationId}`
+                      : ""}
+                    {` · ${chatTaskSnapshot.failure.committedOperations} committed canvas operations. `}
+                    Inspect the failed stage before retrying; confirmed work is retained.
+                  </p>
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    onClick={() => {
+                      void navigator.clipboard
+                        .writeText(
+                          JSON.stringify(chatTaskSafeDiagnostic(chatTaskSnapshot), null, 2),
+                        )
+                        .then(() =>
+                          setChatActivity(
+                            "Sanitized diagnostic copied; it contains no prompt or canvas content.",
+                          ),
+                        )
+                        .catch(() =>
+                          setChatActivity(
+                            "Clipboard unavailable. Copy only the visible safe category/code and companion diagnostic line.",
+                          ),
+                        );
+                    }}
+                  >
+                    Copy sanitized diagnostic
+                  </button>
+                </>
+              )}
               {chatBusy && (
                 <button type="button" className="secondary-action" onClick={stopChat}>
                   Stop
@@ -4229,7 +4267,7 @@ function companionErrorText(error: unknown): string {
     response_incomplete:
       "No completed design/smoke result was accepted. The stream was incomplete or ended before response.completed; partial output was discarded.",
     response_invalid:
-      "The companion received an invalid SSE event. No partial output was accepted; retry once and share only the safe diagnostic.",
+      "The companion rejected an invalid response before executing its calls. Previously confirmed canvas operations, if any, remain intact; retry once and share only the safe diagnostic.",
     resource_exhausted:
       "The companion ran out of available memory or temporary disk space while processing the design. Free local resources, then rerun; completed screens are retained for resuming.",
     response_too_large:

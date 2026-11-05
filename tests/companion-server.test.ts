@@ -15,6 +15,15 @@ import { createMemoryCredentialStore } from "../src/companion/credential-store.j
 import { createCompanionServer, type CompanionServerHandle } from "../src/companion/server.js";
 import { createDraftStore, type DraftStore } from "../src/companion/draft-store.js";
 import { draftFixture } from "./generation-fixture";
+import { createMockApi } from "./figma-mock";
+import { createFigmaToolExecutor } from "../src/plugin/figma-tool-executor";
+import { handleChatTaskStorage } from "../src/plugin/chat-task-storage";
+import { chatTaskCommittedOperationCount, ChatTaskSchema } from "../src/shared/chat-task";
+import { runChatTask } from "../src/ui/chat-task";
+import { streamAuthorizedChat } from "../src/ui/companion-client";
+import type { PluginToUIMessage } from "../src/shared/messages";
+import { UIToPluginSchema, PluginToUISchema } from "../src/shared/messages";
+import { FigmaToolBatchSchema } from "../src/shared/figma-tools";
 
 const discovery: OidcDiscovery = {
   issuer: OIDC_ISSUER,
@@ -38,6 +47,542 @@ afterEach(async () => {
 });
 
 describe("loopback companion", () => {
+  it("continues a persisted one-commit task without colliding with an inspected page alias", async () => {
+    let sequence = 0;
+    const call = (name: string, args: unknown) => ({
+      type: "function_call",
+      call_id: `alias_call_${String(++sequence).padStart(4, "0")}`,
+      name,
+      arguments: JSON.stringify(args),
+    });
+    const brief = {
+      platform: "mobile",
+      viewport: { width: 390, height: 844 },
+      brandDirection: "Minimal",
+      audience: "Shoppers",
+      content: ["Header"],
+      hierarchy: "One clear title",
+      typography: { family: "Arial", style: "Regular", headingSize: 28, bodySize: 14 },
+      spacingScale: [8, 16],
+      radiusScale: [8, 16],
+      palette: {
+        source: "curated-default",
+        background: "#FFFFFF",
+        surface: "#FFFFFF",
+        primary: "#222222",
+        accent: "#AA3366",
+        text: "#222222",
+        muted: "#555555",
+      },
+      imagePolicy: "labeled-native-fallback",
+      interactionPriorities: ["Header"],
+      readingDirection: "RTL",
+    };
+    const plan = call("plan_canvas_task", {
+      brief,
+      stages: [
+        {
+          title: "Mobile root",
+          goal: "Create the requested editable root frame",
+          logicalRefs: ["store_mobile"],
+          completionCriteria: ["The 390 × 844 root frame exists"],
+        },
+      ],
+    });
+    const initialResponses = [
+      call("get_document_context", {}),
+      plan,
+      call("inspect_nodes", { refs: ["store_mobile"], selection: false }),
+      call("create_frame", {
+        ref: "store_mobile",
+        name: "Task store_mobile",
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+      }),
+    ];
+    const mock = createMockApi();
+    let initial = true;
+    let editSent = false;
+    let completeSent = false;
+    let repairSent = false;
+    let modelTurns = 0;
+    const harness = await createHarness({
+      chatResponder: (input) => {
+        modelTurns++;
+        if (initial) {
+          const next = initialResponses.shift();
+          if (next) return { outputItems: [next] };
+          throw new Error("controlled interruption after the committed root");
+        }
+        const latestOutput = [...input]
+          .reverse()
+          .find(
+            (item) =>
+              typeof item === "object" &&
+              item !== null &&
+              "type" in item &&
+              item.type === "function_call_output",
+          );
+        let failureCode = "";
+        if (
+          latestOutput &&
+          typeof latestOutput === "object" &&
+          "output" in latestOutput &&
+          typeof latestOutput.output === "string"
+        ) {
+          try {
+            failureCode = JSON.parse(latestOutput.output).data?.referenceResolution?.code ?? "";
+          } catch {
+            failureCode = "";
+          }
+        }
+        if (!editSent) {
+          editSent = true;
+          return {
+            outputItems: [
+              call("set_properties", { ref: "store_mobile", properties: { fill: "#AA3366" } }),
+            ],
+          };
+        }
+        if (failureCode === "ambiguous_alias" && !repairSent) {
+          repairSent = true;
+          const canonicalRef = mock
+            .find("Task store_mobile")
+            ?.getPluginData("fad.tool.logical-ref.v1");
+          if (!canonicalRef) throw new Error("The committed task node has no canonical ref");
+          return {
+            outputItems: [
+              call("set_properties", { ref: canonicalRef, properties: { fill: "#AA3366" } }),
+            ],
+          };
+        }
+        if (!completeSent) {
+          completeSent = true;
+          return { outputItems: [call("complete_canvas_stage", { summary: "Root is confirmed" })] };
+        }
+        return { text: "Completed", outputItems: [] };
+      },
+    });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const messages: PluginToUIMessage[] = [];
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const seeded = FigmaToolBatchSchema.parse({
+      type: "tool-execute",
+      protocolVersion: 1,
+      batchId: "legacy-seed-batch-01",
+      operations: [
+        {
+          operationId: "legacy-store-mobile-01",
+          idempotencyKey: "legacy:store_mobile",
+          action: {
+            tool: "create_frame",
+            ref: "store_mobile",
+            name: "Existing page store_mobile",
+            parent: { kind: "page" },
+            size: { width: 320, height: 640 },
+          },
+        },
+      ],
+    });
+    await executor(seeded);
+    const task = ChatTaskSchema.parse({
+      version: 1,
+      id: "store-mobile-task-01",
+      referenceScope: "task-v1",
+      documentId: "file-test-56-page_current",
+      prompt: "Create one mobile storefront root frame.",
+      context: [],
+      stages: [],
+      ledger: [],
+      pending: [],
+      recent: [],
+      starts: [],
+      rounds: 0,
+      status: "ready",
+      text: "",
+    });
+    const fetcher: typeof fetch = (url, options) =>
+      fetch(`http://localhost:${harness.handle.port}${new URL(String(url)).pathname}`, {
+        ...options,
+        headers: { ...Object.fromEntries(new Headers(options?.headers)), Origin: "null" },
+      });
+    let saveRequest = 0;
+    let oneCommitCheckpoint: ReturnType<typeof ChatTaskSchema.parse> | undefined;
+    const deps = {
+      signal: new AbortController().signal,
+      progress: () => {},
+      model: (input: Parameters<typeof streamAuthorizedChat>[3]) =>
+        streamAuthorizedChat(token, `alias-request-${++sequence}`, "account-model", input, fetcher),
+      save: async (checkpoint: typeof task) => {
+        const saved = await handleChatTaskStorage(mock.api, {
+          type: "chat-task-save",
+          requestId: `alias-save-${++saveRequest}`,
+          documentId: checkpoint.documentId,
+          task: checkpoint,
+        });
+        expect(saved.success).toBe(true);
+        if (chatTaskCommittedOperationCount(checkpoint) === 1)
+          oneCommitCheckpoint = ChatTaskSchema.parse(JSON.parse(JSON.stringify(checkpoint)));
+      },
+      execute: async (operations: Parameters<Parameters<typeof runChatTask>[1]["execute"]>[0]) => {
+        const batchId = `alias-batch-${++sequence}`;
+        const dispatch = UIToPluginSchema.parse(
+          JSON.parse(
+            JSON.stringify({ type: "tool-execute", protocolVersion: 1, batchId, operations }),
+          ),
+        );
+        if (dispatch.type !== "tool-execute") throw new Error("Invalid dispatch");
+        await executor(dispatch);
+        const result = [...messages]
+          .reverse()
+          .find((message) => message.type === "tool-result" && message.batchId === batchId);
+        if (!result || result.type !== "tool-result") throw new Error("Missing plugin result");
+        return PluginToUISchema.parse(JSON.parse(JSON.stringify(result))) as Extract<
+          PluginToUIMessage,
+          { type: "tool-result" }
+        >;
+      },
+    };
+    await expect(runChatTask(task, deps)).rejects.toThrow();
+    expect(oneCommitCheckpoint).toBeDefined();
+    expect(chatTaskCommittedOperationCount(oneCommitCheckpoint!)).toBe(1);
+    const persisted = await handleChatTaskStorage(mock.api, {
+      type: "chat-task-load",
+      requestId: "alias-load-01",
+    });
+    const restored = ChatTaskSchema.parse(persisted.task);
+    expect(chatTaskCommittedOperationCount(restored)).toBe(1);
+    const storedState = [...mock.storage.values()].find(
+      (value) => typeof value === "object" && value !== null && "refs" in value,
+    ) as { refs: Record<string, { inspectedByTaskId?: string; alias?: string; taskId?: string }> };
+    expect(storedState.refs.store_mobile?.inspectedByTaskId).toBe(task.id);
+    expect(Object.values(storedState.refs).some((entry) => entry.alias === "store_mobile")).toBe(
+      true,
+    );
+
+    initial = false;
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    let resumeError: unknown;
+    try {
+      await runChatTask(restored, deps);
+    } catch (error) {
+      resumeError = error;
+    }
+    const aliasFailures = messages.filter(
+      (message) =>
+        message.type === "tool-result" &&
+        message.results.some((result) => {
+          const resolution = result.data?.referenceResolution;
+          return (
+            typeof resolution === "object" &&
+            resolution !== null &&
+            "code" in resolution &&
+            resolution.code === "ambiguous_alias"
+          );
+        }),
+    );
+    expect(aliasFailures, JSON.stringify(aliasFailures)).toHaveLength(0);
+    expect(resumeError).toBeUndefined();
+    expect(repairSent).toBe(false);
+    expect(restored.status).toBe("completed");
+    expect(restored.stages[0]?.completed).toBe(true);
+    expect(restored.rounds).toBe(7);
+    expect(mock.nodes).toHaveLength(2);
+    expect(mock.find("Existing page store_mobile")?.width).toBe(320);
+    expect(mock.find("Task store_mobile")?.width).toBe(390);
+    expect(mock.find("Task store_mobile")?.fills).toMatchObject([
+      { type: "SOLID", color: { r: 170 / 255, g: 51 / 255, b: 102 / 255 } },
+    ]);
+    expect(modelTurns).toBe(8);
+  }, 20_000);
+
+  it("runs the production HTTP/SSE chat path with simulated planning contamination, checkpoint reload and purchase-button edit (mock OAuth/Responses/Figma)", async () => {
+    let sequence = 0;
+    const call = (name: string, args: unknown) => ({
+      type: "function_call",
+      call_id: `stability_call_${++sequence}`,
+      name,
+      arguments: JSON.stringify(args),
+    });
+    const brief = {
+      platform: "mobile",
+      viewport: { width: 390, height: 844 },
+      brandDirection: "Modern",
+      audience: "Shoppers",
+      content: ["Header", "Search", "Categories", "Banner", "Products", "Purchase"],
+      hierarchy: "Title then products",
+      typography: { family: "Arial", style: "Regular", headingSize: 28, bodySize: 14 },
+      spacingScale: [8, 16],
+      radiusScale: [8, 16],
+      palette: {
+        source: "curated-default",
+        background: "#FFFFFF",
+        surface: "#FFFFFF",
+        primary: "#222222",
+        accent: "#AA3366",
+        text: "#222222",
+        muted: "#555555",
+      },
+      imagePolicy: "labeled-native-fallback",
+      interactionPriorities: ["Purchase"],
+      readingDirection: "RTL",
+    };
+    const stage = {
+      title: "Storefront",
+      goal: "Create editable content",
+      logicalRefs: ["store"],
+      completionCriteria: ["All requested sections exist"],
+    };
+    const contaminatedPlan = call("plan_canvas_task", {
+      brief,
+      stages: [
+        {
+          ...stage,
+          completed: false,
+          operations: 0,
+          rounds: 0,
+          verification: { status: "pending" },
+        },
+      ],
+    });
+    const texts = [
+      "فروشگاه لباس",
+      "جست‌وجو",
+      "دسته‌بندی‌ها",
+      "بنر",
+      "پیراهن — ۵۰۰٬۰۰۰ تومان",
+      "خرید",
+      "شلوار — ۷۰۰٬۰۰۰ تومان",
+      "خرید",
+    ];
+    const nativeCalls = [
+      call("create_frame", {
+        ref: "store",
+        name: "Store",
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+        autoLayout: { direction: "vertical", gap: 8 },
+      }),
+      ...texts.flatMap((text, index) => [
+        ...(index === 4 || index === 6
+          ? [
+              call("create_frame", {
+                ref: `product-${index === 4 ? 0 : 1}`,
+                name: `Product card ${index === 4 ? 0 : 1}`,
+                parent: { kind: "node", ref: "store" },
+                size: { width: 350, height: 160 },
+                autoLayout: { direction: "vertical", gap: 8 },
+              }),
+            ]
+          : []),
+        ...(index === 5 || index === 7
+          ? [
+              call("create_frame", {
+                ref: `purchase-${index === 5 ? 0 : 1}`,
+                name: `Purchase button ${index === 5 ? 0 : 1}`,
+                parent: { kind: "node", ref: `product-${index === 5 ? 0 : 1}` },
+                size: { width: 320, height: 48 },
+                fill: "#222222",
+                cornerRadius: 12,
+                autoLayout: {
+                  direction: "horizontal",
+                  primaryAlign: "CENTER",
+                  counterAlign: "CENTER",
+                },
+              }),
+            ]
+          : []),
+        call("create_text", {
+          ref: index === 0 ? "header" : `content-${index}`,
+          name: `Content ${index}`,
+          parent: {
+            kind: "node",
+            ref:
+              index < 4
+                ? "store"
+                : index === 5 || index === 7
+                  ? `purchase-${index === 5 ? 0 : 1}`
+                  : `product-${Math.floor((index - 4) / 2)}`,
+          },
+          text,
+          size: { width: index === 5 || index === 7 ? 300 : 350, height: 48 },
+          fontSize: index === 0 ? 28 : 16,
+          color: index === 5 || index === 7 ? "#FFFFFF" : "#1F2937",
+          direction: "RTL",
+        }),
+      ]),
+    ];
+    const responses = [
+      { outputItems: [call("get_document_context", {})] },
+      { outputItems: [contaminatedPlan] },
+      { outputItems: nativeCalls.slice(0, 10) },
+      { outputItems: nativeCalls.slice(10) },
+      { outputItems: [call("complete_canvas_stage", { summary: "All sections exist" })] },
+      { text: "Completed", outputItems: [] },
+    ];
+    const harness = await createHarness({ chatResponses: responses });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const task = ChatTaskSchema.parse({
+      version: 1,
+      id: "stability-task-01",
+      referenceScope: "task-v1",
+      documentId: "file-test-56-page_current",
+      prompt:
+        "یک صفحه موبایل 390×844 برای فروشگاه لباس فارسی طراحی کن؛ شامل هدر، جست‌وجو، دسته‌بندی‌ها، بنر، دو کارت محصول با قیمت تومان و دکمه خرید. تمام عناصر قابل‌ویرایش باشند.",
+      context: [],
+      stages: [],
+      ledger: [],
+      pending: [],
+      recent: [],
+      starts: [],
+      rounds: 0,
+      status: "ready",
+      text: "",
+    });
+    const fetcher: typeof fetch = (url, options) =>
+      fetch(`http://localhost:${harness.handle.port}${new URL(String(url)).pathname}`, {
+        ...options,
+        headers: { ...Object.fromEntries(new Headers(options?.headers)), Origin: "null" },
+      });
+    let lost = false;
+    let batch = 0;
+    const progress: string[] = [];
+    const deps = {
+      signal: new AbortController().signal,
+      progress: (message: string) => progress.push(message),
+      model: (input: Parameters<typeof streamAuthorizedChat>[3]) =>
+        streamAuthorizedChat(
+          token,
+          `stability-request-${++sequence}`,
+          "account-model",
+          input,
+          fetcher,
+        ),
+      save: async (checkpoint: typeof task) => {
+        const saved = await handleChatTaskStorage(mock.api, {
+          type: "chat-task-save",
+          requestId: "stability-save-01",
+          documentId: task.documentId,
+          task: checkpoint,
+        });
+        expect(saved.success).toBe(true);
+      },
+      execute: async (operations: Parameters<Parameters<typeof runChatTask>[1]["execute"]>[0]) => {
+        const batchId = `stability-batch-${++batch}`;
+        const dispatch = UIToPluginSchema.parse(
+          JSON.parse(
+            JSON.stringify({ type: "tool-execute", protocolVersion: 1, batchId, operations }),
+          ),
+        );
+        if (dispatch.type !== "tool-execute") throw new Error("Invalid dispatch");
+        await executor(dispatch);
+        const result = [...messages]
+          .reverse()
+          .find((message) => message.type === "tool-result" && message.batchId === batchId);
+        if (!result || result.type !== "tool-result") throw new Error("Missing result");
+        if (!lost && operations.some((operation) => operation.action.tool === "create_frame")) {
+          lost = true;
+          throw new Error("Lost acknowledgement");
+        }
+        const received = PluginToUISchema.parse(JSON.parse(JSON.stringify(result)));
+        if (received.type !== "tool-result") throw new Error("Invalid result");
+        return received;
+      },
+    };
+    await expect(runChatTask(task, deps)).rejects.toThrow("Lost acknowledgement");
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const loaded = await handleChatTaskStorage(mock.api, {
+      type: "chat-task-load",
+      requestId: "stability-load-01",
+    });
+    const restored = ChatTaskSchema.parse(loaded.task);
+    await runChatTask(restored, deps);
+    expect(restored.status).toBe("completed");
+    expect(restored.stages.every((item) => item.completed)).toBe(true);
+    expect(restored.validationCorrections).toBe(0);
+    expect(restored.rounds).toBe(6);
+    expect(mock.nodes).toHaveLength(13);
+    expect(mock.find("Product card 0")?.children).toHaveLength(2);
+    expect(mock.find("Product card 1")?.children).toHaveLength(2);
+    expect(
+      mock.nodes.filter((node) => node.type === "TEXT").map((node) => node.characters),
+    ).toEqual(texts);
+    expect(progress.length).toBeGreaterThan(0);
+    const header = mock.find("Content 0")!;
+    const originalHeaderFills = header.fills;
+    const firstPurchase = mock.find("Purchase button 0")!;
+    const secondPurchase = mock.find("Purchase button 1")!;
+    const firstPurchaseRef = firstPurchase.getPluginData("fad.tool.logical-ref.v1");
+    const secondPurchaseRef = secondPurchase.getPluginData("fad.tool.logical-ref.v1");
+    responses.push(
+      { outputItems: [call("get_document_context", {})] },
+      {
+        outputItems: [
+          call("plan_canvas_task", {
+            brief,
+            stages: [
+              {
+                ...stage,
+                title: "Purchase buttons",
+                goal: "Recolor only the existing purchase buttons",
+                logicalRefs: [firstPurchaseRef, secondPurchaseRef],
+              },
+            ],
+          }),
+        ],
+      },
+      {
+        outputItems: [
+          call("inspect_nodes", {
+            refs: [firstPurchaseRef, secondPurchaseRef],
+            selection: false,
+          }),
+        ],
+      },
+      {
+        outputItems: [
+          call("set_properties", {
+            ref: firstPurchaseRef,
+            properties: { fill: "#C2185B" },
+          }),
+          call("set_properties", {
+            ref: secondPurchaseRef,
+            properties: { fill: "#C2185B" },
+          }),
+        ],
+      },
+      { outputItems: [call("complete_canvas_stage", { summary: "Edited existing buttons" })] },
+      { text: "Edited", outputItems: [] },
+    );
+    const followup = ChatTaskSchema.parse({
+      ...task,
+      id: "stability-edit-01",
+      prompt: "رنگ دکمه‌های خرید را صورتی کن؛ بقیه عناصر تغییر نکنند.",
+      stages: [],
+      ledger: [],
+      pending: [],
+      recent: [],
+      starts: [],
+      rounds: 0,
+      status: "ready",
+    });
+    await runChatTask(followup, deps);
+    expect(followup.status).toBe("completed");
+    expect(mock.nodes).toHaveLength(13);
+    expect(firstPurchase.fills).toMatchObject([
+      { type: "SOLID", color: { r: 194 / 255, g: 24 / 255, b: 91 / 255 } },
+    ]);
+    expect(secondPurchase.fills).toMatchObject([
+      { type: "SOLID", color: { r: 194 / 255, g: 24 / 255, b: 91 / 255 } },
+    ]);
+    expect(header.fills).toEqual(originalHeaderFills);
+  }, 20_000);
+
   it("streams allowlisted chat calls and accepts their function outputs for continuation", async () => {
     const call = {
       type: "function_call",
@@ -141,7 +686,12 @@ describe("loopback companion", () => {
     expect(JSON.stringify(diagnosticRecords)).not.toContain("arguments");
     const sent = JSON.parse(harness.responsesRequest!.body) as {
       input: unknown[];
-      tools: Array<{ name: string }>;
+      tools: Array<{
+        name: string;
+        parameters?: {
+          properties?: Record<string, Record<string, unknown>>;
+        };
+      }>;
       store: boolean;
       parallel_tool_calls: boolean;
     };
@@ -151,8 +701,385 @@ describe("loopback companion", () => {
     });
     expect(sent.tools.map(({ name }) => name)).toContain("create_frame");
     expect(sent.tools.map(({ name }) => name)).not.toContain("delete_node");
+    const inspectTool = sent.tools.find(({ name }) => name === "inspect_nodes");
+    expect(inspectTool?.parameters?.properties?.maxNodes).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: 25,
+      default: 25,
+    });
+    expect(inspectTool?.parameters?.properties?.depth).toMatchObject({
+      type: "integer",
+      minimum: 0,
+      maximum: 4,
+      default: 2,
+    });
     expect(sent.parallel_tool_calls).toBe(true);
   }, 20_000);
+
+  it("sends the bounded inspect_nodes schema to authenticated Responses and clamps safe numeric overflow locally", async () => {
+    const call = {
+      type: "function_call",
+      call_id: "inspect_bounds_001",
+      name: "inspect_nodes",
+      arguments: JSON.stringify({
+        refs: ["store"],
+        selection: false,
+        maxNodes: 999,
+        depth: -8,
+      }),
+    };
+    const harness = await createHarness({ chatResponses: [{ outputItems: [call] }] });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const response = await request(harness.handle, "/v1/chat", {
+      token,
+      body: {
+        requestId: "inspect-contract-0001",
+        model: "account-model",
+        input: [{ role: "user", content: "Inspect the saved storefront." }],
+      },
+    });
+    expect(response.status).toBe(200);
+    const events = await response.text();
+    const payload = events
+      .split(/\r?\n\r?\n/u)
+      .find((frame) => frame.includes("event: tool_calls"))
+      ?.split("\n")
+      .find((line) => line.startsWith("data: "))
+      ?.slice("data: ".length);
+    expect(JSON.parse(payload ?? "{}")).toMatchObject({
+      calls: [
+        {
+          normalizedInspectionParameters: true,
+          action: { tool: "inspect_nodes", refs: ["store"], maxNodes: 25, depth: 0 },
+        },
+      ],
+      functionCallItems: [call],
+    });
+    const requestBody = JSON.parse(harness.responsesRequest!.body) as {
+      tools: Array<{
+        name: string;
+        parameters: { properties: Record<string, Record<string, unknown>> };
+      }>;
+    };
+    const inspectTool = requestBody.tools.find(({ name }) => name === "inspect_nodes");
+    expect(inspectTool?.parameters.properties.maxNodes).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: 25,
+      default: 25,
+    });
+    expect(inspectTool?.parameters.properties.depth).toMatchObject({
+      type: "integer",
+      minimum: 0,
+      maximum: 4,
+      default: 2,
+    });
+  }, 20_000);
+
+  it("stops, resumes, inspects between three stages, and retries without duplicating 31 committed nodes", async () => {
+    let sequence = 0;
+    const call = (name: string, args: unknown) => ({
+      type: "function_call",
+      call_id: `three_stage_${String(++sequence).padStart(4, "0")}`,
+      name,
+      arguments: JSON.stringify(args),
+    });
+    const brief = {
+      platform: "mobile",
+      viewport: { width: 390, height: 844 },
+      brandDirection: "Minimal",
+      audience: "Shoppers",
+      content: ["Shell", "Details", "Finish"],
+      hierarchy: "Shell then details",
+      typography: { family: "Arial", style: "Regular", headingSize: 28, bodySize: 14 },
+      spacingScale: [8, 16],
+      radiusScale: [8, 16],
+      palette: {
+        source: "curated-default",
+        background: "#FFFFFF",
+        surface: "#FFFFFF",
+        primary: "#222222",
+        accent: "#AA3366",
+        text: "#222222",
+        muted: "#555555",
+      },
+      imagePolicy: "labeled-native-fallback",
+      interactionPriorities: ["Details"],
+      readingDirection: "LTR",
+    };
+    const stages = [
+      {
+        title: "Stage one shell",
+        goal: "Build the committed shell",
+        logicalRefs: ["stage1-0"],
+        completionCriteria: ["The shell frame exists"],
+      },
+      {
+        title: "Stage two details",
+        goal: "Inspect the shell then add details",
+        logicalRefs: ["stage2-card"],
+        completionCriteria: ["The details frame exists"],
+      },
+      {
+        title: "Stage three finish",
+        goal: "Add the finishing frame",
+        logicalRefs: ["stage3-card"],
+        completionCriteria: ["The finishing frame exists"],
+      },
+    ];
+    const plan = call("plan_canvas_task", { brief, stages });
+    const stageOneCalls = Array.from({ length: 31 }, (_, index) =>
+      call("create_frame", {
+        ref: `stage1-${index}`,
+        name: `Stage one frame ${index}`,
+        parent: { kind: "page" },
+        size: { width: 60, height: 48 },
+      }),
+    );
+    const modelResponses: Array<{ text?: string; outputItems?: unknown[] }> = [
+      { outputItems: [call("get_document_context", {})] },
+      { outputItems: [plan] },
+      ...[0, 10, 20].map((offset) => ({ outputItems: stageOneCalls.slice(offset, offset + 10) })),
+      { outputItems: stageOneCalls.slice(30) },
+    ];
+    const harness = await createHarness({
+      chatResponder: () => {
+        const next = modelResponses.shift();
+        if (!next) throw new Error("No scripted three-stage response remains.");
+        return next;
+      },
+    });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const taskId = "three-stage-task-01";
+    const documentId = "file-test-56-page_current";
+    let task = ChatTaskSchema.parse({
+      version: 1,
+      id: taskId,
+      referenceScope: "task-v1",
+      documentId,
+      prompt: "Create a three-stage editable mobile layout.",
+      context: [],
+      stages: [],
+      ledger: [],
+      pending: [],
+      recent: [],
+      starts: [],
+      rounds: 0,
+      status: "ready",
+      text: "",
+    });
+    const fetcher: typeof fetch = (url, options) =>
+      fetch(`http://localhost:${harness.handle.port}${new URL(String(url)).pathname}`, {
+        ...options,
+        headers: { ...Object.fromEntries(new Headers(options?.headers)), Origin: "null" },
+      });
+    let requestNumber = 0;
+    let batchNumber = 0;
+    let saveNumber = 0;
+    let virtualNow = Date.now();
+    let committedStageOneCreates = 0;
+    let stopAfter31 = true;
+    let failStageThreeOnce = true;
+    const dependencies = (controller: AbortController) => ({
+      signal: controller.signal,
+      progress: () => {},
+      model: (input: Parameters<typeof streamAuthorizedChat>[3]) =>
+        streamAuthorizedChat(
+          token,
+          `three-stage-request-${++requestNumber}`,
+          "account-model",
+          input,
+          fetcher,
+          controller.signal,
+        ),
+      now: () => virtualNow,
+      wait: async (duration: number) => {
+        virtualNow += duration;
+      },
+      save: async (checkpoint: typeof task) => {
+        const saved = await handleChatTaskStorage(mock.api, {
+          type: "chat-task-save",
+          requestId: `three-stage-save-${++saveNumber}`,
+          documentId: checkpoint.documentId,
+          task: checkpoint,
+        });
+        expect(saved.success).toBe(true);
+      },
+      execute: async (operations: Parameters<Parameters<typeof runChatTask>[1]["execute"]>[0]) => {
+        const batchId = `three-stage-batch-${++batchNumber}`;
+        const rejected = operations.find(
+          (operation) =>
+            failStageThreeOnce &&
+            operation.action.tool === "create_frame" &&
+            operation.action.name === "Stage three card",
+        );
+        if (rejected) {
+          failStageThreeOnce = false;
+          return {
+            type: "tool-result",
+            protocolVersion: 1,
+            batchId,
+            success: false,
+            cancelled: false,
+            committedOperationIds: [],
+            partialOperationIds: [],
+            results: [
+              {
+                operationId: rejected.operationId,
+                success: false,
+                replayed: false,
+                error: "Simulated pre-commit stage-three write rejection.",
+              },
+            ],
+          } satisfies Extract<PluginToUIMessage, { type: "tool-result" }>;
+        }
+        const dispatch = UIToPluginSchema.parse(
+          JSON.parse(
+            JSON.stringify({ type: "tool-execute", protocolVersion: 1, batchId, operations }),
+          ),
+        );
+        if (dispatch.type !== "tool-execute") throw new Error("Invalid tool dispatch");
+        await executor(dispatch);
+        const response = [...messages]
+          .reverse()
+          .find((message) => message.type === "tool-result" && message.batchId === batchId);
+        if (!response || response.type !== "tool-result") throw new Error("Missing tool result");
+        const result = PluginToUISchema.parse(JSON.parse(JSON.stringify(response))) as Extract<
+          PluginToUIMessage,
+          { type: "tool-result" }
+        >;
+        if (stopAfter31) {
+          committedStageOneCreates += result.committedOperationIds.filter((id) =>
+            operations.some(
+              (operation) =>
+                operation.operationId === id &&
+                operation.action.tool === "create_frame" &&
+                operation.action.name.startsWith("Stage one frame "),
+            ),
+          ).length;
+          if (committedStageOneCreates === 31) {
+            stopAfter31 = false;
+            controller.abort();
+          }
+        }
+        return result;
+      },
+    });
+
+    const stopController = new AbortController();
+    await expect(runChatTask(task, dependencies(stopController))).rejects.toThrow("Stopped");
+    expect(task.status).toBe("stopped");
+    expect(chatTaskCommittedOperationCount(task)).toBe(31);
+    expect(mock.nodes).toHaveLength(31);
+    const committedNodeIds = mock.nodes.map((node) => node.id);
+    expect(modelResponses).toHaveLength(0);
+
+    const stoppedCheckpoint = await handleChatTaskStorage(mock.api, {
+      type: "chat-task-load",
+      requestId: "three-stage-load-stopped",
+    });
+    task = ChatTaskSchema.parse(stoppedCheckpoint.task);
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    modelResponses.push(
+      { outputItems: [call("complete_canvas_stage", { summary: "Shell committed" })] },
+      {
+        outputItems: [
+          call("inspect_nodes", {
+            refs: ["stage1-0"],
+            selection: false,
+            maxNodes: 999,
+            depth: 99,
+          }),
+        ],
+      },
+      {
+        outputItems: [
+          call("create_frame", {
+            ref: "stage2-card",
+            name: "Stage two card",
+            parent: { kind: "page" },
+            size: { width: 120, height: 80 },
+          }),
+        ],
+      },
+      { outputItems: [call("complete_canvas_stage", { summary: "Details committed" })] },
+      {
+        outputItems: [
+          call("create_frame", {
+            ref: "stage3-card",
+            name: "Stage three card",
+            parent: { kind: "page" },
+            size: { width: 120, height: 80 },
+          }),
+        ],
+      },
+    );
+    await expect(runChatTask(task, dependencies(new AbortController()))).rejects.toThrow(
+      "Simulated pre-commit stage-three write rejection.",
+    );
+    expect(task.status).toBe("failed");
+    expect(task.stages.map((stage) => stage.completed)).toEqual([true, true, false]);
+    expect(chatTaskCommittedOperationCount(task)).toBe(32);
+    expect(mock.nodes.filter((node) => node.name.startsWith("Stage one frame "))).toHaveLength(31);
+    expect(
+      mock.nodes.map((node) => node.id).filter((id) => committedNodeIds.includes(id)),
+    ).toHaveLength(31);
+    const normalizedInspection = task.ledger.find(
+      (entry) => entry.call.action.tool === "inspect_nodes" && entry.stage === 1,
+    );
+    expect(normalizedInspection?.call).toMatchObject({
+      normalizedInspectionParameters: true,
+      action: { maxNodes: 25, depth: 4 },
+    });
+    expect(task.validationCorrections).toBe(0);
+
+    const failedCheckpoint = await handleChatTaskStorage(mock.api, {
+      type: "chat-task-load",
+      requestId: "three-stage-load-failed",
+    });
+    task = ChatTaskSchema.parse(failedCheckpoint.task);
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const failedOperationId = task.ledger.find((entry) => entry.status === "failed")!.operationId;
+    modelResponses.push(
+      {
+        outputItems: [
+          call("create_frame", {
+            ref: "stage3-card",
+            name: "Stage three card",
+            parent: { kind: "page" },
+            size: { width: 120, height: 80 },
+          }),
+        ],
+      },
+      {
+        outputItems: [
+          call("complete_canvas_stage", {
+            summary: "Stage three repaired",
+            resolvedOperationIds: [failedOperationId],
+          }),
+        ],
+      },
+      { text: "All three stages completed.", outputItems: [] },
+    );
+    await runChatTask(task, dependencies(new AbortController()));
+    expect(task.status).toBe("completed");
+    expect(task.stages.every((stage) => stage.completed)).toBe(true);
+    expect(chatTaskCommittedOperationCount(task)).toBe(33);
+    expect(mock.nodes).toHaveLength(33);
+    expect(mock.nodes.filter((node) => node.name.startsWith("Stage one frame "))).toHaveLength(31);
+    expect(mock.nodes.filter((node) => node.name === "Stage two card")).toHaveLength(1);
+    expect(mock.nodes.filter((node) => node.name === "Stage three card")).toHaveLength(1);
+    expect(committedNodeIds.every((id) => mock.nodes.some((node) => node.id === id))).toBe(true);
+    expect(new Set(mock.nodes.map((node) => node.id)).size).toBe(33);
+    expect(task.validationCorrections).toBe(0);
+  }, 30_000);
 
   it("continues multiple Persian design calls across rounds until it returns user-facing text", async () => {
     const frameCall = {
@@ -318,15 +1245,36 @@ describe("loopback companion", () => {
     const malformed = {
       type: "function_call",
       call_id: "call_badargs_123",
-      name: "create_frame",
-      arguments: '{"private":"must not be echoed"}',
+      name: "create_rectangle",
+      arguments: JSON.stringify({
+        ref: "card",
+        name: "Card",
+        parent: { kind: "page" },
+        size: { width: 300, height: 200 },
+        fill: "rgba(1, 2, 3, 1)",
+        private: "must not be echoed",
+      }),
     };
-    const malformedHarness = await createHarness({ chatResponses: [{ outputItems: [malformed] }] });
+    const validSibling = {
+      type: "function_call",
+      call_id: "call_valid_12345",
+      name: "create_frame",
+      arguments: JSON.stringify({
+        ref: "another-card",
+        name: "Another card",
+        parent: { kind: "page" },
+        size: { width: 300, height: 200 },
+      }),
+    };
+    const malformedHarness = await createHarness({
+      chatResponses: [{ outputItems: [validSibling, malformed] }],
+    });
     const malformedToken = await authorizeAndDiscover(malformedHarness);
     await request(malformedHarness.handle, "/v1/smoke", {
       token: malformedToken,
       body: { model: "account-model" },
     });
+    const diagnostics = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const rejected = await request(malformedHarness.handle, "/v1/chat", {
       token: malformedToken,
       body: {
@@ -336,9 +1284,20 @@ describe("loopback companion", () => {
       },
     });
     const safeError = await rejected.text();
-    expect(safeError).toContain("response_invalid");
+    expect(safeError).toContain("event: tool_validation");
+    expect(safeError).not.toContain("event: tool_calls");
+    expect(safeError).toContain('"toolName":"create_rectangle"');
+    expect(safeError).toContain('"callId":"call_badargs_123"');
+    expect(safeError).toContain('"fieldPaths":["arguments.fill"]');
+    expect(safeError).toContain('"fieldPaths":["arguments.private"]');
     expect(safeError).not.toContain("must not be echoed");
     expect(safeError).not.toContain(malformed.arguments);
+    const log = String(diagnostics.mock.calls[0]?.[1]);
+    expect(log).toContain('"errorCode":"invalid_format"');
+    expect(log).toContain('"stage":"arguments_schema"');
+    expect(log).toContain('"fieldPaths":["arguments.fill"]');
+    expect(log).not.toContain("rgba(");
+    expect(log).not.toContain("must not be echoed");
   }, 20_000);
 
   it("aborts the upstream Responses stream when the chat client stops", async () => {
@@ -2362,6 +3321,12 @@ async function createHarness(
       incompleteReason?: string;
       omitCompletedOutput?: boolean;
     }>;
+    chatResponder?: (input: unknown[]) => {
+      text?: string;
+      outputItems?: unknown[];
+      incompleteReason?: string;
+      omitCompletedOutput?: boolean;
+    };
     responseChunks?: string[];
     responsesHttpError?: { status: number; body: unknown };
     responsesFetchFailure?: boolean;
@@ -2481,6 +3446,7 @@ async function createHarness(
         text?: unknown;
         tools?: unknown;
         tool_choice?: unknown;
+        input?: unknown[];
       };
       if (options.responsesFetchFailure) throw new TypeError("private transport failure text");
       if (options.stallDesignHeaders && JSON.parse(String(init?.body ?? "")).text) {
@@ -2554,7 +3520,8 @@ async function createHarness(
             { status: 200, headers: { "Content-Type": "text/event-stream" } },
           );
         }
-        const chatResponse = options.chatResponses?.shift() ?? { text: "OK", outputItems: [] };
+        const chatResponse = options.chatResponder?.(responsePayload.input ?? []) ??
+          options.chatResponses?.shift() ?? { text: "OK", outputItems: [] };
         if (chatResponse.incompleteReason) {
           return new Response(
             `data: ${JSON.stringify({

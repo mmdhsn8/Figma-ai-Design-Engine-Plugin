@@ -3,6 +3,16 @@ import { z } from "zod";
 const RefSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u);
 const OperationIdSchema = z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u);
 const ColorSchema = z.string().regex(/^#[0-9A-Fa-f]{6}$/u);
+const ShadowSchema = z
+  .object({
+    color: ColorSchema,
+    opacity: z.number().finite().min(0).max(1),
+    offsetX: z.number().finite().min(-100).max(100),
+    offsetY: z.number().finite().min(-100).max(100),
+    radius: z.number().finite().min(0).max(100),
+    spread: z.number().finite().min(-100).max(100),
+  })
+  .strict();
 const DimensionsSchema = z
   .object({
     width: z.number().finite().min(1).max(20_000),
@@ -47,15 +57,30 @@ const TextFontSchema = z
     style: z.string().min(1).max(80).default("Regular"),
   })
   .strict();
+export const INSPECT_NODES_LIMITS = {
+  refs: 20,
+  depth: { min: 0, max: 4, default: 2 },
+  maxNodes: { min: 1, max: 25, default: 25 },
+} as const;
 export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
   z.object({ tool: z.literal("get_document_context") }).strict(),
   z
     .object({
       tool: z.literal("inspect_nodes"),
-      refs: z.array(RefSchema).max(20).default([]),
+      refs: z.array(RefSchema).max(INSPECT_NODES_LIMITS.refs).default([]),
       selection: z.boolean().default(false),
-      depth: z.number().int().min(0).max(4).default(2),
-      maxNodes: z.number().int().min(1).max(25).default(25),
+      depth: z
+        .number()
+        .int()
+        .min(INSPECT_NODES_LIMITS.depth.min)
+        .max(INSPECT_NODES_LIMITS.depth.max)
+        .default(INSPECT_NODES_LIMITS.depth.default),
+      maxNodes: z
+        .number()
+        .int()
+        .min(INSPECT_NODES_LIMITS.maxNodes.min)
+        .max(INSPECT_NODES_LIMITS.maxNodes.max)
+        .default(INSPECT_NODES_LIMITS.maxNodes.default),
     })
     .strict()
     .refine(
@@ -73,10 +98,19 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
       y: z.number().finite().min(-100_000).max(100_000).optional(),
       fill: ColorSchema.optional(),
       stroke: ColorSchema.optional(),
+      strokeWeight: z.number().finite().min(0).max(100).optional(),
       cornerRadius: z.number().finite().min(0).max(500).default(0),
+      paintStyleId: z.string().min(1).max(100).optional(),
+      opacity: z.number().finite().min(0).max(1).optional(),
+      shadow: ShadowSchema.optional(),
+      clipsContent: z.boolean().optional(),
       autoLayout: LayoutSchema.optional(),
     })
-    .strict(),
+    .strict()
+    .refine(
+      (value) => !(value.fill && value.paintStyleId),
+      "Choose a fill color or a local paint style.",
+    ),
   z
     .object({
       tool: z.literal("create_text"),
@@ -88,10 +122,13 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
       font: TextFontSchema.default({ family: "Inter", style: "Regular" }),
       fontSize: z.number().finite().min(1).max(300).default(16),
       color: ColorSchema.default("#1F2937"),
-      align: z.enum(["LEFT", "CENTER", "RIGHT"]).optional(),
+      align: z.enum(["LEFT", "CENTER", "RIGHT", "JUSTIFIED"]).optional(),
       direction: z.enum(["LTR", "RTL"]).default("LTR"),
       horizontalSizing: z.enum(["FIXED", "HUG", "FILL"]).default("FIXED"),
       verticalSizing: z.enum(["FIXED", "HUG", "FILL"]).default("HUG"),
+      lineHeight: z.number().finite().min(1).max(1_000).optional(),
+      letterSpacing: z.number().finite().min(-1_000).max(1_000).optional(),
+      textAutoResize: z.enum(["NONE", "HEIGHT", "WIDTH_AND_HEIGHT", "TRUNCATE"]).default("HEIGHT"),
     })
     .strict(),
   z
@@ -103,12 +140,19 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
       size: DimensionsSchema,
       x: z.number().finite().min(-100_000).max(100_000).optional(),
       y: z.number().finite().min(-100_000).max(100_000).optional(),
-      fill: ColorSchema.default("#FFFFFF"),
+      fill: ColorSchema.optional(),
       stroke: ColorSchema.optional(),
       strokeWeight: z.number().finite().min(0).max(100).default(1),
       cornerRadius: z.number().finite().min(0).max(500).default(0),
+      opacity: z.number().finite().min(0).max(1).optional(),
+      paintStyleId: z.string().min(1).max(100).optional(),
+      shadow: ShadowSchema.optional(),
     })
-    .strict(),
+    .strict()
+    .refine(
+      (value) => !(value.fill && value.paintStyleId),
+      "Choose a fill color or a local paint style.",
+    ),
   z
     .object({
       tool: z.literal("set_auto_layout"),
@@ -133,10 +177,39 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
           fontSize: z.number().finite().min(1).max(300).optional(),
           color: ColorSchema.optional(),
           textStyleId: z.string().min(1).max(100).optional(),
-          align: z.enum(["LEFT", "CENTER", "RIGHT"]).optional(),
+          align: z.enum(["LEFT", "CENTER", "RIGHT", "JUSTIFIED"]).optional(),
+          stroke: ColorSchema.optional(),
+          strokeWeight: z.number().finite().min(0).max(100).optional(),
+          cornerRadius: z.number().finite().min(0).max(500).optional(),
+          opacity: z.number().finite().min(0).max(1).optional(),
+          shadow: ShadowSchema.optional(),
+          fontFamily: z.string().min(1).max(80).optional(),
+          fontStyle: z.string().min(1).max(80).optional(),
+          lineHeight: z.number().finite().min(1).max(1_000).optional(),
+          letterSpacing: z.number().finite().min(-1_000).max(1_000).optional(),
+          textAutoResize: z.enum(["NONE", "HEIGHT", "WIDTH_AND_HEIGHT", "TRUNCATE"]).optional(),
         })
         .strict()
-        .refine((value) => Object.keys(value).length > 0, "At least one property is required."),
+        .refine((value) => Object.keys(value).length > 0, "At least one property is required.")
+        .refine(
+          (value) => !(value.fill && value.paintStyleId),
+          "Choose a fill color or a local paint style.",
+        )
+        .refine(
+          (value) =>
+            !value.textStyleId ||
+            ![
+              value.fontSize,
+              value.color,
+              value.fontFamily,
+              value.fontStyle,
+              value.lineHeight,
+              value.letterSpacing,
+              value.align,
+              value.textAutoResize,
+            ].some((entry) => entry !== undefined),
+          "Choose a text style or explicit typography changes.",
+        ),
     })
     .strict(),
   z.object({ tool: z.literal("append_child"), childRef: RefSchema, parentRef: RefSchema }).strict(),
@@ -155,6 +228,11 @@ export const FigmaToolOperationSchema = z
   .object({
     operationId: OperationIdSchema,
     idempotencyKey: z.string().regex(/^[A-Za-z0-9._:-]{8,120}$/u),
+    taskId: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{8,60}$/u)
+      .optional(),
+    expectedCreationOperationId: OperationIdSchema.optional(),
     action: FigmaToolActionSchema,
   })
   .strict();

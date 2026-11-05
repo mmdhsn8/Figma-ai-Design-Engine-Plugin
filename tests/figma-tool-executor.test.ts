@@ -9,196 +9,7 @@ import { ChatTaskSchema } from "../src/shared/chat-task";
 import { runChatTask } from "../src/ui/chat-task";
 import type { AuthorizedChatTurn } from "../src/ui/companion-client";
 
-type MockNode = SceneNode & {
-  children: MockNode[];
-  pluginData: Map<string, string>;
-  parent: MockNode | PageNode | null;
-  appendChild(node: MockNode): void;
-  remove(): void;
-  removed: boolean;
-  [key: string]: unknown;
-};
-
-function createMockApi() {
-  const roots: MockNode[] = [];
-  const nodes: MockNode[] = [];
-  const storage = new Map<string, unknown>();
-  const rootData = new Map<string, string>();
-  const paintStyles = [
-    { id: "paint-token-brand", name: "Color/Brand", paints: [] },
-  ] as unknown as PaintStyle[];
-  const textStyles = [
-    { id: "text-token-heading", name: "Typography/Heading" },
-  ] as unknown as TextStyle[];
-  let nextId = 1;
-  const detach = (node: MockNode) => {
-    if (!node.parent) return;
-    if (node.parent.type === "PAGE") {
-      const page = node.parent as unknown as { children: MockNode[] };
-      const index = page.children.indexOf(node);
-      if (index >= 0) page.children.splice(index, 1);
-    } else {
-      const parent = node.parent as MockNode;
-      const index = parent.children.indexOf(node);
-      if (index >= 0) parent.children.splice(index, 1);
-    }
-    node.parent = null;
-  };
-  const page = {
-    id: "page:current",
-    name: "Current Page",
-    type: "PAGE",
-    children: roots,
-    selection: [] as MockNode[],
-    findAll(predicate: (node: SceneNode) => boolean = () => true) {
-      const result: MockNode[] = [];
-      const visit = (node: MockNode) => {
-        if (predicate(node)) result.push(node);
-        node.children.forEach(visit);
-      };
-      roots.forEach(visit);
-      return result;
-    },
-    appendChild(node: MockNode) {
-      detach(node);
-      roots.push(node);
-      node.parent = page as unknown as PageNode;
-    },
-  };
-  const makeNode = (type: string): MockNode => {
-    const node = {
-      id: `mock:${nextId++}`,
-      type,
-      name: "",
-      x: 0,
-      y: 0,
-      width: 100,
-      height: 100,
-      visible: true,
-      fills: [] as readonly Paint[],
-      strokes: [] as readonly Paint[],
-      strokeWeight: 1,
-      cornerRadius: 0,
-      layoutMode: "NONE",
-      primaryAxisSizingMode: "FIXED",
-      counterAxisSizingMode: "FIXED",
-      primaryAxisAlignItems: "MIN",
-      counterAxisAlignItems: "MIN",
-      itemSpacing: 0,
-      paddingTop: 0,
-      paddingRight: 0,
-      paddingBottom: 0,
-      paddingLeft: 0,
-      layoutAlign: "INHERIT",
-      layoutGrow: 0,
-      layoutSizingHorizontal: "FIXED",
-      layoutSizingVertical: "FIXED",
-      fontName: { family: "Inter", style: "Regular" },
-      fontSize: 16,
-      characters: "",
-      textAutoResize: "HEIGHT",
-      textAlignHorizontal: "LEFT",
-      children: [] as MockNode[],
-      parent: null as MockNode | PageNode | null,
-      removed: false,
-      pluginData: new Map<string, string>(),
-      get absoluteRenderBounds() {
-        return { x: node.x, y: node.y, width: node.width, height: node.height };
-      },
-      get absoluteBoundingBox() {
-        return { x: node.x, y: node.y, width: node.width, height: node.height };
-      },
-      get absoluteTransform() {
-        return [
-          [1, 0, node.x],
-          [0, 1, node.y],
-        ] as Transform;
-      },
-      resize(width: number, height: number) {
-        const mutable = node as unknown as { width: number; height: number };
-        mutable.width = width;
-        mutable.height = height;
-      },
-      appendChild(child: MockNode) {
-        detach(child);
-        node.children.push(child);
-        (child as unknown as { parent: MockNode | PageNode | null }).parent =
-          node as unknown as MockNode;
-      },
-      remove() {
-        [...node.children].forEach((child) => child.remove());
-        detach(node);
-        node.removed = true;
-      },
-      getPluginData(key: string) {
-        return node.pluginData.get(key) ?? "";
-      },
-      setPluginData(key: string, value: string) {
-        node.pluginData.set(key, value);
-      },
-      async setFillStyleIdAsync(id: string) {
-        (node as unknown as Record<string, unknown>).fillStyleId = id;
-      },
-      async setTextStyleIdAsync(id: string) {
-        (node as unknown as Record<string, unknown>).textStyleId = id;
-      },
-    } as unknown as MockNode;
-    nodes.push(node);
-    roots.push(node);
-    node.parent = page as unknown as PageNode;
-    return node;
-  };
-  const root = {
-    getPluginData: (key: string) => rootData.get(key) ?? "",
-    setPluginData: (key: string, value: string) => rootData.set(key, value),
-  };
-  const api = {
-    fileKey: "file-test-56",
-    mixed: Symbol("mixed"),
-    root,
-    currentPage: page,
-    viewport: { center: { x: 500, y: 400 }, scrollAndZoomIntoView() {} },
-    clientStorage: {
-      getAsync: async (key: string) => storage.get(key),
-      setAsync: async (key: string, value: unknown) => void storage.set(key, value),
-    },
-    getNodeByIdAsync: async (id: string) =>
-      nodes.find((node) => node.id === id && !node.removed) ?? null,
-    createFrame: () => makeNode("FRAME") as unknown as FrameNode,
-    createRectangle: () => makeNode("RECTANGLE") as unknown as RectangleNode,
-    createText: () => makeNode("TEXT") as unknown as TextNode,
-    listAvailableFontsAsync: async () => [
-      { fontName: { family: "Inter", style: "Regular" } },
-      { fontName: { family: "Arial", style: "Regular" } },
-    ],
-    loadFontAsync: async () => undefined,
-    getLocalPaintStylesAsync: async () => paintStyles,
-    getLocalTextStylesAsync: async () => textStyles,
-    variables: {
-      getLocalVariablesAsync: async () => [],
-      getLocalVariableCollectionsAsync: async () => [],
-    },
-    commitUndo: () => undefined,
-  } as unknown as PluginAPI;
-  const otherPage = {
-    ...page,
-    id: "page:other",
-    name: "Other Page",
-    children: [] as MockNode[],
-    selection: [] as MockNode[],
-  };
-  return {
-    api,
-    page,
-    nodes,
-    roots,
-    storage,
-    switchCurrentPage: () => {
-      (api as unknown as { currentPage: PageNode }).currentPage = otherPage as unknown as PageNode;
-    },
-    find: (name: string) => page.findAll((node) => node.name === name)[0] as MockNode | undefined,
-  };
-}
+import { createMockApi, type MockNode } from "./figma-mock";
 
 function operation(operationId: string, action: unknown) {
   return FigmaToolOperationSchema.parse({
@@ -230,6 +41,500 @@ function resultFor(messages: PluginToUIMessage[], batchId: string) {
 }
 
 describe("safe Figma tool executor", () => {
+  it("isolates store/header across tasks, reuses confirmed nodes after reload, and edits only inspected foreign refs", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const create = (taskId: string, id: string, ref: string, parent?: string) => ({
+      ...operation(id, {
+        tool: "create_frame",
+        ref,
+        name: `${taskId}-${ref}`,
+        parent: parent ? { kind: "node", ref: parent } : { kind: "page" },
+        size: { width: 390, height: 844 },
+      }),
+      taskId,
+    });
+    const first = await run(executor, [
+      create("task-first-0001", "first-store-0001", "store"),
+      create("task-first-0001", "first-header-001", "header", "store"),
+    ]);
+    expect(resultFor(messages, first)).toMatchObject({ success: true });
+    const firstHeader = mock.find("task-first-0001-header")!;
+    const originalRef = firstHeader.getPluginData("fad.tool.logical-ref.v1");
+    expect(originalRef).toMatch(/^task-/u);
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const repeated = await run(executor, [
+      create("task-first-0001", "repeat-header-001", "header", "store"),
+    ]);
+    expect(resultFor(messages, repeated)).toMatchObject({
+      success: true,
+      committedOperationIds: [],
+      results: [{ replayed: true, logicalRef: originalRef, data: { reused: true } }],
+    });
+    expect(mock.nodes).toHaveLength(2);
+    expect(firstHeader.name).toBe("task-first-0001-header");
+    expect(firstHeader.width).toBe(390);
+    const second = await run(executor, [
+      create("task-second-001", "second-store-001", "store"),
+      create("task-second-001", "second-header-01", "header", "store"),
+    ]);
+    expect(resultFor(messages, second)).toMatchObject({ success: true });
+    expect(mock.nodes).toHaveLength(4);
+    expect(mock.find("task-second-001-header")!.getPluginData("fad.tool.logical-ref.v1")).not.toBe(
+      originalRef,
+    );
+
+    const edit = {
+      ...operation("followup-edit-001", {
+        tool: "set_properties",
+        ref: originalRef,
+        properties: { name: "Edited original header" },
+      }),
+      taskId: "task-followup-01",
+    };
+    const blocked = await run(executor, [edit]);
+    expect(resultFor(messages, blocked)).toMatchObject({
+      success: false,
+      results: [{ data: { referenceResolution: { code: "inspection_required" } } }],
+    });
+    const inspected = await run(executor, [
+      {
+        ...operation("followup-inspect1", {
+          tool: "inspect_nodes",
+          refs: [originalRef],
+          selection: false,
+        }),
+        taskId: "task-followup-01",
+      },
+    ]);
+    expect(resultFor(messages, inspected)).toMatchObject({ success: true });
+    const edited = await run(executor, [edit]);
+    expect(resultFor(messages, edited)).toMatchObject({ success: true });
+    expect(firstHeader.name).toBe("Edited original header");
+    expect(mock.find("task-second-001-header")!.name).toBe("task-second-001-header");
+    expect(mock.nodes).toHaveLength(4);
+  });
+
+  it("returns bounded canonical candidates when persisted current-task aliases are ambiguous", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const created = await run(executor, [
+      {
+        ...operation("candidate-store-001", {
+          tool: "create_frame",
+          ref: "store",
+          name: "Store",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+        }),
+        taskId: "candidate-task-01",
+      },
+    ]);
+    const creation = resultFor(messages, created);
+    expect(creation?.type).toBe("tool-result");
+    if (creation?.type !== "tool-result") throw new Error("Missing create result");
+    const canonicalRef = creation.results[0]?.logicalRef;
+    expect(canonicalRef).toBeDefined();
+    const persisted = [...mock.storage.values()].find(
+      (value) => typeof value === "object" && value !== null && "refs" in value,
+    ) as {
+      refs: Record<
+        string,
+        {
+          nodeId: string;
+          pageId: string;
+          parentId?: string;
+          nodeType?: string;
+          creationFingerprint?: string;
+          taskId?: string;
+          alias?: string;
+          creationOperationId?: string;
+        }
+      >;
+      operations: Record<string, unknown>;
+    };
+    const secondNode = mock.api.createFrame();
+    secondNode.name = "Second candidate";
+    secondNode.setPluginData("fad.tool.logical-ref.v1", "task-second-candidate");
+    secondNode.setPluginData("fad.tool.task-id.v1", "candidate-task-01");
+    secondNode.setPluginData("fad.tool.operation-id.v1", "candidate-store-002");
+    secondNode.setPluginData("fad.tool.operation-fingerprint.v1", "a".repeat(32));
+    persisted.refs["task-second-candidate"] = {
+      nodeId: secondNode.id,
+      pageId: "page:current",
+      parentId: "page:current",
+      nodeType: "FRAME",
+      creationFingerprint: "a".repeat(32),
+      taskId: "candidate-task-01",
+      alias: "store",
+      creationOperationId: "candidate-store-002",
+    };
+    persisted.operations["candidate-store-002"] = {
+      operationId: "candidate-store-002",
+      taskId: "candidate-task-01",
+      creationRef: "task-second-candidate",
+      idempotencyKey: "idem:candidate-store-002",
+      fingerprint: "a".repeat(32),
+      status: "completed",
+      updatedAt: Date.now(),
+      result: {
+        operationId: "candidate-store-002",
+        success: true,
+        replayed: false,
+        logicalRef: "task-second-candidate",
+      },
+    };
+
+    const ambiguous = await run(executor, [
+      {
+        ...operation("candidate-edit-001", {
+          tool: "set_properties",
+          ref: "store",
+          properties: { name: "Must not guess" },
+        }),
+        taskId: "candidate-task-01",
+      },
+    ]);
+    expect(resultFor(messages, ambiguous)).toMatchObject({
+      success: false,
+      results: [
+        {
+          data: {
+            referenceResolution: {
+              code: "ambiguous",
+              candidateCount: 2,
+              candidates: [
+                { canonicalRef, provenance: "current_task_alias" },
+                { canonicalRef: "task-second-candidate", provenance: "current_task_alias" },
+              ],
+              alternatives: expect.arrayContaining([
+                "inspect_nodes one listed canonical ref at a time",
+              ]),
+            },
+          },
+        },
+      ],
+    });
+    const inspectCandidate = await run(executor, [
+      {
+        ...operation("candidate-inspect-001", {
+          tool: "inspect_nodes",
+          refs: ["task-second-candidate"],
+          selection: false,
+        }),
+        taskId: "candidate-task-01",
+      },
+    ]);
+    expect(resultFor(messages, inspectCandidate)).toMatchObject({ success: true });
+    expect(mock.nodes[0]?.name).toBe("Store");
+  });
+
+  it("fails closed when a persisted node was moved outside an authorized reparent operation", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const created = await run(executor, [
+      {
+        ...operation("move-root-a-001", {
+          tool: "create_frame",
+          ref: "root-a",
+          name: "Root A",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+        }),
+        taskId: "moved-task-0001",
+      },
+      {
+        ...operation("move-root-b-001", {
+          tool: "create_frame",
+          ref: "root-b",
+          name: "Root B",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+        }),
+        taskId: "moved-task-0001",
+      },
+      {
+        ...operation("move-child-001", {
+          tool: "create_text",
+          ref: "child",
+          name: "Child",
+          parent: { kind: "node", ref: "root-a" },
+          text: "Keep me",
+          size: { width: 100, height: 32 },
+        }),
+        taskId: "moved-task-0001",
+      },
+    ]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const canonicalRef = resultFor(messages, created);
+    if (canonicalRef?.type !== "tool-result") throw new Error("Missing creation result");
+    const childRef = canonicalRef.results[2]?.logicalRef;
+    const child = mock.find("Child")!;
+    const state = [...mock.storage.values()].find(
+      (value) => typeof value === "object" && value !== null && "refs" in value,
+    ) as {
+      refs: Record<string, { creationFingerprint?: string }>;
+    };
+    const fingerprint = state.refs[childRef!]?.creationFingerprint;
+    expect(fingerprint).toBeDefined();
+    child.setPluginData("fad.tool.operation-fingerprint.v1", "f".repeat(32));
+    const tampered = await run(executor, [
+      {
+        ...operation("move-child-tamper-001", {
+          tool: "set_properties",
+          ref: childRef,
+          properties: { text: "Must not change" },
+        }),
+        taskId: "moved-task-0001",
+      },
+    ]);
+    expect(resultFor(messages, tampered)).toMatchObject({
+      success: false,
+      results: [{ data: { referenceResolution: { code: "stale" } } }],
+    });
+    child.setPluginData("fad.tool.operation-fingerprint.v1", fingerprint!);
+    mock.find("Root B")!.appendChild(child);
+
+    const edited = await run(executor, [
+      {
+        ...operation("move-child-edit-001", {
+          tool: "set_properties",
+          ref: childRef,
+          properties: { text: "Must not change" },
+        }),
+        taskId: "moved-task-0001",
+      },
+    ]);
+    expect(resultFor(messages, edited)).toMatchObject({
+      success: false,
+      results: [{ data: { referenceResolution: { code: "stale" } } }],
+    });
+    expect(child.characters).toBe("Keep me");
+    expect(child.parent?.id).toBe(mock.find("Root B")?.id);
+  });
+
+  it("updates the persisted parent identity after an authorized reparent commits", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const taskId = "reparent-task-01";
+    const created = await run(executor, [
+      {
+        ...operation("reparent-root-a-01", {
+          tool: "create_frame",
+          ref: "root-a",
+          name: "Root A",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+        }),
+        taskId,
+      },
+      {
+        ...operation("reparent-root-b-01", {
+          tool: "create_frame",
+          ref: "root-b",
+          name: "Root B",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+        }),
+        taskId,
+      },
+      {
+        ...operation("reparent-child-01", {
+          tool: "create_text",
+          ref: "child",
+          name: "Movable child",
+          parent: { kind: "node", ref: "root-a" },
+          text: "Original content",
+          size: { width: 180, height: 32 },
+        }),
+        taskId,
+      },
+    ]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const child = mock.find("Movable child")!;
+    const rootB = mock.find("Root B")!;
+    const moved = await run(executor, [
+      {
+        ...operation("reparent-child-02", {
+          tool: "reparent_node",
+          ref: "child",
+          parentRef: "root-b",
+        }),
+        taskId,
+      },
+    ]);
+    expect(resultFor(messages, moved)).toMatchObject({ success: true });
+    expect(child.parent?.id).toBe(rootB.id);
+    const state = [...mock.storage.values()].find(
+      (value) => typeof value === "object" && value !== null && "refs" in value,
+    ) as {
+      refs: Record<string, { taskId?: string; alias?: string; nodeId: string; parentId?: string }>;
+    };
+    const childEntry = Object.values(state.refs).find(
+      (entry) => entry.taskId === taskId && entry.alias === "child",
+    );
+    const rootBEntry = Object.values(state.refs).find(
+      (entry) => entry.taskId === taskId && entry.alias === "root-b",
+    );
+    expect(childEntry?.parentId).toBe(rootBEntry?.nodeId);
+
+    const edited = await run(executor, [
+      {
+        ...operation("reparent-child-edit-01", {
+          tool: "set_properties",
+          ref: "child",
+          properties: { text: "Edited after authorized move" },
+        }),
+        taskId,
+      },
+    ]);
+    expect(resultFor(messages, edited)).toMatchObject({ success: true });
+    expect(child.characters).toBe("Edited after authorized move");
+  });
+
+  it("fails closed for deleted, ambiguous and unconfirmed task refs instead of recreating them", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const create = (id: string, ref: string) => ({
+      ...operation(id, {
+        tool: "create_frame",
+        ref,
+        name: ref,
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+      }),
+      taskId: "task-uncertain-01",
+    });
+    await run(executor, [create("uncertain-store1", "store")]);
+    const node = mock.find("store")!;
+    node.remove();
+    const stale = await run(executor, [create("uncertain-store2", "store")]);
+    expect(resultFor(messages, stale)).toMatchObject({
+      success: false,
+      results: [{ data: { referenceResolution: { code: "stale" } } }],
+    });
+    expect(mock.nodes).toHaveLength(1);
+
+    await run(executor, [create("uncertain-headr1", "header")]);
+    const header = mock.find("header")!;
+    const copied = mock.api.createFrame();
+    copied.setPluginData(
+      "fad.tool.logical-ref.v1",
+      header.getPluginData("fad.tool.logical-ref.v1"),
+    );
+    const ambiguous = await run(executor, [create("uncertain-headr2", "header")]);
+    expect(resultFor(messages, ambiguous)).toMatchObject({
+      success: false,
+      results: [{ data: { referenceResolution: { code: "ambiguous" } } }],
+    });
+
+    await run(executor, [create("uncertain-footer1", "footer")]);
+    const key = [...mock.storage.keys()][0]!;
+    const state = mock.storage.get(key) as {
+      operations: Record<string, { status: string }>;
+      refs: Record<string, { alias?: string }>;
+    };
+    state.operations["uncertain-footer1"]!.status = "running";
+    const footerRef = Object.keys(state.refs).find((ref) => state.refs[ref]?.alias === "footer")!;
+    delete state.refs[footerRef];
+    const interrupted = await run(executor, [create("uncertain-footer2", "footer")]);
+    expect(resultFor(messages, interrupted)).toMatchObject({
+      success: false,
+      results: [{ data: { referenceResolution: { code: "unconfirmed_creation" } } }],
+    });
+    const recovered = await run(executor, [create("uncertain-footer1", "footer")]);
+    expect(resultFor(messages, recovered)).toMatchObject({
+      success: true,
+      results: [{ replayed: true }],
+    });
+  });
+
+  it("retains legacy reservations but namespaces a new task using the same generic store ref", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const action = {
+      tool: "create_frame",
+      ref: "store",
+      name: "Legacy store",
+      parent: { kind: "page" },
+      size: { width: 390, height: 844 },
+    };
+    await run(executor, [operation("legacy-store-001", action)]);
+    const collision = await run(executor, [operation("legacy-store-002", action)]);
+    expect(resultFor(messages, collision)).toMatchObject({
+      success: false,
+      results: [{ data: { referenceResolution: { code: "reserved_by_other_or_legacy_task" } } }],
+    });
+    const scoped = await run(executor, [
+      { ...operation("scoped-store-001", action), taskId: "task-scoped-001" },
+    ]);
+    expect(resultFor(messages, scoped)).toMatchObject({ success: true });
+    expect(mock.nodes).toHaveLength(2);
+    expect(mock.nodes[0]!.getPluginData("fad.tool.logical-ref.v1")).toBe("store");
+  });
+
+  it("does not recreate a checkpointed creation when the executor registry is missing", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const batch = await run(executor, [
+      {
+        ...operation("checkpoint-store-02", {
+          tool: "create_frame",
+          ref: "store",
+          name: "Store",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+        }),
+        taskId: "task-checkpoint1",
+        expectedCreationOperationId: "checkpoint-store-01",
+      },
+    ]);
+    expect(resultFor(messages, batch)).toMatchObject({
+      success: false,
+      results: [{ data: { referenceResolution: { code: "checkpoint_registry_conflict" } } }],
+    });
+    expect(mock.nodes).toHaveLength(0);
+  });
+
+  it("reuses a legacy task node only with a matching confirmed same-task creation ID", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const action = {
+      tool: "create_frame",
+      ref: "store",
+      name: "Store",
+      parent: { kind: "page" },
+      size: { width: 390, height: 844 },
+    };
+    await run(executor, [operation("chat-legacy-001-op-1", action)]);
+    const reused = await run(executor, [
+      {
+        ...operation("chat-legacy-001-op-2", action),
+        expectedCreationOperationId: "chat-legacy-001-op-1",
+      },
+    ]);
+    expect(resultFor(messages, reused)).toMatchObject({
+      success: true,
+      results: [{ replayed: true, data: { reused: true } }],
+    });
+    const foreign = await run(executor, [
+      {
+        ...operation("chat-foreign-01-op-1", action),
+        expectedCreationOperationId: "chat-legacy-001-op-1",
+      },
+    ]);
+    expect(resultFor(messages, foreign)).toMatchObject({ success: false });
+    expect(mock.nodes).toHaveLength(1);
+  });
+
   it("progressively executes a planned Persian storefront through the real executor, waits for capacity, and reconciles a lost result", async () => {
     const mock = createMockApi();
     const messages: PluginToUIMessage[] = [];
@@ -272,6 +577,7 @@ describe("safe Figma tool executor", () => {
           parent: { kind: "node", ref: container ? `${prefix}-${index - 1}` : "storefront-page" },
           text: `فروشگاه لباس ${index}`,
           size: { width: 340, height: 44 },
+          color: prefix === "purchase" ? "#FFFFFF" : "#1F2937",
           direction: "RTL",
           align: "RIGHT",
         });
@@ -286,15 +592,44 @@ describe("safe Figma tool executor", () => {
     const finishStage = () =>
       toolTurn("complete_canvas_stage", { summary: "Confirmed native section" });
     const turns: AuthorizedChatTurn[] = [
+      toolTurn("get_document_context", {}),
       toolTurn("plan_canvas_task", {
+        brief: {
+          platform: "mobile",
+          viewport: { width: 390, height: 844 },
+          brandDirection: "مدرن و مینیمال",
+          audience: "خریداران پوشاک",
+          content: ["هدر", "جست‌وجو", "دسته‌بندی", "محصولات", "خرید"],
+          hierarchy: "عنوان برجسته و قیمت خوانا",
+          typography: { family: "Arial", style: "Regular", headingSize: 28, bodySize: 14 },
+          spacingScale: [8, 12, 16, 24],
+          radiusScale: [12, 16, 20],
+          palette: {
+            source: "curated-default",
+            background: "#FBF7F4",
+            surface: "#FFFFFF",
+            primary: "#9B3F62",
+            accent: "#D4A373",
+            text: "#241B20",
+            muted: "#675D63",
+          },
+          imagePolicy: "labeled-native-fallback",
+          interactionPriorities: ["خرید محصول"],
+          readingDirection: "RTL",
+        },
         stages: [
-          "صفحه",
-          "هدر و ناوبری",
-          "جست‌وجو",
-          "دسته‌بندی‌ها",
-          "کارت محصولات",
-          "دکمه‌های خرید",
-        ],
+          ["صفحه", "storefront-page"],
+          ["هدر و ناوبری", "header-0"],
+          ["جست‌وجو", "search-0"],
+          ["دسته‌بندی‌ها", "category-0"],
+          ["کارت محصولات", "product-a-0", "product-b-0"],
+          ["دکمه‌های خرید", "purchase-0"],
+        ].map(([title, ...logicalRefs]) => ({
+          title: title!,
+          goal: `ساخت ${title}`,
+          logicalRefs: logicalRefs!,
+          completionCriteria: [`${title} در فیگما قابل ویرایش باشد`],
+        })),
       }),
       toolTurn("create_frame", {
         ref: "storefront-page",
@@ -320,6 +655,7 @@ describe("safe Figma tool executor", () => {
     const current = ChatTaskSchema.parse({
       version: 1,
       id: "storefront-task-0001",
+      referenceScope: "task-v1",
       documentId: "file-test-56-page_current",
       prompt:
         "یک صفحه موبایل فروشگاه لباس با هدر، جست‌وجو، دسته‌بندی‌ها، کارت محصولات و دکمه‌های خرید بساز",
@@ -336,13 +672,17 @@ describe("safe Figma tool executor", () => {
     const batches: ReturnType<typeof operation>[][] = [];
     let clock = Date.now();
     const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
-    let loseResult = true;
+    let lostOperationIds: string[] | undefined;
+    let activeTask = current;
     const waits: number[] = [];
     const deps = {
       signal: new AbortController().signal,
       model: async () => {
         const turn = turns.shift();
-        if (!turn) throw new Error("No scripted storefront turn");
+        if (!turn)
+          throw new Error(
+            `No scripted storefront turn at round ${activeTask.rounds}; remaining turns ${turns.length}; pending ${JSON.stringify(activeTask.pending.map(({ action }) => action.tool))}; recent ${JSON.stringify(activeTask.recent.slice(-2))}; stages ${JSON.stringify(activeTask.stages.map(({ title, completed, verified, operations, qaAttempts }) => ({ title, completed, verified, operations, qaAttempts })))}; QA ${JSON.stringify(activeTask.ledger.filter(({ call }) => call.action.tool === "inspect_nodes").map(({ stage, output }) => ({ stage, output })))}; ledger ${activeTask.ledger.length}`,
+          );
         return turn;
       },
       save: async () => {},
@@ -356,8 +696,8 @@ describe("safe Figma tool executor", () => {
         const batchId = await run(executor, operations);
         const result = resultFor(messages, batchId);
         if (result?.type !== "tool-result") throw new Error("Missing confirmation");
-        if (loseResult) {
-          loseResult = false;
+        if (!lostOperationIds && operations.some((item) => item.action.tool === "create_frame")) {
+          lostOperationIds = operations.map((item) => item.operationId);
           throw new Error("Simulated lost UI acknowledgement");
         }
         return result;
@@ -365,9 +705,14 @@ describe("safe Figma tool executor", () => {
     };
     try {
       await expect(runChatTask(current, deps)).rejects.toThrow("Simulated lost UI acknowledgement");
+      expect(current.pending.map(({ action }) => action.tool)).toEqual(["create_frame"]);
+      expect(turns).toHaveLength(13);
       expect(mock.nodes).toHaveLength(1);
       executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
-      await runChatTask(ChatTaskSchema.parse(JSON.parse(JSON.stringify(current))), deps);
+      const restored = ChatTaskSchema.parse(JSON.parse(JSON.stringify(current)));
+      activeTask = restored;
+      expect(restored.pending.map(({ action }) => action.tool)).toEqual(["create_frame"]);
+      await runChatTask(restored, deps);
       expect(mock.nodes).toHaveLength(43);
       expect(mock.find("فروشگاه لباس")).toMatchObject({ type: "FRAME", width: 390, height: 844 });
       expect(mock.find("product-a 0")).toMatchObject({ type: "FRAME" });
@@ -376,7 +721,12 @@ describe("safe Figma tool executor", () => {
         type: "TEXT",
         characters: "فروشگاه لباس 1",
       });
-      expect(batches[0]).toEqual(batches[1]);
+      const replay = batches.findIndex(
+        (batch, index) => index > 0 && batch[0]?.operationId === lostOperationIds?.[0],
+      );
+      expect(batches[replay]).toEqual(
+        batches.find((batch) => batch.some((item) => item.operationId === lostOperationIds?.[0])),
+      );
       expect(batches.every((batch) => batch.length <= 3)).toBe(true);
       expect(waits.length).toBeGreaterThan(0);
       expect(
@@ -622,6 +972,18 @@ describe("safe Figma tool executor", () => {
         parent: { kind: "page" },
         size: { width: 390, height: 844 },
         fill: "#F8FAFC",
+        stroke: "#D1D5DB",
+        strokeWeight: 1,
+        opacity: 0.98,
+        shadow: {
+          color: "#111827",
+          opacity: 0.12,
+          offsetX: 0,
+          offsetY: 6,
+          radius: 16,
+          spread: 0,
+        },
+        clipsContent: true,
         autoLayout: {
           direction: "vertical",
           gap: 16,
@@ -639,6 +1001,9 @@ describe("safe Figma tool executor", () => {
         font: { family: "Unavailable Persian Font", style: "Regular" },
         direction: "RTL",
         fontSize: 24,
+        lineHeight: 32,
+        letterSpacing: 0.2,
+        textAutoResize: "HEIGHT",
         horizontalSizing: "FILL",
         verticalSizing: "HUG",
       }),
@@ -649,7 +1014,18 @@ describe("safe Figma tool executor", () => {
         parent: { kind: "node", ref: "mobile-frame" },
         size: { width: 200, height: 48 },
         fill: "#6841D8",
+        stroke: "#4C2AB0",
+        strokeWeight: 2,
         cornerRadius: 10,
+        opacity: 0.9,
+        shadow: {
+          color: "#111827",
+          opacity: 0.16,
+          offsetX: 0,
+          offsetY: 3,
+          radius: 8,
+          spread: 0,
+        },
       }),
       operation("test-color-0001", {
         tool: "set_properties",
@@ -665,6 +1041,19 @@ describe("safe Figma tool executor", () => {
         tool: "set_properties",
         ref: "persian-title",
         properties: { textStyleId: "text-token-heading" },
+      }),
+      operation("test-typography-01", {
+        tool: "set_properties",
+        ref: "persian-title",
+        properties: {
+          fontFamily: "Arial",
+          fontStyle: "Regular",
+          fontSize: 20,
+          lineHeight: 28,
+          letterSpacing: 0.25,
+          align: "RIGHT",
+          textAutoResize: "TRUNCATE",
+        },
       }),
     ];
     const firstBatch = await run(executor, ops);
@@ -690,9 +1079,26 @@ describe("safe Figma tool executor", () => {
     expect(JSON.stringify([...mock.storage.values()])).not.toContain("سلام فروشگاه");
     expect(JSON.stringify([...title.pluginData.entries()])).not.toContain("سلام فروشگاه");
     expect(title.textAlignHorizontal).toBe("RIGHT");
-    expect(title.fontName).toEqual({ family: "Inter", style: "Regular" });
+    expect(title.fontName).toEqual({ family: "Arial", style: "Regular" });
+    expect(title).toMatchObject({
+      fontSize: 20,
+      lineHeight: { unit: "PIXELS", value: 28 },
+      letterSpacing: { unit: "PIXELS", value: 0.25 },
+      textAutoResize: "TRUNCATE",
+    });
     expect(button.fillStyleId).toBe("paint-token-brand");
     expect(title.textStyleId).toBe("text-token-heading");
+    expect(frame).toMatchObject({
+      opacity: 0.98,
+      strokeWeight: 1,
+      clipsContent: true,
+      effects: [{ type: "DROP_SHADOW", radius: 16, spread: 0 }],
+    });
+    expect(button).toMatchObject({
+      opacity: 0.9,
+      strokeWeight: 2,
+      effects: [{ type: "DROP_SHADOW", radius: 8, spread: 0 }],
+    });
     expect(mock.find("Original user layer")?.fills).toEqual([
       { type: "SOLID", color: { r: 1, g: 0, b: 0 } },
     ]);

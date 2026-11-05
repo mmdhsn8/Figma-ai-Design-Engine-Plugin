@@ -844,6 +844,39 @@ describe("Figma UI companion client", () => {
     );
   });
 
+  it("returns safe tool validation details for a bounded correction turn", async () => {
+    const requestId = "chat-validation-call";
+    const issues = [
+      {
+        toolName: "create_rectangle",
+        callId: "call_badargs_123",
+        stage: "arguments_schema",
+        errorCode: "invalid_format",
+        fieldPaths: ["arguments.fill"],
+      },
+    ];
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response(`event: tool_validation\ndata: ${JSON.stringify({ requestId, issues })}\n\n`, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "X-FAD-Request-Id": requestId,
+            "X-FAD-Model": "account-model",
+          },
+        }),
+    );
+
+    await expect(
+      streamAuthorizedChat(
+        "session-bearer",
+        requestId,
+        "account-model",
+        [{ role: "user", content: "Create a card" }],
+        fetcher,
+      ),
+    ).resolves.toEqual({ kind: "tool_validation", issues });
+  });
+
   it("rejects a streamed function call whose continuation identity does not match", async () => {
     const requestId = "chat-request-mismatch";
     const functionCall = {

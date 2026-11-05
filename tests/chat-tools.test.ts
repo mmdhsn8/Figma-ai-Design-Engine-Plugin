@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CHAT_FUNCTION_TOOLS,
+  ChatFunctionCallValidationError,
   ChatInputItemSchema,
   parseResponsesFunctionCalls,
   trimChatInputHistory,
@@ -66,6 +67,195 @@ describe("allowlisted chat functions", () => {
         output: "{}",
       }).success,
     ).toBe(false);
+  });
+
+  it("advertises only supported professional styling and structured planning fields", () => {
+    const properties = (name: string) =>
+      (
+        CHAT_FUNCTION_TOOLS.find((tool) => tool.name === name)?.parameters as {
+          properties: Record<string, unknown>;
+        }
+      ).properties;
+    const createText = properties("create_text");
+    const setProperties = (
+      properties("set_properties").properties as { properties: Record<string, unknown> }
+    ).properties;
+    expect(createText).toHaveProperty("lineHeight");
+    expect(createText).toHaveProperty("letterSpacing");
+    expect(createText).not.toHaveProperty("textStyleId");
+    expect(setProperties).toHaveProperty("textStyleId");
+    expect(setProperties).toHaveProperty("fontFamily");
+    expect(setProperties).toHaveProperty("shadow");
+    expect(properties("plan_canvas_task")).toMatchObject({
+      brief: { type: "object" },
+      stages: { type: "array", maxItems: 12 },
+    });
+  });
+
+  it("derives model parameter bounds from executor schemas and reports only safe field paths", () => {
+    const parameters = (name: string) =>
+      CHAT_FUNCTION_TOOLS.find((tool) => tool.name === name)?.parameters as {
+        properties: Record<string, unknown>;
+        required?: string[];
+      };
+    const rectangle = parameters("create_rectangle");
+    expect(rectangle.required).not.toContain("tool");
+    expect(rectangle.properties).not.toHaveProperty("tool");
+    expect(rectangle.properties.fill).toMatchObject({
+      type: "string",
+      pattern: "^#[0-9A-Fa-f]{6}$",
+    });
+    expect(rectangle.properties.size).toMatchObject({
+      properties: {
+        width: { minimum: 1, maximum: 20_000 },
+        height: { minimum: 1, maximum: 20_000 },
+      },
+    });
+    const setProperties = parameters("set_properties").properties.properties as {
+      properties: Record<string, { pattern?: string }>;
+      minProperties: number;
+    };
+    expect(setProperties.properties.fill?.pattern).toBe("^#[0-9A-Fa-f]{6}$");
+    expect(setProperties.minProperties).toBe(1);
+    const inspectNodes = parameters("inspect_nodes");
+    expect(inspectNodes.properties.maxNodes).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: 25,
+      default: 25,
+    });
+    expect(inspectNodes.properties.depth).toMatchObject({
+      type: "integer",
+      minimum: 0,
+      maximum: 4,
+      default: 2,
+    });
+
+    let thrown: unknown;
+    try {
+      parseResponsesFunctionCalls([
+        {
+          type: "function_call",
+          call_id: "call_style_1234",
+          name: "create_rectangle",
+          arguments: JSON.stringify({
+            ref: "card",
+            name: "Card",
+            parent: { kind: "page" },
+            size: { width: 300, height: 200 },
+            fill: "rgba(1, 2, 3, 1)",
+            private: "must never appear in diagnostics",
+          }),
+        },
+      ]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ChatFunctionCallValidationError);
+    const issues = (thrown as ChatFunctionCallValidationError).validationIssues;
+    expect(issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          toolName: "create_rectangle",
+          callId: "call_style_1234",
+          stage: "arguments_schema",
+          fieldPaths: ["arguments.fill"],
+        }),
+        expect.objectContaining({ fieldPaths: ["arguments.private"] }),
+      ]),
+    );
+    expect(JSON.stringify(issues)).not.toContain("rgba(");
+    expect(JSON.stringify(issues)).not.toContain("must never appear");
+
+    let conflict: unknown;
+    try {
+      parseResponsesFunctionCalls([
+        {
+          type: "function_call",
+          call_id: "call_style_conflict",
+          name: "create_rectangle",
+          arguments: JSON.stringify({
+            ref: "card",
+            name: "Card",
+            parent: { kind: "page" },
+            size: { width: 300, height: 200 },
+            fill: "#FFFFFF",
+            paintStyleId: "style-123",
+          }),
+        },
+      ]);
+    } catch (error) {
+      conflict = error;
+    }
+    expect((conflict as ChatFunctionCallValidationError).validationIssues[0]?.fieldPaths).toEqual([
+      "arguments.fill",
+      "arguments.paintStyleId",
+    ]);
+  });
+
+  it("clamps finite out-of-range inspect_nodes numbers but rejects invalid types without coercion", () => {
+    const rawCall = {
+      type: "function_call",
+      call_id: "inspect_bounds_001",
+      name: "inspect_nodes",
+      arguments: JSON.stringify({
+        refs: ["store"],
+        selection: false,
+        maxNodes: 500,
+        depth: -12,
+      }),
+    };
+    const [normalized] = parseResponsesFunctionCalls([rawCall]);
+    expect(normalized).toMatchObject({
+      normalizedInspectionParameters: true,
+      action: { tool: "inspect_nodes", refs: ["store"], maxNodes: 25, depth: 0 },
+      functionCall: rawCall,
+    });
+
+    const [defaults] = parseResponsesFunctionCalls([
+      {
+        ...rawCall,
+        call_id: "inspect_defaults_01",
+        arguments: JSON.stringify({ refs: ["store"], selection: false }),
+      },
+    ]);
+    expect(defaults).toMatchObject({
+      action: { tool: "inspect_nodes", maxNodes: 25, depth: 2 },
+    });
+    expect(defaults?.normalizedInspectionParameters).toBeUndefined();
+
+    let thrown: unknown;
+    try {
+      parseResponsesFunctionCalls([
+        {
+          ...rawCall,
+          arguments: JSON.stringify({ refs: ["store"], selection: false, maxNodes: "500" }),
+        },
+      ]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ChatFunctionCallValidationError);
+    const issues = (thrown as ChatFunctionCallValidationError).validationIssues;
+    expect(issues).toEqual([
+      expect.objectContaining({
+        toolName: "inspect_nodes",
+        callId: "inspect_bounds_001",
+        stage: "arguments_schema",
+        fieldPaths: ["arguments.maxNodes"],
+        receivedType: "string",
+      }),
+    ]);
+    expect(JSON.stringify(issues)).not.toContain('"500"');
+
+    expect(() =>
+      parseResponsesFunctionCalls([
+        {
+          ...rawCall,
+          arguments: JSON.stringify({ refs: Array.from({ length: 21 }, (_, i) => `ref-${i}`) }),
+        },
+      ]),
+    ).toThrow();
   });
 
   it("trims only complete chat turns so function-call outputs are never orphaned", () => {

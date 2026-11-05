@@ -9,23 +9,44 @@ const STORAGE_PREFIX = "fad.figma-tools.v1";
 const REF_PLUGIN_KEY = "fad.tool.logical-ref.v1";
 const OP_PLUGIN_KEY = "fad.tool.operation-id.v1";
 const FINGERPRINT_PLUGIN_KEY = "fad.tool.operation-fingerprint.v1";
+const TASK_PLUGIN_KEY = "fad.tool.task-id.v1";
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 48 * 1024;
 const MAX_STORED_OPERATIONS = 400;
 const OPERATION_TIMEOUT_MS = 10_000;
+const ReferenceCandidateSchema = z
+  .object({
+    canonicalRef: z.string().max(80),
+    provenance: z.literal("current_task_alias"),
+  })
+  .strict();
 
 const StoredStateSchema = z
   .object({
     version: z.literal(1),
     refs: z.record(
       z.string().max(80),
-      z.object({ nodeId: z.string().max(100), pageId: z.string().max(200) }).strict(),
+      z
+        .object({
+          nodeId: z.string().max(100),
+          pageId: z.string().max(200),
+          parentId: z.string().max(100).optional(),
+          nodeType: z.string().max(20).optional(),
+          creationFingerprint: z.string().length(32).optional(),
+          taskId: z.string().max(60).optional(),
+          alias: z.string().max(80).optional(),
+          creationOperationId: z.string().max(100).optional(),
+          inspectedByTaskId: z.string().max(60).optional(),
+        })
+        .strict(),
     ),
     operations: z.record(
       z.string().max(100),
       z
         .object({
           operationId: z.string().max(100),
+          taskId: z.string().max(60).optional(),
+          creationRef: z.string().max(80).optional(),
           idempotencyKey: z.string().max(120),
           fingerprint: z.string().length(32),
           status: z.enum(["running", "completed", "failed"]),
@@ -38,6 +59,23 @@ const StoredStateSchema = z
               logicalRef: z.string().max(80).optional(),
               summary: z.string().max(300).optional(),
               error: z.string().max(400).optional(),
+              data: z
+                .object({
+                  reused: z.boolean().optional(),
+                  referenceResolution: z
+                    .object({
+                      code: z.string().max(60),
+                      ref: z.string().max(80),
+                      stage: z.literal("reference_resolution"),
+                      alternatives: z.array(z.string().max(150)).max(3),
+                      candidates: z.array(ReferenceCandidateSchema).max(3).optional(),
+                      candidateCount: z.number().int().min(0).max(500).optional(),
+                    })
+                    .strict()
+                    .optional(),
+                })
+                .strict()
+                .optional(),
             })
             .strict()
             .optional(),
@@ -61,6 +99,149 @@ type OperationResult = {
 type ToolSend = (message: PluginToUIMessage) => void;
 type ToolLayout = Extract<FigmaToolAction, { tool: "set_auto_layout" }>["layout"];
 
+class ReferenceResolutionError extends Error {
+  constructor(
+    readonly code: string,
+    readonly ref: string,
+    readonly candidates: z.infer<typeof ReferenceCandidateSchema>[] = [],
+    readonly candidateCount = candidates.length,
+  ) {
+    super(
+      `Reference resolution ${code} for “${ref}”. Inspect a candidate canonical ref or the current selection before editing; do not recreate uncertain nodes.`,
+    );
+  }
+}
+
+function isCreation(
+  action: FigmaToolAction,
+): action is Extract<
+  FigmaToolAction,
+  { tool: "create_frame" | "create_text" | "create_rectangle" }
+> {
+  return (
+    action.tool === "create_frame" ||
+    action.tool === "create_text" ||
+    action.tool === "create_rectangle"
+  );
+}
+
+function referenceFailure(operationId: string, error: ReferenceResolutionError): OperationResult {
+  return {
+    operationId,
+    success: false,
+    replayed: false,
+    error: error.message.slice(0, 400),
+    data: {
+      referenceResolution: {
+        code: error.code,
+        ref: error.ref,
+        stage: "reference_resolution",
+        alternatives: error.candidates.length
+          ? [
+              "inspect_nodes one listed canonical ref at a time",
+              "use set_properties only after inspection confirms the intended node",
+              "do not create a replacement",
+            ]
+          : [
+              "inspect_nodes with selection:true, then use its returned canonical ref",
+              "get_operation_status with the original operation ID before retrying",
+              "do not create a replacement",
+            ],
+        ...(error.candidates.length ? { candidates: error.candidates } : {}),
+        ...(error.candidateCount ? { candidateCount: error.candidateCount } : {}),
+      },
+    },
+  };
+}
+
+function resolveTaskAction(state: StoredState, operation: FigmaToolOperation): FigmaToolAction {
+  const taskId = operation.taskId!;
+  const action = operation.action;
+  const confirmed = (ref: string, entry: StoredState["refs"][string], inspecting: boolean) => {
+    if (
+      !inspecting &&
+      entry.taskId &&
+      (!entry.creationOperationId ||
+        state.operations[entry.creationOperationId]?.status !== "completed")
+    )
+      throw new ReferenceResolutionError("unconfirmed_creation", ref);
+  };
+  const resolve = (ref: string, inspecting = false): string => {
+    const own = Object.entries(state.refs).filter(
+      ([, entry]) => entry.taskId === taskId && entry.alias === ref,
+    );
+    if (own.length > 1)
+      throw new ReferenceResolutionError(
+        "ambiguous",
+        ref,
+        own.slice(0, 3).map(([canonicalRef]) => ({
+          canonicalRef,
+          provenance: "current_task_alias",
+        })),
+        own.length,
+      );
+    const entry = state.refs[ref];
+    if (own.length === 1) {
+      // A task-owned alias is authoritative; a page-global literal may be another inspected node.
+      confirmed(own[0]![0], own[0]![1], inspecting);
+      return own[0]![0];
+    }
+    if (!entry) throw new ReferenceResolutionError("missing_or_uninspected", ref);
+    if (!inspecting && entry.taskId !== taskId && entry.inspectedByTaskId !== taskId)
+      throw new ReferenceResolutionError("inspection_required", ref);
+    confirmed(ref, entry, inspecting);
+    return ref;
+  };
+  if (isCreation(action)) {
+    const owned = state.refs[action.ref];
+    const ref =
+      owned?.taskId === taskId ? action.ref : `task-${fingerprint(`${taskId}:${action.ref}`)}`;
+    const reservation = state.refs[ref];
+    if (
+      operation.expectedCreationOperationId &&
+      (!reservation || reservation.creationOperationId !== operation.expectedCreationOperationId)
+    )
+      throw new ReferenceResolutionError("checkpoint_registry_conflict", ref);
+    if (
+      reservation &&
+      (reservation.taskId !== taskId || (reservation.alias !== action.ref && action.ref !== ref))
+    )
+      throw new ReferenceResolutionError("namespace_conflict", ref);
+    if (
+      Object.values(state.operations).some(
+        (saved) =>
+          saved.taskId === taskId &&
+          saved.creationRef === ref &&
+          saved.operationId !== operation.operationId &&
+          saved.status !== "completed",
+      )
+    )
+      throw new ReferenceResolutionError("unconfirmed_creation", ref);
+    return {
+      ...action,
+      ref,
+      parent:
+        action.parent.kind === "node"
+          ? { kind: "node", ref: resolve(action.parent.ref) }
+          : action.parent,
+    };
+  }
+  if (action.tool === "inspect_nodes")
+    return { ...action, refs: action.refs.map((ref) => resolve(ref, true)) };
+  if (action.tool === "set_auto_layout")
+    return {
+      ...action,
+      ref: resolve(action.ref),
+      children: action.children.map((child) => ({ ...child, ref: resolve(child.ref) })),
+    };
+  if (action.tool === "append_child")
+    return { ...action, childRef: resolve(action.childRef), parentRef: resolve(action.parentRef) };
+  if (action.tool === "reparent_node")
+    return { ...action, ref: resolve(action.ref), parentRef: resolve(action.parentRef) };
+  if ("ref" in action) return { ...action, ref: resolve(action.ref) };
+  return action;
+}
+
 function isMutatingAction(tool: FigmaToolAction["tool"]): boolean {
   return [
     "create_frame",
@@ -83,6 +264,25 @@ function color(hex: string): RGB {
   };
 }
 
+function shadowEffect(shadow: {
+  color: string;
+  opacity: number;
+  offsetX: number;
+  offsetY: number;
+  radius: number;
+  spread: number;
+}): Effect {
+  return {
+    type: "DROP_SHADOW",
+    color: { ...color(shadow.color), a: shadow.opacity },
+    offset: { x: shadow.offsetX, y: shadow.offsetY },
+    radius: shadow.radius,
+    spread: shadow.spread,
+    visible: true,
+    blendMode: "NORMAL",
+  };
+}
+
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -95,7 +295,10 @@ function stableJson(value: unknown): string {
 }
 
 function actionFingerprint(action: FigmaToolAction): string {
-  const input = stableJson(action);
+  return fingerprint(stableJson(action));
+}
+
+function fingerprint(input: string): string {
   const hashes = [2166136261, 2246822519, 3266489917, 668265263];
   for (let index = 0; index < input.length; index++) {
     const code = input.charCodeAt(index);
@@ -143,6 +346,22 @@ function withTimeout<T>(
 }
 
 function summarizeNode(node: SceneNode, ref?: string) {
+  const colorHex = (paints: readonly Paint[] | PluginAPI["mixed"]): string | undefined => {
+    if (!Array.isArray(paints)) return undefined;
+    const paint = paints.find((item): item is SolidPaint => item.type === "SOLID");
+    if (!paint || (paint.opacity !== undefined && paint.opacity < 0.999)) return undefined;
+    return `#${[paint.color.r, paint.color.g, paint.color.b]
+      .map((channel) =>
+        Math.round(channel * 255)
+          .toString(16)
+          .padStart(2, "0"),
+      )
+      .join("")}`.toUpperCase();
+  };
+  const bounds = node.absoluteBoundingBox;
+  const opacity = "opacity" in node ? (node as SceneNode & BlendMixin).opacity : undefined;
+  const strokeWeight =
+    "strokeWeight" in node ? (node as SceneNode & GeometryMixin).strokeWeight : undefined;
   return {
     ...(ref ? { ref } : {}),
     type: node.type,
@@ -152,9 +371,39 @@ function summarizeNode(node: SceneNode, ref?: string) {
     width: Math.round(node.width),
     height: Math.round(node.height),
     visible: node.visible,
+    ...(bounds
+      ? {
+          bounds: {
+            x: Math.round(bounds.x),
+            y: Math.round(bounds.y),
+            width: Math.round(bounds.width),
+            height: Math.round(bounds.height),
+          },
+        }
+      : {}),
+    ...(colorHex("fills" in node ? node.fills : [])
+      ? { fill: colorHex((node as GeometryMixin).fills) }
+      : {}),
+    ...(colorHex("strokes" in node ? node.strokes : [])
+      ? { stroke: colorHex((node as GeometryMixin).strokes) }
+      : {}),
+    ...(typeof opacity === "number" ? { opacity } : {}),
+    ...(typeof strokeWeight === "number" ? { strokeWeight } : {}),
+    ...("cornerRadius" in node && typeof node.cornerRadius === "number"
+      ? { cornerRadius: node.cornerRadius }
+      : {}),
     ...(node.type === "TEXT" ? { text: node.characters.slice(0, 120) } : {}),
+    ...(node.type === "TEXT" && typeof node.fontSize === "number"
+      ? { fontSize: node.fontSize, textColor: colorHex(node.fills) }
+      : {}),
     ...(node.type === "FRAME" || node.type === "COMPONENT"
-      ? { layout: node.layoutMode.toLowerCase(), childCount: node.children.length }
+      ? {
+          layout: node.layoutMode.toLowerCase(),
+          layoutMode: node.layoutMode,
+          itemSpacing: node.itemSpacing,
+          clipsContent: node.clipsContent,
+          childCount: node.children.length,
+        }
       : {}),
   };
 }
@@ -183,6 +432,16 @@ function compactResult(result: OperationResult): StoredOperationResult {
     ...(result.logicalRef ? { logicalRef: result.logicalRef } : {}),
     ...(result.summary ? { summary: result.summary } : {}),
     ...(result.error ? { error: result.error } : {}),
+    ...(result.data?.reused ? { data: { reused: true } } : {}),
+    ...(result.data?.referenceResolution
+      ? {
+          data: {
+            referenceResolution: result.data.referenceResolution as NonNullable<
+              StoredOperationResult["data"]
+            >["referenceResolution"],
+          },
+        }
+      : {}),
   };
 }
 
@@ -278,8 +537,13 @@ export function createFigmaToolExecutor(
         "Figma page changed during the operation; no node was targeted on the new page.",
       );
     const entry = state.refs[ref];
+    const creationFingerprint =
+      entry?.creationFingerprint ??
+      (entry?.creationOperationId
+        ? state.operations[entry.creationOperationId]?.fingerprint
+        : undefined);
     if (!entry || entry.pageId !== pageId)
-      throw new Error(`Logical reference “${ref}” is missing or belongs to another page.`);
+      throw new ReferenceResolutionError("missing_or_other_page", ref);
     const node = await timed(api.getNodeByIdAsync(entry.nodeId), "Node reference lookup");
     if (
       api.currentPage.id !== pageId ||
@@ -288,9 +552,21 @@ export function createFigmaToolExecutor(
       node.type === "DOCUMENT" ||
       node.type === "PAGE" ||
       !belongsToPage(node, api.currentPage) ||
-      (node as SceneNode).getPluginData(REF_PLUGIN_KEY) !== ref
+      (node as SceneNode).getPluginData(REF_PLUGIN_KEY) !== ref ||
+      (entry.parentId && (node as SceneNode).parent?.id !== entry.parentId) ||
+      (entry.nodeType && (node as SceneNode).type !== entry.nodeType) ||
+      (creationFingerprint &&
+        (node as SceneNode).getPluginData(FINGERPRINT_PLUGIN_KEY) !== creationFingerprint) ||
+      (entry.taskId && (node as SceneNode).getPluginData(TASK_PLUGIN_KEY) !== entry.taskId) ||
+      (entry.creationOperationId &&
+        (node as SceneNode).getPluginData(OP_PLUGIN_KEY) !== entry.creationOperationId)
     )
-      throw new Error(`Logical reference “${ref}” is stale; no node was changed.`);
+      throw new ReferenceResolutionError("stale", ref);
+    if (
+      api.currentPage.findAll((candidate) => candidate.getPluginData(REF_PLUGIN_KEY) === ref)
+        .length !== 1
+    )
+      throw new ReferenceResolutionError("ambiguous", ref);
     return node as SceneNode;
   };
 
@@ -308,7 +584,12 @@ export function createFigmaToolExecutor(
     return asContainer(node);
   };
 
-  const registerLogicalRef = (state: StoredState, node: SceneNode, pageId: string): string => {
+  const registerLogicalRef = (
+    state: StoredState,
+    node: SceneNode,
+    pageId: string,
+    taskId?: string,
+  ): string => {
     if (api.currentPage.id !== pageId || !belongsToPage(node, api.currentPage))
       throw new Error(
         "Figma page changed during inspection; no other page was tagged or inspected.",
@@ -318,7 +599,16 @@ export function createFigmaToolExecutor(
     );
     if (existing) {
       if (node.getPluginData(REF_PLUGIN_KEY) !== existing[0])
-        node.setPluginData(REF_PLUGIN_KEY, existing[0]);
+        throw new ReferenceResolutionError("stale", existing[0]);
+      if (
+        api.currentPage.findAll(
+          (candidate) => candidate.getPluginData(REF_PLUGIN_KEY) === existing[0],
+        ).length !== 1
+      )
+        throw new ReferenceResolutionError("ambiguous", existing[0]);
+      if (taskId) existing[1].inspectedByTaskId = taskId;
+      existing[1].parentId = node.parent?.id;
+      existing[1].nodeType = node.type;
       return existing[0];
     }
     if (Object.keys(state.refs).length >= 500)
@@ -326,12 +616,26 @@ export function createFigmaToolExecutor(
         "This page already has 500 retained logical references; inspection stopped safely.",
       );
     const storedRef = node.getPluginData(REF_PLUGIN_KEY);
+    if (storedRef && state.refs[storedRef])
+      throw new ReferenceResolutionError("ambiguous", storedRef);
+    if (
+      storedRef &&
+      api.currentPage.findAll((candidate) => candidate.getPluginData(REF_PLUGIN_KEY) === storedRef)
+        .length !== 1
+    )
+      throw new ReferenceResolutionError("ambiguous", storedRef);
     const ref =
       storedRef && /^[A-Za-z][A-Za-z0-9._-]{0,79}$/u.test(storedRef) && !state.refs[storedRef]
         ? storedRef
         : `inspected-${randomLocalRef()}`;
     node.setPluginData(REF_PLUGIN_KEY, ref);
-    state.refs[ref] = { nodeId: node.id, pageId };
+    state.refs[ref] = {
+      nodeId: node.id,
+      pageId,
+      parentId: node.parent?.id,
+      nodeType: node.type,
+      ...(taskId ? { inspectedByTaskId: taskId } : {}),
+    };
     return ref;
   };
 
@@ -358,7 +662,12 @@ export function createFigmaToolExecutor(
     state: StoredState,
     operation: FigmaToolOperation,
     pageId: string,
-  ): Promise<{ summary: string; logicalRef?: string; data?: Record<string, unknown> }> => {
+  ): Promise<{
+    summary: string;
+    logicalRef?: string;
+    data?: Record<string, unknown>;
+    replayed?: boolean;
+  }> => {
     if (api.currentPage.id !== pageId)
       throw new Error(
         "Figma page changed during the operation; no node was targeted on the new page.",
@@ -410,6 +719,13 @@ export function createFigmaToolExecutor(
           page: { name: api.currentPage.name },
           viewport: { center: api.viewport.center },
           selection,
+          logicalReferences: Object.entries(state.refs)
+            .slice(0, 50)
+            .map(([ref, entry]) => ({
+              ref,
+              ...(entry.taskId ? { taskId: entry.taskId, alias: entry.alias } : {}),
+              instruction: "Inspect this ref before editing; availability is not yet verified.",
+            })),
           tokens: {
             paintStyles: paintStyles
               .slice(0, 20)
@@ -430,23 +746,32 @@ export function createFigmaToolExecutor(
         throw new Error("Figma page changed while resolving inspection targets.");
       const seen = new Set<string>();
       const result: Array<Record<string, unknown>> = [];
-      const visit = (node: SceneNode, depth: number): string | undefined => {
+      const queue: Array<{ node: SceneNode; depth: number; summary: Record<string, unknown> }> = [];
+      const add = (node: SceneNode, depth: number): Record<string, unknown> | undefined => {
         if (seen.has(node.id) || result.length >= action.maxNodes) return undefined;
         seen.add(node.id);
-        const ref = registerLogicalRef(state, node, pageId);
+        const ref = registerLogicalRef(state, node, pageId, operation.taskId);
         const summary = summarizeNode(node, ref) as Record<string, unknown>;
         result.push(summary);
-        if (depth < action.depth && directChildren(node).length)
-          summary.children = directChildren(node)
-            .slice(0, action.maxNodes - result.length)
-            .map((child) => visit(child, depth + 1))
-            .filter((childRef): childRef is string => Boolean(childRef));
-        return ref;
+        queue.push({ node, depth, summary });
+        return summary;
       };
-      roots.slice(0, action.maxNodes).forEach((node) => visit(node, 0));
+      const rootNodes = roots
+        .slice(0, action.maxNodes)
+        .map((node) => add(node, 0))
+        .filter((node): node is Record<string, unknown> => Boolean(node));
+      for (let cursor = 0; cursor < queue.length && result.length < action.maxNodes; cursor++) {
+        const current = queue[cursor]!;
+        if (current.depth >= action.depth) continue;
+        const children = directChildren(current.node)
+          .slice(0, action.maxNodes - result.length)
+          .map((child) => add(child, current.depth + 1))
+          .filter((child): child is Record<string, unknown> => Boolean(child));
+        if (children.length) current.summary.children = children;
+      }
       return {
         summary: `Inspected ${result.length} node(s) within depth ${action.depth}.`,
-        data: { nodes: result },
+        data: { nodes: rootNodes },
       };
     }
     if (action.tool === "get_operation_status") {
@@ -467,13 +792,72 @@ export function createFigmaToolExecutor(
       action.tool === "create_rectangle" ||
       action.tool === "create_text"
     ) {
-      if (state.refs[action.ref])
-        throw new Error(`Logical reference “${action.ref}” is already reserved.`);
+      if (!state.refs[action.ref] && operation.expectedCreationOperationId)
+        throw new ReferenceResolutionError("checkpoint_registry_conflict", action.ref);
+      if (state.refs[action.ref]) {
+        const entry = state.refs[action.ref]!;
+        const legacyTask =
+          !operation.taskId &&
+          operation.expectedCreationOperationId &&
+          operation.operationId.match(/^(.+)-op-\d+$/u)?.[1];
+        const legacyOwned =
+          legacyTask && operation.expectedCreationOperationId?.startsWith(`${legacyTask}-op-`);
+        if ((!operation.taskId || entry.taskId !== operation.taskId) && !legacyOwned)
+          throw new ReferenceResolutionError("reserved_by_other_or_legacy_task", action.ref);
+        const existing = await resolveRef(state, action.ref, pageId);
+        const creationId =
+          entry.creationOperationId ??
+          (legacyOwned ? operation.expectedCreationOperationId : undefined);
+        const creation = creationId ? state.operations[creationId] : undefined;
+        if (
+          !creation ||
+          creation.status !== "completed" ||
+          !creation.result?.success ||
+          existing.getPluginData(OP_PLUGIN_KEY) !== creationId ||
+          (operation.taskId && existing.getPluginData(TASK_PLUGIN_KEY) !== operation.taskId) ||
+          existing.getPluginData(FINGERPRINT_PLUGIN_KEY) !== creation.fingerprint
+        )
+          throw new ReferenceResolutionError("unconfirmed_creation", action.ref);
+        const expectedType =
+          action.tool === "create_frame"
+            ? "FRAME"
+            : action.tool === "create_text"
+              ? "TEXT"
+              : "RECTANGLE";
+        const parent = await resolveParent(state, action.parent, pageId);
+        if (existing.type !== expectedType || existing.parent?.id !== parent.id)
+          throw new ReferenceResolutionError("type_or_parent_conflict", action.ref);
+        return {
+          replayed: true,
+          logicalRef: action.ref,
+          summary:
+            "Reused the confirmed task node without changing it. Use set_properties for explicit edits.",
+          data: {
+            reused: true,
+            creationOperationId: creationId,
+            node: summarizeNode(existing, action.ref),
+          },
+        };
+      }
+      if (
+        api.currentPage.findAll((node) => node.getPluginData(REF_PLUGIN_KEY) === action.ref).length
+      )
+        throw new ReferenceResolutionError("unregistered_existing_node", action.ref);
       if (Object.keys(state.refs).length >= 500)
         throw new Error(
           "This page already has 500 retained logical references; start a new page-scoped tool session.",
         );
       const parent = await resolveParent(state, action.parent, pageId);
+      const paintStyle =
+        action.tool !== "create_text" && action.paintStyleId
+          ? (await timed(api.getLocalPaintStylesAsync(), "Paint token lookup")).find(
+              ({ id }) => id === action.paintStyleId,
+            )
+          : undefined;
+      if (action.tool !== "create_text" && action.paintStyleId && !paintStyle)
+        throw new Error(
+          "The requested paint token is not present in this document's local styles.",
+        );
       const isPageParent = parent.type === "PAGE";
       if (
         action.tool === "create_text" &&
@@ -517,7 +901,11 @@ export function createFigmaToolExecutor(
           text.fills = [{ type: "SOLID", color: color(action.color) }];
           text.textAlignHorizontal =
             action.align ?? (action.direction === "RTL" ? "RIGHT" : "LEFT");
-          text.textAutoResize = "HEIGHT";
+          if (action.lineHeight !== undefined)
+            text.lineHeight = { unit: "PIXELS", value: action.lineHeight };
+          if (action.letterSpacing !== undefined)
+            text.letterSpacing = { unit: "PIXELS", value: action.letterSpacing };
+          text.textAutoResize = action.textAutoResize;
           text.resize(action.size.width, action.size.height);
         } else if (action.tool === "create_frame") {
           const frame = api.createFrame();
@@ -529,7 +917,13 @@ export function createFigmaToolExecutor(
           frame.resize(action.size.width, action.size.height);
           frame.fills = action.fill ? [{ type: "SOLID", color: color(action.fill) }] : [];
           frame.strokes = action.stroke ? [{ type: "SOLID", color: color(action.stroke) }] : [];
+          if (action.strokeWeight !== undefined) frame.strokeWeight = action.strokeWeight;
           frame.cornerRadius = action.cornerRadius;
+          if (action.opacity !== undefined) frame.opacity = action.opacity;
+          if (action.shadow) frame.effects = [shadowEffect(action.shadow)];
+          if (action.clipsContent !== undefined) frame.clipsContent = action.clipsContent;
+          if (paintStyle)
+            await timed(frame.setFillStyleIdAsync(paintStyle.id), "Paint token apply");
           if (action.autoLayout) applyLayout(frame, action.autoLayout);
         } else {
           const rectangle = api.createRectangle();
@@ -539,12 +933,17 @@ export function createFigmaToolExecutor(
           rectangle.setPluginData(FINGERPRINT_PLUGIN_KEY, actionFingerprint(action));
           rectangle.name = action.name;
           rectangle.resize(action.size.width, action.size.height);
-          rectangle.fills = [{ type: "SOLID", color: color(action.fill) }];
+          rectangle.fills = action.fill ? [{ type: "SOLID", color: color(action.fill) }] : [];
           rectangle.strokes = action.stroke ? [{ type: "SOLID", color: color(action.stroke) }] : [];
           rectangle.strokeWeight = action.strokeWeight;
           rectangle.cornerRadius = action.cornerRadius;
+          if (action.opacity !== undefined) rectangle.opacity = action.opacity;
+          if (action.shadow) rectangle.effects = [shadowEffect(action.shadow)];
+          if (paintStyle)
+            await timed(rectangle.setFillStyleIdAsync(paintStyle.id), "Paint token apply");
         }
         created = createdNode!;
+        if (operation.taskId) created.setPluginData(TASK_PLUGIN_KEY, operation.taskId);
         if (!isPageParent) parent.appendChild(created);
         if (isPageParent && placement)
           placeTopLevelNode(
@@ -578,7 +977,16 @@ export function createFigmaToolExecutor(
         createdNode?.remove();
         throw error;
       }
-      state.refs[action.ref] = { nodeId: created.id, pageId };
+      state.refs[action.ref] = {
+        nodeId: created.id,
+        pageId,
+        parentId: created.parent?.id,
+        nodeType: created.type,
+        creationFingerprint: actionFingerprint(action),
+        ...(operation.taskId
+          ? { taskId: operation.taskId, creationOperationId: operation.operationId }
+          : {}),
+      };
       const summary = `${action.tool === "create_text" ? "Editable text" : action.tool === "create_frame" ? "Frame" : "Rectangle"} “${created.name}” created.`;
       return {
         summary: fontFallback
@@ -685,7 +1093,14 @@ export function createFigmaToolExecutor(
         );
       if (
         properties.textStyleId &&
-        (properties.fontSize !== undefined || properties.color !== undefined)
+        (properties.fontSize !== undefined ||
+          properties.color !== undefined ||
+          properties.fontFamily !== undefined ||
+          properties.fontStyle !== undefined ||
+          properties.lineHeight !== undefined ||
+          properties.letterSpacing !== undefined ||
+          properties.align !== undefined ||
+          properties.textAutoResize !== undefined)
       )
         throw new Error(
           "Choose an existing text style or explicit font/color changes in one operation.",
@@ -694,7 +1109,12 @@ export function createFigmaToolExecutor(
         properties.text !== undefined ||
         properties.fontSize !== undefined ||
         properties.color !== undefined ||
-        properties.align !== undefined;
+        properties.align !== undefined ||
+        properties.fontFamily !== undefined ||
+        properties.fontStyle !== undefined ||
+        properties.lineHeight !== undefined ||
+        properties.letterSpacing !== undefined ||
+        properties.textAutoResize !== undefined;
       if (changesText && node.type !== "TEXT")
         throw new Error("Text properties can only target an editable text node.");
       if (
@@ -707,6 +1127,17 @@ export function createFigmaToolExecutor(
         !("fills" in node)
       )
         throw new Error("This node type does not support a fill color.");
+      if (
+        (properties.stroke !== undefined || properties.strokeWeight !== undefined) &&
+        !("strokes" in node)
+      )
+        throw new Error("This node type does not support a stroke.");
+      if (properties.cornerRadius !== undefined && !("cornerRadius" in node))
+        throw new Error("This node type does not support corner radii.");
+      if (properties.opacity !== undefined && !("opacity" in node))
+        throw new Error("This Figma node does not support opacity on this platform.");
+      if (properties.shadow !== undefined && !("effects" in node))
+        throw new Error("This Figma node does not support effects on this platform.");
       const paintStyle = properties.paintStyleId
         ? (await timed(api.getLocalPaintStylesAsync(), "Paint token lookup")).find(
             ({ id }) => id === properties.paintStyleId,
@@ -725,13 +1156,17 @@ export function createFigmaToolExecutor(
         throw new Error(
           "The requested text token is unavailable or the target is not editable text.",
         );
+      const currentFont = node.type === "TEXT" ? (node as TextNode).fontName : undefined;
+      const currentFontName =
+        currentFont === undefined || currentFont === api.mixed
+          ? undefined
+          : (currentFont as FontName);
       const loadedFont =
         changesText && !textStyle
-          ? await loadFont(
-              (node as TextNode).fontName === api.mixed
-                ? { family: "Inter", style: "Regular" }
-                : ((node as TextNode).fontName as FontName),
-            )
+          ? await loadFont({
+              family: properties.fontFamily ?? currentFontName?.family ?? "Inter",
+              style: properties.fontStyle ?? currentFontName?.style ?? "Regular",
+            })
           : undefined;
       if (api.currentPage.id !== pageId)
         throw new Error("Figma page changed before properties were updated.");
@@ -745,6 +1180,22 @@ export function createFigmaToolExecutor(
       if (properties.fill !== undefined) {
         (node as SceneNode & { fills: readonly Paint[] }).fills = [
           { type: "SOLID", color: color(properties.fill) },
+        ];
+      }
+      if (properties.stroke !== undefined) {
+        (node as GeometryMixin).strokes = [{ type: "SOLID", color: color(properties.stroke) }];
+      }
+      if (properties.strokeWeight !== undefined)
+        (node as GeometryMixin).strokeWeight = properties.strokeWeight;
+      if (properties.cornerRadius !== undefined)
+        (node as SceneNode & CornerMixin).cornerRadius = properties.cornerRadius;
+      if (properties.opacity !== undefined)
+        (node as SceneNode & BlendMixin).opacity = properties.opacity;
+      if (properties.shadow !== undefined) {
+        const target = node as SceneNode & BlendMixin;
+        target.effects = [
+          ...target.effects.filter((effect) => effect.type !== "DROP_SHADOW"),
+          shadowEffect(properties.shadow),
         ];
       }
       if (paintStyle)
@@ -762,6 +1213,12 @@ export function createFigmaToolExecutor(
         if (properties.color !== undefined)
           text.fills = [{ type: "SOLID", color: color(properties.color) }];
         if (properties.align !== undefined) text.textAlignHorizontal = properties.align;
+        if (properties.lineHeight !== undefined)
+          text.lineHeight = { unit: "PIXELS", value: properties.lineHeight };
+        if (properties.letterSpacing !== undefined)
+          text.letterSpacing = { unit: "PIXELS", value: properties.letterSpacing };
+        if (properties.textAutoResize !== undefined)
+          text.textAutoResize = properties.textAutoResize;
       }
       return {
         summary: `Updated only the requested properties on “${node.name}”.`,
@@ -840,6 +1297,15 @@ export function createFigmaToolExecutor(
     operation: FigmaToolOperation,
     pageId: string,
   ): Promise<OperationResult> => {
+    const alias = isCreation(operation.action) ? operation.action.ref : undefined;
+    if (operation.taskId) {
+      try {
+        operation = { ...operation, action: resolveTaskAction(state, operation) };
+      } catch (error) {
+        if (!(error instanceof ReferenceResolutionError)) throw error;
+        return referenceFailure(operation.operationId, error);
+      }
+    }
     if (api.currentPage.id !== pageId)
       return {
         operationId: operation.operationId,
@@ -855,6 +1321,7 @@ export function createFigmaToolExecutor(
     if (prior) {
       if (
         prior.operationId !== operation.operationId ||
+        prior.taskId !== operation.taskId ||
         prior.fingerprint !== fingerprint ||
         prior.idempotencyKey !== operation.idempotencyKey
       )
@@ -864,6 +1331,21 @@ export function createFigmaToolExecutor(
           replayed: true,
           error: "Operation ID or idempotency key was already used with different input.",
         };
+      if (
+        prior.status === "completed" &&
+        prior.result &&
+        operation.taskId &&
+        isCreation(operation.action)
+      ) {
+        try {
+          const node = await resolveRef(state, operation.action.ref, pageId);
+          if (node.getPluginData(TASK_PLUGIN_KEY) !== operation.taskId)
+            throw new ReferenceResolutionError("ownership_conflict", operation.action.ref);
+        } catch (error) {
+          if (!(error instanceof ReferenceResolutionError)) throw error;
+          return referenceFailure(operation.operationId, error);
+        }
+      }
       if (prior.status === "completed" && prior.result)
         return { ...(prior.result as unknown as OperationResult), replayed: true };
       if (prior.status === "failed" && prior.result)
@@ -874,15 +1356,31 @@ export function createFigmaToolExecutor(
           operation.action.tool === "create_rectangle" ||
           operation.action.tool === "create_text")
       ) {
-        const recovered = api.currentPage.findAll(
+        const creationRef = operation.action.ref;
+        const candidates = api.currentPage.findAll(
           (node) => node.getPluginData(OP_PLUGIN_KEY) === operation.operationId,
-        )[0];
+        );
+        const recovered = candidates.length === 1 ? candidates[0] : undefined;
         if (
           recovered &&
+          (!state.refs[operation.action.ref] ||
+            state.refs[operation.action.ref]!.nodeId === recovered.id) &&
+          api.currentPage.findAll((node) => node.getPluginData(REF_PLUGIN_KEY) === creationRef)
+            .length === 1 &&
+          (!operation.taskId || recovered.getPluginData(TASK_PLUGIN_KEY) === operation.taskId) &&
           recovered.getPluginData(REF_PLUGIN_KEY) === operation.action.ref &&
           recovered.getPluginData(FINGERPRINT_PLUGIN_KEY) === fingerprint
         ) {
-          state.refs[operation.action.ref] = { nodeId: recovered.id, pageId };
+          state.refs[operation.action.ref] = {
+            nodeId: recovered.id,
+            pageId,
+            parentId: recovered.parent?.id,
+            nodeType: recovered.type,
+            creationFingerprint: fingerprint,
+            ...(operation.taskId
+              ? { taskId: operation.taskId, alias, creationOperationId: operation.operationId }
+              : {}),
+          };
           const result: OperationResult = {
             operationId: operation.operationId,
             success: true,
@@ -940,11 +1438,23 @@ export function createFigmaToolExecutor(
         operation.action.tool === "create_rectangle" ||
         operation.action.tool === "create_text")
     ) {
-      const recovered = api.currentPage.findAll(
+      const creationRef = operation.action.ref;
+      const candidates = api.currentPage.findAll(
         (node) => node.getPluginData(OP_PLUGIN_KEY) === operation.operationId,
-      )[0];
+      );
+      if (candidates.length > 1)
+        return referenceFailure(
+          operation.operationId,
+          new ReferenceResolutionError("ambiguous", operation.action.ref),
+        );
+      const recovered = candidates[0];
       if (recovered) {
         if (
+          (state.refs[operation.action.ref] &&
+            state.refs[operation.action.ref]!.nodeId !== recovered.id) ||
+          api.currentPage.findAll((node) => node.getPluginData(REF_PLUGIN_KEY) === creationRef)
+            .length !== 1 ||
+          (operation.taskId && recovered.getPluginData(TASK_PLUGIN_KEY) !== operation.taskId) ||
           recovered.getPluginData(REF_PLUGIN_KEY) !== operation.action.ref ||
           recovered.getPluginData(FINGERPRINT_PLUGIN_KEY) !== fingerprint
         )
@@ -954,7 +1464,16 @@ export function createFigmaToolExecutor(
             replayed: true,
             error: "This operation ID is already attached to a different native node.",
           };
-        state.refs[operation.action.ref] = { nodeId: recovered.id, pageId };
+        state.refs[operation.action.ref] = {
+          nodeId: recovered.id,
+          pageId,
+          parentId: recovered.parent?.id,
+          nodeType: recovered.type,
+          creationFingerprint: fingerprint,
+          ...(operation.taskId
+            ? { taskId: operation.taskId, alias, creationOperationId: operation.operationId }
+            : {}),
+        };
         const result: OperationResult = {
           operationId: operation.operationId,
           success: true,
@@ -965,6 +1484,9 @@ export function createFigmaToolExecutor(
         state.operations[operation.operationId] = {
           operationId: operation.operationId,
           idempotencyKey: operation.idempotencyKey,
+          ...(operation.taskId
+            ? { taskId: operation.taskId, creationRef: operation.action.ref }
+            : {}),
           fingerprint,
           status: "completed",
           updatedAt: Date.now(),
@@ -988,6 +1510,10 @@ export function createFigmaToolExecutor(
     state.operations[operation.operationId] = {
       operationId: operation.operationId,
       idempotencyKey: operation.idempotencyKey,
+      ...(operation.taskId ? { taskId: operation.taskId } : {}),
+      ...(operation.taskId && isCreation(operation.action)
+        ? { creationRef: operation.action.ref }
+        : {}),
       fingerprint,
       status: "running",
       updatedAt: now,
@@ -997,7 +1523,12 @@ export function createFigmaToolExecutor(
     try {
       const output = await actionResult(state, operation, pageId);
       result = { operationId: operation.operationId, success: true, replayed: false, ...output };
+      if (operation.taskId && isCreation(operation.action)) {
+        const entry = state.refs[operation.action.ref];
+        if (entry) entry.alias ??= alias;
+      }
       if (
+        !result.replayed &&
         [
           "create_frame",
           "create_text",
@@ -1010,6 +1541,18 @@ export function createFigmaToolExecutor(
         ].includes(operation.action.tool)
       )
         api.commitUndo();
+      if (
+        !result.replayed &&
+        (operation.action.tool === "append_child" || operation.action.tool === "reparent_node")
+      ) {
+        const childRef =
+          operation.action.tool === "append_child"
+            ? operation.action.childRef
+            : operation.action.ref;
+        const childEntry = state.refs[childRef];
+        const parentEntry = state.refs[operation.action.parentRef];
+        if (childEntry && parentEntry) childEntry.parentId = parentEntry.nodeId;
+      }
       if (api.currentPage.id !== pageId)
         throw new Error("Figma page changed before the operation status was saved.");
       state.operations[operation.operationId] = {
@@ -1028,6 +1571,9 @@ export function createFigmaToolExecutor(
           0,
           400,
         ),
+        ...(error instanceof ReferenceResolutionError
+          ? { data: referenceFailure(operation.operationId, error).data }
+          : {}),
       };
       state.operations[operation.operationId] = {
         ...state.operations[operation.operationId]!,
