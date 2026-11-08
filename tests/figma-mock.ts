@@ -2,6 +2,7 @@ export type MockNode = SceneNode & {
   children: MockNode[];
   pluginData: Map<string, string>;
   parent: MockNode | PageNode | null;
+  resize(width: number, height: number): void;
   appendChild(node: MockNode): void;
   remove(): void;
   removed: boolean;
@@ -13,6 +14,7 @@ export function createMockApi() {
   const nodes: MockNode[] = [];
   const storage = new Map<string, unknown>();
   const rootData = new Map<string, string>();
+  const viewportFocusCalls: string[][] = [];
   const paintStyles = [
     { id: "paint-token-brand", name: "Color/Brand", paints: [] },
   ] as unknown as PaintStyle[];
@@ -55,6 +57,8 @@ export function createMockApi() {
     },
   };
   const makeNode = (type: string): MockNode => {
+    let layoutSizingHorizontal: "FIXED" | "HUG" | "FILL" = "FIXED";
+    let layoutSizingVertical: "FIXED" | "HUG" | "FILL" = "FIXED";
     const node = {
       id: `mock:${nextId++}`,
       type,
@@ -96,17 +100,35 @@ export function createMockApi() {
       parent: null as MockNode | PageNode | null,
       removed: false,
       pluginData: new Map<string, string>(),
-      get absoluteRenderBounds() {
-        return { x: node.x, y: node.y, width: node.width, height: node.height };
-      },
-      get absoluteBoundingBox() {
-        return { x: node.x, y: node.y, width: node.width, height: node.height };
-      },
       get absoluteTransform() {
+        if (node.parent && node.parent.type !== "PAGE") {
+          const [[a, c, e], [b, d, f]] = node.parent.absoluteTransform;
+          return [
+            [a, c, a * node.x + c * node.y + e],
+            [b, d, b * node.x + d * node.y + f],
+          ] as Transform;
+        }
         return [
           [1, 0, node.x],
           [0, 1, node.y],
         ] as Transform;
+      },
+      get absoluteBoundingBox() {
+        const [[a, c, e], [b, d, f]] = node.absoluteTransform;
+        const corners = [
+          [0, 0],
+          [node.width, 0],
+          [0, node.height],
+          [node.width, node.height],
+        ].map(([x, y]) => ({ x: a * x + c * y + e, y: b * x + d * y + f }));
+        const left = Math.min(...corners.map(({ x }) => x));
+        const top = Math.min(...corners.map(({ y }) => y));
+        const right = Math.max(...corners.map(({ x }) => x));
+        const bottom = Math.max(...corners.map(({ y }) => y));
+        return { x: left, y: top, width: right - left, height: bottom - top };
+      },
+      get absoluteRenderBounds() {
+        return node.absoluteBoundingBox;
       },
       resize(width: number, height: number) {
         const mutable = node as unknown as { width: number; height: number };
@@ -119,9 +141,8 @@ export function createMockApi() {
           const paddingLeft = Number(node.paddingLeft) || 0;
           const paddingTop = Number(node.paddingTop) || 0;
           const itemSpacing = Number(node.itemSpacing) || 0;
-          child.x = node.x + paddingLeft;
+          child.x = paddingLeft;
           child.y =
-            node.y +
             paddingTop +
             node.children.reduce((height, sibling) => height + sibling.height, 0) +
             itemSpacing * node.children.length;
@@ -130,11 +151,10 @@ export function createMockApi() {
           const paddingTop = Number(node.paddingTop) || 0;
           const itemSpacing = Number(node.itemSpacing) || 0;
           child.x =
-            node.x +
             paddingLeft +
             node.children.reduce((width, sibling) => width + sibling.width, 0) +
             itemSpacing * node.children.length;
-          child.y = node.y + paddingTop;
+          child.y = paddingTop;
         }
         node.children.push(child);
         (child as unknown as { parent: MockNode | PageNode | null }).parent =
@@ -158,6 +178,33 @@ export function createMockApi() {
         (node as unknown as Record<string, unknown>).textStyleId = id;
       },
     } as unknown as MockNode;
+    for (const [property, read, write] of [
+      [
+        "layoutSizingHorizontal",
+        () => layoutSizingHorizontal,
+        (value: "FIXED" | "HUG" | "FILL") => (layoutSizingHorizontal = value),
+      ],
+      [
+        "layoutSizingVertical",
+        () => layoutSizingVertical,
+        (value: "FIXED" | "HUG" | "FILL") => (layoutSizingVertical = value),
+      ],
+    ] as const) {
+      Object.defineProperty(node, property, {
+        configurable: true,
+        get: read,
+        set(value: "FIXED" | "HUG" | "FILL") {
+          if (
+            value === "FILL" &&
+            (!node.parent ||
+              (node.parent.type !== "FRAME" && node.parent.type !== "COMPONENT") ||
+              (node.parent as MockNode).layoutMode === "NONE")
+          )
+            throw new Error("Figma requires a text FILL size to have an Auto Layout parent.");
+          write(value);
+        },
+      });
+    }
     if (type === "TEXT") delete (node as unknown as Record<string, unknown>).cornerRadius;
     nodes.push(node);
     roots.push(node);
@@ -173,14 +220,21 @@ export function createMockApi() {
     mixed: Symbol("mixed"),
     root,
     currentPage: page,
-    viewport: { center: { x: 500, y: 400 }, scrollAndZoomIntoView() {} },
+    viewport: {
+      center: { x: 500, y: 400 },
+      scrollAndZoomIntoView(focused: SceneNode[]) {
+        viewportFocusCalls.push(focused.map(({ id }) => id));
+      },
+    },
     clientStorage: {
       getAsync: async (key: string) => storage.get(key),
       setAsync: async (key: string, value: unknown) => void storage.set(key, value),
+      deleteAsync: async (key: string) => void storage.delete(key),
     },
     getNodeByIdAsync: async (id: string) =>
       nodes.find((node) => node.id === id && !node.removed) ?? null,
     createFrame: () => makeNode("FRAME") as unknown as FrameNode,
+    createComponent: () => makeNode("COMPONENT") as unknown as ComponentNode,
     createRectangle: () => makeNode("RECTANGLE") as unknown as RectangleNode,
     createText: () => makeNode("TEXT") as unknown as TextNode,
     listAvailableFontsAsync: async () => [
@@ -209,6 +263,7 @@ export function createMockApi() {
     nodes,
     roots,
     storage,
+    viewportFocusCalls,
     switchCurrentPage: () => {
       (api as unknown as { currentPage: PageNode }).currentPage = otherPage as unknown as PageNode;
     },

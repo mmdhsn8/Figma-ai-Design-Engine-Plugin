@@ -16,9 +16,30 @@ import {
 } from "../shared/messages";
 import { FigmaToolOperationSchema, type FigmaToolOperation } from "../shared/figma-tools";
 import { type ChatInputItem } from "../shared/chat-tools";
-import { type ChatTask, chatTaskProgress, chatTaskSafeDiagnostic } from "../shared/chat-task";
+import {
+  chatHistoryExportJson,
+  chatHistoryTitle,
+  duplicateChatHistoryConversation,
+  newChatHistoryConversation,
+  renameChatHistoryConversation,
+  type ChatHistoryConversation,
+  type ChatHistoryMessage,
+} from "../shared/chat-history";
+import { type ChatTask, chatTaskCapacityUsage, chatTaskProgress } from "../shared/chat-task";
 import { runChatTask, chatTaskInput } from "./chat-task";
-import { chatTaskBridge } from "./chat-task-bridge";
+import { chatHistoryBridge, chatTaskBridge } from "./chat-task-bridge";
+import { ChatHistoryView } from "./chat-history-view";
+import { ChatDeleteDialog } from "./chat-delete-dialog";
+import { HomeDashboard } from "./home-dashboard";
+import { MoreMenu, PrimaryNavigation } from "./workspace-navigation";
+import { WorkspaceDetailView } from "./workspace-detail-view";
+import type { PluginView } from "./workspace-routes";
+export type { PluginView } from "./workspace-routes";
+import {
+  chatTaskDiagnosticJson,
+  copyDiagnosticJson,
+  downloadDiagnosticJson,
+} from "./diagnostic-export";
 import { isMultiScreenInput, parseMultiScreenText } from "../shared/multi-screen-schema";
 import {
   createMultiScreenPreview,
@@ -102,12 +123,7 @@ type GenerationDraft = {
   transactions: SavedDraft["transactions"];
 };
 
-type ChatMessage = {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  error?: string;
-};
+type ChatMessage = ChatHistoryMessage;
 
 type ChatToolResult = Extract<PluginToUIMessage, { type: "tool-result" }>;
 
@@ -115,6 +131,39 @@ function safeChatProse(text: string): string {
   if (/```|^\s*[[{]|"(?:tool|arguments|call_id|properties)"\s*:/mu.test(text))
     return "Internal structured output was hidden. See task progress for confirmed canvas changes.";
   return text;
+}
+
+function messagesForTask(task: ChatTask): ChatMessage[] {
+  return [
+    { id: `${task.id}-user`, role: "user", content: task.prompt },
+    {
+      id: task.id,
+      role: "assistant",
+      content: task.status === "completed" ? safeChatProse(task.text) : "",
+      ...(task.status !== "completed"
+        ? {
+            error:
+              task.error ??
+              "Saved task restored. Resume reconciles native operations before continuing.",
+          }
+        : {}),
+    },
+  ];
+}
+
+function modelContextFromMessages(messages: ChatMessage[]): ChatInputItem[] {
+  return messages
+    .filter(({ content }) => content.trim())
+    .map(({ role, content }) => ({ role, content }));
+}
+
+function boundedHistoryMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.slice(-80).map(({ id, role, content, error }) => ({
+    id: id.slice(0, 100),
+    role,
+    content: content.slice(0, 8_000),
+    ...(error ? { error: error.slice(0, 1_500) } : {}),
+  }));
 }
 
 type SectionStage =
@@ -138,7 +187,6 @@ export type CompanionConnectionState =
   | "pairing"
   | "connected";
 
-export type PluginView = "chat" | "design" | "json" | "assets" | "system" | "quality";
 export type ModelDiscoveryState = "idle" | "loading" | "loaded" | "empty" | "error";
 type GenerationTarget = DesignGenerationRequest["target"];
 type GenerationLanguage = DesignGenerationRequest["language"];
@@ -382,7 +430,7 @@ function phase56FixtureOperations() {
   ];
 }
 
-export default function App({ initialView = "chat" }: { initialView?: PluginView } = {}) {
+export default function App({ initialView = "home" }: { initialView?: PluginView } = {}) {
   const [navigation, dispatchNavigation] = useReducer(navigationReducer, {
     activeView: initialView,
     settingsOpen: false,
@@ -476,6 +524,21 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
   } | null>(null);
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatHistory, setChatHistory] = useState<ChatHistoryConversation[]>([]);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [chatHistoryLoaded, setChatHistoryLoaded] = useState(false);
+  const [historyDocumentId, setHistoryDocumentId] = useState<string | null>(null);
+  const [pendingDeleteChat, setPendingDeleteChat] = useState<ChatHistoryConversation | null>(null);
+  const [chatSwitchBusy, setChatSwitchBusy] = useState(false);
+  const chatSwitching = useRef(false);
+  const closeDeleteDialog = useCallback(() => setPendingDeleteChat(null), []);
+  const activeChatIdRef = useRef<string | null>(null);
+  const activeChatModel = useRef("");
+  const chatSelectionEpoch = useRef(0);
+  const chatHistoryRef = useRef(chatHistory);
+  useEffect(() => {
+    chatHistoryRef.current = chatHistory;
+  }, [chatHistory]);
   const [chatBusy, setChatBusy] = useState(false);
   const [chatActivity, setChatActivity] = useState("");
   const [chatPendingTool, setChatPendingTool] = useState(false);
@@ -538,43 +601,147 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
 
   useEffect(() => {
     let active = true;
-    void chatTaskBridge({ type: "chat-task-load", requestId: `chat-load-${Date.now()}` })
-      .then((result) => {
+    void (async () => {
+      try {
+        const loaded = await chatHistoryBridge({
+          type: "chat-history-load",
+          requestId: `chat-history-load-${Date.now()}`,
+        });
         if (!active) return;
-        const task = result.task ?? null;
+        let conversations = loaded.history?.conversations ?? [];
+        let activeId = loaded.history?.activeChatId ?? null;
+        setHistoryDocumentId(loaded.documentId);
+        setDocumentId((current) => current ?? loaded.documentId);
+        let legacyTask: ChatTask | null = null;
+        try {
+          const legacyResult = await chatTaskBridge({
+            type: "chat-task-load",
+            requestId: `legacy-chat-task-load-${Date.now()}`,
+            documentId: loaded.documentId,
+          });
+          legacyTask = legacyResult.task ?? null;
+        } catch (error) {
+          setChatActivity(
+            error instanceof Error ? error.message : "The legacy checkpoint could not be read.",
+          );
+        }
+        if (!active) return;
+        if (legacyTask && !conversations.some(({ id }) => id === legacyTask.id)) {
+          const messages = messagesForTask(legacyTask);
+          const now = Date.now();
+          const migrated: ChatHistoryConversation = {
+            id: legacyTask.id,
+            title: chatHistoryTitle(messages),
+            createdAt: now,
+            updatedAt: now,
+            taskId: legacyTask.id,
+            taskState: legacyTask.status,
+            messages,
+          };
+          const saved = await chatHistoryBridge({
+            type: "chat-history-upsert",
+            requestId: `chat-history-migrate-${Date.now()}`,
+            documentId: loaded.documentId,
+            conversation: migrated,
+            activeChatId: conversations.some(({ id }) => id === activeId)
+              ? activeId
+              : legacyTask.id,
+          });
+          conversations = saved.history?.conversations ?? [...conversations, migrated];
+          activeId = saved.history?.activeChatId ?? activeId ?? legacyTask.id;
+        }
+        if (!active) return;
+        const selected = conversations.some(({ id }) => id === activeId)
+          ? activeId
+          : (conversations[0]?.id ?? legacyTask?.id ?? null);
+        let task = selected && legacyTask?.id === selected ? legacyTask : null;
+        if (selected && !task) {
+          try {
+            const taskResult = await chatTaskBridge({
+              type: "chat-task-load",
+              requestId: `chat-task-load-${Date.now()}`,
+              chatId: selected,
+              documentId: loaded.documentId,
+            });
+            task = taskResult.task ?? null;
+          } catch (error) {
+            setChatActivity(
+              error instanceof Error ? error.message : "The task checkpoint could not be loaded.",
+            );
+          }
+        }
+        if (!active) return;
+        const selectedConversation = conversations.find(({ id }) => id === selected);
+        const messages = selectedConversation?.messages ?? (task ? messagesForTask(task) : []);
+        activeChatIdRef.current = selected;
+        activeChatModel.current = selectedConversation?.model ?? "";
+        setActiveChatId(selected);
+        chatHistoryRef.current = conversations;
+        setChatHistory(conversations);
         chatTask.current = task;
         setChatTaskSnapshot(task);
         setChatTaskLoaded(true);
-        if (!task) return;
-        if (task.status === "completed")
-          chatModelInput.current = chatTaskInput({ ...task, recent: [] }).filter(
-            (item) => "role" in item,
-          );
-        setChatPendingTool(task.status !== "completed");
-        setChatRetryMessageId(task.status === "completed" ? null : task.id);
-        setChatMessages([
-          { id: `${task.id}-user`, role: "user", content: task.prompt },
-          {
-            id: task.id,
-            role: "assistant",
-            content: task.status === "completed" ? safeChatProse(task.text) : "",
-            ...(task.status !== "completed"
-              ? {
-                  error:
-                    task.error ??
-                    "Saved task restored. Resume reconciles native operations before continuing.",
-                }
-              : {}),
-          },
-        ]);
-      })
-      .catch((error: Error) => {
-        if (active) setChatActivity(error.message);
-      });
+        setChatPendingTool(Boolean(task && task.status !== "completed"));
+        setChatRetryMessageId(task && task.status !== "completed" ? task.id : null);
+        setChatMessages(messages);
+        chatModelInput.current = modelContextFromMessages(messages);
+        setSelectedCompanionModel(selectedConversation?.model ?? "");
+        setChatHistoryLoaded(true);
+      } catch (error) {
+        if (!active) return;
+        setChatActivity(
+          error instanceof Error ? error.message : "Chat history could not be loaded.",
+        );
+        setChatHistoryLoaded(true);
+        setChatTaskLoaded(true);
+      }
+    })();
     return () => {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!chatHistoryLoaded || !historyDocumentId || !activeChatId) return;
+    const messages = boundedHistoryMessages(chatMessages);
+    const existing = chatHistoryRef.current.find(({ id }) => id === activeChatId);
+    const taskId = chatTaskSnapshot?.id;
+    const taskStatus = chatTaskSnapshot?.status;
+    const updatedAt = Date.now();
+    const conversation: ChatHistoryConversation = {
+      id: activeChatId,
+      title:
+        existing && existing.title !== "New chat" ? existing.title : chatHistoryTitle(messages),
+      createdAt: existing?.createdAt ?? updatedAt,
+      updatedAt,
+      ...(selectedCompanionModel ? { model: selectedCompanionModel.slice(0, 100) } : {}),
+      ...(taskId ? { taskId } : existing?.taskId ? { taskId: existing.taskId } : {}),
+      taskState: chatBusy ? "running" : (taskStatus ?? existing?.taskState ?? "new"),
+      messages,
+    };
+    const nextHistory = [
+      conversation,
+      ...chatHistoryRef.current.filter(({ id }) => id !== activeChatId),
+    ].sort((first, second) => second.updatedAt - first.updatedAt);
+    chatHistoryRef.current = nextHistory;
+    setChatHistory(nextHistory);
+    void chatHistoryBridge({
+      type: "chat-history-upsert",
+      requestId: `chat-history-save-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      documentId: historyDocumentId,
+      conversation,
+      activeChatId,
+    }).catch((error: Error) => setChatActivity(error.message));
+  }, [
+    activeChatId,
+    chatBusy,
+    chatHistoryLoaded,
+    chatMessages,
+    chatTaskSnapshot?.id,
+    chatTaskSnapshot?.status,
+    historyDocumentId,
+    selectedCompanionModel,
+  ]);
   const generationBlockReason = getDesignGenerationBlockReason({
     prompt,
     planValid: generationPlan.success,
@@ -662,7 +829,10 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
       if (
         message.type === "generation-result" ||
         message.type === "generation-node-progress" ||
-        message.type === "chat-task-result"
+        message.type === "chat-task-result" ||
+        message.type === "chat-history-result" ||
+        message.type === "task-native-inspection-result" ||
+        message.type === "task-native-focus-result"
       )
         return;
       if (message.type === "tool-progress") {
@@ -1027,6 +1197,270 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
 
   const nextRequestId = () => `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+  const canSwitchChats =
+    chatHistoryLoaded && Boolean(historyDocumentId) && !chatBusy && !toolBusy && !chatSwitchBusy;
+  const canSwitchChatsNow = () =>
+    canSwitchChats && !chatSwitching.current && !chatRunning.current && !toolBatchId.current;
+  const chatSwitchBlockReason = !chatHistoryLoaded
+    ? undefined
+    : !historyDocumentId
+      ? "Saved chat history is available inside the Figma plugin. No chat data was changed in this preview."
+      : chatBusy || toolBusy
+        ? "A native operation is active. Stop or wait for the current task before switching chats; it will not be cancelled in the background."
+        : chatSwitchBusy
+          ? "Loading the selected chat. Please wait."
+          : undefined;
+
+  const saveConversation = async (
+    conversation: ChatHistoryConversation,
+    selectedId: string | null = activeChatIdRef.current,
+  ) => {
+    if (!historyDocumentId) throw new Error("Chat history is still loading.");
+    const result = await chatHistoryBridge({
+      type: "chat-history-upsert",
+      requestId: nextRequestId(),
+      documentId: historyDocumentId,
+      conversation,
+      activeChatId: selectedId,
+    });
+    const conversations = result.history?.conversations ?? chatHistoryRef.current;
+    chatHistoryRef.current = conversations;
+    setChatHistory(conversations);
+    return result.history;
+  };
+
+  const snapshotActiveConversation = (): ChatHistoryConversation | null => {
+    const id = activeChatIdRef.current;
+    if (!id) return null;
+    const existing = chatHistoryRef.current.find((conversation) => conversation.id === id);
+    const now = Date.now();
+    const task = chatTask.current;
+    return {
+      id,
+      title:
+        existing?.title && existing.title !== "New chat"
+          ? existing.title
+          : chatHistoryTitle(chatMessages),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      ...(selectedCompanionModel ? { model: selectedCompanionModel.slice(0, 100) } : {}),
+      ...(task ? { taskId: task.id } : existing?.taskId ? { taskId: existing.taskId } : {}),
+      taskState: chatBusy ? "running" : (task?.status ?? existing?.taskState ?? "new"),
+      messages: boundedHistoryMessages(chatMessages),
+    };
+  };
+
+  const installConversation = (conversation: ChatHistoryConversation, task: ChatTask | null) => {
+    activeChatIdRef.current = conversation.id;
+    activeChatModel.current = conversation.model ?? "";
+    setActiveChatId(conversation.id);
+    chatTask.current = task;
+    setChatTaskSnapshot(task);
+    setChatTaskLoaded(true);
+    setChatPendingTool(Boolean(task && task.status !== "completed"));
+    setChatRetryMessageId(task && task.status !== "completed" ? task.id : null);
+    setChatMessages(conversation.messages);
+    chatModelInput.current = modelContextFromMessages(conversation.messages);
+    setChatActivity("");
+    setSelectedCompanionModel(conversation.model ?? "");
+    dispatchNavigation({ type: "navigate", view: "chat" });
+  };
+
+  const openConversation = async (conversation: ChatHistoryConversation) => {
+    if (!canSwitchChatsNow() || conversation.id === activeChatIdRef.current) return;
+    chatSwitching.current = true;
+    const epoch = ++chatSelectionEpoch.current;
+    setChatSwitchBusy(true);
+    setChatTaskLoaded(false);
+    try {
+      const current = snapshotActiveConversation();
+      if (current) await saveConversation(current);
+      const loaded = await chatTaskBridge({
+        type: "chat-task-load",
+        requestId: nextRequestId(),
+        chatId: conversation.id,
+        documentId: historyDocumentId!,
+      });
+      if (epoch !== chatSelectionEpoch.current) return;
+      const selected = { ...conversation, updatedAt: Date.now() };
+      const history = await saveConversation(selected, selected.id);
+      if (epoch !== chatSelectionEpoch.current) return;
+      const conversations = history?.conversations ?? [
+        selected,
+        ...chatHistoryRef.current.filter(({ id }) => id !== selected.id),
+      ];
+      chatHistoryRef.current = conversations;
+      setChatHistory(conversations);
+      installConversation(selected, loaded.task ?? null);
+    } catch (error) {
+      if (epoch === chatSelectionEpoch.current) {
+        setChatTaskLoaded(true);
+        setChatActivity(error instanceof Error ? error.message : "This chat could not be opened.");
+      }
+    } finally {
+      if (epoch === chatSelectionEpoch.current) {
+        chatSwitching.current = false;
+        setChatSwitchBusy(false);
+      }
+    }
+  };
+
+  const createNewChat = async () => {
+    if (!canSwitchChatsNow() || !historyDocumentId) return;
+    chatSwitching.current = true;
+    const epoch = ++chatSelectionEpoch.current;
+    setChatSwitchBusy(true);
+    try {
+      const current = snapshotActiveConversation();
+      if (current) await saveConversation(current);
+      const now = Date.now();
+      const conversation = newChatHistoryConversation(
+        `chat-${now}-${Math.random().toString(36).slice(2, 8)}`,
+        now,
+        selectedCompanionModel,
+      );
+      const history = await saveConversation(conversation, conversation.id);
+      if (epoch !== chatSelectionEpoch.current) return;
+      const conversations = history?.conversations ?? [conversation, ...chatHistoryRef.current];
+      chatHistoryRef.current = conversations;
+      setChatHistory(conversations);
+      setChatInput("");
+      installConversation(conversation, null);
+    } catch (error) {
+      if (epoch === chatSelectionEpoch.current)
+        setChatActivity(
+          error instanceof Error ? error.message : "A new chat could not be created.",
+        );
+    } finally {
+      if (epoch === chatSelectionEpoch.current) {
+        chatSwitching.current = false;
+        setChatSwitchBusy(false);
+      }
+    }
+  };
+
+  const duplicateConversation = async (source: ChatHistoryConversation) => {
+    if (!canSwitchChatsNow() || !historyDocumentId) return;
+    chatSwitching.current = true;
+    const epoch = ++chatSelectionEpoch.current;
+    setChatSwitchBusy(true);
+    try {
+      const current = snapshotActiveConversation();
+      if (current) await saveConversation(current);
+      const now = Date.now();
+      const id = `chat-${now}-${Math.random().toString(36).slice(2, 8)}`;
+      const duplicate = duplicateChatHistoryConversation(source, id, now);
+      const history = await saveConversation(duplicate, id);
+      if (epoch !== chatSelectionEpoch.current) return;
+      const conversations = history?.conversations ?? [duplicate, ...chatHistoryRef.current];
+      chatHistoryRef.current = conversations;
+      setChatHistory(conversations);
+      installConversation(duplicate, null);
+    } catch (error) {
+      if (epoch === chatSelectionEpoch.current)
+        setChatActivity(
+          error instanceof Error ? error.message : "This chat could not be duplicated.",
+        );
+    } finally {
+      if (epoch === chatSelectionEpoch.current) {
+        chatSwitching.current = false;
+        setChatSwitchBusy(false);
+      }
+    }
+  };
+
+  const renameConversation = async (source: ChatHistoryConversation, title: string) => {
+    if (!canSwitchChatsNow()) return;
+    const renamed = renameChatHistoryConversation(source, title, Date.now());
+    try {
+      const history = await saveConversation(renamed);
+      const conversations = history?.conversations ?? [
+        renamed,
+        ...chatHistoryRef.current.filter(({ id }) => id !== renamed.id),
+      ];
+      chatHistoryRef.current = conversations;
+      setChatHistory(conversations);
+    } catch (error) {
+      setChatActivity(error instanceof Error ? error.message : "This chat could not be renamed.");
+    }
+  };
+
+  const exportConversation = (conversation: ChatHistoryConversation) => {
+    try {
+      downloadDiagnosticJson(
+        chatHistoryExportJson(conversation),
+        `figma-ai-chat-${conversation.id}.json`,
+      );
+      setChatActivity(
+        "Chat export started. It contains messages and chat metadata, not task checkpoints or account credentials.",
+      );
+    } catch (error) {
+      setChatActivity(error instanceof Error ? error.message : "Chat export is unavailable.");
+    }
+  };
+
+  const deleteConversation = async () => {
+    const target = pendingDeleteChat;
+    if (!target || !canSwitchChatsNow() || !historyDocumentId) return;
+    chatSwitching.current = true;
+    const epoch = ++chatSelectionEpoch.current;
+    setChatSwitchBusy(true);
+    try {
+      const result = await chatHistoryBridge({
+        type: "chat-history-delete",
+        requestId: nextRequestId(),
+        documentId: historyDocumentId,
+        chatId: target.id,
+      });
+      if (epoch !== chatSelectionEpoch.current) return;
+      const history = result.history;
+      const removedActive = activeChatIdRef.current === target.id;
+      setPendingDeleteChat(null);
+      const conversations =
+        history?.conversations ?? chatHistoryRef.current.filter(({ id }) => id !== target.id);
+      chatHistoryRef.current = conversations;
+      setChatHistory(conversations);
+      if (removedActive) {
+        activeChatIdRef.current = null;
+        setActiveChatId(null);
+        setChatMessages([]);
+        chatModelInput.current = [];
+        chatTask.current = null;
+        setChatTaskSnapshot(null);
+        setChatPendingTool(false);
+        setChatRetryMessageId(null);
+        const next = history?.conversations.find(({ id }) => id === history.activeChatId);
+        if (next) {
+          const loaded = await chatTaskBridge({
+            type: "chat-task-load",
+            requestId: nextRequestId(),
+            chatId: next.id,
+            documentId: historyDocumentId!,
+          });
+          if (epoch !== chatSelectionEpoch.current) return;
+          installConversation(next, loaded.task ?? null);
+        } else {
+          const now = Date.now();
+          const nextChat = newChatHistoryConversation(
+            `chat-${now}-${Math.random().toString(36).slice(2, 8)}`,
+            now,
+          );
+          await saveConversation(nextChat, nextChat.id);
+          if (epoch !== chatSelectionEpoch.current) return;
+          installConversation(nextChat, null);
+        }
+      }
+    } catch (error) {
+      setPendingDeleteChat(null);
+      setChatActivity(error instanceof Error ? error.message : "The chat could not be deleted.");
+    } finally {
+      if (epoch === chatSelectionEpoch.current) {
+        chatSwitching.current = false;
+        setChatSwitchBusy(false);
+      }
+    }
+  };
+
   const runToolOperations = (
     operations: FigmaToolOperation[],
     completion?: {
@@ -1063,11 +1497,22 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
   };
 
   const sendChatMessage = async (retry = false) => {
-    if (chatRunning.current || toolBatchId.current || !chatTaskLoaded) return;
+    if (
+      chatRunning.current ||
+      toolBatchId.current ||
+      !chatTaskLoaded ||
+      !historyDocumentId ||
+      chatSwitching.current ||
+      chatSwitchBusy
+    )
+      return;
     if (!companionToken || !selectedCompanionModel || !chatReady) return;
     if (!retry && chatTask.current && chatTask.current.status !== "completed") return;
     const text = chatInput.trim();
     if (!retry && !text) return;
+    if (!activeChatIdRef.current) await createNewChat();
+    const taskChatId = activeChatIdRef.current;
+    if (!taskChatId) return;
     chatStopRequested.current = false;
     chatRunning.current = true;
     setChatBusy(true);
@@ -1076,10 +1521,15 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
     let assistantId = chatTask.current?.id ?? "";
     try {
       if (!retry) {
-        const loaded = await chatTaskBridge({ type: "chat-task-load", requestId: nextRequestId() });
+        const loaded = await chatTaskBridge({
+          type: "chat-task-load",
+          requestId: nextRequestId(),
+          chatId: taskChatId,
+          documentId: historyDocumentId ?? undefined,
+        });
         if (loaded.task && loaded.task.status !== "completed")
           throw new Error(
-            "A saved task is pending on this page. Reload the plugin to restore it rather than overwrite its checkpoint.",
+            "This chat has a saved task that needs recovery. Resume it before starting another request.",
           );
         const id = `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         assistantId = id;
@@ -1089,19 +1539,26 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
           referenceScope: "task-v1",
           documentId: loaded.documentId,
           prompt: text,
-          context:
-            chatTask.current?.documentId === loaded.documentId
-              ? chatModelInput.current
-              : loaded.task
-                ? chatTaskInput(loaded.task).filter((item) => "role" in item)
-                : [],
+          lifecycle: "UNPLANNED",
+          context: chatTask.current?.documentId === loaded.documentId ? chatModelInput.current : [],
           stages: [],
           ledger: [],
           pending: [],
           recent: [],
           starts: chatTask.current?.starts ?? [],
           rounds: 0,
+          roundBreakdown: {
+            prePlan: 0,
+            planning: 0,
+            execution: 0,
+            inspection: 0,
+            completion: 0,
+            correction: 0,
+            continuation: 0,
+            modelRetries: 0,
+          },
           batches: 0,
+          lifecycleTransitions: 0,
           lastResponseCalls: 0,
           validationCorrections: 0,
           referenceCorrections: 0,
@@ -1131,17 +1588,19 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
             type: "chat-task-save",
             requestId: nextRequestId(),
             documentId: checkpoint.documentId,
+            chatId: taskChatId,
             task: checkpoint,
           });
           setChatTaskSnapshot(structuredClone(checkpoint));
         },
         progress: setChatActivity,
-        model: (input) =>
+        model: (input, lifecycle) =>
           streamAuthorizedChat(
             companionToken,
             nextRequestId(),
             selectedCompanionModel,
             input,
+            lifecycle,
             fetch,
             controller.signal,
             () => setChatActivity("Receiving the next bounded stage…"),
@@ -1197,41 +1656,6 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
     chatAbort.current?.abort();
     if (toolBatchId.current) cancelToolBatch();
     setChatActivity("Stopping; the current native operation will finish or time out…");
-  };
-
-  const clearChat = () => {
-    if (chatBusy || toolBusy) return;
-    const documentId = chatTask.current?.documentId;
-    if (
-      chatTask.current &&
-      chatTask.current.status !== "completed" &&
-      !window.confirm(
-        "Discard the saved task? Existing canvas changes will remain, but this task will no longer be resumable.",
-      )
-    )
-      return;
-    if (documentId)
-      void chatTaskBridge({
-        type: "chat-task-save",
-        requestId: nextRequestId(),
-        documentId,
-        task: null,
-      })
-        .then(() => {
-          chatTask.current = null;
-          setChatTaskSnapshot(null);
-          setChatPendingTool(false);
-          setChatMessages([]);
-          chatModelInput.current = [];
-          setChatRetryMessageId(null);
-          setChatActivity("");
-        })
-        .catch((error: Error) => setChatActivity(error.message));
-    else {
-      chatModelInput.current = [];
-      setChatMessages([]);
-      setChatActivity("");
-    }
   };
 
   const runFixtureStep = (start: number, end: number) =>
@@ -1493,10 +1917,11 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
       const status = await getCompanionStatus(companionToken);
       const nextModel = retainSelectedAccountModel(
         models,
-        selectedCompanionModel,
+        activeChatModel.current || selectedCompanionModel,
         status.inferenceVerifiedModel,
       );
       setCompanionModels(models);
+      activeChatModel.current = nextModel;
       setSelectedCompanionModel(nextModel);
       if (nextModel !== selectedCompanionModel) {
         setSmokeResult(null);
@@ -2448,12 +2873,16 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
           <div className="brand-subtitle">Structured, editable design workflows</div>
         </div>
         {chatBusy && (
-          <button className="text-button muted" type="button" onClick={stopChat}>
+          <button className="text-button muted topbar-action" type="button" onClick={stopChat}>
             Stop chat
           </button>
         )}
         {toolBusy && !chatBusy && (
-          <button className="text-button muted" type="button" onClick={cancelToolBatch}>
+          <button
+            className="text-button muted topbar-action"
+            type="button"
+            onClick={cancelToolBatch}
+          >
             Cancel operation
           </button>
         )}
@@ -2488,29 +2917,10 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
       </header>
 
       {!settingsOpen && (
-        <nav className="primary-nav" aria-label="Plugin sections">
-          {(
-            [
-              ["chat", "AI Chat"],
-              ["design", "Design"],
-              ["json", "JSON"],
-              ["assets", "Assets"],
-              ["system", "System"],
-              ["quality", "Quality"],
-            ] as const
-          ).map(([view, label]) => (
-            <button
-              className={`nav-item ${activeView === view ? "is-active" : ""}`}
-              key={view}
-              type="button"
-              aria-label={view === "system" ? "Design System" : label}
-              aria-current={activeView === view ? "page" : undefined}
-              onClick={() => dispatchNavigation({ type: "navigate", view })}
-            >
-              {label}
-            </button>
-          ))}
-        </nav>
+        <PrimaryNavigation
+          activeView={activeView}
+          onNavigate={(view) => dispatchNavigation({ type: "navigate", view })}
+        />
       )}
 
       {settingsOpen ? (
@@ -2526,6 +2936,64 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
             Manage local pairing, ChatGPT access, account-visible models, and developer diagnostics.
           </p>
         </section>
+      ) : activeView === "home" ? (
+        <HomeDashboard
+          connection={connectionSummary}
+          model={selectedCompanionModel || "No model selected"}
+          recentChats={chatHistory}
+          taskSummary={chatTaskSnapshot ? chatTaskProgress(chatTaskSnapshot) : undefined}
+          taskState={
+            chatBusy
+              ? "running"
+              : chatTaskSnapshot?.status === "running"
+                ? "needs recovery"
+                : chatTaskSnapshot?.status
+          }
+          canOpenChats={canSwitchChats}
+          onStartChat={() => void createNewChat()}
+          onNavigate={(view) => dispatchNavigation({ type: "navigate", view })}
+          onOpenChat={(conversation) => {
+            if (conversation.id === activeChatId)
+              dispatchNavigation({ type: "navigate", view: "chat" });
+            else void openConversation(conversation);
+          }}
+        />
+      ) : activeView === "history" ? (
+        <ChatHistoryView
+          conversations={chatHistory}
+          activeChatId={activeChatId}
+          canSwitch={canSwitchChats}
+          disabledReason={chatSwitchBlockReason}
+          loading={!chatHistoryLoaded}
+          onNew={() => void createNewChat()}
+          onOpen={(conversation) => void openConversation(conversation)}
+          onRename={(conversation, title) => void renameConversation(conversation, title)}
+          onDuplicate={(conversation) => void duplicateConversation(conversation)}
+          onExport={exportConversation}
+          onDelete={setPendingDeleteChat}
+        />
+      ) : activeView === "more" ? (
+        <MoreMenu onNavigate={(view) => dispatchNavigation({ type: "navigate", view })} />
+      ) : activeView === "progress" ||
+        activeView === "activity" ||
+        activeView === "results" ||
+        activeView === "layers" ||
+        activeView === "brand-kit" ||
+        activeView === "brand-kit-create" ||
+        activeView === "skills" ||
+        activeView === "skill-detail" ||
+        activeView === "skill-add" ||
+        activeView === "help" ||
+        activeView === "about" ? (
+        <WorkspaceDetailView
+          view={activeView}
+          task={chatTaskSnapshot}
+          isRunning={chatBusy}
+          canResume={chatReady && !toolBusy && !chatSwitchBusy}
+          onStop={stopChat}
+          onResume={() => void sendChatMessage(true)}
+          onNavigate={(view) => dispatchNavigation({ type: "navigate", view })}
+        />
       ) : activeView === "chat" ? (
         <section className="chat-home" aria-labelledby="chat-title">
           <div className="page-heading">
@@ -2540,10 +3008,36 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
             <button
               className="text-button muted"
               type="button"
-              disabled={chatBusy || toolBusy || !chatMessages.length}
-              onClick={clearChat}
+              disabled={
+                !canSwitchChats ||
+                (Boolean(activeChatId) && !chatMessages.length && !chatTaskSnapshot)
+              }
+              onClick={() => void createNewChat()}
             >
               New chat
+            </button>
+          </div>
+          <div className="chat-context-summary" aria-label="Current generation context">
+            <button type="button" onClick={() => dispatchNavigation({ type: "open-settings" })}>
+              <small>MODEL</small>
+              <strong>
+                {companionModels.find(({ slug }) => slug === selectedCompanionModel)?.displayName ??
+                  (selectedCompanionModel || "No model selected")}
+              </strong>
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatchNavigation({ type: "navigate", view: "brand-kit" })}
+            >
+              <small>BRAND KIT</small>
+              <strong>Not available yet</strong>
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatchNavigation({ type: "navigate", view: "skills" })}
+            >
+              <small>SKILLS</small>
+              <strong>Not available yet</strong>
             </button>
           </div>
           <div
@@ -2597,10 +3091,66 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
                   </li>
                 ))}
               </ol>
+              <div className="task-detail-links">
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => dispatchNavigation({ type: "navigate", view: "progress" })}
+                >
+                  Generation Progress
+                </button>
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => dispatchNavigation({ type: "navigate", view: "results" })}
+                >
+                  Results
+                </button>
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => dispatchNavigation({ type: "navigate", view: "layers" })}
+                >
+                  Layers & Structure
+                </button>
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => dispatchNavigation({ type: "navigate", view: "activity" })}
+                >
+                  Activity & Diagnostics
+                </button>
+              </div>
+              {!chatBusy && chatTaskSnapshot.status !== "completed" && (
+                <button
+                  type="button"
+                  className="secondary-action"
+                  disabled={!chatReady || toolBusy || chatSwitchBusy}
+                  onClick={() => void sendChatMessage(true)}
+                >
+                  {chatTaskSnapshot.status === "failed"
+                    ? "Retry failed stage"
+                    : "Resume saved task"}
+                </button>
+              )}
               <small>
-                Task {chatTaskSnapshot.id} · {chatTaskSnapshot.rounds} model rounds ·{" "}
-                {chatTaskSnapshot.batches} batches · {chatTaskSnapshot.lastResponseCalls} calls in
-                last response · {chatTaskSnapshot.ledger.length} scheduled operations
+                Task {chatTaskSnapshot.id} ·{" "}
+                {chatTaskSnapshot.rounds + chatTaskSnapshot.roundBreakdown.modelRetries} model
+                requests · {chatTaskSnapshot.batches} batches · {chatTaskSnapshot.lastResponseCalls}{" "}
+                calls in last response · {chatTaskCapacityUsage(chatTaskSnapshot).mutations}/
+                {chatTaskCapacityUsage(chatTaskSnapshot).mutationCapacity} mutations ·{" "}
+                {chatTaskCapacityUsage(chatTaskSnapshot).readOnlyOperations} read-only ·{" "}
+                {chatTaskCapacityUsage(chatTaskSnapshot).verificationOperations} verification
+              </small>
+              <small>
+                State: {chatTaskSnapshot.lifecycle} · Lifecycle:{" "}
+                {chatTaskSnapshot.roundBreakdown.planning} planning ·{" "}
+                {chatTaskSnapshot.roundBreakdown.execution} execution ·{" "}
+                {chatTaskSnapshot.roundBreakdown.inspection} inspection ·{" "}
+                {chatTaskSnapshot.roundBreakdown.completion} completion ·{" "}
+                {chatTaskSnapshot.roundBreakdown.correction} correction ·{" "}
+                {chatTaskSnapshot.roundBreakdown.modelRetries} model retries ·{" "}
+                {chatTaskSnapshot.lifecycleTransitions} state transitions
               </small>
               {chatTaskSnapshot.failure && (
                 <>
@@ -2613,27 +3163,92 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
                     {` · ${chatTaskSnapshot.failure.committedOperations} committed canvas operations. `}
                     Inspect the failed stage before retrying; confirmed work is retained.
                   </p>
+                  {chatTaskSnapshot.lastRequestDiagnostic && (
+                    <small>
+                      Request {chatTaskSnapshot.lastRequestDiagnostic.requestId} ·{" "}
+                      {chatTaskSnapshot.lastRequestDiagnostic.requestPhase ?? "unknown phase"} ·{" "}
+                      {chatTaskSnapshot.lastRequestDiagnostic.timeoutSource ??
+                        chatTaskSnapshot.lastRequestDiagnostic.terminationReason ??
+                        chatTaskSnapshot.lastRequestDiagnostic.outcome}
+                      {chatTaskSnapshot.lastRequestDiagnostic.elapsedMs !== undefined
+                        ? ` · ${chatTaskSnapshot.lastRequestDiagnostic.elapsedMs} ms elapsed`
+                        : ""}
+                      {chatTaskSnapshot.lastRequestDiagnostic.lastEventAtMs !== undefined
+                        ? ` · last event at ${chatTaskSnapshot.lastRequestDiagnostic.lastEventAtMs}`
+                        : ""}
+                    </small>
+                  )}
+                  {(() => {
+                    const stage = chatTaskSnapshot.stages.find((item) => !item.completed);
+                    return stage?.verificationHistory.length ? (
+                      <div
+                        className="chat-quality-diagnostic"
+                        aria-label="Structural quality diagnostic"
+                      >
+                        <p>
+                          Structural checks: {stage.verificationHistory.length} · repair attempts:{" "}
+                          {stage.repairOperationsAttempted} · confirmed mutations:{" "}
+                          {stage.repairOperationsExecuted} · findings resolved:{" "}
+                          {stage.repairFindingsResolved ?? 0}
+                        </p>
+                        {stage.qualityFindings.length > 0 && (
+                          <ul>
+                            {stage.qualityFindings.map((finding, index) => (
+                              <li key={`${finding.code}-${index}`}>
+                                <strong>{finding.code}</strong>
+                                {finding.refs.length ? ` · refs: ${finding.refs.join(", ")}` : ""}
+                                {` · expected ${finding.expected} · actual ${finding.actual}`}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        <small>
+                          Repair operations attempted:{" "}
+                          {stage.repairOperationsAttempted > 0 ? "yes" : "no"}
+                          {` · native mutations confirmed: ${stage.repairOperationsExecuted > 0 ? "yes" : "no"}`}
+                        </small>
+                      </div>
+                    ) : null;
+                  })()}
                   <button
                     type="button"
                     className="secondary-action"
                     onClick={() => {
-                      void navigator.clipboard
-                        .writeText(
-                          JSON.stringify(chatTaskSafeDiagnostic(chatTaskSnapshot), null, 2),
-                        )
-                        .then(() =>
+                      void copyDiagnosticJson(chatTaskDiagnosticJson(chatTaskSnapshot))
+                        .then((method) =>
                           setChatActivity(
-                            "Sanitized diagnostic copied; it contains no prompt or canvas content.",
+                            method === "clipboard"
+                              ? "Sanitized diagnostic copied to the clipboard."
+                              : "Sanitized diagnostic copied using the plugin UI fallback.",
                           ),
                         )
                         .catch(() =>
                           setChatActivity(
-                            "Clipboard unavailable. Copy only the visible safe category/code and companion diagnostic line.",
+                            "Copy failed. Use Download diagnostic JSON; no task or canvas data was changed.",
                           ),
                         );
                     }}
                   >
                     Copy sanitized diagnostic
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    onClick={() => {
+                      try {
+                        downloadDiagnosticJson(
+                          chatTaskDiagnosticJson(chatTaskSnapshot),
+                          `figma-ai-diagnostic-${chatTaskSnapshot.id.replace(/[^A-Za-z0-9_-]/gu, "_")}.json`,
+                        );
+                        setChatActivity("Sanitized diagnostic JSON download started.");
+                      } catch {
+                        setChatActivity(
+                          "Diagnostic download failed; the task and canvas were not changed.",
+                        );
+                      }
+                    }}
+                  >
+                    Download diagnostic JSON
                   </button>
                 </>
               )}
@@ -2668,7 +3283,7 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
               rows={3}
               dir={/[\u0600-\u06ff]/u.test(chatInput) ? "rtl" : "auto"}
               placeholder="Describe a design or change… / تغییر موردنظرت را توضیح بده…"
-              disabled={chatBusy}
+              disabled={chatBusy || chatSwitchBusy || !chatTaskLoaded}
               onChange={(event) => setChatInput(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -2688,7 +3303,7 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
               <button
                 type="submit"
                 className="primary-action"
-                disabled={!chatInput.trim() || !chatCanSubmit || chatBusy}
+                disabled={!chatInput.trim() || !chatCanSubmit || chatBusy || chatSwitchBusy}
               >
                 Send
               </button>
@@ -2987,6 +3602,7 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
                     id="design-model"
                     value={selectedCompanionModel}
                     onChange={(event) => {
+                      activeChatModel.current = event.target.value;
                       setSelectedCompanionModel(event.target.value);
                       setSmokeResult(null);
                       setSmokeDiagnostic(null);
@@ -3058,6 +3674,7 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
                   setGenerationStyle(request.style);
                   setGenerationProjectType(request.projectType);
                   setGenerationTheme(request.theme);
+                  activeChatModel.current = savedDraft.manifest.model;
                   setSelectedCompanionModel(savedDraft.manifest.model);
                   setDraftNotice(
                     `Restored ${savedDraft.screens.length} saved screens. Verify the exact selected model if needed, then press Generate to resume.`,
@@ -3656,6 +4273,7 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
                       <select
                         value={selectedCompanionModel}
                         onChange={(event) => {
+                          activeChatModel.current = event.target.value;
                           setSelectedCompanionModel(event.target.value);
                           setSmokeResult(null);
                           setSmokeDiagnostic(null);
@@ -4182,6 +4800,21 @@ export default function App({ initialView = "chat" }: { initialView?: PluginView
             </button>
           </div>
         </>
+      )}
+
+      {chatActivity && activeView !== "chat" && !settingsOpen && (
+        <p className="route-status" role="status" aria-live="polite">
+          {safeChatProse(chatActivity)}
+        </p>
+      )}
+
+      {pendingDeleteChat && (
+        <ChatDeleteDialog
+          conversation={pendingDeleteChat}
+          busy={chatSwitchBusy}
+          onCancel={closeDeleteDialog}
+          onConfirm={() => void deleteConversation()}
+        />
       )}
 
       <footer className="footer-note">

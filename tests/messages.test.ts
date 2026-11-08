@@ -2,6 +2,105 @@ import { describe, expect, it } from "vitest";
 import { PluginToUISchema, UIToPluginSchema } from "../src/shared/messages";
 
 describe("plugin message contract", () => {
+  it("bounds task-owned native inspection and focus requests and responses", () => {
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "task-native-inspect",
+        requestId: "inspect-task-0001",
+        documentId: "file-page",
+        taskId: "chat-task-0001",
+        refs: ["screen-root"],
+      }).success,
+    ).toBe(true);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "task-native-inspect",
+        requestId: "inspect-task-0001",
+        documentId: "file-page",
+        taskId: "chat-task-0001",
+        refs: [],
+        includeDocument: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "task-native-focus",
+        requestId: "focus-task-0001",
+        documentId: "file-page",
+        taskId: "chat-task-0001",
+        nodeIds: ["node:1"],
+        mode: "select",
+      }).success,
+    ).toBe(true);
+    expect(
+      PluginToUISchema.safeParse({
+        type: "task-native-inspection-result",
+        requestId: "inspect-task-0001",
+        success: true,
+        taskId: "chat-task-0001",
+        nodes: [
+          {
+            id: "node:1",
+            name: "Home screen",
+            type: "FRAME",
+            x: 0,
+            y: 0,
+            width: 390,
+            height: 844,
+            visible: true,
+          },
+        ],
+        unresolvedRefs: [],
+        truncated: false,
+      }).success,
+    ).toBe(true);
+  });
+
+  it("validates document-scoped chat history operations and scoped checkpoints", () => {
+    const conversation = {
+      id: "conversation-0001",
+      title: "Storefront",
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_000,
+      taskState: "new",
+      messages: [],
+    };
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "chat-history-upsert",
+        requestId: "history-1",
+        documentId: "file-page",
+        conversation,
+        activeChatId: conversation.id,
+      }).success,
+    ).toBe(true);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "chat-history-delete",
+        requestId: "history-2",
+        documentId: "file-page",
+        chatId: conversation.id,
+        deleteCanvas: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "chat-task-load",
+        requestId: "task-load",
+        chatId: conversation.id,
+      }).success,
+    ).toBe(true);
+    expect(
+      PluginToUISchema.safeParse({
+        type: "chat-history-result",
+        requestId: "history-load",
+        success: true,
+        documentId: "file-page",
+        history: { version: 1, activeChatId: null, conversations: [] },
+      }).success,
+    ).toBe(true);
+  });
+
   it("allows only encrypted local restore tickets through Figma client storage messages", () => {
     const sealed = "FADP1T:" + "A".repeat(64);
     expect(UIToPluginSchema.safeParse({ type: "load-companion-restore-ticket" }).success).toBe(

@@ -254,6 +254,180 @@ export const FigmaToolCancelSchema = z
   })
   .strict();
 
+export const FigmaToolAcknowledgementSchema = z.enum([
+  "confirmed_mutation",
+  "verified_idempotent_replay",
+  "rejected",
+  "ambiguous",
+  "read_only",
+  "not_attempted",
+]);
+
+const CompatibilityParentTypeSchema = z.enum(["PAGE", "FRAME", "COMPONENT"]);
+const CompatibilityLayoutModeSchema = z.enum(["NONE", "HORIZONTAL", "VERTICAL"]);
+
+export const FigmaToolCompatibilityNormalizationSchema = z
+  .object({
+    toolName: z.enum(["create_text", "set_auto_layout"]),
+    nodeType: z.string().regex(/^[A-Z_]{1,40}$/u),
+    fieldPath: z.enum([
+      "action.horizontalSizing",
+      "action.verticalSizing",
+      "action.textAutoResize",
+      "action.layout.primarySizing",
+      "action.layout.counterSizing",
+      "action.children.sizing",
+    ]),
+    requested: z.enum([
+      "FIXED",
+      "HUG",
+      "FILL",
+      "NONE",
+      "HEIGHT",
+      "WIDTH_AND_HEIGHT",
+      "TRUNCATE",
+      "AUTO",
+    ]),
+    applied: z.enum([
+      "FIXED",
+      "HUG",
+      "FILL",
+      "NONE",
+      "HEIGHT",
+      "WIDTH_AND_HEIGHT",
+      "TRUNCATE",
+      "AUTO",
+    ]),
+    reason: z.enum([
+      "page_root_uses_explicit_geometry",
+      "non_auto_layout_parent_uses_content_box",
+      "fixed_geometry_requires_native_text_resize",
+      "hug_sizing_uses_native_text_resize",
+      "fill_child_requires_fixed_parent_axis",
+      "stretch_child_uses_fill_sizing",
+    ]),
+    parentType: CompatibilityParentTypeSchema.optional(),
+    parentLayoutMode: CompatibilityLayoutModeSchema.optional(),
+    resolvedDimension: z.number().finite().min(1).max(20_000).optional(),
+    affectedRefs: z.array(RefSchema).max(100).optional(),
+  })
+  .strict();
+
+export const FigmaToolCompatibilityFailureSchema = z
+  .object({
+    toolName: z.enum([
+      "create_frame",
+      "create_text",
+      "create_rectangle",
+      "set_auto_layout",
+      "set_properties",
+      "append_child",
+      "reparent_node",
+      "delete_node",
+    ]),
+    nodeType: z.string().regex(/^[A-Z_]{1,40}$/u),
+    code: z.enum([
+      "fill_parent_bounds_unavailable",
+      "text_sizing_requires_auto_layout",
+      "unsupported_parent_type",
+      "unsupported_target_type",
+      "unsupported_property",
+      "style_not_found",
+      "conflicting_style_properties",
+      "invalid_layout_rules",
+      "unsupported_hug_target",
+      "invalid_parenting",
+      "delete_consent_required",
+      "invalid_position",
+    ]),
+    fieldPath: z.enum([
+      "action.parent",
+      "action.ref",
+      "action.paintStyleId",
+      "action.horizontalSizing",
+      "action.verticalSizing",
+      "action.textAutoResize",
+      "action.layout",
+      "action.layout.direction",
+      "action.layout.counterAlign",
+      "action.children",
+      "action.children.ref",
+      "action.properties",
+      "action.properties.fill",
+      "action.properties.paintStyleId",
+      "action.properties.textStyleId",
+      "action.properties.text",
+      "action.properties.width",
+      "action.properties.height",
+      "action.properties.stroke",
+      "action.properties.cornerRadius",
+      "action.properties.opacity",
+      "action.properties.shadow",
+      "action.consentToken",
+      "action.parentRef",
+      "action.x",
+      "action.y",
+    ]),
+    parentType: CompatibilityParentTypeSchema.optional(),
+    parentLayoutMode: CompatibilityLayoutModeSchema.optional(),
+    permittedRemediations: z
+      .array(
+        z.enum([
+          "use_explicit_fixed_size",
+          "establish_auto_layout_before_creation",
+          "use_compatible_parent",
+          "use_supported_property",
+          "select_available_local_style",
+          "remove_conflicting_property",
+          "inspect_current_parent",
+          "use_explicit_reparent",
+          "request_delete_consent",
+        ]),
+      )
+      .min(1)
+      .max(4),
+  })
+  .strict();
+
+export const FigmaToolParentingDiagnosticSchema = z
+  .object({
+    operationId: OperationIdSchema,
+    toolName: z.enum(["append_child", "reparent_node"]),
+    sourceLogicalRef: RefSchema,
+    targetLogicalRef: RefSchema,
+    sourceParentCategory: z.enum([
+      "page_root",
+      "frame",
+      "component",
+      "other",
+      "detached",
+      "unknown",
+    ]),
+    expectedParentCategory: z.enum(["frame", "component", "unknown"]),
+    actualParentCategory: z.enum([
+      "page_root",
+      "frame",
+      "component",
+      "other",
+      "detached",
+      "unknown",
+    ]),
+    decision: z.enum([
+      "appended",
+      "already_parented",
+      "reparented",
+      "reconciled_commit",
+      "reconciled_noop",
+      "rejected_non_root",
+      "rejected_stale_or_ambiguous",
+      "rejected_cycle",
+      "rejected_parent",
+      "native_error",
+    ]),
+    acknowledgementStatus: FigmaToolAcknowledgementSchema,
+  })
+  .strict();
+
 export const FigmaToolDeleteConsentSchema = z
   .object({
     type: z.literal("tool-delete-consent"),
@@ -300,6 +474,7 @@ export const FigmaToolBatchResultSchema = z
             operationId: OperationIdSchema,
             success: z.boolean(),
             replayed: z.boolean(),
+            acknowledgementStatus: FigmaToolAcknowledgementSchema.optional(),
             logicalRef: RefSchema.optional(),
             summary: z.string().max(300).optional(),
             data: z.record(z.string(), z.unknown()).optional(),
@@ -334,6 +509,7 @@ export const FigmaToolOperationStatusSchema = z
 export type FigmaToolAction = z.infer<typeof FigmaToolActionSchema>;
 export type FigmaToolOperation = z.infer<typeof FigmaToolOperationSchema>;
 export type FigmaToolBatch = z.infer<typeof FigmaToolBatchSchema>;
+export type FigmaToolParentingDiagnostic = z.infer<typeof FigmaToolParentingDiagnosticSchema>;
 export type FigmaToolMessage =
   | z.infer<typeof FigmaToolProgressSchema>
   | z.infer<typeof FigmaToolBatchResultSchema>

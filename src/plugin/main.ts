@@ -12,6 +12,7 @@ import { collectFontRequirements, unavailableFontWarnings } from "./font-preflig
 import { createGenerationController } from "./generation-controller";
 import { createFigmaToolExecutor } from "./figma-tool-executor";
 import { handleChatTaskStorage } from "./chat-task-storage";
+import { handleChatHistoryStorage } from "./chat-history-storage";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
 const COMPANION_RESTORE_TICKET_KEY = "companion-restore-ticket-v1";
@@ -23,7 +24,7 @@ function send(message: PluginToUIMessage): void {
 function toolRequestId(raw: unknown): string | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const message = raw as Record<string, unknown>;
-  const value = message.type === "tool-delete-consent" ? message.requestId : message.batchId;
+  const value = typeof message.requestId === "string" ? message.requestId : message.batchId;
   return typeof value === "string" && /^[A-Za-z0-9_-]{8,100}$/u.test(value) ? value : undefined;
 }
 
@@ -51,15 +52,40 @@ function reportToolExecutorFailure(
     success: false,
     cancelled: false,
     committedOperationIds: [],
-    partialOperationIds: [],
-    results: [
-      {
-        operationId: message.operations[0]!.operationId,
-        success: false,
-        replayed: false,
-        error: details,
-      },
-    ],
+    partialOperationIds:
+      message.operations[0] &&
+      [
+        "create_frame",
+        "create_text",
+        "create_rectangle",
+        "set_auto_layout",
+        "set_properties",
+        "append_child",
+        "reparent_node",
+        "delete_node",
+      ].includes(message.operations[0].action.tool)
+        ? [message.operations[0].operationId]
+        : [],
+    results: message.operations.map((operation, index) => ({
+      operationId: operation.operationId,
+      success: false,
+      replayed: false,
+      acknowledgementStatus:
+        index === 0 &&
+        [
+          "create_frame",
+          "create_text",
+          "create_rectangle",
+          "set_auto_layout",
+          "set_properties",
+          "append_child",
+          "reparent_node",
+          "delete_node",
+        ].includes(operation.action.tool)
+          ? "ambiguous"
+          : "not_attempted",
+      error: index === 0 ? details : "Not attempted after the plugin executor stopped.",
+    })),
   });
 }
 
@@ -95,9 +121,19 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     return;
   }
   if (
+    message.data.type === "chat-history-load" ||
+    message.data.type === "chat-history-upsert" ||
+    message.data.type === "chat-history-delete"
+  ) {
+    send(await handleChatHistoryStorage(figma, message.data));
+    return;
+  }
+  if (
     message.data.type === "tool-execute" ||
     message.data.type === "tool-cancel" ||
-    message.data.type === "tool-delete-consent"
+    message.data.type === "tool-delete-consent" ||
+    message.data.type === "task-native-inspect" ||
+    message.data.type === "task-native-focus"
   ) {
     void figmaToolExecutor(message.data).catch((error: unknown) => {
       if (message.data.type === "tool-execute" || message.data.type === "tool-delete-consent")

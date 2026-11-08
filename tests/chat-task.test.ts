@@ -4,6 +4,7 @@ import {
   chatTaskCommittedOperationCount,
   chatTaskProgress,
   chatTaskSafeDiagnostic,
+  isCanvasMutationTool,
   type ChatTask,
 } from "../src/shared/chat-task";
 import {
@@ -81,12 +82,17 @@ function success(ops: FigmaToolOperation[]): Result {
     batchId: "task-test-batch",
     success: true,
     cancelled: false,
-    committedOperationIds: ops.map((op) => op.operationId),
+    committedOperationIds: ops
+      .filter((op) => isCanvasMutationTool(op.action.tool))
+      .map((op) => op.operationId),
     partialOperationIds: [],
     results: ops.map((op) => ({
       operationId: op.operationId,
       success: true,
       replayed: false,
+      acknowledgementStatus: isCanvasMutationTool(op.action.tool)
+        ? "confirmed_mutation"
+        : "read_only",
       ...("ref" in op.action ? { logicalRef: op.action.ref } : {}),
       summary: "Confirmed",
       ...(op.action.tool === "inspect_nodes"
@@ -109,7 +115,7 @@ function success(ops: FigmaToolOperation[]): Result {
     })),
   };
 }
-function harness(turns: AuthorizedChatTurn[], autoReadContext = true) {
+function harness(turns: Array<AuthorizedChatTurn | Error>, autoReadContext = true) {
   let clock = 100_000;
   const checkpoints: ChatTask[] = [];
   const batches: FigmaToolOperation[][] = [];
@@ -122,6 +128,7 @@ function harness(turns: AuthorizedChatTurn[], autoReadContext = true) {
       inputs.push(input);
       const next = turns.shift();
       if (!next) throw new Error("No scripted turn left");
+      if (next instanceof Error) throw next;
       if (
         next.kind === "tool_calls" &&
         next.calls.some((call) => call.action.tool === "get_document_context")
@@ -222,11 +229,19 @@ describe("progressive conversational canvas tasks", () => {
         logicalRefs: ["private-ref"],
         completionCriteria: ["Keep private"],
         completed: false,
+        estimatedMutations: 3,
         operations: 1,
+        readOnlyOperations: 0,
+        segments: [],
         rounds: 7,
         qaAttempts: 0,
         verificationOperations: 0,
         verified: false,
+        verificationHistory: [],
+        qualityFindings: [],
+        repairOperationsExecuted: 0,
+        repairOperationsAttempted: 0,
+        awaitingQualityRepair: false,
       },
     ];
     current.ledger = [
@@ -266,6 +281,23 @@ describe("progressive conversational canvas tasks", () => {
       errorCode: "inspection_required",
       referenceResolution: { code: "ambiguous", candidateCount: 4 },
       committedOperations: 1,
+      capacity: {
+        mutationCapacity: 240,
+        mutations: 1,
+        confirmedMutations: 0,
+        readOnlyOperations: 0,
+        verificationOperations: 0,
+        confirmedNodes: 0,
+      },
+      completionReason: "missing_required_refs",
+      stageCapacity: [
+        {
+          stageId: "stage-1",
+          mutationUsage: 1,
+          remainingRequirements: 1,
+          completionReason: "missing_required_refs",
+        },
+      ],
       modelRounds: 7,
       nativeBatches: 6,
     });
@@ -288,8 +320,12 @@ describe("progressive conversational canvas tasks", () => {
     const checkpoint = input.find(
       (item) => "role" in item && item.content.startsWith("Confirmed task checkpoint"),
     );
-    expect(checkpoint && "role" in checkpoint ? checkpoint.content : "").not.toMatch(
-      /"(?:operations|rounds|verification|verified|completed)":/u,
+    const checkpointContent = checkpoint && "role" in checkpoint ? checkpoint.content : "";
+    const modelCheckpoint = JSON.parse(
+      checkpointContent.slice(checkpointContent.indexOf(": ") + 2),
+    );
+    expect(Object.keys(modelCheckpoint.stages[0]).sort()).toEqual(
+      ["completionCriteria", "estimatedMutations", "goal", "logicalRefs", "title"].sort(),
     );
     expect(current.stages[0]).toHaveProperty("completed", true);
   });
@@ -314,12 +350,277 @@ describe("progressive conversational canvas tasks", () => {
     ).toThrow();
   });
 
-  it("stops repeated valid replanning without replacing the saved plan", async () => {
+  it("reuses the canonical saved plan when the model requests planning again", async () => {
     const current = task();
-    const h = harness([plan(["Original"]), plan(["Replacement"]), plan(["Replacement"])]);
-    await expect(runChatTask(current, h.deps)).rejects.toThrow("no_progress_repeated_error");
+    const h = harness([plan(["Original"]), plan(["Replacement"]), creates(1), finish(), done]);
+    await runChatTask(current, h.deps);
     expect(current.stages[0]?.title).toBe("Original");
-    expect(current.rounds).toBeLessThan(6);
+    expect(current.status).toBe("completed");
+    expect(current.validationCorrections).toBe(0);
+    expect(current.roundBreakdown.planning).toBe(2);
+    expect(
+      h.inputs
+        .flat()
+        .some(
+          (item) =>
+            "type" in item &&
+            item.type === "function_call_output" &&
+            JSON.parse(item.output).canonicalPlanReused === true,
+        ),
+    ).toBe(true);
+  });
+
+  it("does not spend the planning budget on four confirmed mutations and four inspections", async () => {
+    const requiredRefs = ["home-screen", "home-header", "home-search", "home-hero"];
+    const current = task();
+    const h = harness([
+      turn("plan_canvas_task", {
+        brief: defaultBrief,
+        stages: [
+          {
+            title: "Home",
+            goal: "Build the Persian clothing storefront home screen",
+            logicalRefs: requiredRefs,
+            completionCriteria: [
+              "Header, search, categories, hero, product cards, toman prices, and purchase buttons are editable RTL layers in Auto Layout",
+            ],
+          },
+          {
+            title: "Product",
+            goal: "Build the Persian product screen",
+            logicalRefs: ["product-0"],
+            completionCriteria: [
+              "Gallery placeholder, title, price, variants, details, and add-to-cart are editable RTL layers in Auto Layout",
+            ],
+          },
+        ],
+      }),
+      ...requiredRefs.flatMap((ref, index) => [
+        turn("create_frame", {
+          ref,
+          name: `Home requirement ${index + 1}`,
+          parent: { kind: "page" },
+          size: { width: 390, height: index ? 120 : 844 },
+          autoLayout: { direction: "vertical", gap: 8 },
+        }),
+        turn("inspect_nodes", {
+          refs: requiredRefs.slice(0, index + 1),
+          selection: false,
+          depth: 2,
+          maxNodes: 25,
+        }),
+      ]),
+      finish(),
+      creates(4, "product"),
+      finish(),
+      done,
+    ]);
+
+    await runChatTask(current, h.deps);
+
+    expect(current.status).toBe("completed");
+    expect(current.stages.map(({ completed }) => completed)).toEqual([true, true]);
+    expect(current.stages[0]).toMatchObject({
+      operations: 4,
+      rounds: 9,
+      roundBreakdown: {
+        execution: 4,
+        inspection: 4,
+        completion: 1,
+      },
+    });
+    expect(current.roundBreakdown).toMatchObject({
+      prePlan: 2,
+      planning: 1,
+      execution: 5,
+      inspection: 5,
+      completion: 2,
+      correction: 0,
+    });
+    expect(chatTaskCommittedOperationCount(current)).toBe(8);
+    expect(current.failure?.code).not.toBe("planning_budget_exhausted");
+    const savedPlan = h.checkpoints.find(
+      (checkpoint) =>
+        checkpoint.stages.length === 2 &&
+        !checkpoint.ledger.some(
+          (entry) =>
+            entry.status === "completed" && entry.call.action.tool !== "get_document_context",
+        ),
+    );
+    expect(savedPlan?.stages.map(({ title }) => title)).toEqual(["Home", "Product"]);
+    expect(savedPlan?.lifecycle).toBe("PLAN_SAVED");
+    expect(h.checkpoints.some(({ lifecycle }) => lifecycle === "VERIFYING_STAGE")).toBe(true);
+    expect(h.checkpoints.some(({ lifecycle }) => lifecycle === "STAGE_COMPLETED")).toBe(true);
+    expect(current.lifecycle).toBe("TASK_COMPLETED");
+  });
+
+  it("keeps task and segment mutation counts equal when a failed operation was repaired", async () => {
+    const current = task();
+    current.lifecycle = "PLAN_SAVED";
+    current.stages = [
+      {
+        title: "Product cards",
+        goal: "Build cards",
+        logicalRefs: ["product-0"],
+        completionCriteria: ["Native card exists"],
+        completed: false,
+        estimatedMutations: 14,
+        operations: 14,
+        readOnlyOperations: 0,
+        segments: [],
+        rounds: 0,
+        qaAttempts: 0,
+        verificationOperations: 0,
+        verified: false,
+        verificationHistory: [],
+        qualityFindings: [],
+        repairOperationsExecuted: 0,
+        repairOperationsAttempted: 0,
+        awaitingQualityRepair: false,
+      },
+    ];
+    current.ledger = Array.from({ length: 14 }, (_, index) => {
+      const call = turn("create_frame", {
+        ref: `product-${index}`,
+        name: `Card ${index}`,
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+      });
+      if (call.kind !== "tool_calls") throw new Error("Expected a canvas mutation.");
+      const repaired = index === 13;
+      return {
+        call: call.calls[0]!,
+        operationId: `chat-task-0001-op-${String(index + 1).padStart(2, "0")}`,
+        stage: 0,
+        status: repaired ? ("repaired" as const) : ("completed" as const),
+        category: "mutation" as const,
+        acknowledgementStatus: repaired ? ("rejected" as const) : ("confirmed_mutation" as const),
+        segment: 0,
+      };
+    });
+    const h = harness([new Error("Stop after accounting sync")], false);
+    await expect(runChatTask(current, h.deps)).rejects.toThrow("Stop after accounting sync");
+    const diagnostic = chatTaskSafeDiagnostic(current);
+    expect(chatTaskCommittedOperationCount(current)).toBe(13);
+    expect(current.stages[0]!.segments[0]).toMatchObject({
+      mutationCount: 14,
+      confirmedMutations: 13,
+      rejectedMutations: 1,
+    });
+    expect(diagnostic.taskSegmentCountConsistency).toEqual({
+      taskConfirmedMutations: 13,
+      segmentConfirmedMutations: 13,
+      consistent: true,
+    });
+  });
+
+  it("exports allowlisted parenting and reconciliation diagnostics without canvas text", () => {
+    const current = task();
+    const parsed = turn("append_child", { childRef: "source-ref", parentRef: "target-ref" });
+    if (parsed.kind !== "tool_calls") throw new Error("Expected a parenting call.");
+    const call = parsed.calls[0]!;
+    current.stages = [
+      {
+        title: "Move layer",
+        goal: "Keep identity",
+        logicalRefs: ["source-ref"],
+        completionCriteria: ["The native parent is correct"],
+        completed: false,
+        estimatedMutations: 1,
+        operations: 1,
+        readOnlyOperations: 0,
+        segments: [],
+        rounds: 0,
+        qaAttempts: 0,
+        verificationOperations: 0,
+        verified: false,
+        verificationHistory: [],
+        qualityFindings: [],
+        repairOperationsExecuted: 0,
+        repairOperationsAttempted: 0,
+        awaitingQualityRepair: false,
+      },
+    ];
+    current.ledger = [
+      {
+        call,
+        operationId: "chat-task-0001-op-1",
+        stage: 0,
+        status: "failed",
+        category: "mutation",
+        acknowledgementStatus: "ambiguous",
+        output: JSON.stringify({
+          success: false,
+          error: "PRIVATE CANVAS TEXT must not escape",
+          data: {
+            parenting: {
+              operationId: "chat-task-0001-op-1",
+              toolName: "append_child",
+              sourceLogicalRef: "source-ref",
+              targetLogicalRef: "target-ref",
+              sourceParentCategory: "frame",
+              expectedParentCategory: "frame",
+              actualParentCategory: "frame",
+              decision: "native_error",
+              acknowledgementStatus: "ambiguous",
+            },
+          },
+        }),
+      },
+    ];
+    current.failure = {
+      category: "ambiguous_recovery",
+      code: "inspection_required",
+      committedOperations: 0,
+      operationId: "chat-task-0001-op-1",
+    };
+    const diagnostic = chatTaskSafeDiagnostic(current);
+    expect(diagnostic).toMatchObject({
+      parenting: {
+        operationId: "chat-task-0001-op-1",
+        toolName: "append_child",
+        sourceLogicalRef: "source-ref",
+        targetLogicalRef: "target-ref",
+        sourceParentCategory: "frame",
+        expectedParentCategory: "frame",
+        actualParentCategory: "frame",
+        acknowledgementStatus: "ambiguous",
+      },
+      partialCommitReconciliation: {
+        operationId: "chat-task-0001-op-1",
+        acknowledgementStatus: "ambiguous",
+        result: "inspection_required",
+      },
+      taskSegmentCountConsistency: {
+        taskConfirmedMutations: 0,
+        segmentConfirmedMutations: 0,
+        consistent: true,
+      },
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE CANVAS TEXT");
+  });
+
+  it("reuses an identical inspection locally until canvas state changes", async () => {
+    const inspection = () =>
+      turn("inspect_nodes", {
+        refs: ["product-0"],
+        selection: false,
+        depth: 2,
+        maxNodes: 25,
+      });
+    const current = task();
+    const h = harness([plan(["Frame"]), creates(1), inspection(), inspection(), finish(), done]);
+
+    await runChatTask(current, h.deps);
+
+    const modelInspections = current.ledger.filter(
+      (entry) => entry.call.action.tool === "inspect_nodes" && !entry.operationId.includes("-qa-"),
+    );
+    expect(modelInspections).toHaveLength(2);
+    expect(modelInspections[1]).toMatchObject({ status: "completed", reused: true });
+    expect(
+      h.batches.flat().filter((operation) => operation.action.tool === "inspect_nodes"),
+    ).toHaveLength(2);
   });
 
   it.each([
@@ -334,14 +635,22 @@ describe("progressive conversational canvas tasks", () => {
     h.deps.execute.mockImplementation(async (operations) => {
       if (operations.every((operation) => operation.action.tool === "get_document_context"))
         return success(operations);
+      const acknowledgementStatus = message.includes("rate limit")
+        ? ("not_attempted" as const)
+        : message.includes("does not support")
+          ? ("rejected" as const)
+          : ("ambiguous" as const);
       return {
         ...success([]),
         success: false,
+        partialOperationIds:
+          acknowledgementStatus === "ambiguous" ? [operations[0]!.operationId] : [],
         results: [
           {
             operationId: operations[0]!.operationId,
             success: false,
             replayed: false,
+            acknowledgementStatus,
             error: message,
           },
         ],
@@ -353,7 +662,100 @@ describe("progressive conversational canvas tasks", () => {
     expect(current.failure?.operationId).toBeDefined();
   });
 
-  it("completes 50 operations across five planned stages using sequential three-operation batches", async () => {
+  it("persists timeout correlation after seven commits and resumes the same stage without replay", async () => {
+    const requiredRefs = Array.from({ length: 9 }, (_, index) => `home-${index}`);
+    const planTurn = turn("plan_canvas_task", {
+      brief: defaultBrief,
+      stages: [
+        {
+          title: "Home",
+          goal: "Finish the saved Home layout",
+          logicalRefs: requiredRefs,
+          completionCriteria: ["All nine Home refs are native and editable"],
+        },
+      ],
+    });
+    const diagnostic = {
+      model: "account-model",
+      requestId: "chat-timeout-live-01",
+      requestStartedAtMs: 1_800_000_000_000,
+      requestPhase: "upstream_stream",
+      stage: "stream",
+      outcome: "timed_out",
+      timeoutKind: "idle",
+      timeoutSource: "upstream_inactivity",
+      terminationReason: "upstream_inactivity",
+      elapsedMs: 62_000,
+      idleMs: 60_000,
+      lastEvent: "response.output_item.done",
+      lastEventAtMs: 1_800_000_002_000,
+      lastEventAgeMs: 60_000,
+    } as const;
+    const h = harness([
+      planTurn,
+      creates(7, "home"),
+      new CompanionClientError("request_timed_out", diagnostic),
+    ]);
+    const current = task();
+    await expect(runChatTask(current, h.deps)).rejects.toMatchObject({
+      category: "request_timed_out",
+    });
+    expect(chatTaskCommittedOperationCount(current)).toBe(7);
+    expect(current.stages[0]?.logicalRefs).toEqual(requiredRefs);
+    expect(current.lastRequestDiagnostic).toMatchObject({
+      requestId: "chat-timeout-live-01",
+      requestPhase: "upstream_stream",
+      timeoutKind: "idle",
+      timeoutSource: "upstream_inactivity",
+      terminationReason: "upstream_inactivity",
+      elapsedMs: 62_000,
+      lastEventAtMs: 1_800_000_002_000,
+    });
+    expect(h.checkpoints.at(-1)?.lastRequestDiagnostic).toEqual(current.lastRequestDiagnostic);
+    const confirmedIds = current.ledger
+      .filter((entry) => entry.status === "completed" && entry.category === "mutation")
+      .map((entry) => entry.operationId);
+
+    const tail = [
+      turn("create_frame", {
+        ref: "home-7",
+        name: "Home footer",
+        parent: { kind: "page" },
+        size: { width: 342, height: 48 },
+      }),
+      turn("create_frame", {
+        ref: "home-8",
+        name: "Home footer content",
+        parent: { kind: "page" },
+        size: { width: 342, height: 48 },
+      }),
+    ].flatMap((turnValue) => (turnValue.kind === "tool_calls" ? turnValue.calls : []));
+    const tailTurn: AuthorizedChatTurn = {
+      kind: "tool_calls",
+      calls: tail,
+      functionCallItems: tail.map((call) => call.functionCall),
+      text: "",
+    };
+    const restored = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    const resumed = harness([tailTurn, finish(), done]);
+    await runChatTask(restored, resumed.deps);
+
+    expect(restored.status).toBe("completed");
+    expect(chatTaskCommittedOperationCount(restored)).toBe(9);
+    expect(
+      restored.ledger.filter((entry) => confirmedIds.includes(entry.operationId)),
+    ).toHaveLength(7);
+    expect(
+      resumed.batches
+        .flat()
+        .filter((operation) => operation.action.tool !== "inspect_nodes")
+        .map(({ operationId }) => operationId),
+    ).toHaveLength(2);
+    expect(restored.stages[0]?.completed).toBe(true);
+    expect(restored.lastRequestDiagnostic?.requestId).toBe("chat-timeout-live-01");
+  });
+
+  it("completes 50 operations across five planned stages using bounded ten-operation batches", async () => {
     const turns = [
       plan(
         [
@@ -382,12 +784,12 @@ describe("progressive conversational canvas tasks", () => {
       current.ledger.filter((entry) => entry.call.action.tool === "inspect_nodes"),
     ).toHaveLength(5);
     expect(current.stages.every((stage) => stage.completed)).toBe(true);
-    expect(h.batches).toHaveLength(26);
-    expect(h.batches.every((batch) => batch.length <= 3)).toBe(true);
+    expect(h.batches).toHaveLength(11);
+    expect(h.batches.every((batch) => batch.length <= 10)).toBe(true);
     expect(h.deps.wait).toHaveBeenCalled();
     expect(new Set(h.batches.flat().map((op) => op.operationId)).size).toBe(56);
     expect(chatTaskProgress(current)).toContain("5/5 stages completed");
-    expect(chatTaskProgress(current)).toContain("50 operations confirmed");
+    expect(chatTaskProgress(current)).toContain("50 mutations confirmed");
     for (const input of h.inputs) {
       const calls = input.filter((item) => "type" in item && item.type === "function_call");
       const outputs = input.filter(
@@ -403,7 +805,7 @@ describe("progressive conversational canvas tasks", () => {
     ).toBe(true);
   });
 
-  it("stops after a confirmed partial batch, reloads the checkpoint, and resumes only pending IDs", async () => {
+  it("stops after a confirmed stage, reloads the checkpoint, and resumes without replaying mutations", async () => {
     const h = harness([plan(["Products"], ["product-0"]), creates(8), finish(), done]);
     const current = task();
     h.deps.execute.mockImplementationOnce(async (operations) => success(operations));
@@ -418,11 +820,11 @@ describe("progressive conversational canvas tasks", () => {
         (entry) =>
           entry.status === "completed" && entry.call.action.tool !== "get_document_context",
       ),
-    ).toHaveLength(3);
+    ).toHaveLength(8);
     const restored = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
     const resume = harness([finish(), done]);
     await runChatTask(restored, resume.deps);
-    expect(resume.batches.flat()).toHaveLength(6);
+    expect(resume.batches.flat().every((op) => op.action.tool === "inspect_nodes")).toBe(true);
     expect(
       resume.batches
         .flat()
@@ -456,15 +858,16 @@ describe("progressive conversational canvas tasks", () => {
     h.deps.execute.mockImplementationOnce(async (ops) => ({
       ...success([]),
       success: false,
-      results: [
-        {
-          operationId: ops[0]!.operationId,
-          success: false,
-          replayed: false,
-          error:
-            "Local tool rate limit reached; wait one minute and retry with a new operation ID.",
-        },
-      ],
+      results: ops.map((operation, index) => ({
+        operationId: operation.operationId,
+        success: false,
+        replayed: false,
+        acknowledgementStatus: "not_attempted" as const,
+        error:
+          index === 0
+            ? "Local tool rate limit reached; wait one minute before retrying with the same IDs."
+            : "Not attempted because executor capacity was exhausted.",
+      })),
     }));
     await runChatTask(task(), h.deps);
     expect(h.deps.wait).toHaveBeenCalledWith(60_100, expect.any(AbortSignal));
@@ -489,14 +892,22 @@ describe("progressive conversational canvas tasks", () => {
     h.deps.execute.mockImplementationOnce(async (ops) => ({
       ...success(ops.slice(0, 1)),
       success: false,
-      partialOperationIds: [ops[1]!.operationId],
+      partialOperationIds: [],
       results: [
         ...success(ops.slice(0, 1)).results,
         {
           operationId: ops[1]!.operationId,
           success: false,
           replayed: false,
+          acknowledgementStatus: "rejected",
           error: "Invalid parent",
+        },
+        {
+          operationId: ops[2]!.operationId,
+          success: false,
+          replayed: false,
+          acknowledgementStatus: "not_attempted",
+          error: "Not attempted after earlier failure.",
         },
       ],
     }));
@@ -532,6 +943,7 @@ describe("progressive conversational canvas tasks", () => {
           operationId: ops[1]!.operationId,
           success: false,
           replayed: false,
+          acknowledgementStatus: "rejected",
           error: "Missing parent",
         },
       ],
@@ -577,11 +989,13 @@ describe("progressive conversational canvas tasks", () => {
     h.deps.execute.mockImplementationOnce(async (ops) => ({
       ...success([]),
       success: false,
+      partialOperationIds: [ops[0]!.operationId],
       results: [
         {
           operationId: ops[0]!.operationId,
           success: false,
           replayed: false,
+          acknowledgementStatus: "ambiguous",
           error: "Property write failed",
         },
       ],
@@ -656,21 +1070,330 @@ describe("progressive conversational canvas tasks", () => {
     ).toBe(false);
   });
 
-  it("enforces the per-stage budget rather than running an unbounded task", async () => {
+  it("continues a stage above 32 mutations in deterministic persisted segments", async () => {
     const h = harness([
-      plan(["Oversized stage"], ["budget-a-0"]),
+      turn("plan_canvas_task", {
+        brief: defaultBrief,
+        stages: [
+          {
+            title: "Oversized stage",
+            goal: "Create a detailed native screen",
+            logicalRefs: ["budget-a-0"],
+            completionCriteria: ["The detailed screen is editable"],
+            estimatedMutations: 40,
+          },
+        ],
+      }),
       creates(10, "budget-a"),
       creates(10, "budget-b"),
       creates(10, "budget-c"),
       creates(10, "budget-d"),
+      finish(),
+      done,
     ]);
     const current = task();
-    await expect(runChatTask(current, h.deps)).rejects.toThrow("stage 30/32");
+    await runChatTask(current, h.deps);
     expect(h.batches.flat().filter((op) => op.action.tool !== "get_document_context")).toHaveLength(
-      30,
+      41,
     );
-    expect(current.stages[0]!.completed).toBe(false);
-    expect(current.status).toBe("failed");
+    expect(current.stages[0]).toMatchObject({
+      completed: true,
+      operations: 40,
+      segments: [
+        { index: 0, mutationCount: 32, confirmedMutations: 32, status: "confirmed" },
+        { index: 1, mutationCount: 8, confirmedMutations: 8, status: "confirmed" },
+      ],
+    });
+    expect(current.status).toBe("completed");
+    expect(
+      h.checkpoints.find(({ lifecycle }) => lifecycle === "PLAN_SAVED")?.stages[0]?.segments,
+    ).toEqual([
+      {
+        index: 0,
+        mutationCount: 0,
+        confirmedMutations: 0,
+        attemptedMutations: 0,
+        rejectedMutations: 0,
+        ambiguousMutations: 0,
+        verifiedIdempotentReplays: 0,
+        status: "active",
+      },
+      {
+        index: 1,
+        mutationCount: 0,
+        confirmedMutations: 0,
+        attemptedMutations: 0,
+        rejectedMutations: 0,
+        ambiguousMutations: 0,
+        verifiedIdempotentReplays: 0,
+        status: "pending",
+      },
+    ]);
+  });
+
+  it("does not reproduce the old stage 31/32 failure after 25 mutations and six inspections", async () => {
+    const inspections = Array.from({ length: 6 }, (_, index) =>
+      turn("inspect_nodes", {
+        refs: ["exact-0"],
+        selection: false,
+        depth: index % 5,
+        maxNodes: index + 1,
+      }),
+    );
+    const h = harness([
+      plan(["Reported capacity boundary"], ["exact-0"]),
+      creates(10, "exact"),
+      creates(10, "exact-b"),
+      creates(5, "exact-c"),
+      ...inspections,
+      creates(1, "exact-tail"),
+      finish(),
+      done,
+    ]);
+    const current = task();
+
+    await runChatTask(current, h.deps);
+
+    expect(current.status).toBe("completed");
+    expect(current.error).toBeUndefined();
+    expect(current.stages[0]).toMatchObject({
+      operations: 26,
+      readOnlyOperations: 7,
+      verificationOperations: 1,
+      completed: true,
+    });
+    expect(chatTaskSafeDiagnostic(current)).toMatchObject({
+      lifecycle: "TASK_COMPLETED",
+      capacity: {
+        mutationCapacity: 240,
+        mutations: 26,
+        confirmedMutations: 26,
+        readOnlyOperations: 7,
+        verificationOperations: 1,
+      },
+      completionReason: "required_refs_and_native_verification_confirmed",
+    });
+  });
+
+  it("stops when identical structural findings recur without a confirmed repair", async () => {
+    const h = harness([
+      plan(["Frame"], ["product-0"]),
+      creates(1),
+      finish(),
+      finish(),
+      finish(),
+      finish(),
+      finish(),
+    ]);
+    h.deps.execute.mockImplementation(async (operations) => {
+      const result = success(operations);
+      for (const item of result.results)
+        if (item.data?.nodes)
+          item.data.nodes = (item.data.nodes as Array<Record<string, unknown>>).map((node) => ({
+            ...node,
+            visible: false,
+          }));
+      return result;
+    });
+    const current = task();
+    await expect(runChatTask(current, h.deps)).rejects.toThrow("no_progress_repeated_error");
+    expect(current.stages[0]?.verificationHistory).toHaveLength(2);
+
+    const stage = current.stages[0]!;
+    expect(stage.verificationHistory).toHaveLength(2);
+    expect(stage.verificationHistory.map(({ attempt }) => attempt)).toEqual([1, 2]);
+    expect(stage.qualityFindings).toEqual([
+      {
+        code: "hidden-node",
+        refs: ["product-0"],
+        expected: "visible=true",
+        actual: "visible=false",
+      },
+    ]);
+    expect(stage.repairOperationsExecuted).toBe(0);
+    expect(stage.repairOperationsAttempted).toBe(0);
+    const diagnostic = chatTaskSafeDiagnostic(current);
+    expect(diagnostic).toMatchObject({
+      activeStageProgress: {
+        structuralQuality: {
+          verificationAttempts: 2,
+          repairsExecuted: false,
+          repairOperationsExecuted: 0,
+          failedRules: stage.qualityFindings,
+        },
+      },
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain(current.prompt);
+  });
+
+  it("records confirmed repair operations between failed and successful structural checks", async () => {
+    let repaired = false;
+    const h = harness([
+      plan(["Frame"], ["product-0"]),
+      creates(1),
+      finish(),
+      turn("set_properties", { ref: "product-0", properties: { visible: true } }),
+      finish(),
+      done,
+    ]);
+    h.deps.execute.mockImplementation(async (operations) => {
+      const result = success(operations);
+      if (operations.some((operation) => operation.action.tool === "set_properties"))
+        repaired = true;
+      for (const item of result.results)
+        if (item.data?.nodes)
+          item.data.nodes = (item.data.nodes as Array<Record<string, unknown>>).map((node) => ({
+            ...node,
+            visible: repaired,
+          }));
+      return result;
+    });
+    const current = task();
+    await runChatTask(current, h.deps);
+    expect(current.status).toBe("completed");
+    expect(current.stages[0]).toMatchObject({
+      repairOperationsExecuted: 1,
+      repairOperationsAttempted: 1,
+      awaitingQualityRepair: false,
+      verificationHistory: [
+        { attempt: 1, findings: [{ code: "hidden-node", refs: ["product-0"] }] },
+        { attempt: 2, findings: [] },
+      ],
+    });
+  });
+
+  it("stops immediately when a confirmed repair leaves every native finding unchanged", async () => {
+    const h = harness([
+      plan(["Frame"], ["product-0"]),
+      creates(1),
+      finish(),
+      turn("set_properties", { ref: "product-0", properties: { fill: "#FFFFFF" } }),
+    ]);
+    let inspections = 0;
+    let manuallyFixed = false;
+    h.deps.execute.mockImplementation(async (operations) => {
+      const result = success(operations);
+      for (const item of result.results) {
+        const action = operations.find(
+          ({ operationId }) => operationId === item.operationId,
+        )?.action;
+        if (action?.tool === "inspect_nodes") {
+          inspections++;
+          item.data!.nodes = (item.data!.nodes as Array<Record<string, unknown>>).map((node) => ({
+            ...node,
+            visible: manuallyFixed,
+          }));
+        }
+      }
+      return result;
+    });
+    const current = task();
+    await expect(runChatTask(current, h.deps)).rejects.toThrow("structural_repair_no_progress");
+    expect(inspections).toBe(2);
+    expect(h.deps.model).toHaveBeenCalledTimes(5);
+    expect(current.stages[0]).toMatchObject({
+      repairOperationsAttempted: 1,
+      repairOperationsExecuted: 1,
+      repairFindingsResolved: 0,
+      repairVerificationPending: false,
+      verificationHistory: [
+        { findings: [{ code: "hidden-node", refs: ["product-0"], actual: "visible=false" }] },
+        { findings: [{ code: "hidden-node", refs: ["product-0"], actual: "visible=false" }] },
+      ],
+    });
+    manuallyFixed = true;
+    const resume = harness([finish(), done]);
+    resume.deps.execute.mockImplementation(h.deps.execute.getMockImplementation()!);
+    await runChatTask(current, resume.deps);
+    expect(current.status).toBe("completed");
+    expect(resume.deps.model).toHaveBeenCalledTimes(2);
+    expect(current.stages[0]).toMatchObject({
+      qualityRepairBlocked: false,
+      qualityFindings: [],
+      completed: true,
+      verified: true,
+    });
+  });
+
+  it("re-inspects native contrast after a localized text-color mutation and records resolution", async () => {
+    const h = harness([
+      plan(["Store"], ["store"]),
+      turn("create_frame", {
+        ref: "store",
+        name: "Store",
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+      }),
+      finish(),
+      turn("set_properties", { ref: "store-label", properties: { color: "#000000" } }),
+      finish(),
+      done,
+    ]);
+    let color = "#91875A";
+    const inspectedColors: string[] = [];
+    const inspectionAfterMutation: boolean[] = [];
+    let mutationConfirmed = false;
+    h.deps.execute.mockImplementation(async (operations) => {
+      const result = success(operations);
+      if (operations.some(({ action }) => action.tool === "set_properties")) {
+        color = "#000000";
+        mutationConfirmed = true;
+      }
+      for (const item of result.results) {
+        const action = operations.find(
+          ({ operationId }) => operationId === item.operationId,
+        )?.action;
+        if (action?.tool !== "inspect_nodes") continue;
+        inspectedColors.push(color);
+        inspectionAfterMutation.push(mutationConfirmed);
+        item.data!.nodes = [
+          {
+            ref: "store",
+            type: "FRAME",
+            name: "Store",
+            x: 0,
+            y: 0,
+            width: 390,
+            height: 844,
+            visible: true,
+            fill: "#FFFFFF",
+            bounds: { x: 0, y: 0, width: 390, height: 844 },
+            children: [
+              {
+                ref: "store-label",
+                type: "TEXT",
+                name: "Label",
+                text: "Store",
+                x: 8,
+                y: 8,
+                width: 100,
+                height: 24,
+                visible: true,
+                textColor: color,
+                fontSize: 14,
+                bounds: { x: 8, y: 8, width: 100, height: 24 },
+              },
+            ],
+          },
+        ];
+      }
+      return result;
+    });
+    const current = task();
+    await runChatTask(current, h.deps);
+    expect(inspectedColors).toEqual(["#91875A", "#000000"]);
+    expect(inspectionAfterMutation).toEqual([false, true]);
+    expect(current.stages[0]).toMatchObject({
+      completed: true,
+      verified: true,
+      repairOperationsAttempted: 1,
+      repairOperationsExecuted: 1,
+      repairFindingsResolved: 1,
+      verificationHistory: [
+        { findings: [{ code: "low-contrast", refs: ["store-label"] }] },
+        { findings: [] },
+      ],
+    });
   });
 
   it("splits Unicode-heavy operations by byte budget without dropping any calls", async () => {
@@ -749,7 +1472,7 @@ describe("progressive conversational canvas tasks", () => {
 
     expect(current.status).toBe("completed");
     expect(current.validationCorrections).toBe(1);
-    expect(chatTaskProgress(current)).toContain("2 operations confirmed");
+    expect(chatTaskProgress(current)).toContain("2 mutations confirmed");
     expect(h.inputs.some((input) => JSON.stringify(input).includes("arguments.fill"))).toBe(true);
     const executed = h.batches.flat();
     expect(executed.filter((operation) => operation.action.tool === "create_frame")).toHaveLength(
@@ -757,6 +1480,30 @@ describe("progressive conversational canvas tasks", () => {
     );
     expect(executed.some((operation) => operation.action.tool === "create_rectangle")).toBe(false);
     expect(new Set(executed.map((operation) => operation.operationId)).size).toBe(executed.length);
+  });
+
+  it("explains call_set/too_many_calls as an oversized batch, not an unknown tool", async () => {
+    const validation: AuthorizedChatTurn = {
+      kind: "tool_validation",
+      issues: [
+        {
+          stage: "call_set",
+          errorCode: "too_many_calls",
+          fieldPaths: ["calls"],
+        },
+      ],
+    };
+    const h = harness([plan(["Store"], ["product-0"]), creates(1), validation, finish(), done]);
+    const current = task();
+    await runChatTask(current, h.deps);
+    const correction = h.inputs
+      .map((input) => JSON.stringify(input))
+      .find((input) => input.includes("tool-call set"));
+    expect(correction).toBeDefined();
+    expect(correction).toContain("tool-call set");
+    expect(correction).toContain("more than 10 function calls");
+    expect(correction).not.toContain("unknown tool: call_set");
+    expect(current.validationCorrections).toBe(1);
   });
 
   it("gives precise inspect_nodes range feedback and preserves 31 committed operations", async () => {
@@ -770,11 +1517,19 @@ describe("progressive conversational canvas tasks", () => {
         logicalRefs: ["shell"],
         completionCriteria: ["The shell is present"],
         completed: true,
+        estimatedMutations: 31,
         operations: 31,
+        readOnlyOperations: 0,
+        segments: [],
         rounds: 8,
         qaAttempts: 1,
         verificationOperations: 1,
         verified: true,
+        verificationHistory: [],
+        qualityFindings: [],
+        repairOperationsExecuted: 0,
+        repairOperationsAttempted: 0,
+        awaitingQualityRepair: false,
       },
       {
         title: "Current details",
@@ -782,11 +1537,19 @@ describe("progressive conversational canvas tasks", () => {
         logicalRefs: ["shell"],
         completionCriteria: ["Details are present"],
         completed: false,
+        estimatedMutations: 3,
         operations: 0,
+        readOnlyOperations: 0,
+        segments: [],
         rounds: 0,
         qaAttempts: 0,
         verificationOperations: 0,
         verified: false,
+        verificationHistory: [],
+        qualityFindings: [],
+        repairOperationsExecuted: 0,
+        repairOperationsAttempted: 0,
+        awaitingQualityRepair: false,
       },
     ];
     current.ledger = Array.from({ length: 31 }, (_, index) => {
@@ -856,7 +1619,7 @@ describe("progressive conversational canvas tasks", () => {
       status: "completed",
       output: JSON.stringify({ success: true }),
     });
-    expect(chatTaskProgress(current)).toContain("0 operations confirmed");
+    expect(chatTaskProgress(current)).toContain("0 mutations confirmed");
   });
 
   it("stops after the bounded validation-correction budget and retains earlier commits", async () => {
@@ -877,7 +1640,7 @@ describe("progressive conversational canvas tasks", () => {
     await expect(runChatTask(current, h.deps)).rejects.toThrow("no_progress_repeated_error");
     expect(current.status).toBe("failed");
     expect(current.validationCorrections).toBe(1);
-    expect(chatTaskProgress(current)).toContain("1 operations confirmed");
+    expect(chatTaskProgress(current)).toContain("1 mutations confirmed");
     expect(
       h.batches.flat().filter((operation) => operation.action.tool === "create_frame"),
     ).toHaveLength(1);
@@ -899,6 +1662,7 @@ describe("progressive conversational canvas tasks", () => {
               operationId: operations[0]!.operationId,
               success: false,
               replayed: false,
+              acknowledgementStatus: "rejected",
               error: "Reference inspection required",
               data: {
                 referenceResolution: {
@@ -954,6 +1718,7 @@ describe("progressive conversational canvas tasks", () => {
           return {
             ...result,
             success: false,
+            acknowledgementStatus: "not_attempted" as const,
             error: "Local tool rate limit reached; wait one minute and retry with the same ID.",
           };
         return {
@@ -987,7 +1752,7 @@ describe("progressive conversational canvas tasks", () => {
     const current = task();
     await runChatTask(current, h.deps);
     expect(current.status).toBe("completed");
-    expect(current.stages[0]).toMatchObject({ completed: true, verified: true, qaAttempts: 2 });
+    expect(current.stages[0]).toMatchObject({ completed: true, verified: true, qaAttempts: 1 });
     expect(inspections).toBe(3);
     expect(h.deps.wait).toHaveBeenCalledWith(60_100, expect.any(AbortSignal));
     const inspectionOperations = h.batches
@@ -1008,6 +1773,50 @@ describe("progressive conversational canvas tasks", () => {
 });
 
 describe("document-scoped canvas task checkpoints", () => {
+  it("migrates a legacy checkpoint only for its matching chat ID", async () => {
+    const data = new Map<string, unknown>();
+    const legacy = task();
+    data.set("fad.chat-task.v1:file-test-page_1", legacy);
+    const api = {
+      fileKey: "file-test",
+      currentPage: { id: "page:1" },
+      root: { getPluginData: () => "local", setPluginData: () => {} },
+      clientStorage: {
+        getAsync: async (key: string) => data.get(key),
+        setAsync: async (key: string, value: unknown) => data.set(key, structuredClone(value)),
+        deleteAsync: async (key: string) => data.delete(key),
+      },
+    } as unknown as PluginAPI;
+
+    expect(
+      (
+        await handleChatTaskStorage(api, {
+          type: "chat-task-load",
+          requestId: "load-matching-legacy",
+          chatId: legacy.id,
+        })
+      ).task,
+    ).toEqual(legacy);
+    expect(
+      (
+        await handleChatTaskStorage(api, {
+          type: "chat-task-load",
+          requestId: "do-not-borrow-legacy",
+          chatId: "chat-other-0001",
+        })
+      ).task,
+    ).toBeNull();
+    expect(data.has("fad.chat-task.v1:file-test-page_1")).toBe(true);
+    const wrongPage = await handleChatTaskStorage(api, {
+      type: "chat-task-load",
+      requestId: "reject-wrong-page",
+      chatId: legacy.id,
+      documentId: "file-test-page_other",
+    });
+    expect(wrongPage.success).toBe(false);
+    expect(wrongPage.error).toContain("Document/page changed");
+  });
+
   it("persists and reloads strict checkpoints and rejects cross-page saves without deleting work", async () => {
     const data = new Map<string, unknown>();
     const api = {

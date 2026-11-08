@@ -12,9 +12,10 @@ const readJson = async (path) => JSON.parse(await readFile(new URL(path, root), 
 const pluginBundle = await readFile(new URL("dist/plugin.js", root), "utf8");
 const uiHtml = await readFile(new URL("dist/ui.html", root), "utf8");
 const companionServer = await readFile(new URL("dist-companion/companion/server.js", root), "utf8");
-const uiMarker = "figma.showUI(`";
+const uiMarker = "figma.showUI(";
 const uiStart = pluginBundle.indexOf(uiMarker);
-const uiEndMarker = "</html>" + "\n" + String.fromCharCode(96);
+const quote = pluginBundle[uiStart + uiMarker.length];
+const uiEndMarker = quote === "`" ? "</html>\n`" : `</html>\\n${quote}`;
 const uiEnd = pluginBundle.indexOf(uiEndMarker, uiStart);
 const pkg = await readJson("package.json");
 const manifest = await readJson("manifest.json");
@@ -47,12 +48,24 @@ assert.ok(
 );
 assert.ok(uiHtml.includes("Enter to send"), "UI bundle is missing the conversational composer.");
 assert.ok(
+  uiHtml.includes("Generation Progress") && uiHtml.includes("Task-owned native nodes only"),
+  "UI bundle is missing task progress and task-owned native layer inspection.",
+);
+assert.ok(
+  pluginBundle.includes("task-native-inspect") && pluginBundle.includes("task-native-focus"),
+  "Plugin bundle is missing the read-only native inspection and validated focus protocol.",
+);
+assert.ok(
   uiHtml.includes("Retry Failed Stage") && uiHtml.includes("Resume"),
   "UI is missing task recovery controls.",
 );
 assert.ok(
   pluginBundle.includes("chat-task-save"),
   "Plugin bundle is missing durable chat-task checkpoints.",
+);
+assert.ok(
+  pluginBundle.includes("chat-history-upsert"),
+  "Plugin bundle is missing persisted chat history.",
 );
 assert.ok(
   companionServer.includes("plan_canvas_task"),
@@ -69,8 +82,18 @@ for (const [source, output] of [
   ["src/shared/chat-tools.ts", "dist-companion/shared/chat-tools.js"],
   ["src/companion/draft-store.ts", "dist-companion/companion/draft-store.js"],
   ["src/ui/App.tsx", "dist/ui.html"],
+  ["src/ui/chat-history-view.tsx", "dist/ui.html"],
+  ["src/ui/chat-delete-dialog.tsx", "dist/ui.html"],
+  ["src/ui/home-dashboard.tsx", "dist/ui.html"],
+  ["src/ui/workspace-detail-view.tsx", "dist/ui.html"],
+  ["src/ui/task-workspace-view.tsx", "dist/ui.html"],
+  ["src/ui/task-native-bridge.ts", "dist/ui.html"],
+  ["src/ui/workspace-navigation.tsx", "dist/ui.html"],
+  ["src/shared/chat-history.ts", "dist/ui.html"],
+  ["src/shared/chat-history.ts", "dist/plugin.js"],
   ["src/ui/chat-task.ts", "dist/ui.html"],
   ["src/ui/chat-task-bridge.ts", "dist/ui.html"],
+  ["src/plugin/chat-history-storage.ts", "dist/plugin.js"],
   ["src/shared/chat-task.ts", "dist/plugin.js"],
   ["src/plugin/chat-task-storage.ts", "dist/plugin.js"],
   ["src/plugin/generation-controller.ts", "dist/plugin.js"],

@@ -27,14 +27,56 @@ function status(auth: CompanionStatus["auth"]): CompanionStatus {
 }
 
 describe("plugin UI navigation and capability states", () => {
-  it("keeps Design selected on its explicit route and exposes all six navigation buttons", () => {
+  it("keeps secondary routes under More and exposes the four primary navigation buttons", () => {
     const html = render();
 
-    expect(html).toContain('<nav class="primary-nav" aria-label="Plugin sections">');
-    expect(html).toContain('aria-current="page">Design</button>');
-    for (const label of ["AI Chat", "JSON", "Assets", "System", "Quality"]) {
-      expect(html).toContain(`>${label}</button>`);
+    expect(html).toContain('<nav class="primary-nav" aria-label="Main navigation">');
+    expect(html).toContain('aria-current="page"');
+    for (const label of ["Home", "Chat", "History", "More"]) {
+      expect(html).toContain(`>${label}</span>`);
     }
+  });
+
+  it("renders the navy Home dashboard and all advanced destinations in More", () => {
+    const home = render("home");
+    expect(home).toContain("Design with clarity.");
+    expect(home).toContain("Start New Chat");
+    expect(home).toContain("Quick access");
+    expect(home).toContain("Chat History");
+
+    const more = render("more");
+    for (const label of [
+      "Design System",
+      "Asset Library",
+      "Activity & Diagnostics",
+      "Help & Guide",
+      "About",
+      "JSON Advanced",
+      "Generation Options",
+      "Generation Progress",
+    ])
+      expect(more).toContain(label.replaceAll("&", "&amp;"));
+    expect(more).not.toContain("Export &amp; Import");
+    expect(more).not.toContain("Settings &amp; Model Health");
+  });
+
+  it("shows honest Phase A capability states for Brand Kit and Skills routes", () => {
+    expect(render("brand-kit")).toContain(
+      "Brand Kit creation, editing, and generation integration are not available",
+    );
+    expect(render("brand-kit-create")).toContain("No kit has been created");
+    expect(render("skills")).toContain("No skill text is loaded or executed");
+    expect(render("skill-add")).toContain("No file is read or executed here");
+  });
+
+  it("exposes saved history loading and the task detail routes", () => {
+    const history = render("history");
+    expect(history).toContain("Loading saved chats");
+    expect(history).not.toContain("A native operation is active");
+    expect(render("results")).toContain("canvas remains the actual design preview");
+    expect(render("layers")).toContain("read-only native hierarchy");
+    expect(render("activity")).toContain("stage lifecycle, native execution, verification");
+    expect(render("progress")).toContain("No task data for this chat");
   });
 
   it("provides the bilingual AI Chat composer and a collapsed native developer harness", () => {
@@ -49,6 +91,9 @@ describe("plugin UI navigation and capability states", () => {
     expect(html).not.toContain("function_call");
     expect(html).not.toContain("tool-execute");
     expect(html).toContain("Native operation harness");
+    expect(html).toContain("Current generation context");
+    expect(html).toContain("BRAND KIT");
+    expect(html).toContain("SKILLS");
     expect(html).toContain("Create 390 × 844 frame");
     expect(html).toContain("Change button color only");
     expect(html).toContain("Safe invalid-layout check");
@@ -138,12 +183,14 @@ describe("plugin UI navigation and capability states", () => {
     expect(render("quality")).not.toContain("Asset source / license");
   });
 
-  it("defines compact six-item navigation and removes the plugin minimum width", () => {
+  it("defines responsive four-item navigation and removes the plugin minimum width", () => {
     const css = readFileSync("src/ui/styles.css", "utf8");
 
-    expect(css).toContain("grid-template-columns: repeat(6, minmax(0, 1fr))");
+    expect(css).toContain("grid-template-columns: repeat(4, minmax(0, 1fr))");
     expect(css).toContain("@media (max-width: 420px)");
     expect(css).toContain("@media (max-width: 340px)");
     expect(css).toContain("min-width: 0;");
+    expect(css).toContain("--bg: #090e1d");
+    expect(css).toContain("linear-gradient(115deg, #7655e9");
   });
 });
