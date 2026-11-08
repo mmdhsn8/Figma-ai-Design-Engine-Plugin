@@ -39,6 +39,26 @@ describe("offline visual asset safety", () => {
     ).toContain("checksums are corrupt");
   });
 
+  it.each([
+    ["bit depth", 24, 3],
+    ["color type", 25, 1],
+    ["compression method", 26, 1],
+    ["filter method", 27, 1],
+    ["interlace method", 28, 2],
+  ] as const)("rejects PNGs with invalid IHDR %s despite a valid checksum", (_, index, value) => {
+    const invalidHeader = embeddedImageBytes(ONE_PIXEL_PNG);
+    invalidHeader[index] = value;
+    const headerCrc = crc32ForPngChunk(invalidHeader.slice(12, 29));
+    invalidHeader[29] = headerCrc >>> 24;
+    invalidHeader[30] = (headerCrc >>> 16) & 0xff;
+    invalidHeader[31] = (headerCrc >>> 8) & 0xff;
+    invalidHeader[32] = headerCrc & 0xff;
+
+    expect(
+      inspectEmbeddedImage(Buffer.from(invalidHeader).toString("base64"), "image/png").valid,
+    ).toBe(false);
+  });
+
   it("accepts a deliberately small editable SVG path subset", () => {
     const safe = parseSafeSvg(
       '<svg viewBox="0 0 24 24"><path id="check" d="M 3 12 L 9 18 L 21 4 Z" fill="#2563EB"/></svg>',
