@@ -55,6 +55,14 @@ function readJpegDimensions(bytes: Uint8Array): { width: number; height: number 
   return undefined;
 }
 
+const PNG_BIT_DEPTHS: Readonly<Record<number, readonly number[]>> = {
+  0: [1, 2, 4, 8, 16],
+  2: [8, 16],
+  3: [1, 2, 4, 8],
+  4: [8, 16],
+  6: [8, 16],
+};
+
 function crc32(bytes: Uint8Array, start: number, end: number): number {
   let crc = 0xffffffff;
   for (let index = start; index < end; index++) {
@@ -96,6 +104,15 @@ function readPngDimensions(bytes: Uint8Array): { width: number; height: number }
     if (crc32(bytes, offset + 4, chunkEnd - 4) !== expectedCrc) return undefined;
     if (!seenHeader) {
       if (type !== "IHDR" || length !== 13) return undefined;
+      const bitDepth = bytes[offset + 16];
+      const colorType = bytes[offset + 17];
+      if (
+        !PNG_BIT_DEPTHS[colorType]?.includes(bitDepth) ||
+        bytes[offset + 18] !== 0 ||
+        bytes[offset + 19] !== 0 ||
+        bytes[offset + 20] > 1
+      )
+        return undefined;
       width =
         bytes[offset + 8] * 2 ** 24 +
         bytes[offset + 9] * 2 ** 16 +
