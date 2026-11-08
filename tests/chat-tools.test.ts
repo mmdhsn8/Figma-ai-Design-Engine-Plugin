@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CHAT_FUNCTION_TOOLS,
+  chatFunctionToolsForState,
   ChatFunctionCallValidationError,
   ChatInputItemSchema,
   parseResponsesFunctionCalls,
@@ -9,6 +10,31 @@ import {
 } from "../src/shared/chat-tools";
 
 describe("allowlisted chat functions", () => {
+  it("exposes planning only while the lifecycle is unplanned", () => {
+    expect(chatFunctionToolsForState("UNPLANNED").map(({ name }) => name)).toContain(
+      "plan_canvas_task",
+    );
+    for (const state of [
+      "PLAN_SAVED",
+      "EXECUTING_STAGE",
+      "VERIFYING_STAGE",
+      "STAGE_COMPLETED",
+      "TASK_COMPLETED",
+    ] as const)
+      expect(chatFunctionToolsForState(state).map(({ name }) => name)).not.toContain(
+        "plan_canvas_task",
+      );
+    expect(chatFunctionToolsForState("PLAN_SAVED").map(({ name }) => name)).toContain(
+      "create_frame",
+    );
+    expect(chatFunctionToolsForState("PLAN_SAVED").map(({ name }) => name)).not.toContain(
+      "complete_canvas_stage",
+    );
+    expect(chatFunctionToolsForState("EXECUTING_STAGE").map(({ name }) => name)).toContain(
+      "complete_canvas_stage",
+    );
+  });
+
   it("exposes bounded native actions and validates model arguments into tool actions", () => {
     const functionCall = {
       type: "function_call",
@@ -67,6 +93,65 @@ describe("allowlisted chat functions", () => {
         output: "{}",
       }).success,
     ).toBe(false);
+  });
+
+  it("accepts the supported ten-call batch and rejects an oversized call set before dispatch", () => {
+    const calls = Array.from({ length: 11 }, (_, index) => ({
+      type: "function_call",
+      call_id: `call_batch_${String(index).padStart(4, "0")}`,
+      name: "get_document_context",
+      arguments: "{}",
+    }));
+    expect(parseResponsesFunctionCalls(calls.slice(0, 10))).toHaveLength(10);
+    try {
+      parseResponsesFunctionCalls(calls);
+      throw new Error("Expected an oversized Responses call set to be rejected.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ChatFunctionCallValidationError);
+      expect((error as ChatFunctionCallValidationError).validationIssues).toEqual([
+        {
+          stage: "call_set",
+          errorCode: "too_many_calls",
+          fieldPaths: ["calls"],
+        },
+      ]);
+    }
+  });
+
+  it("rejects unsupported call_set wrappers without reading or executing embedded calls", () => {
+    try {
+      parseResponsesFunctionCalls([
+        {
+          type: "call_set",
+          calls: [
+            {
+              type: "function_call",
+              call_id: "embedded_call_01",
+              name: "create_frame",
+              arguments: JSON.stringify({
+                ref: "must-not-execute",
+                name: "Untrusted wrapper",
+                parent: { kind: "page" },
+                size: { width: 100, height: 100 },
+              }),
+            },
+          ],
+        },
+      ]);
+      throw new Error("Expected unsupported call_set wrapper rejection.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ChatFunctionCallValidationError);
+      expect((error as ChatFunctionCallValidationError).validationIssues).toEqual([
+        {
+          stage: "call_item",
+          errorCode: "unsupported_wrapper",
+          fieldPaths: ["type"],
+        },
+      ]);
+      expect(
+        JSON.stringify((error as ChatFunctionCallValidationError).validationIssues),
+      ).not.toContain("must-not-execute");
+    }
   });
 
   it("advertises only supported professional styling and structured planning fields", () => {

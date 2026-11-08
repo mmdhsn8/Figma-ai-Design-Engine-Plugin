@@ -3,6 +3,11 @@ import { ChatTaskSchema } from "./chat-task";
 import { DraftIdentitySchema, DraftManifestSchema } from "./generation-draft";
 import { GenerationTransactionSchema } from "./generation-transaction";
 import {
+  ChatHistoryChatIdSchema,
+  ChatHistoryConversationSchema,
+  ChatHistoryIndexSchema,
+} from "./chat-history";
+import {
   FigmaToolBatchSchema,
   FigmaToolCancelSchema,
   FigmaToolDeleteConsentSchema,
@@ -92,6 +97,44 @@ const MultiScreenProgressSchema = z
   })
   .strict();
 
+const TaskNativeNodeSchema = z
+  .object({
+    id: z.string().min(1).max(100),
+    parentId: z.string().min(1).max(100).optional(),
+    ref: z
+      .string()
+      .regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u)
+      .optional(),
+    name: z.string().max(100),
+    type: z.string().min(1).max(40),
+    x: z.number().finite(),
+    y: z.number().finite(),
+    width: z.number().finite().nonnegative(),
+    height: z.number().finite().nonnegative(),
+    visible: z.boolean(),
+    layoutMode: z.string().max(20).optional(),
+    itemSpacing: z.number().finite().optional(),
+    padding: z
+      .object({
+        top: z.number().finite(),
+        right: z.number().finite(),
+        bottom: z.number().finite(),
+        left: z.number().finite(),
+      })
+      .strict()
+      .optional(),
+    primaryAxisSizingMode: z.string().max(20).optional(),
+    counterAxisSizingMode: z.string().max(20).optional(),
+  })
+  .strict();
+
+const TaskNativeUnresolvedRefSchema = z
+  .object({
+    ref: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u),
+    status: z.enum(["missing", "stale", "ambiguous", "unavailable"]),
+  })
+  .strict();
+
 const MultiScreenRenderResultSchema = z
   .object({
     type: z.literal("multi-screen-result"),
@@ -114,13 +157,60 @@ const MultiScreenRenderResultSchema = z
   .strict();
 
 export const UIToPluginSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("chat-task-load"), requestId: z.string().min(1).max(100) }).strict(),
+  z
+    .object({
+      type: z.literal("chat-task-load"),
+      requestId: z.string().min(1).max(100),
+      chatId: ChatHistoryChatIdSchema.optional(),
+      documentId: z.string().min(1).max(300).optional(),
+    })
+    .strict(),
   z
     .object({
       type: z.literal("chat-task-save"),
       requestId: z.string().min(1).max(100),
       documentId: z.string().min(1).max(300),
+      chatId: ChatHistoryChatIdSchema.optional(),
       task: ChatTaskSchema.nullable(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("task-native-inspect"),
+      requestId: z.string().min(1).max(100),
+      documentId: z.string().min(1).max(300),
+      taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+      refs: z.array(z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u)).max(500),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("task-native-focus"),
+      requestId: z.string().min(1).max(100),
+      documentId: z.string().min(1).max(300),
+      taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+      nodeIds: z.array(z.string().min(1).max(100)).min(1).max(20),
+      mode: z.enum(["select", "zoom"]),
+    })
+    .strict(),
+  z
+    .object({ type: z.literal("chat-history-load"), requestId: z.string().min(1).max(100) })
+    .strict(),
+  z
+    .object({
+      type: z.literal("chat-history-upsert"),
+      requestId: z.string().min(1).max(100),
+      documentId: z.string().min(1).max(300),
+      conversation: ChatHistoryConversationSchema,
+      activeChatId: ChatHistoryChatIdSchema.nullable().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("chat-history-delete"),
+      requestId: z.string().min(1).max(100),
+      documentId: z.string().min(1).max(300),
+      chatId: ChatHistoryChatIdSchema,
     })
     .strict(),
   FigmaToolBatchSchema,
@@ -203,11 +293,42 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
 export const PluginToUISchema = z.discriminatedUnion("type", [
   z
     .object({
+      type: z.literal("chat-history-result"),
+      requestId: z.string().min(1).max(100),
+      success: z.boolean(),
+      documentId: z.string().max(300),
+      history: ChatHistoryIndexSchema.optional(),
+      error: z.string().max(500).optional(),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("chat-task-result"),
       requestId: z.string().min(1).max(100),
       success: z.boolean(),
       documentId: z.string().max(300),
       task: ChatTaskSchema.nullable().optional(),
+      error: z.string().max(500).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("task-native-inspection-result"),
+      requestId: z.string().min(1).max(100),
+      success: z.boolean(),
+      taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+      nodes: z.array(TaskNativeNodeSchema).max(500).optional(),
+      unresolvedRefs: z.array(TaskNativeUnresolvedRefSchema).max(500).optional(),
+      truncated: z.boolean().optional(),
+      error: z.string().max(500).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("task-native-focus-result"),
+      requestId: z.string().min(1).max(100),
+      success: z.boolean(),
+      nodeIds: z.array(z.string().min(1).max(100)).max(20).optional(),
       error: z.string().max(500).optional(),
     })
     .strict(),

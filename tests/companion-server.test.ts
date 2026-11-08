@@ -12,7 +12,11 @@ import {
   type OidcDiscovery,
 } from "../src/companion/oauth.js";
 import { createMemoryCredentialStore } from "../src/companion/credential-store.js";
-import { createCompanionServer, type CompanionServerHandle } from "../src/companion/server.js";
+import {
+  createCompanionServer,
+  readCompletedResponse,
+  type CompanionServerHandle,
+} from "../src/companion/server.js";
 import { createDraftStore, type DraftStore } from "../src/companion/draft-store.js";
 import { draftFixture } from "./generation-fixture";
 import { createMockApi } from "./figma-mock";
@@ -212,8 +216,18 @@ describe("loopback companion", () => {
     const deps = {
       signal: new AbortController().signal,
       progress: () => {},
-      model: (input: Parameters<typeof streamAuthorizedChat>[3]) =>
-        streamAuthorizedChat(token, `alias-request-${++sequence}`, "account-model", input, fetcher),
+      model: (
+        input: Parameters<typeof streamAuthorizedChat>[3],
+        lifecycle: Parameters<typeof streamAuthorizedChat>[4],
+      ) =>
+        streamAuthorizedChat(
+          token,
+          `alias-request-${++sequence}`,
+          "account-model",
+          input,
+          lifecycle,
+          fetcher,
+        ),
       save: async (checkpoint: typeof task) => {
         const saved = await handleChatTaskStorage(mock.api, {
           type: "chat-task-save",
@@ -455,12 +469,16 @@ describe("loopback companion", () => {
     const deps = {
       signal: new AbortController().signal,
       progress: (message: string) => progress.push(message),
-      model: (input: Parameters<typeof streamAuthorizedChat>[3]) =>
+      model: (
+        input: Parameters<typeof streamAuthorizedChat>[3],
+        lifecycle: Parameters<typeof streamAuthorizedChat>[4],
+      ) =>
         streamAuthorizedChat(
           token,
           `stability-request-${++sequence}`,
           "account-model",
           input,
+          lifecycle,
           fetcher,
         ),
       save: async (checkpoint: typeof task) => {
@@ -630,7 +648,12 @@ describe("loopback companion", () => {
     const userItem = { role: "user", content: "Create a home frame." };
     const first = await request(harness.handle, "/v1/chat", {
       token,
-      body: { requestId: "chat-test-0001", model: "account-model", input: [userItem] },
+      body: {
+        requestId: "chat-test-0001",
+        model: "account-model",
+        input: [userItem],
+        lifecycle: "EXECUTING_STAGE",
+      },
     });
     expect(first.status).toBe(200);
     expect(first.headers.get("x-fad-request-id")).toBe("chat-test-0001");
@@ -660,6 +683,7 @@ describe("loopback companion", () => {
         requestId: "chat-test-0002",
         model: "account-model",
         input: [userItem, call, toolOutput],
+        lifecycle: "EXECUTING_STAGE",
       },
     });
     expect(second.status).toBe(200);
@@ -830,6 +854,7 @@ describe("loopback companion", () => {
       },
     ];
     const plan = call("plan_canvas_task", { brief, stages });
+    const duplicatePlan = call("plan_canvas_task", { brief, stages });
     const stageOneCalls = Array.from({ length: 31 }, (_, index) =>
       call("create_frame", {
         ref: `stage1-${index}`,
@@ -841,6 +866,7 @@ describe("loopback companion", () => {
     const modelResponses: Array<{ text?: string; outputItems?: unknown[] }> = [
       { outputItems: [call("get_document_context", {})] },
       { outputItems: [plan] },
+      { outputItems: [duplicatePlan] },
       ...[0, 10, 20].map((offset) => ({ outputItems: stageOneCalls.slice(offset, offset + 10) })),
       { outputItems: stageOneCalls.slice(30) },
     ];
@@ -890,12 +916,16 @@ describe("loopback companion", () => {
     const dependencies = (controller: AbortController) => ({
       signal: controller.signal,
       progress: () => {},
-      model: (input: Parameters<typeof streamAuthorizedChat>[3]) =>
+      model: (
+        input: Parameters<typeof streamAuthorizedChat>[3],
+        lifecycle: Parameters<typeof streamAuthorizedChat>[4],
+      ) =>
         streamAuthorizedChat(
           token,
           `three-stage-request-${++requestNumber}`,
           "account-model",
           input,
+          lifecycle,
           fetcher,
           controller.signal,
         ),
@@ -930,14 +960,17 @@ describe("loopback companion", () => {
             cancelled: false,
             committedOperationIds: [],
             partialOperationIds: [],
-            results: [
-              {
-                operationId: rejected.operationId,
-                success: false,
-                replayed: false,
-                error: "Simulated pre-commit stage-three write rejection.",
-              },
-            ],
+            results: operations.map((operation) => ({
+              operationId: operation.operationId,
+              success: false,
+              replayed: false,
+              acknowledgementStatus:
+                operation.operationId === rejected.operationId ? "rejected" : "not_attempted",
+              error:
+                operation.operationId === rejected.operationId
+                  ? "Simulated pre-commit stage-three write rejection."
+                  : "Not attempted after the rejected operation.",
+            })),
           } satisfies Extract<PluginToUIMessage, { type: "tool-result" }>;
         }
         const dispatch = UIToPluginSchema.parse(
@@ -980,6 +1013,18 @@ describe("loopback companion", () => {
     expect(mock.nodes).toHaveLength(31);
     const committedNodeIds = mock.nodes.map((node) => node.id);
     expect(modelResponses).toHaveLength(0);
+    expect(task.validationCorrections).toBe(0);
+    expect(task.roundBreakdown.planning).toBe(2);
+    const stateAwareRequests = harness.responsesRequests.map(({ body }) => JSON.parse(body));
+    expect(
+      stateAwareRequests.some(
+        ({ instructions, tools }) =>
+          String(instructions).includes("Current lifecycle state: PLAN_SAVED") &&
+          Array.isArray(tools) &&
+          !tools.some((tool) => tool.name === "plan_canvas_task") &&
+          tools.some((tool) => tool.name === "create_frame"),
+      ),
+    ).toBe(true);
 
     const stoppedCheckpoint = await handleChatTaskStorage(mock.api, {
       type: "chat-task-load",
@@ -1300,6 +1345,83 @@ describe("loopback companion", () => {
     expect(log).not.toContain("must not be echoed");
   }, 20_000);
 
+  it("rejects an oversized Responses call set before emitting any dispatchable calls", async () => {
+    const outputItems = Array.from({ length: 11 }, (_, index) => ({
+      type: "function_call",
+      call_id: `call_overflow_${String(index).padStart(3, "0")}`,
+      name: "get_document_context",
+      arguments: "{}",
+    }));
+    const harness = await createHarness({ chatResponses: [{ outputItems }] });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    const rejected = await request(harness.handle, "/v1/chat", {
+      token,
+      body: {
+        requestId: "chat-callset-overflow-01",
+        model: "account-model",
+        input: [{ role: "user", content: "Create a storefront." }],
+        lifecycle: "UNPLANNED",
+      },
+    });
+    const event = await rejected.text();
+    expect(event).toContain("event: tool_validation");
+    expect(event).toContain('"stage":"call_set"');
+    expect(event).toContain('"errorCode":"too_many_calls"');
+    expect(event).toContain('"fieldPaths":["calls"]');
+    expect(event).not.toContain("event: tool_calls");
+    expect(event).not.toContain('"name":"get_document_context"');
+  }, 20_000);
+
+  it("rejects a nested call_set wrapper before its embedded mutation reaches the client", async () => {
+    const harness = await createHarness({
+      chatResponses: [
+        {
+          outputItems: [
+            {
+              type: "call_set",
+              calls: [
+                {
+                  type: "function_call",
+                  call_id: "embedded_call_01",
+                  name: "create_frame",
+                  arguments: JSON.stringify({
+                    ref: "must-not-execute",
+                    name: "Wrapped call",
+                    parent: { kind: "page" },
+                    size: { width: 100, height: 100 },
+                  }),
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", {
+      token,
+      body: { model: "account-model" },
+    });
+    const rejected = await request(harness.handle, "/v1/chat", {
+      token,
+      body: {
+        requestId: "chat-invalid-wrapper-01",
+        model: "account-model",
+        input: [{ role: "user", content: "Create a storefront." }],
+        lifecycle: "UNPLANNED",
+      },
+    });
+    const event = await rejected.text();
+    expect(event).toContain("event: tool_validation");
+    expect(event).toContain('"errorCode":"unsupported_wrapper"');
+    expect(event).not.toContain("event: tool_calls");
+    expect(event).not.toContain("must-not-execute");
+  }, 20_000);
+
   it("aborts the upstream Responses stream when the chat client stops", async () => {
     const harness = await createHarness();
     const token = await authorizeAndDiscover(harness);
@@ -1307,6 +1429,7 @@ describe("loopback companion", () => {
       token,
       body: { model: "account-model" },
     });
+    const diagnostics = vi.spyOn(console, "info").mockImplementation(() => undefined);
     harness.stallNextResponse();
     const controller = new AbortController();
     const pending = request(harness.handle, "/v1/chat", {
@@ -1332,6 +1455,15 @@ describe("loopback companion", () => {
     controller.abort();
     await expect(pending).rejects.toBeDefined();
     await vi.waitFor(() => expect(harness.wasResponseStreamCancelled()).toBe(true));
+    await vi.waitFor(() =>
+      expect(
+        diagnostics.mock.calls.some(
+          ([, line]) =>
+            String(line).includes('"requestId":"chat-cancel-0001"') &&
+            String(line).includes('"terminationReason":"user_cancelled"'),
+        ),
+      ).toBe(true),
+    );
   }, 20_000);
 
   it("protects durable checkpoints behind pairing and restores them after companion restart", async () => {
@@ -2314,6 +2446,139 @@ describe("loopback companion", () => {
     expect(await (await request(harness.handle, "/v1/status", { token })).json()).toMatchObject({
       auth: "scope_granted",
     });
+  });
+
+  it.each([
+    {
+      kind: "idle" as const,
+      idle: 25,
+      overall: 1_000,
+      timeoutSource: "upstream_inactivity",
+      terminationReason: "upstream_inactivity",
+    },
+    {
+      kind: "overall" as const,
+      idle: 1_000,
+      overall: 30,
+      timeoutSource: "overall_deadline",
+      terminationReason: "overall_deadline",
+    },
+  ])(
+    "preserves the authenticated chat $kind timeout boundary through SSE and the client",
+    async ({ kind, idle, overall, timeoutSource, terminationReason }) => {
+      const harness = await createHarness({
+        requestTimeoutMs: 1_000,
+        streamIdleTimeoutMs: idle,
+        streamOverallTimeoutMs: overall,
+      });
+      const token = await authorizeAndDiscover(harness);
+      await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+      harness.stallNextResponse();
+      const requestId = `chat-timeout-${kind}-01`;
+      const localFetcher: typeof fetch = (url, init) =>
+        fetch(`http://localhost:${harness.handle.port}${new URL(String(url)).pathname}`, {
+          ...init,
+          headers: { ...Object.fromEntries(new Headers(init?.headers)), Origin: "null" },
+        });
+
+      await expect(
+        streamAuthorizedChat(
+          token,
+          requestId,
+          "account-model",
+          [{ role: "user", content: "Continue the saved Home stage." }],
+          "EXECUTING_STAGE",
+          localFetcher,
+        ),
+      ).rejects.toMatchObject({
+        category: "request_timed_out",
+        diagnostic: {
+          requestId,
+          requestPhase: "upstream_stream",
+          requestStartedAtMs: expect.any(Number),
+          stage: "stream",
+          outcome: "timed_out",
+          timeoutKind: kind,
+          timeoutSource,
+          terminationReason,
+          elapsedMs: expect.any(Number),
+          idleMs: expect.any(Number),
+        },
+      });
+    },
+  );
+
+  it("reports an authenticated chat header timeout separately from upstream stream timeouts", async () => {
+    const harness = await createHarness({ requestTimeoutMs: 25 });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    harness.stallNextChatHeaders();
+    const requestId = "chat-header-timeout-01";
+    const localFetcher: typeof fetch = (url, init) =>
+      fetch(`http://localhost:${harness.handle.port}${new URL(String(url)).pathname}`, {
+        ...init,
+        headers: { ...Object.fromEntries(new Headers(init?.headers)), Origin: "null" },
+      });
+
+    await expect(
+      streamAuthorizedChat(
+        token,
+        requestId,
+        "account-model",
+        [{ role: "user", content: "Continue the saved stage." }],
+        "EXECUTING_STAGE",
+        localFetcher,
+      ),
+    ).rejects.toMatchObject({
+      category: "request_timed_out",
+      diagnostic: {
+        requestId,
+        requestPhase: "upstream_headers",
+        outcome: "timed_out",
+        timeoutKind: "headers",
+        timeoutSource: "upstream_headers",
+        terminationReason: "upstream_header_timeout",
+        elapsedMs: expect.any(Number),
+      },
+    });
+  });
+
+  it("accepts response.completed already received before a delayed SSE handler crosses the deadline", async () => {
+    const startedAt = performance.now();
+    const requestStartedAtMs = Date.now();
+    const payload = [
+      `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "valid reasoning" })}\n\n`,
+      `data: ${JSON.stringify({
+        type: "response.completed",
+        response: { status: "completed", output: [] },
+      })}\n\n`,
+    ].join("");
+    const response = new Response(payload, {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+
+    const completed = await readCompletedResponse(
+      response,
+      1_000,
+      startedAt + 30,
+      undefined,
+      "account-model",
+      async () => new Promise((resolve) => setTimeout(resolve, 60)),
+      startedAt,
+      undefined,
+      "chat-slow-terminal-01",
+      requestStartedAtMs,
+    );
+
+    expect(completed.diagnostic).toMatchObject({
+      requestId: "chat-slow-terminal-01",
+      requestStartedAtMs,
+      requestPhase: "upstream_stream",
+      outcome: "completed",
+      terminationReason: "response_completed",
+      terminalEvent: "response.completed",
+    });
+    expect(completed.diagnostic.elapsedMs).toBeGreaterThan(30);
   });
 
   it("reports an overall stream deadline when output deltas keep arriving", async () => {
@@ -3309,6 +3574,7 @@ async function createHarness(
     modelsUnauthorized?: boolean;
     usageFailure?: boolean;
     stalledStream?: boolean;
+    stallChatHeaders?: boolean;
     stallAfterGeneratedDelta?: boolean;
     timeoutGeneratedStreams?: number;
     progressingGeneratedStream?: boolean;
@@ -3352,6 +3618,7 @@ async function createHarness(
   };
   let openedUrl: string | undefined;
   let responsesRequest: { body: string; headers: HeadersInit } | undefined;
+  const responsesRequests: Array<{ body: string; headers: HeadersInit }> = [];
   let responsesCallCount = 0;
   let refreshRequest: string | undefined;
   let codeExchange: string | undefined;
@@ -3361,6 +3628,7 @@ async function createHarness(
     markResponseStreamStarted = resolve;
   });
   let stallNextResponses = false;
+  let stallChatHeaders = false;
   let nextResponsesUsageFailure = false;
   const resetResponseStreamWaiter = () => {
     responseStreamStarted = new Promise<void>((resolve) => {
@@ -3442,6 +3710,7 @@ async function createHarness(
     if (url === "https://api.openai.com/v1/responses") {
       responsesCallCount++;
       responsesRequest = { body: String(init?.body ?? ""), headers: init?.headers ?? {} };
+      responsesRequests.push(responsesRequest);
       const responsePayload = JSON.parse(String(init?.body ?? "")) as {
         text?: unknown;
         tools?: unknown;
@@ -3449,6 +3718,20 @@ async function createHarness(
         input?: unknown[];
       };
       if (options.responsesFetchFailure) throw new TypeError("private transport failure text");
+      if (
+        stallChatHeaders &&
+        Array.isArray(responsePayload.tools) &&
+        responsePayload.tool_choice === "auto"
+      ) {
+        stallChatHeaders = false;
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      }
       if (options.stallDesignHeaders && JSON.parse(String(init?.body ?? "")).text) {
         return await new Promise<Response>((_resolve, reject) => {
           init?.signal?.addEventListener(
@@ -3673,6 +3956,9 @@ async function createHarness(
     get responsesRequest() {
       return responsesRequest;
     },
+    get responsesRequests() {
+      return responsesRequests;
+    },
     get responsesCallCount() {
       return responsesCallCount;
     },
@@ -3724,6 +4010,9 @@ async function createHarness(
       stallNextResponses = true;
       resetResponseStreamWaiter();
     },
+    stallNextChatHeaders() {
+      stallChatHeaders = true;
+    },
     failNextResponseWithUsage() {
       nextResponsesUsageFailure = true;
     },
@@ -3762,12 +4051,20 @@ async function request(
   options: { token?: string; body?: unknown; origin?: string; signal?: AbortSignal },
 ): Promise<Response> {
   const headers = new Headers({ Origin: options.origin ?? "null" });
-  if (options.body !== undefined) headers.set("Content-Type", "application/json");
+  const body =
+    path === "/v1/chat" &&
+    options.body &&
+    typeof options.body === "object" &&
+    !Array.isArray(options.body) &&
+    !("lifecycle" in options.body)
+      ? { ...options.body, lifecycle: "UNPLANNED" }
+      : options.body;
+  if (body !== undefined) headers.set("Content-Type", "application/json");
   if (options.token) headers.set("Authorization", `Bearer ${options.token}`);
   return fetch(`http://localhost:${handle.port}${path}`, {
-    method: options.body !== undefined ? "POST" : "GET",
+    method: body !== undefined ? "POST" : "GET",
     headers,
-    ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     ...(options.signal ? { signal: options.signal } : {}),
   });
 }

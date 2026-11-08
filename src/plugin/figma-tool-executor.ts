@@ -1,5 +1,15 @@
 import { z } from "zod";
-import type { FigmaToolAction, FigmaToolBatch, FigmaToolOperation } from "../shared/figma-tools";
+import {
+  FigmaToolAcknowledgementSchema,
+  FigmaToolCompatibilityFailureSchema,
+  FigmaToolCompatibilityNormalizationSchema,
+  FigmaToolParentingDiagnosticSchema,
+  type FigmaToolAction,
+  type FigmaToolBatch,
+  type FigmaToolOperation,
+  type FigmaToolParentingDiagnostic,
+} from "../shared/figma-tools";
+import { FigmaCompatibilityError, figmaCompatibilityEngine } from "./figma-compatibility";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
 import { utf8Bytes } from "../shared/generation-limits";
 import { planCanvasPlacements } from "./canvas-placement";
@@ -21,9 +31,8 @@ const ReferenceCandidateSchema = z
   })
   .strict();
 
-const StoredStateSchema = z
+const StoredStateDataSchema = z
   .object({
-    version: z.literal(1),
     refs: z.record(
       z.string().max(80),
       z
@@ -51,17 +60,26 @@ const StoredStateSchema = z
           fingerprint: z.string().length(32),
           status: z.enum(["running", "completed", "failed"]),
           updatedAt: z.number().int().nonnegative(),
+          parentingSourceParentId: z.string().max(100).optional(),
+          parentingTargetParentId: z.string().max(100).optional(),
           result: z
             .object({
               operationId: z.string().max(100),
               success: z.boolean(),
               replayed: z.boolean(),
+              acknowledgementStatus: FigmaToolAcknowledgementSchema.optional(),
               logicalRef: z.string().max(80).optional(),
               summary: z.string().max(300).optional(),
               error: z.string().max(400).optional(),
               data: z
                 .object({
                   reused: z.boolean().optional(),
+                  parenting: FigmaToolParentingDiagnosticSchema.optional(),
+                  compatibilityNormalizations: z
+                    .array(FigmaToolCompatibilityNormalizationSchema)
+                    .max(3)
+                    .optional(),
+                  compatibilityFailure: FigmaToolCompatibilityFailureSchema.optional(),
                   referenceResolution: z
                     .object({
                       code: z.string().max(60),
@@ -85,12 +103,46 @@ const StoredStateSchema = z
   })
   .strict();
 
-type StoredState = z.infer<typeof StoredStateSchema>;
+const StoredStateV1Schema = StoredStateDataSchema.extend({ version: z.literal(1) }).strict();
+const StoredStateV2Schema = StoredStateDataSchema.extend({ version: z.literal(2) }).strict();
+const StoredStateSchema = z.discriminatedUnion("version", [
+  StoredStateV1Schema,
+  StoredStateV2Schema,
+]);
+
+type StoredState = z.infer<typeof StoredStateV2Schema>;
 type StoredOperationResult = NonNullable<StoredState["operations"][string]["result"]>;
+
+export function downgradeStoredToolStateForRollback(input: unknown) {
+  const state = StoredStateV2Schema.parse(input);
+  const operations = Object.fromEntries(
+    Object.entries(state.operations).map(([id, operation]) => {
+      if (!operation.result?.data) return [id, operation];
+      const data = Object.fromEntries(
+        Object.entries(operation.result.data).filter(
+          ([key]) => key !== "compatibilityFailure" && key !== "compatibilityNormalizations",
+        ),
+      );
+      const result = { ...operation.result };
+      if (Object.keys(data).length) result.data = data;
+      else delete result.data;
+      return [
+        id,
+        {
+          ...operation,
+          result,
+        },
+      ];
+    }),
+  );
+  return StoredStateV1Schema.parse({ ...state, version: 1, operations });
+}
+
 type OperationResult = {
   operationId: string;
   success: boolean;
   replayed: boolean;
+  acknowledgementStatus?: z.infer<typeof FigmaToolAcknowledgementSchema>;
   logicalRef?: string;
   summary?: string;
   data?: Record<string, unknown>;
@@ -112,6 +164,16 @@ class ReferenceResolutionError extends Error {
   }
 }
 
+class ParentingOperationError extends Error {
+  constructor(
+    message: string,
+    readonly diagnostic: FigmaToolParentingDiagnostic,
+    readonly referenceResolution?: OperationResult["data"],
+  ) {
+    super(message);
+  }
+}
+
 function isCreation(
   action: FigmaToolAction,
 ): action is Extract<
@@ -130,6 +192,7 @@ function referenceFailure(operationId: string, error: ReferenceResolutionError):
     operationId,
     success: false,
     replayed: false,
+    acknowledgementStatus: "rejected",
     error: error.message.slice(0, 400),
     data: {
       referenceResolution: {
@@ -152,6 +215,51 @@ function referenceFailure(operationId: string, error: ReferenceResolutionError):
       },
     },
   };
+}
+
+function isParentingAction(
+  action: FigmaToolAction,
+): action is Extract<FigmaToolAction, { tool: "append_child" | "reparent_node" }> {
+  return action.tool === "append_child" || action.tool === "reparent_node";
+}
+
+function parentCategory(
+  parent: BaseNode | null | undefined,
+): "page_root" | "frame" | "component" | "other" | "detached" | "unknown" {
+  if (!parent) return "detached";
+  if (parent.type === "PAGE") return "page_root";
+  if (parent.type === "FRAME") return "frame";
+  if (parent.type === "COMPONENT") return "component";
+  return "other";
+}
+
+function parentingDiagnostic(
+  operationId: string,
+  action: Extract<FigmaToolAction, { tool: "append_child" | "reparent_node" }>,
+  sourceLogicalRef: string,
+  targetLogicalRef: string,
+  sourceParent: BaseNode | null | undefined,
+  expectedParent: BaseNode | null | undefined,
+  actualParent: BaseNode | null | undefined,
+  decision: FigmaToolParentingDiagnostic["decision"],
+  acknowledgementStatus: FigmaToolParentingDiagnostic["acknowledgementStatus"],
+): FigmaToolParentingDiagnostic {
+  return FigmaToolParentingDiagnosticSchema.parse({
+    operationId,
+    toolName: action.tool,
+    sourceLogicalRef,
+    targetLogicalRef,
+    sourceParentCategory: parentCategory(sourceParent),
+    expectedParentCategory:
+      expectedParent?.type === "FRAME"
+        ? "frame"
+        : expectedParent?.type === "COMPONENT"
+          ? "component"
+          : "unknown",
+    actualParentCategory: parentCategory(actualParent),
+    decision,
+    acknowledgementStatus,
+  });
 }
 
 function resolveTaskAction(state: StoredState, operation: FigmaToolOperation): FigmaToolAction {
@@ -314,11 +422,6 @@ function belongsToPage(node: BaseNode, page: PageNode): boolean {
   return current?.id === page.id;
 }
 
-function asContainer(node: BaseNode): PageNode | FrameNode | ComponentNode {
-  if (node.type === "PAGE" || node.type === "FRAME" || node.type === "COMPONENT") return node;
-  throw new Error("The parent must be the current page, a frame, or a component.");
-}
-
 function withTimeout<T>(
   promise: Promise<T>,
   label: string,
@@ -346,10 +449,12 @@ function withTimeout<T>(
 }
 
 function summarizeNode(node: SceneNode, ref?: string) {
-  const colorHex = (paints: readonly Paint[] | PluginAPI["mixed"]): string | undefined => {
+  const solidPaint = (paints: readonly Paint[] | PluginAPI["mixed"]): SolidPaint | undefined => {
     if (!Array.isArray(paints)) return undefined;
-    const paint = paints.find((item): item is SolidPaint => item.type === "SOLID");
-    if (!paint || (paint.opacity !== undefined && paint.opacity < 0.999)) return undefined;
+    return paints.find((item): item is SolidPaint => item.type === "SOLID");
+  };
+  const colorHex = (paint: SolidPaint | undefined): string | undefined => {
+    if (!paint) return undefined;
     return `#${[paint.color.r, paint.color.g, paint.color.b]
       .map((channel) =>
         Math.round(channel * 255)
@@ -358,35 +463,53 @@ function summarizeNode(node: SceneNode, ref?: string) {
       )
       .join("")}`.toUpperCase();
   };
+  const singleVisibleSolid = (
+    paints: readonly Paint[] | PluginAPI["mixed"],
+  ): SolidPaint | undefined => {
+    if (!Array.isArray(paints)) return undefined;
+    const visible = paints.filter((paint) => paint.visible !== false);
+    if (visible.length !== 1 || visible[0]?.type !== "SOLID") return undefined;
+    const paint = visible[0] as SolidPaint;
+    return paint.blendMode === undefined || paint.blendMode === "NORMAL" ? paint : undefined;
+  };
   const bounds = node.absoluteBoundingBox;
   const opacity = "opacity" in node ? (node as SceneNode & BlendMixin).opacity : undefined;
   const strokeWeight =
     "strokeWeight" in node ? (node as SceneNode & GeometryMixin).strokeWeight : undefined;
+  const fillPaint = singleVisibleSolid("fills" in node ? node.fills : []);
+  const strokePaint = solidPaint("strokes" in node ? node.strokes : []);
+  const textPaint = node.type === "TEXT" ? singleVisibleSolid(node.fills) : undefined;
+  const fillColor = colorHex(fillPaint);
+  const strokeColor = colorHex(strokePaint);
+  const textColor = colorHex(textPaint);
+  const frame = node.type === "FRAME" || node.type === "COMPONENT" ? node : undefined;
   return {
     ...(ref ? { ref } : {}),
     type: node.type,
     name: node.name.slice(0, 100),
-    x: Math.round(node.x),
-    y: Math.round(node.y),
-    width: Math.round(node.width),
-    height: Math.round(node.height),
+    x: node.x,
+    y: node.y,
+    width: node.width,
+    height: node.height,
     visible: node.visible,
     ...(bounds
       ? {
           bounds: {
-            x: Math.round(bounds.x),
-            y: Math.round(bounds.y),
-            width: Math.round(bounds.width),
-            height: Math.round(bounds.height),
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
           },
         }
       : {}),
-    ...(colorHex("fills" in node ? node.fills : [])
-      ? { fill: colorHex((node as GeometryMixin).fills) }
+    ...(fillColor && fillPaint
+      ? {
+          fill: fillColor,
+          fillRGB: { r: fillPaint.color.r, g: fillPaint.color.g, b: fillPaint.color.b },
+          fillOpacity: fillPaint.opacity ?? 1,
+        }
       : {}),
-    ...(colorHex("strokes" in node ? node.strokes : [])
-      ? { stroke: colorHex((node as GeometryMixin).strokes) }
-      : {}),
+    ...(strokeColor ? { stroke: strokeColor } : {}),
     ...(typeof opacity === "number" ? { opacity } : {}),
     ...(typeof strokeWeight === "number" ? { strokeWeight } : {}),
     ...("cornerRadius" in node && typeof node.cornerRadius === "number"
@@ -394,17 +517,56 @@ function summarizeNode(node: SceneNode, ref?: string) {
       : {}),
     ...(node.type === "TEXT" ? { text: node.characters.slice(0, 120) } : {}),
     ...(node.type === "TEXT" && typeof node.fontSize === "number"
-      ? { fontSize: node.fontSize, textColor: colorHex(node.fills) }
-      : {}),
-    ...(node.type === "FRAME" || node.type === "COMPONENT"
       ? {
-          layout: node.layoutMode.toLowerCase(),
-          layoutMode: node.layoutMode,
-          itemSpacing: node.itemSpacing,
-          clipsContent: node.clipsContent,
-          childCount: node.children.length,
+          fontSize: node.fontSize,
+          ...(typeof node.textAlignHorizontal === "string"
+            ? { textAlignHorizontal: node.textAlignHorizontal }
+            : {}),
+          ...(textColor && textPaint
+            ? {
+                textColor,
+                textColorRGB: {
+                  r: textPaint.color.r,
+                  g: textPaint.color.g,
+                  b: textPaint.color.b,
+                },
+                textColorOpacity: textPaint.opacity ?? 1,
+              }
+            : {}),
         }
       : {}),
+    ...(frame
+      ? {
+          layout: frame.layoutMode.toLowerCase(),
+          layoutMode: frame.layoutMode,
+          itemSpacing: frame.itemSpacing,
+          padding: {
+            top: frame.paddingTop,
+            right: frame.paddingRight,
+            bottom: frame.paddingBottom,
+            left: frame.paddingLeft,
+          },
+          primaryAxisSizingMode: frame.primaryAxisSizingMode,
+          counterAxisSizingMode: frame.counterAxisSizingMode,
+          primaryAxisAlignItems: frame.primaryAxisAlignItems,
+          counterAxisAlignItems: frame.counterAxisAlignItems,
+          clipsContent: frame.clipsContent,
+          childCount: frame.children.length,
+        }
+      : {}),
+    ...(node.absoluteTransform
+      ? {
+          absoluteTransform: node.absoluteTransform.map((row) => [...row]) as [
+            [number, number, number],
+            [number, number, number],
+          ],
+        }
+      : {}),
+    ...("layoutSizingHorizontal" in node
+      ? { layoutSizingHorizontal: node.layoutSizingHorizontal }
+      : {}),
+    ...("layoutSizingVertical" in node ? { layoutSizingVertical: node.layoutSizingVertical } : {}),
+    ...("layoutPositioning" in node ? { layoutPositioning: node.layoutPositioning } : {}),
   };
 }
 
@@ -425,23 +587,44 @@ function randomLocalRef(): string {
 }
 
 function compactResult(result: OperationResult): StoredOperationResult {
+  const data = {
+    ...(result.data?.reused ? { reused: true } : {}),
+    ...(result.data?.parenting
+      ? { parenting: FigmaToolParentingDiagnosticSchema.parse(result.data.parenting) }
+      : {}),
+    ...(Array.isArray(result.data?.compatibilityNormalizations)
+      ? {
+          compatibilityNormalizations: result.data.compatibilityNormalizations.map(
+            (item: unknown) => FigmaToolCompatibilityNormalizationSchema.parse(item),
+          ),
+        }
+      : {}),
+    ...(result.data?.compatibilityFailure
+      ? {
+          compatibilityFailure: FigmaToolCompatibilityFailureSchema.parse(
+            result.data.compatibilityFailure,
+          ),
+        }
+      : {}),
+    ...(result.data?.referenceResolution
+      ? {
+          referenceResolution: result.data.referenceResolution as NonNullable<
+            StoredOperationResult["data"]
+          >["referenceResolution"],
+        }
+      : {}),
+  };
   return {
     operationId: result.operationId,
     success: result.success,
     replayed: result.replayed,
+    ...(result.acknowledgementStatus
+      ? { acknowledgementStatus: result.acknowledgementStatus }
+      : {}),
     ...(result.logicalRef ? { logicalRef: result.logicalRef } : {}),
     ...(result.summary ? { summary: result.summary } : {}),
     ...(result.error ? { error: result.error } : {}),
-    ...(result.data?.reused ? { data: { reused: true } } : {}),
-    ...(result.data?.referenceResolution
-      ? {
-          data: {
-            referenceResolution: result.data.referenceResolution as NonNullable<
-              StoredOperationResult["data"]
-            >["referenceResolution"],
-          },
-        }
-      : {}),
+    ...(Object.keys(data).length ? { data } : {}),
   };
 }
 
@@ -495,7 +678,7 @@ export function createFigmaToolExecutor(
       api.clientStorage.getAsync(documentPageKey(pageId)),
       "Tool state read",
     );
-    if (raw === undefined) return { version: 1, refs: {}, operations: {} };
+    if (raw === undefined) return { version: 2, refs: {}, operations: {} };
     let serialized: string;
     try {
       serialized = JSON.stringify(raw);
@@ -512,7 +695,7 @@ export function createFigmaToolExecutor(
       Object.keys(parsed.data.operations).length > 400
     )
       throw new Error("Saved tool state exceeds its record limit; refusing to resolve it.");
-    return parsed.data;
+    return parsed.data.version === 1 ? { ...parsed.data, version: 2 } : parsed.data;
   };
 
   const saveState = async (state: StoredState, pageId = api.currentPage.id): Promise<void> => {
@@ -527,10 +710,163 @@ export function createFigmaToolExecutor(
     );
   };
 
+  const assertTaskPageScope = (documentId: string, pageId: string, taskId: string): void => {
+    const localDocumentId = api.root.getPluginData("fad.document-id");
+    const fileId = api.fileKey ?? localDocumentId;
+    const activeDocumentId = fileId ? `${fileId}-${pageId.replaceAll(":", "_")}` : undefined;
+    if (api.currentPage.id !== pageId || activeDocumentId !== documentId)
+      throw new Error(
+        "The active Figma document or page changed. Reopen this task before inspecting it.",
+      );
+    if (!taskId) throw new Error("A task ID is required for native inspection.");
+  };
+
+  const inspectTaskNativeNodes = async (
+    message: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
+  ) => {
+    const pageId = api.currentPage.id;
+    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    const state = await loadState(pageId);
+    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    const owned = api.currentPage.findAll(
+      (node) => node.getPluginData(TASK_PLUGIN_KEY) === message.taskId,
+    );
+    const visibleNodes = owned.slice(0, 500);
+    const ownedIds = new Set(visibleNodes.map(({ id }) => id));
+    const nodes = visibleNodes.map((node) => {
+      const savedRef = node.getPluginData(REF_PLUGIN_KEY);
+      const refEntry = savedRef ? state.refs[savedRef] : undefined;
+      const frame = node as SceneNode & {
+        layoutMode?: string;
+        itemSpacing?: number;
+        paddingTop?: number;
+        paddingRight?: number;
+        paddingBottom?: number;
+        paddingLeft?: number;
+        primaryAxisSizingMode?: string;
+        counterAxisSizingMode?: string;
+      };
+      const hasLayout = typeof frame.layoutMode === "string";
+      return {
+        id: node.id,
+        ...(node.parent && ownedIds.has(node.parent.id) ? { parentId: node.parent.id } : {}),
+        ...(savedRef &&
+        refEntry?.nodeId === node.id &&
+        refEntry.pageId === pageId &&
+        refEntry.taskId === message.taskId
+          ? { ref: refEntry.alias ?? savedRef }
+          : {}),
+        name: node.name.slice(0, 100),
+        type: node.type,
+        x: node.x,
+        y: node.y,
+        width: node.width,
+        height: node.height,
+        visible: node.visible,
+        ...(hasLayout
+          ? {
+              layoutMode: frame.layoutMode,
+              ...(typeof frame.itemSpacing === "number" ? { itemSpacing: frame.itemSpacing } : {}),
+              ...(typeof frame.paddingTop === "number" &&
+              typeof frame.paddingRight === "number" &&
+              typeof frame.paddingBottom === "number" &&
+              typeof frame.paddingLeft === "number"
+                ? {
+                    padding: {
+                      top: frame.paddingTop,
+                      right: frame.paddingRight,
+                      bottom: frame.paddingBottom,
+                      left: frame.paddingLeft,
+                    },
+                  }
+                : {}),
+              ...(typeof frame.primaryAxisSizingMode === "string"
+                ? { primaryAxisSizingMode: frame.primaryAxisSizingMode }
+                : {}),
+              ...(typeof frame.counterAxisSizingMode === "string"
+                ? { counterAxisSizingMode: frame.counterAxisSizingMode }
+                : {}),
+            }
+          : {}),
+      };
+    });
+    const unresolvedRefs: Array<{
+      ref: string;
+      status: "missing" | "stale" | "ambiguous" | "unavailable";
+    }> = [];
+    for (const ref of new Set(message.refs)) {
+      const matches = Object.entries(state.refs).filter(
+        ([canonicalRef, entry]) => canonicalRef === ref || entry.alias === ref,
+      );
+      const owned = matches.filter(([, entry]) => entry.taskId === message.taskId);
+      if (owned.length > 1) {
+        unresolvedRefs.push({ ref, status: "ambiguous" });
+        continue;
+      }
+      const [canonicalRef, entry] = owned[0] ?? [];
+      if (!entry) {
+        unresolvedRefs.push({ ref, status: matches.length ? "unavailable" : "missing" });
+        continue;
+      }
+      if (entry.pageId !== pageId) {
+        unresolvedRefs.push({ ref, status: "missing" });
+        continue;
+      }
+      try {
+        const node = await resolveRef(state, canonicalRef!, pageId);
+        if (node.getPluginData(TASK_PLUGIN_KEY) !== message.taskId)
+          unresolvedRefs.push({ ref, status: "unavailable" });
+      } catch (error) {
+        const code = error instanceof ReferenceResolutionError ? error.code : "stale";
+        const staleNode = code === "stale" ? await api.getNodeByIdAsync(entry.nodeId) : undefined;
+        unresolvedRefs.push({
+          ref,
+          status:
+            code === "ambiguous"
+              ? "ambiguous"
+              : code === "missing_or_other_page"
+                ? "missing"
+                : code === "stale" && !staleNode
+                  ? "missing"
+                  : "stale",
+        });
+      }
+    }
+    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    return { nodes, unresolvedRefs, truncated: owned.length > visibleNodes.length };
+  };
+
+  const focusTaskNativeNodes = async (
+    message: Extract<UIToPluginMessage, { type: "task-native-focus" }>,
+  ): Promise<string[]> => {
+    const pageId = api.currentPage.id;
+    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    const nodes = await Promise.all(message.nodeIds.map((id) => api.getNodeByIdAsync(id)));
+    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    if (
+      nodes.some(
+        (node) =>
+          !node ||
+          !("type" in node) ||
+          node.type === "DOCUMENT" ||
+          node.type === "PAGE" ||
+          !belongsToPage(node, api.currentPage) ||
+          (node as SceneNode).getPluginData(TASK_PLUGIN_KEY) !== message.taskId,
+      )
+    )
+      throw new Error("A selected layer is missing, stale, or not owned by this task.");
+    const sceneNodes = nodes as SceneNode[];
+    if (message.mode === "select") api.currentPage.selection = sceneNodes;
+    api.viewport.scrollAndZoomIntoView(sceneNodes);
+    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    return sceneNodes.map(({ id }) => id);
+  };
+
   const resolveRef = async (
     state: StoredState,
     ref: string,
     pageId = api.currentPage.id,
+    allowParentChange = false,
   ): Promise<SceneNode> => {
     if (api.currentPage.id !== pageId)
       throw new Error(
@@ -553,7 +889,7 @@ export function createFigmaToolExecutor(
       node.type === "PAGE" ||
       !belongsToPage(node, api.currentPage) ||
       (node as SceneNode).getPluginData(REF_PLUGIN_KEY) !== ref ||
-      (entry.parentId && (node as SceneNode).parent?.id !== entry.parentId) ||
+      (!allowParentChange && entry.parentId && (node as SceneNode).parent?.id !== entry.parentId) ||
       (entry.nodeType && (node as SceneNode).type !== entry.nodeType) ||
       (creationFingerprint &&
         (node as SceneNode).getPluginData(FINGERPRINT_PLUGIN_KEY) !== creationFingerprint) ||
@@ -574,14 +910,24 @@ export function createFigmaToolExecutor(
     state: StoredState,
     parent: Extract<FigmaToolAction, { tool: "create_frame" }>["parent"],
     pageId: string,
-  ): Promise<PageNode | FrameNode | ComponentNode> => {
+  ): Promise<BaseNode> => {
     if (api.currentPage.id !== pageId)
       throw new Error(
         "Figma page changed during the operation; no node was targeted on the new page.",
       );
     if (parent.kind === "page") return api.currentPage;
-    const node = await resolveRef(state, parent.ref, pageId);
-    return asContainer(node);
+    return resolveRef(state, parent.ref, pageId);
+  };
+
+  const resolveParentingTargets = async (
+    state: StoredState,
+    action: Extract<FigmaToolAction, { tool: "append_child" | "reparent_node" }>,
+    pageId: string,
+  ) => {
+    const childRef = action.tool === "append_child" ? action.childRef : action.ref;
+    const child = await resolveRef(state, childRef, pageId, true);
+    const parent = await resolveRef(state, action.parentRef, pageId);
+    return { child, parent, childRef };
   };
 
   const registerLogicalRef = (
@@ -662,11 +1008,14 @@ export function createFigmaToolExecutor(
     state: StoredState,
     operation: FigmaToolOperation,
     pageId: string,
+    markNativeMutation: () => void,
+    requestedAction: FigmaToolAction = operation.action,
   ): Promise<{
     summary: string;
     logicalRef?: string;
     data?: Record<string, unknown>;
     replayed?: boolean;
+    acknowledgementStatus?: OperationResult["acknowledgementStatus"];
   }> => {
     if (api.currentPage.id !== pageId)
       throw new Error(
@@ -740,18 +1089,20 @@ export function createFigmaToolExecutor(
     }
     if (action.tool === "inspect_nodes") {
       const roots = action.refs.length
-        ? await Promise.all(action.refs.map((ref) => resolveRef(state, ref, pageId)))
+        ? await Promise.all(action.refs.map((ref) => resolveRef(state, ref, pageId, true)))
         : api.currentPage.selection;
       if (api.currentPage.id !== pageId)
         throw new Error("Figma page changed while resolving inspection targets.");
-      const seen = new Set<string>();
+      const summariesById = new Map<string, Record<string, unknown>>();
       const result: Array<Record<string, unknown>> = [];
       const queue: Array<{ node: SceneNode; depth: number; summary: Record<string, unknown> }> = [];
       const add = (node: SceneNode, depth: number): Record<string, unknown> | undefined => {
-        if (seen.has(node.id) || result.length >= action.maxNodes) return undefined;
-        seen.add(node.id);
+        const existing = summariesById.get(node.id);
+        if (existing) return existing;
+        if (result.length >= action.maxNodes) return undefined;
         const ref = registerLogicalRef(state, node, pageId, operation.taskId);
         const summary = summarizeNode(node, ref) as Record<string, unknown>;
+        summariesById.set(node.id, summary);
         result.push(summary);
         queue.push({ node, depth, summary });
         return summary;
@@ -824,7 +1175,10 @@ export function createFigmaToolExecutor(
             : action.tool === "create_text"
               ? "TEXT"
               : "RECTANGLE";
-        const parent = await resolveParent(state, action.parent, pageId);
+        const parent = figmaCompatibilityEngine.requireCreationParent(
+          action,
+          await resolveParent(state, action.parent, pageId),
+        );
         if (existing.type !== expectedType || existing.parent?.id !== parent.id)
           throw new ReferenceResolutionError("type_or_parent_conflict", action.ref);
         return {
@@ -847,32 +1201,21 @@ export function createFigmaToolExecutor(
         throw new Error(
           "This page already has 500 retained logical references; start a new page-scoped tool session.",
         );
-      const parent = await resolveParent(state, action.parent, pageId);
+      const parent = figmaCompatibilityEngine.requireCreationParent(
+        action,
+        await resolveParent(state, action.parent, pageId),
+      );
+      if (action.tool !== "create_text") figmaCompatibilityEngine.validateCreationPosition(action);
       const paintStyle =
         action.tool !== "create_text" && action.paintStyleId
           ? (await timed(api.getLocalPaintStylesAsync(), "Paint token lookup")).find(
               ({ id }) => id === action.paintStyleId,
             )
           : undefined;
-      if (action.tool !== "create_text" && action.paintStyleId && !paintStyle)
-        throw new Error(
-          "The requested paint token is not present in this document's local styles.",
-        );
-      const isPageParent = parent.type === "PAGE";
-      if (
-        action.tool === "create_text" &&
-        (action.horizontalSizing === "FILL" || action.verticalSizing === "FILL") &&
-        (isPageParent ||
-          (parent.type !== "FRAME" && parent.type !== "COMPONENT") ||
-          parent.layoutMode === "NONE")
-      )
-        throw new Error("FILL text sizing requires an Auto Layout frame or component parent.");
+      figmaCompatibilityEngine.requirePaintStyle(action, Boolean(paintStyle));
       const x = "x" in action ? action.x : undefined;
       const y = "y" in action ? action.y : undefined;
-      if ((x === undefined) !== (y === undefined))
-        throw new Error(
-          "Set both x and y for explicit placement, or omit both to use safe canvas placement.",
-        );
+      const isPageParent = parent.type === "PAGE";
       const placement =
         isPageParent && (x === undefined || y === undefined)
           ? planCanvasPlacements(
@@ -883,12 +1226,28 @@ export function createFigmaToolExecutor(
       let created: SceneNode;
       let fontFallback: boolean | undefined;
       let createdNode: SceneNode | undefined;
+      let actualParent: PageNode | FrameNode | ComponentNode = parent;
+      let textAction: Extract<FigmaToolAction, { tool: "create_text" }> | undefined;
+      let compatibilityNormalizations: ReturnType<
+        typeof FigmaToolCompatibilityNormalizationSchema.parse
+      >[] = [];
       try {
         if (action.tool === "create_text") {
           const loaded = await loadFont({ family: action.font.family, style: action.font.style });
           if (api.currentPage.id !== pageId)
             throw new Error("Figma page changed while loading the font; text was not created.");
+          actualParent = figmaCompatibilityEngine.requireCreationParent(
+            action,
+            await resolveParent(state, action.parent, pageId),
+          );
+          const normalized = figmaCompatibilityEngine.normalizeTextSizingForParent(
+            action,
+            actualParent,
+          );
+          textAction = normalized.action;
+          compatibilityNormalizations = normalized.normalizations;
           fontFallback = loaded.fallback;
+          markNativeMutation();
           const text = api.createText();
           createdNode = text;
           text.setPluginData(REF_PLUGIN_KEY, action.ref);
@@ -905,9 +1264,10 @@ export function createFigmaToolExecutor(
             text.lineHeight = { unit: "PIXELS", value: action.lineHeight };
           if (action.letterSpacing !== undefined)
             text.letterSpacing = { unit: "PIXELS", value: action.letterSpacing };
-          text.textAutoResize = action.textAutoResize;
-          text.resize(action.size.width, action.size.height);
+          text.textAutoResize = textAction.textAutoResize;
+          text.resize(textAction.size.width, textAction.size.height);
         } else if (action.tool === "create_frame") {
+          markNativeMutation();
           const frame = api.createFrame();
           createdNode = frame;
           frame.setPluginData(REF_PLUGIN_KEY, action.ref);
@@ -926,6 +1286,7 @@ export function createFigmaToolExecutor(
             await timed(frame.setFillStyleIdAsync(paintStyle.id), "Paint token apply");
           if (action.autoLayout) applyLayout(frame, action.autoLayout);
         } else {
+          markNativeMutation();
           const rectangle = api.createRectangle();
           createdNode = rectangle;
           rectangle.setPluginData(REF_PLUGIN_KEY, action.ref);
@@ -944,8 +1305,9 @@ export function createFigmaToolExecutor(
         }
         created = createdNode!;
         if (operation.taskId) created.setPluginData(TASK_PLUGIN_KEY, operation.taskId);
-        if (!isPageParent) parent.appendChild(created);
-        if (isPageParent && placement)
+        const isActualPageParent = actualParent.type === "PAGE";
+        if (!isActualPageParent) actualParent.appendChild(created);
+        if (isActualPageParent && placement)
           placeTopLevelNode(
             created,
             { x: created.x, y: created.y, width: created.width, height: created.height },
@@ -957,21 +1319,23 @@ export function createFigmaToolExecutor(
         }
         if (
           action.tool === "create_text" &&
-          !isPageParent &&
-          (parent.type === "FRAME" || parent.type === "COMPONENT") &&
-          parent.layoutMode !== "NONE"
+          !isActualPageParent &&
+          (actualParent.type === "FRAME" || actualParent.type === "COMPONENT") &&
+          actualParent.layoutMode !== "NONE"
         ) {
           const child = created as TextNode;
-          const verticalLayout = parent.layoutMode === "VERTICAL";
+          const verticalLayout = actualParent.layoutMode === "VERTICAL";
           if (verticalLayout) {
-            if (action.horizontalSizing === "FILL") parent.counterAxisSizingMode = "FIXED";
-            if (action.verticalSizing === "FILL") parent.primaryAxisSizingMode = "FIXED";
+            if (textAction!.horizontalSizing === "FILL")
+              actualParent.counterAxisSizingMode = "FIXED";
+            if (textAction!.verticalSizing === "FILL") actualParent.primaryAxisSizingMode = "FIXED";
           } else {
-            if (action.horizontalSizing === "FILL") parent.primaryAxisSizingMode = "FIXED";
-            if (action.verticalSizing === "FILL") parent.counterAxisSizingMode = "FIXED";
+            if (textAction!.horizontalSizing === "FILL")
+              actualParent.primaryAxisSizingMode = "FIXED";
+            if (textAction!.verticalSizing === "FILL") actualParent.counterAxisSizingMode = "FIXED";
           }
-          child.layoutSizingHorizontal = action.horizontalSizing;
-          child.layoutSizingVertical = action.verticalSizing;
+          child.layoutSizingHorizontal = textAction!.horizontalSizing;
+          child.layoutSizingVertical = textAction!.verticalSizing;
         }
       } catch (error) {
         createdNode?.remove();
@@ -996,115 +1360,54 @@ export function createFigmaToolExecutor(
         data: {
           node: summarizeNode(created, action.ref),
           ...(fontFallback ? { fontFallback: true } : {}),
+          ...(compatibilityNormalizations.length ? { compatibilityNormalizations } : {}),
         },
       };
     }
     if (action.tool === "set_auto_layout") {
       const node = await resolveRef(state, action.ref, pageId);
-      if (node.type !== "FRAME" && node.type !== "COMPONENT")
-        throw new Error("Auto Layout can only be set on a frame or component.");
-      if (action.layout.counterAlign === "BASELINE" && action.layout.direction !== "horizontal")
-        throw new Error(
-          "Baseline counter-axis alignment is only valid for horizontal Auto Layout.",
-        );
-      if (new Set(action.children.map(({ ref }) => ref)).size !== action.children.length)
-        throw new Error("Auto Layout child rules must use unique logical references.");
-      const children = action.children.map((rule) => {
-        const child = state.refs[rule.ref];
-        if (!child) throw new Error(`Child reference “${rule.ref}” does not exist.`);
-        return rule;
-      });
-      const childNodes: Array<{ rule: (typeof children)[number]; node: SceneNode }> = [];
-      for (const rule of children) {
-        const child = await resolveRef(state, rule.ref, pageId);
-        if (child.parent?.id !== node.id)
-          throw new Error(`“${rule.ref}” is not a direct child of “${action.ref}”.`);
-        const horizontal =
-          action.layout.direction === "vertical" && rule.align === "STRETCH"
-            ? "FILL"
-            : rule.horizontal;
-        const vertical =
-          action.layout.direction === "horizontal" && rule.align === "STRETCH"
-            ? "FILL"
-            : rule.vertical;
-        const supportsHug =
-          child.type === "TEXT" ||
-          ((child.type === "FRAME" || child.type === "COMPONENT") && child.layoutMode !== "NONE");
-        if ((horizontal === "HUG" || vertical === "HUG") && !supportsHug)
-          throw new Error(
-            `HUG sizing requires editable text or an Auto Layout frame (${rule.ref}).`,
-          );
-        childNodes.push({ rule, node: child });
-      }
-      const verticalLayout = action.layout.direction === "vertical";
-      const primaryFill = childNodes.some(
-        ({ rule }) =>
-          rule.grow === 1 || (verticalLayout ? rule.vertical : rule.horizontal) === "FILL",
+      const childNodes = await Promise.all(
+        action.children.map(async (rule) => ({
+          rule,
+          node: await resolveRef(state, rule.ref, pageId),
+        })),
       );
-      const counterFill = childNodes.some(
-        ({ rule }) =>
-          rule.align === "STRETCH" || (verticalLayout ? rule.horizontal : rule.vertical) === "FILL",
-      );
-      const layout = {
-        ...action.layout,
-        primarySizing: primaryFill ? ("FIXED" as const) : action.layout.primarySizing,
-        counterSizing: counterFill ? ("FIXED" as const) : action.layout.counterSizing,
-      };
+      const compatible = figmaCompatibilityEngine.normalizeAutoLayout(action, node, childNodes);
       if (api.currentPage.id !== pageId)
         throw new Error("Figma page changed before Auto Layout was applied.");
-      applyLayout(node, layout);
-      const normalized: string[] = [];
-      for (const { rule, node: child } of childNodes) {
+      markNativeMutation();
+      applyLayout(node as FrameNode | ComponentNode, compatible.layout);
+      for (const { rule, node: child, horizontal, vertical } of compatible.children) {
         const autoChild = child as SceneNode & AutoLayoutChildrenMixin & LayoutMixin;
         if (rule.align) autoChild.layoutAlign = rule.align;
         if (rule.grow !== undefined) autoChild.layoutGrow = rule.grow;
-        const horizontal =
-          layout.direction === "vertical" && rule.align === "STRETCH" ? "FILL" : rule.horizontal;
-        const vertical =
-          layout.direction === "horizontal" && rule.align === "STRETCH" ? "FILL" : rule.vertical;
         if (horizontal) autoChild.layoutSizingHorizontal = horizontal;
         if (vertical) autoChild.layoutSizingVertical = vertical;
-        if (
-          (horizontal !== rule.horizontal && rule.horizontal) ||
-          (vertical !== rule.vertical && rule.vertical)
-        )
-          normalized.push(rule.ref);
       }
       return {
-        summary: normalized.length
-          ? `Auto Layout set; stretch sizing was normalized for ${normalized.join(", ")}.`
-          : primaryFill || counterFill
+        summary: compatible.normalizedStretchRefs.length
+          ? `Auto Layout set; stretch sizing was normalized for ${compatible.normalizedStretchRefs.join(", ")}.`
+          : compatible.normalizations.length
             ? "Auto Layout set; parent sizing was normalized to fixed where FILL/stretch children require it."
-            : `Auto Layout set to ${layout.direction.toLowerCase()} with ${childNodes.length} child rule(s).`,
+            : `Auto Layout set to ${compatible.layout.direction.toLowerCase()} with ${childNodes.length} child rule(s).`,
         data: {
-          direction: layout.direction.toLowerCase(),
-          normalizedStretchRefs: normalized,
-          normalizedPrimarySizing: primaryFill,
-          normalizedCounterSizing: counterFill,
+          direction: compatible.layout.direction.toLowerCase(),
+          normalizedStretchRefs: compatible.normalizedStretchRefs,
+          normalizedPrimarySizing: compatible.normalizations.some(
+            ({ fieldPath }) => fieldPath === "action.layout.primarySizing",
+          ),
+          normalizedCounterSizing: compatible.normalizations.some(
+            ({ fieldPath }) => fieldPath === "action.layout.counterSizing",
+          ),
+          ...(compatible.normalizations.length
+            ? { compatibilityNormalizations: compatible.normalizations }
+            : {}),
         },
       };
     }
     if (action.tool === "set_properties") {
       const node = await resolveRef(state, action.ref, pageId);
       const properties = action.properties;
-      if (properties.fill !== undefined && properties.paintStyleId !== undefined)
-        throw new Error(
-          "Choose either a literal fill color or an existing paint token in one operation.",
-        );
-      if (
-        properties.textStyleId &&
-        (properties.fontSize !== undefined ||
-          properties.color !== undefined ||
-          properties.fontFamily !== undefined ||
-          properties.fontStyle !== undefined ||
-          properties.lineHeight !== undefined ||
-          properties.letterSpacing !== undefined ||
-          properties.align !== undefined ||
-          properties.textAutoResize !== undefined)
-      )
-        throw new Error(
-          "Choose an existing text style or explicit font/color changes in one operation.",
-        );
       const changesText =
         properties.text !== undefined ||
         properties.fontSize !== undefined ||
@@ -1115,47 +1418,20 @@ export function createFigmaToolExecutor(
         properties.lineHeight !== undefined ||
         properties.letterSpacing !== undefined ||
         properties.textAutoResize !== undefined;
-      if (changesText && node.type !== "TEXT")
-        throw new Error("Text properties can only target an editable text node.");
-      if (
-        (properties.width !== undefined || properties.height !== undefined) &&
-        !("resize" in node)
-      )
-        throw new Error("This node type does not support dimensions.");
-      if (
-        (properties.fill !== undefined || properties.paintStyleId !== undefined) &&
-        !("fills" in node)
-      )
-        throw new Error("This node type does not support a fill color.");
-      if (
-        (properties.stroke !== undefined || properties.strokeWeight !== undefined) &&
-        !("strokes" in node)
-      )
-        throw new Error("This node type does not support a stroke.");
-      if (properties.cornerRadius !== undefined && !("cornerRadius" in node))
-        throw new Error("This node type does not support corner radii.");
-      if (properties.opacity !== undefined && !("opacity" in node))
-        throw new Error("This Figma node does not support opacity on this platform.");
-      if (properties.shadow !== undefined && !("effects" in node))
-        throw new Error("This Figma node does not support effects on this platform.");
       const paintStyle = properties.paintStyleId
         ? (await timed(api.getLocalPaintStylesAsync(), "Paint token lookup")).find(
             ({ id }) => id === properties.paintStyleId,
           )
         : undefined;
-      if (properties.paintStyleId && !paintStyle)
-        throw new Error(
-          "The requested paint token is not present in this document's local styles.",
-        );
       const textStyle = properties.textStyleId
         ? (await timed(api.getLocalTextStylesAsync(), "Text token lookup")).find(
             ({ id }) => id === properties.textStyleId,
           )
         : undefined;
-      if (properties.textStyleId && (node.type !== "TEXT" || !textStyle))
-        throw new Error(
-          "The requested text token is unavailable or the target is not editable text.",
-        );
+      figmaCompatibilityEngine.validateSetProperties(action, node, {
+        paintStyleAvailable: Boolean(paintStyle),
+        textStyleAvailable: Boolean(textStyle),
+      });
       const currentFont = node.type === "TEXT" ? (node as TextNode).fontName : undefined;
       const currentFontName =
         currentFont === undefined || currentFont === api.mixed
@@ -1170,6 +1446,7 @@ export function createFigmaToolExecutor(
           : undefined;
       if (api.currentPage.id !== pageId)
         throw new Error("Figma page changed before properties were updated.");
+      markNativeMutation();
       if (properties.name !== undefined) node.name = properties.name;
       if (properties.visible !== undefined) node.visible = properties.visible;
       if (properties.width !== undefined || properties.height !== undefined)
@@ -1226,42 +1503,143 @@ export function createFigmaToolExecutor(
         data: { node: summarizeNode(node, action.ref) },
       };
     }
-    if (action.tool === "append_child" || action.tool === "reparent_node") {
-      const childRef = action.tool === "append_child" ? action.childRef : action.ref;
-      const child = await resolveRef(state, childRef, pageId);
-      const parentNode = await resolveRef(state, action.parentRef, pageId);
-      const parent = asContainer(parentNode);
-      if (parent.type === "PAGE")
-        throw new Error("Use an explicit frame/component reference as the destination parent.");
-      if (child.id === parent.id) throw new Error("A node cannot be parented to itself.");
-      if (action.tool === "append_child" && child.parent?.type !== "PAGE")
-        throw new Error(
-          "append_child only accepts a node currently at the page root; use reparent_node for an intentional move.",
+    if (isParentingAction(action)) {
+      const logicalSource = isParentingAction(requestedAction)
+        ? requestedAction.tool === "append_child"
+          ? requestedAction.childRef
+          : requestedAction.ref
+        : action.tool === "append_child"
+          ? action.childRef
+          : action.ref;
+      const logicalTarget = isParentingAction(requestedAction)
+        ? requestedAction.parentRef
+        : action.parentRef;
+      let child: SceneNode;
+      let parentNode: SceneNode;
+      let canonicalChildRef: string;
+      const referenceError = (error: ReferenceResolutionError): never => {
+        const diagnostic = parentingDiagnostic(
+          operation.operationId,
+          action,
+          logicalSource,
+          logicalTarget,
+          undefined,
+          undefined,
+          undefined,
+          "rejected_stale_or_ambiguous",
+          "rejected",
         );
-      let ancestor: BaseNode | null = parent;
-      while (ancestor && ancestor.type !== "PAGE") {
-        if (ancestor.id === child.id)
-          throw new Error("Reparenting would create a parent-child cycle.");
-        ancestor = ancestor.parent;
+        throw new ParentingOperationError(
+          error.message,
+          diagnostic,
+          referenceFailure(operation.operationId, error).data,
+        );
+      };
+      try {
+        ({
+          child,
+          parent: parentNode,
+          childRef: canonicalChildRef,
+        } = await resolveParentingTargets(state, action, pageId));
+      } catch (error) {
+        if (error instanceof ReferenceResolutionError) referenceError(error);
+        throw error;
       }
-      if (child.parent?.id !== parent.id) parent.appendChild(child);
+      const sourceParent = child.parent;
+      const diagnostic = (
+        decision: FigmaToolParentingDiagnostic["decision"],
+        acknowledgementStatus: FigmaToolParentingDiagnostic["acknowledgementStatus"],
+        actualParent: BaseNode | null | undefined = child.parent,
+      ) =>
+        parentingDiagnostic(
+          operation.operationId,
+          action,
+          logicalSource,
+          logicalTarget,
+          sourceParent,
+          parentNode,
+          actualParent,
+          decision,
+          acknowledgementStatus,
+        );
+      const savedParentId =
+        action.tool === "reparent_node" ? state.refs[action.ref]?.parentId : undefined;
+      const parentingDecision = figmaCompatibilityEngine.decideParentingCompatibility(
+        action,
+        child,
+        parentNode,
+        { expectedSourceParentId: savedParentId },
+      );
+      if (parentingDecision === "already_parented") {
+        const parent = parentNode as FrameNode | ComponentNode;
+        const parenting = diagnostic("already_parented", "verified_idempotent_replay");
+        return {
+          summary: `“${child.name}” is already a child of “${parent.name}”; no move was made.`,
+          logicalRef: canonicalChildRef,
+          replayed: true,
+          acknowledgementStatus: "verified_idempotent_replay",
+          data: { reused: true, parenting },
+        };
+      }
+      if (parentingDecision !== "ready") {
+        const messages = {
+          rejected_parent: "The parent must be a current-page frame or component.",
+          rejected_cycle: "Reparenting would create a parent-child cycle.",
+          rejected_non_root:
+            "append_child only accepts a node currently at the page root; use reparent_node for an intentional move.",
+          rejected_stale_or_ambiguous:
+            "The node's parent changed outside a confirmed operation; inspect its current parent before reparenting.",
+        } as const;
+        throw new ParentingOperationError(
+          messages[parentingDecision],
+          diagnostic(
+            parentingDecision,
+            parentingDecision === "rejected_stale_or_ambiguous" ? "ambiguous" : "rejected",
+          ),
+        );
+      }
+      const parent = parentNode as FrameNode | ComponentNode;
+      try {
+        markNativeMutation();
+        parent.appendChild(child);
+      } catch {
+        if (child.parent?.id !== parent.id)
+          throw new ParentingOperationError(
+            "Figma did not confirm the requested parent change; inspect the node before retrying.",
+            diagnostic(
+              "native_error",
+              child.parent?.id === sourceParent?.id ? "rejected" : "ambiguous",
+            ),
+          );
+      }
+      if (child.parent?.id !== parent.id)
+        throw new ParentingOperationError(
+          "Figma did not confirm the requested parent change; inspect the node before retrying.",
+          diagnostic("native_error", "ambiguous"),
+        );
+      const parenting = diagnostic(
+        action.tool === "append_child" ? "appended" : "reparented",
+        "confirmed_mutation",
+        child.parent,
+      );
       return {
         summary: `“${child.name}” is now a child of “${parent.name}”.`,
-        logicalRef: childRef,
-        data: { parentRef: action.parentRef },
+        logicalRef: canonicalChildRef,
+        acknowledgementStatus: "confirmed_mutation",
+        data: { parenting },
       };
     }
     if (action.tool === "delete_node") {
       const consent = deleteConsents.get(action.consentToken);
-      if (
-        !consent ||
-        consent.token !== action.consentToken ||
-        consent.ref !== action.ref ||
-        consent.expiresAt < Date.now()
-      )
-        throw new Error(
-          "Deletion requires a fresh, matching user confirmation for this logical reference.",
-        );
+      figmaCompatibilityEngine.requireDeleteConsent(
+        action,
+        Boolean(
+          consent &&
+          consent.token === action.consentToken &&
+          consent.ref === action.ref &&
+          consent.expiresAt >= Date.now(),
+        ),
+      );
       deleteConsents.delete(action.consentToken);
       const node = await resolveRef(state, action.ref, pageId);
       const subtreeIds = new Set<string>([node.id]);
@@ -1271,6 +1649,7 @@ export function createFigmaToolExecutor(
           collect(nested);
         });
       collect(node);
+      markNativeMutation();
       node.remove();
       return {
         summary: `Deleted “${node.name}” and its ${subtreeIds.size - 1} descendant(s) after scoped confirmation.`,
@@ -1297,13 +1676,29 @@ export function createFigmaToolExecutor(
     operation: FigmaToolOperation,
     pageId: string,
   ): Promise<OperationResult> => {
+    const requestedAction = operation.action;
     const alias = isCreation(operation.action) ? operation.action.ref : undefined;
     if (operation.taskId) {
       try {
         operation = { ...operation, action: resolveTaskAction(state, operation) };
       } catch (error) {
         if (!(error instanceof ReferenceResolutionError)) throw error;
-        return referenceFailure(operation.operationId, error);
+        const result = referenceFailure(operation.operationId, error);
+        if (!isParentingAction(requestedAction)) return result;
+        const sourceLogicalRef =
+          requestedAction.tool === "append_child" ? requestedAction.childRef : requestedAction.ref;
+        const parenting = FigmaToolParentingDiagnosticSchema.parse({
+          operationId: operation.operationId,
+          toolName: requestedAction.tool,
+          sourceLogicalRef,
+          targetLogicalRef: requestedAction.parentRef,
+          sourceParentCategory: "unknown",
+          expectedParentCategory: "unknown",
+          actualParentCategory: "unknown",
+          decision: "rejected_stale_or_ambiguous",
+          acknowledgementStatus: "rejected",
+        });
+        return { ...result, data: { ...result.data, parenting } };
       }
     }
     if (api.currentPage.id !== pageId)
@@ -1311,6 +1706,7 @@ export function createFigmaToolExecutor(
         operationId: operation.operationId,
         success: false,
         replayed: false,
+        acknowledgementStatus: "rejected",
         error: "Figma page changed during the batch; no operation was applied to the new page.",
       };
     const fingerprint = actionFingerprint(operation.action);
@@ -1329,6 +1725,7 @@ export function createFigmaToolExecutor(
           operationId: operation.operationId,
           success: false,
           replayed: true,
+          acknowledgementStatus: "rejected",
           error: "Operation ID or idempotency key was already used with different input.",
         };
       if (
@@ -1347,11 +1744,176 @@ export function createFigmaToolExecutor(
         }
       }
       if (prior.status === "completed" && prior.result)
-        return { ...(prior.result as unknown as OperationResult), replayed: true };
-      if (prior.status === "failed" && prior.result)
-        return { ...(prior.result as unknown as OperationResult), replayed: true };
+        return {
+          ...(prior.result as unknown as OperationResult),
+          replayed: true,
+          acknowledgementStatus:
+            prior.result.acknowledgementStatus ??
+            (prior.result.success
+              ? prior.result.data?.reused
+                ? "verified_idempotent_replay"
+                : isMutatingAction(operation.action.tool)
+                  ? "confirmed_mutation"
+                  : "read_only"
+              : "rejected"),
+        };
+      let resumeParenting = false;
       if (
-        prior.status === "running" &&
+        isParentingAction(operation.action) &&
+        (prior.status === "running" ||
+          (prior.status === "failed" && prior.result?.acknowledgementStatus === "ambiguous"))
+      ) {
+        const recoveryAction = operation.action;
+        const requestedParentingAction = isParentingAction(requestedAction)
+          ? requestedAction
+          : recoveryAction;
+        const sourceLogicalRef =
+          requestedParentingAction.tool === "append_child"
+            ? requestedParentingAction.childRef
+            : requestedParentingAction.ref;
+        const targetLogicalRef = requestedParentingAction.parentRef;
+        const persistParentingRecovery = async (result: OperationResult) => {
+          prior.status = result.success ? "completed" : "failed";
+          prior.updatedAt = Date.now();
+          prior.result = compactResult(result);
+          if (result.success) {
+            const childRef =
+              recoveryAction.tool === "append_child" ? recoveryAction.childRef : recoveryAction.ref;
+            const childEntry = state.refs[childRef];
+            const targetEntry = state.refs[recoveryAction.parentRef];
+            if (childEntry && targetEntry) childEntry.parentId = targetEntry.nodeId;
+          }
+          await saveState(state, pageId);
+          return result;
+        };
+        try {
+          const { child, parent } = await resolveParentingTargets(state, operation.action, pageId);
+          const canonicalChildRef =
+            operation.action.tool === "append_child"
+              ? operation.action.childRef
+              : operation.action.ref;
+          const parentingDecision = figmaCompatibilityEngine.decideParentingCompatibility(
+            operation.action,
+            child,
+            parent,
+            { expectedSourceParentId: prior.parentingSourceParentId, recovery: true },
+          );
+          if (parentingDecision === "rejected_parent" || parentingDecision === "rejected_cycle") {
+            const decision = parentingDecision;
+            const diagnostic = parentingDiagnostic(
+              operation.operationId,
+              operation.action,
+              sourceLogicalRef,
+              targetLogicalRef,
+              child.parent,
+              parent,
+              child.parent,
+              decision,
+              "rejected",
+            );
+            return persistParentingRecovery({
+              operationId: operation.operationId,
+              success: false,
+              replayed: true,
+              acknowledgementStatus: "rejected",
+              error:
+                decision === "rejected_parent"
+                  ? "The parent must be a current-page frame or component."
+                  : "Reparenting would create a parent-child cycle.",
+              data: { parenting: diagnostic },
+            });
+          }
+          if (parentingDecision === "already_parented") {
+            const committedBeforeInterruption =
+              Boolean(prior.parentingSourceParentId) && prior.parentingSourceParentId !== parent.id;
+            const acknowledgementStatus = committedBeforeInterruption
+              ? "confirmed_mutation"
+              : "verified_idempotent_replay";
+            const diagnostic = parentingDiagnostic(
+              operation.operationId,
+              operation.action,
+              sourceLogicalRef,
+              targetLogicalRef,
+              child.parent,
+              parent,
+              child.parent,
+              committedBeforeInterruption ? "reconciled_commit" : "reconciled_noop",
+              acknowledgementStatus,
+            );
+            const result: OperationResult = {
+              operationId: operation.operationId,
+              success: true,
+              replayed: true,
+              acknowledgementStatus,
+              logicalRef: canonicalChildRef,
+              summary:
+                "The saved parenting operation was reconciled against the current native parent.",
+              data: {
+                ...(acknowledgementStatus === "verified_idempotent_replay" ? { reused: true } : {}),
+                parenting: diagnostic,
+              },
+            };
+            return persistParentingRecovery(result);
+          }
+          if (parentingDecision === "ready") resumeParenting = true;
+          else {
+            const diagnostic = parentingDiagnostic(
+              operation.operationId,
+              operation.action,
+              sourceLogicalRef,
+              targetLogicalRef,
+              child.parent,
+              parent,
+              child.parent,
+              "rejected_stale_or_ambiguous",
+              "ambiguous",
+            );
+            return persistParentingRecovery({
+              operationId: operation.operationId,
+              success: false,
+              replayed: true,
+              acknowledgementStatus: "ambiguous",
+              error:
+                "The node is neither at its saved source nor its intended parent; inspect the current canvas before retrying.",
+              data: { parenting: diagnostic },
+            });
+          }
+        } catch (error) {
+          if (!(error instanceof ReferenceResolutionError)) throw error;
+          const failed = referenceFailure(operation.operationId, error);
+          const diagnostic = parentingDiagnostic(
+            operation.operationId,
+            operation.action,
+            sourceLogicalRef,
+            targetLogicalRef,
+            undefined,
+            undefined,
+            undefined,
+            "rejected_stale_or_ambiguous",
+            "rejected",
+          );
+          return persistParentingRecovery({
+            ...failed,
+            replayed: true,
+            data: { ...failed.data, parenting: diagnostic },
+          });
+        }
+      }
+      if (prior.status === "failed" && prior.result)
+        if (
+          !resumeParenting &&
+          !(prior.result.acknowledgementStatus === "ambiguous" && isCreation(operation.action))
+        )
+          return {
+            ...(prior.result as unknown as OperationResult),
+            replayed: true,
+            acknowledgementStatus:
+              prior.result.acknowledgementStatus ??
+              (prior.result.success ? "confirmed_mutation" : "rejected"),
+          };
+      if (
+        (prior.status === "running" ||
+          (prior.status === "failed" && prior.result?.acknowledgementStatus === "ambiguous")) &&
         (operation.action.tool === "create_frame" ||
           operation.action.tool === "create_rectangle" ||
           operation.action.tool === "create_text")
@@ -1361,8 +1923,25 @@ export function createFigmaToolExecutor(
           (node) => node.getPluginData(OP_PLUGIN_KEY) === operation.operationId,
         );
         const recovered = candidates.length === 1 ? candidates[0] : undefined;
+        const expectedType =
+          operation.action.tool === "create_frame"
+            ? "FRAME"
+            : operation.action.tool === "create_text"
+              ? "TEXT"
+              : "RECTANGLE";
+        let expectedParentId: string | undefined;
+        if (recovered) {
+          try {
+            expectedParentId = (await resolveParent(state, operation.action.parent, pageId)).id;
+          } catch {
+            expectedParentId = undefined;
+          }
+        }
         if (
           recovered &&
+          expectedParentId &&
+          recovered.type === expectedType &&
+          recovered.parent?.id === expectedParentId &&
           (!state.refs[operation.action.ref] ||
             state.refs[operation.action.ref]!.nodeId === recovered.id) &&
           api.currentPage.findAll((node) => node.getPluginData(REF_PLUGIN_KEY) === creationRef)
@@ -1385,6 +1964,7 @@ export function createFigmaToolExecutor(
             operationId: operation.operationId,
             success: true,
             replayed: true,
+            acknowledgementStatus: "confirmed_mutation",
             logicalRef: operation.action.ref,
             summary: `Recovered completed creation “${recovered.name}”.`,
             data: { node: summarizeNode(recovered, operation.action.ref) },
@@ -1402,6 +1982,7 @@ export function createFigmaToolExecutor(
           operationId: operation.operationId,
           success: false,
           replayed: true,
+          acknowledgementStatus: "ambiguous",
           error:
             "The operation was interrupted; inspect the canvas before retrying with a new operation ID.",
         };
@@ -1414,11 +1995,12 @@ export function createFigmaToolExecutor(
         await saveState(state, pageId);
         return result;
       }
-      if (prior.status === "running") {
+      if (prior.status === "running" && !resumeParenting) {
         const result: OperationResult = {
           operationId: operation.operationId,
           success: false,
           replayed: true,
+          acknowledgementStatus: "ambiguous",
           error:
             "The operation was interrupted and may have partially applied; inspect the canvas before retrying with a new operation ID.",
         };
@@ -1449,7 +2031,22 @@ export function createFigmaToolExecutor(
         );
       const recovered = candidates[0];
       if (recovered) {
+        const expectedType =
+          operation.action.tool === "create_frame"
+            ? "FRAME"
+            : operation.action.tool === "create_text"
+              ? "TEXT"
+              : "RECTANGLE";
+        let expectedParentId: string | undefined;
+        try {
+          expectedParentId = (await resolveParent(state, operation.action.parent, pageId)).id;
+        } catch {
+          expectedParentId = undefined;
+        }
         if (
+          !expectedParentId ||
+          recovered.type !== expectedType ||
+          recovered.parent?.id !== expectedParentId ||
           (state.refs[operation.action.ref] &&
             state.refs[operation.action.ref]!.nodeId !== recovered.id) ||
           api.currentPage.findAll((node) => node.getPluginData(REF_PLUGIN_KEY) === creationRef)
@@ -1462,6 +2059,7 @@ export function createFigmaToolExecutor(
             operationId: operation.operationId,
             success: false,
             replayed: true,
+            acknowledgementStatus: "rejected",
             error: "This operation ID is already attached to a different native node.",
           };
         state.refs[operation.action.ref] = {
@@ -1478,6 +2076,7 @@ export function createFigmaToolExecutor(
           operationId: operation.operationId,
           success: true,
           replayed: true,
+          acknowledgementStatus: "confirmed_mutation",
           logicalRef: operation.action.ref,
           summary: `Recovered prior creation “${recovered.name}”.`,
         };
@@ -1504,9 +2103,24 @@ export function createFigmaToolExecutor(
         operationId: operation.operationId,
         success: false,
         replayed: false,
+        acknowledgementStatus: "not_attempted",
         error: "Local tool rate limit reached; wait one minute and retry with a new operation ID.",
       };
     startedOperations.push(now);
+    const parentingChildRef =
+      operation.action.tool === "append_child"
+        ? operation.action.childRef
+        : operation.action.tool === "reparent_node"
+          ? operation.action.ref
+          : undefined;
+    const parentingSourceParentId =
+      isParentingAction(operation.action) && prior?.parentingSourceParentId === undefined
+        ? state.refs[parentingChildRef!]?.parentId
+        : prior?.parentingSourceParentId;
+    const parentingTargetParentId =
+      isParentingAction(operation.action) && prior?.parentingTargetParentId === undefined
+        ? state.refs[operation.action.parentRef]?.nodeId
+        : prior?.parentingTargetParentId;
     state.operations[operation.operationId] = {
       operationId: operation.operationId,
       idempotencyKey: operation.idempotencyKey,
@@ -1517,12 +2131,50 @@ export function createFigmaToolExecutor(
       fingerprint,
       status: "running",
       updatedAt: now,
+      ...(parentingSourceParentId ? { parentingSourceParentId } : {}),
+      ...(parentingTargetParentId ? { parentingTargetParentId } : {}),
     };
-    await saveState(state, pageId);
-    let result: OperationResult;
     try {
-      const output = await actionResult(state, operation, pageId);
-      result = { operationId: operation.operationId, success: true, replayed: false, ...output };
+      await saveState(state, pageId);
+    } catch (error) {
+      return {
+        operationId: operation.operationId,
+        success: false,
+        replayed: false,
+        acknowledgementStatus: "not_attempted",
+        error: (error instanceof Error
+          ? `Operation intent was not confirmed in storage; no native mutation was started. ${error.message}`
+          : "Operation intent was not confirmed in storage; no native mutation was started."
+        ).slice(0, 400),
+      };
+    }
+    let result: OperationResult;
+    let nativeMutationStarted = false;
+    let successfulOutput: Awaited<ReturnType<typeof actionResult>> | undefined;
+    try {
+      const output = await actionResult(
+        state,
+        operation,
+        pageId,
+        () => {
+          nativeMutationStarted = true;
+        },
+        requestedAction,
+      );
+      successfulOutput = output;
+      result = {
+        operationId: operation.operationId,
+        success: true,
+        replayed: false,
+        acknowledgementStatus:
+          output.acknowledgementStatus ??
+          (isMutatingAction(operation.action.tool)
+            ? output.replayed && output.data?.reused
+              ? "verified_idempotent_replay"
+              : "confirmed_mutation"
+            : "read_only"),
+        ...output,
+      };
       if (operation.taskId && isCreation(operation.action)) {
         const entry = state.refs[operation.action.ref];
         if (entry) entry.alias ??= alias;
@@ -1541,10 +2193,7 @@ export function createFigmaToolExecutor(
         ].includes(operation.action.tool)
       )
         api.commitUndo();
-      if (
-        !result.replayed &&
-        (operation.action.tool === "append_child" || operation.action.tool === "reparent_node")
-      ) {
+      if (isParentingAction(operation.action)) {
         const childRef =
           operation.action.tool === "append_child"
             ? operation.action.childRef
@@ -1567,13 +2216,43 @@ export function createFigmaToolExecutor(
         operationId: operation.operationId,
         success: false,
         replayed: false,
+        acknowledgementStatus:
+          error instanceof FigmaCompatibilityError
+            ? "rejected"
+            : error instanceof ParentingOperationError
+              ? error.diagnostic.acknowledgementStatus
+              : error instanceof ReferenceResolutionError ||
+                  !isMutatingAction(operation.action.tool)
+                ? "rejected"
+                : nativeMutationStarted
+                  ? "ambiguous"
+                  : "rejected",
         error: (error instanceof Error ? error.message : "Figma operation failed safely.").slice(
           0,
           400,
         ),
-        ...(error instanceof ReferenceResolutionError
-          ? { data: referenceFailure(operation.operationId, error).data }
-          : {}),
+        ...(error instanceof ParentingOperationError
+          ? {
+              data: {
+                ...(error.referenceResolution ?? {}),
+                parenting: error.diagnostic,
+              },
+            }
+          : error instanceof ReferenceResolutionError
+            ? { data: referenceFailure(operation.operationId, error).data }
+            : error instanceof FigmaCompatibilityError
+              ? { data: { compatibilityFailure: error.diagnostic } }
+              : successfulOutput?.data?.parenting
+                ? {
+                    data: {
+                      parenting: FigmaToolParentingDiagnosticSchema.parse({
+                        ...successfulOutput.data.parenting,
+                        decision: "native_error",
+                        acknowledgementStatus: "ambiguous",
+                      }),
+                    },
+                  }
+                : {}),
       };
       state.operations[operation.operationId] = {
         ...state.operations[operation.operationId]!,
@@ -1612,17 +2291,18 @@ export function createFigmaToolExecutor(
           cancelled: false,
           committedOperationIds: [],
           partialOperationIds: [],
-          results: [
-            {
-              operationId: batch.operations[0]!.operationId,
-              success: false,
-              replayed: false,
-              error:
-                duplicatedIds || duplicatedKeys
+          results: batch.operations.map((operation, index) => ({
+            operationId: operation.operationId,
+            success: false,
+            replayed: false,
+            acknowledgementStatus: index === 0 ? "rejected" : "not_attempted",
+            error:
+              index === 0
+                ? duplicatedIds || duplicatedKeys
                   ? "Operation IDs and idempotency keys must be unique within a batch."
-                  : "Tool batch exceeds the 64 KiB safety limit.",
-            },
-          ],
+                  : "Tool batch exceeds the 64 KiB safety limit."
+                : "Not attempted because the batch failed validation.",
+          })),
         });
         return;
       }
@@ -1645,21 +2325,11 @@ export function createFigmaToolExecutor(
         results.push(result);
         boundResults(results);
         if (
-          result.success &&
-          !result.replayed &&
-          [
-            "create_frame",
-            "create_text",
-            "create_rectangle",
-            "set_auto_layout",
-            "set_properties",
-            "append_child",
-            "reparent_node",
-            "delete_node",
-          ].includes(operation.action.tool)
+          isMutatingAction(operation.action.tool) &&
+          result.acknowledgementStatus === "confirmed_mutation"
         )
           committedOperationIds.push(operation.operationId);
-        if (!result.success && isMutatingAction(operation.action.tool))
+        if (isMutatingAction(operation.action.tool) && result.acknowledgementStatus === "ambiguous")
           partialOperationIds.push(operation.operationId);
         send({
           type: "tool-progress",
@@ -1678,19 +2348,30 @@ export function createFigmaToolExecutor(
         state = await loadState(pageId);
       }
       const cancelled = token.cancelled;
-      if (cancelled && results.length < batch.operations.length) {
-        const operation = batch.operations[results.length]!;
+      const nextIndex = results.length;
+      if (cancelled && nextIndex < batch.operations.length) {
+        const operation = batch.operations[nextIndex]!;
         send({
           type: "tool-progress",
           protocolVersion: 1,
           batchId: batch.batchId,
           operationId: operation.operationId,
-          index: results.length,
+          index: nextIndex,
           total: batch.operations.length,
           status: "cancelled",
           message: "Cancelled before this operation; earlier commits remain on the canvas.",
         });
       }
+      for (const operation of batch.operations.slice(nextIndex))
+        results.push({
+          operationId: operation.operationId,
+          success: false,
+          replayed: false,
+          acknowledgementStatus: "not_attempted",
+          error: cancelled
+            ? "Not attempted because the batch was cancelled before this operation."
+            : "Not attempted because an earlier operation failed; confirmed work was retained.",
+        });
       send({
         type: "tool-result",
         protocolVersion: 1,
@@ -1706,17 +2387,31 @@ export function createFigmaToolExecutor(
       });
     } catch (error) {
       const operation = currentOperation ?? batch.operations[results.length];
-      if (currentOperation && isMutatingAction(currentOperation.action.tool))
+      const acknowledgementStatus = currentOperation
+        ? isMutatingAction(currentOperation.action.tool)
+          ? "ambiguous"
+          : "read_only"
+        : "not_attempted";
+      if (currentOperation && acknowledgementStatus === "ambiguous")
         partialOperationIds.push(currentOperation.operationId);
       if (operation)
         results.push({
           operationId: operation.operationId,
           success: false,
           replayed: false,
+          acknowledgementStatus,
           error: (error instanceof Error ? error.message : "Tool batch failed safely.").slice(
             0,
             400,
           ),
+        });
+      for (const notAttempted of batch.operations.slice(results.length))
+        results.push({
+          operationId: notAttempted.operationId,
+          success: false,
+          replayed: false,
+          acknowledgementStatus: "not_attempted",
+          error: "Not attempted after the batch stopped before this operation.",
         });
       boundResults(results);
       send({
@@ -1735,9 +2430,62 @@ export function createFigmaToolExecutor(
   return async (
     message: Extract<
       UIToPluginMessage,
-      { type: "tool-execute" | "tool-cancel" | "tool-delete-consent" }
+      {
+        type:
+          | "tool-execute"
+          | "tool-cancel"
+          | "tool-delete-consent"
+          | "task-native-inspect"
+          | "task-native-focus";
+      }
     >,
   ): Promise<void> => {
+    if (message.type === "task-native-inspect") {
+      try {
+        const result = await inspectTaskNativeNodes(message);
+        send({
+          type: "task-native-inspection-result",
+          requestId: message.requestId,
+          success: true,
+          taskId: message.taskId,
+          ...result,
+        });
+      } catch (error) {
+        send({
+          type: "task-native-inspection-result",
+          requestId: message.requestId,
+          success: false,
+          taskId: message.taskId,
+          error: (error instanceof Error
+            ? error.message
+            : "Native layers could not be read."
+          ).slice(0, 500),
+        });
+      }
+      return;
+    }
+    if (message.type === "task-native-focus") {
+      try {
+        const nodeIds = await focusTaskNativeNodes(message);
+        send({
+          type: "task-native-focus-result",
+          requestId: message.requestId,
+          success: true,
+          nodeIds,
+        });
+      } catch (error) {
+        send({
+          type: "task-native-focus-result",
+          requestId: message.requestId,
+          success: false,
+          error: (error instanceof Error
+            ? error.message
+            : "The task layer could not be focused."
+          ).slice(0, 500),
+        });
+      }
+      return;
+    }
     if (message.type === "tool-cancel") {
       const active = cancellation.get(message.batchId);
       if (active) active.cancelled = true;
@@ -1785,14 +2533,16 @@ export function createFigmaToolExecutor(
         cancelled: false,
         committedOperationIds: [],
         partialOperationIds: [],
-        results: [
-          {
-            operationId: message.operations[0]!.operationId,
-            success: false,
-            replayed: false,
-            error: "The local tool queue is full; try again after the current batch completes.",
-          },
-        ],
+        results: message.operations.map((operation, index) => ({
+          operationId: operation.operationId,
+          success: false,
+          replayed: false,
+          acknowledgementStatus: "not_attempted",
+          error:
+            index === 0
+              ? "The local tool queue is full; try again after the current batch completes."
+              : "Not attempted because the local tool queue is full.",
+        })),
       });
       return;
     }

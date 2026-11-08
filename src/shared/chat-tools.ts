@@ -20,6 +20,17 @@ export const CHAT_TOOL_NAMES = [
   "complete_canvas_stage",
 ] as const;
 
+export const CHAT_LIFECYCLE_STATES = [
+  "UNPLANNED",
+  "PLAN_SAVED",
+  "EXECUTING_STAGE",
+  "VERIFYING_STAGE",
+  "STAGE_COMPLETED",
+  "TASK_COMPLETED",
+] as const;
+export const ChatLifecycleStateSchema = z.enum(CHAT_LIFECYCLE_STATES);
+export type ChatLifecycleState = z.infer<typeof ChatLifecycleStateSchema>;
+
 const ChatToolNameSchema = z.enum(CHAT_TOOL_NAMES);
 const CallIdSchema = z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u);
 
@@ -96,6 +107,7 @@ export const ChatDesignStageSchema = z
       .min(1)
       .max(20),
     completionCriteria: z.array(z.string().min(1).max(180)).min(1).max(5),
+    estimatedMutations: z.number().int().min(1).max(240).optional(),
   })
   .strict();
 
@@ -110,11 +122,12 @@ export const ChatPlanActionSchema = z
   .strict();
 
 export function modelPlanStages(stages: z.infer<typeof ChatDesignStageSchema>[]) {
-  return stages.map(({ title, goal, logicalRefs, completionCriteria }) => ({
+  return stages.map(({ title, goal, logicalRefs, completionCriteria, estimatedMutations }) => ({
     title,
     goal,
     logicalRefs,
     completionCriteria,
+    ...(estimatedMutations ? { estimatedMutations } : {}),
   }));
 }
 
@@ -129,6 +142,15 @@ function normalizePlanArguments(args: Record<string, unknown>): Record<string, u
     "qaAttempts",
     "verificationOperations",
     "verified",
+    "segments",
+    "readOnlyOperations",
+    "completionReason",
+    "verificationHistory",
+    "qualityFindings",
+    "repairOperationsExecuted",
+    "repairOperationsAttempted",
+    "qualityRepairAttempted",
+    "awaitingQualityRepair",
   ];
   return {
     ...args,
@@ -177,6 +199,7 @@ export const ChatFunctionCallSchema = z
     action: z.union([FigmaToolActionSchema, ChatPlanActionSchema, ChatStageActionSchema]),
     normalizedPlanningMetadata: z.boolean().optional(),
     normalizedInspectionParameters: z.boolean().optional(),
+    stateRedirectedPlanning: z.boolean().optional(),
     functionCall: z
       .object({
         type: z.literal("function_call"),
@@ -219,9 +242,9 @@ type ChatToolName = (typeof CHAT_TOOL_NAMES)[number];
 
 const descriptions: Record<ChatToolName, string> = {
   plan_canvas_task:
-    "Before canvas work, call alone once. Return an internal concise design brief (viewport/platform, direction, audience, content, hierarchy, typography, spacing/radii, palette source/roles, image policy, interactions) and 1–12 ordered stages. Each stage needs a goal, stable logicalRefs for expected root nodes, and measurable completionCriteria; keep it under the operation budget. Preserve existing document styles/tokens and requested colors. No canvas edits in this call.",
+    "Before canvas work, call alone once. Return an internal concise design brief (viewport/platform, direction, audience, content, hierarchy, typography, spacing/radii, palette source/roles, image policy, interactions) and 1–12 ordered stages. Each stage needs a goal, stable logicalRefs for every required acceptance layer, completionCriteria that name measurable native-layer, RTL, content, size, and Auto Layout outcomes, and an estimatedMutations count when known. Work over 32 mutations continues in deterministic local segments; do not replan for that internal boundary. This plan is persisted and must not be recreated after execution starts. Preserve existing document styles/tokens and requested colors. No canvas edits in this call.",
   complete_canvas_stage:
-    "Finish only the current planned stage after all native operations are confirmed successful. Call alone. For failed operations, first obtain a confirmed repair using the same tool and logical ref, then include their original operation IDs in resolvedOperationIds. Never omit failed elements. The result identifies the next stage; continue automatically until all stages finish.",
+    "Finish only the current saved stage after every required logicalRef and native operation is confirmed. Call alone. Local deterministic verification checks required refs and editable geometry; missing requirements are returned explicitly. For failed operations, first obtain a confirmed repair using the same tool and logical ref, then include their original operation IDs in resolvedOperationIds. Never omit failed elements or replan. The result persists completion and identifies the next stage; continue automatically until all stages finish.",
   get_document_context:
     "Read current page name, selection, viewport, and local design tokens. No canvas edits.",
   inspect_nodes: `Read-only inspection. Use at most ${INSPECT_NODES_LIMITS.refs} refs. depth is an integer from ${INSPECT_NODES_LIMITS.depth.min}–${INSPECT_NODES_LIMITS.depth.max} (default ${INSPECT_NODES_LIMITS.depth.default}); maxNodes is an integer from ${INSPECT_NODES_LIMITS.maxNodes.min}–${INSPECT_NODES_LIMITS.maxNodes.max} (default ${INSPECT_NODES_LIMITS.maxNodes.default}). Finite numbers outside either range are clamped locally. Invalid types and in-range fractions are rejected. Never inspect more than ${INSPECT_NODES_LIMITS.maxNodes.max} nodes. Set selection:true when refs is empty. Returns stable logical refs for follow-up edits.`,
@@ -236,8 +259,9 @@ const descriptions: Record<ChatToolName, string> = {
   set_properties:
     "Change only explicitly requested, allowlisted properties on an inspected/created logical ref.",
   append_child:
-    "Append a current page-root native node to a frame using logical refs. Does not accept raw Figma IDs.",
-  reparent_node: "Move a native node by logical refs. Invalid parents and cycles are rejected.",
+    "Append only a current page-root native node to a frame using logical refs. If it is already a direct child of that frame, the executor verifies a no-op; if it has another parent, this call is rejected. Never call inspect_nodes only to decide parent state and never use this to move a nested node.",
+  reparent_node:
+    "Explicitly move an inspected or current-task native node to a frame/component using logical refs when the requested task calls for that move. The executor rejects stale parent identity and cycles; it does not infer authorization from append_child.",
   get_operation_status: "Read the saved status of a prior operation by operation ID.",
 };
 
@@ -294,6 +318,26 @@ export const CHAT_FUNCTION_TOOLS = CHAT_TOOL_NAMES.map((name) => ({
   strict: false,
 }));
 
+export function chatFunctionToolsForState(state: ChatLifecycleState) {
+  const allowed = new Set<ChatToolName>(
+    state === "UNPLANNED"
+      ? ["get_document_context", "inspect_nodes", "plan_canvas_task"]
+      : state === "EXECUTING_STAGE"
+        ? CHAT_TOOL_NAMES.filter(
+            (name) => name !== "plan_canvas_task" && name !== "get_document_context",
+          )
+        : state === "PLAN_SAVED" || state === "STAGE_COMPLETED"
+          ? CHAT_TOOL_NAMES.filter(
+              (name) =>
+                name !== "plan_canvas_task" &&
+                name !== "get_document_context" &&
+                name !== "complete_canvas_stage",
+            )
+          : ["inspect_nodes", "get_operation_status"],
+  );
+  return CHAT_FUNCTION_TOOLS.filter(({ name }) => allowed.has(name));
+}
+
 export const ChatFunctionCallValidationIssueSchema = z
   .object({
     toolName: z
@@ -321,13 +365,15 @@ export class ChatFunctionCallValidationError extends Error {
   constructor(readonly validationIssues: ChatFunctionCallValidationIssue[]) {
     const first = validationIssues[0];
     super(
-      first?.errorCode === "duplicate_call_id"
-        ? "The model returned duplicate function-call IDs."
-        : first?.errorCode === "unknown_tool"
-          ? "The model requested a function that is not allowlisted."
-          : first
-            ? `The model returned an invalid function call (${first.errorCode} at ${first.fieldPaths.join(", ")}).`
-            : "The model returned an invalid function call.",
+      first?.errorCode === "unsupported_wrapper"
+        ? "The model returned an unsupported function-call wrapper."
+        : first?.errorCode === "duplicate_call_id"
+          ? "The model returned duplicate function-call IDs."
+          : first?.errorCode === "unknown_tool"
+            ? "The model requested a function that is not allowlisted."
+            : first
+              ? `The model returned an invalid function call (${first.errorCode} at ${first.fieldPaths.join(", ")}).`
+              : "The model returned an invalid function call.",
     );
     this.name = "ChatFunctionCallValidationError";
   }
@@ -335,6 +381,14 @@ export class ChatFunctionCallValidationError extends Error {
 
 export function parseResponsesFunctionCalls(output: unknown): ChatFunctionCall[] {
   if (!Array.isArray(output)) return [];
+  if (output.some((item) => isRecord(item) && item.type === "call_set"))
+    throw new ChatFunctionCallValidationError([
+      {
+        stage: "call_item",
+        errorCode: "unsupported_wrapper",
+        fieldPaths: ["type"],
+      },
+    ]);
   const functionItems = output.filter((item) => isRecord(item) && item.type === "function_call");
   const issues: ChatFunctionCallValidationIssue[] = [];
   if (functionItems.length > 10)

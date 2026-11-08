@@ -1,20 +1,29 @@
 import { describe, expect, it, vi } from "vitest";
 import { FigmaToolOperationSchema, FigmaToolBatchSchema } from "../src/shared/figma-tools";
-import { UIToPluginSchema, type PluginToUIMessage } from "../src/shared/messages";
-import { createFigmaToolExecutor } from "../src/plugin/figma-tool-executor";
+import {
+  UIToPluginSchema,
+  type PluginToUIMessage,
+  type UIToPluginMessage,
+} from "../src/shared/messages";
+import {
+  createFigmaToolExecutor,
+  downgradeStoredToolStateForRollback,
+} from "../src/plugin/figma-tool-executor";
 import { boundsIntersectWithGap, DEFAULT_MIN_CANVAS_GAP } from "../src/plugin/canvas-placement";
 import { parseResponsesFunctionCalls } from "../src/shared/chat-tools";
 import { utf8Bytes } from "../src/shared/generation-limits";
-import { ChatTaskSchema } from "../src/shared/chat-task";
+import { ChatTaskSchema, chatTaskCommittedOperationCount } from "../src/shared/chat-task";
+import { handleChatTaskStorage } from "../src/plugin/chat-task-storage";
 import { runChatTask } from "../src/ui/chat-task";
-import type { AuthorizedChatTurn } from "../src/ui/companion-client";
+import { CompanionClientError, type AuthorizedChatTurn } from "../src/ui/companion-client";
 
 import { createMockApi, type MockNode } from "./figma-mock";
 
-function operation(operationId: string, action: unknown) {
+function operation(operationId: string, action: unknown, taskId?: string) {
   return FigmaToolOperationSchema.parse({
     operationId,
     idempotencyKey: `idem:${operationId}`,
+    ...(taskId ? { taskId } : {}),
     action,
   });
 }
@@ -40,7 +49,489 @@ function resultFor(messages: PluginToUIMessage[], batchId: string) {
     .find((message) => message.type === "tool-result" && message.batchId === batchId);
 }
 
+function taskNativeRequest(message: unknown) {
+  return UIToPluginSchema.parse(message) as Extract<
+    UIToPluginMessage,
+    { type: "task-native-inspect" | "task-native-focus" }
+  >;
+}
+
 describe("safe Figma tool executor", () => {
+  it("reads only task-owned native hierarchy without changing canvas or plugin data, then validates focus", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const taskId = "chat-task-0001";
+    await run(executor, [
+      operation(
+        "layers-root-create",
+        {
+          tool: "create_frame",
+          ref: "layers-root",
+          name: "Task Screen",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+          autoLayout: {
+            direction: "vertical",
+            gap: 8,
+            padding: { top: 16, right: 12, bottom: 16, left: 12 },
+          },
+        },
+        taskId,
+      ),
+      operation(
+        "layers-child-create",
+        {
+          tool: "create_text",
+          ref: "layers-title",
+          name: "Screen title",
+          parent: { kind: "node", ref: "layers-root" },
+          text: "Private generated copy",
+          size: { width: 200, height: 32 },
+          direction: "LTR",
+          horizontalSizing: "FIXED",
+          verticalSizing: "FIXED",
+        },
+        taskId,
+      ),
+      operation(
+        "layers-other-task-create",
+        {
+          tool: "create_frame",
+          ref: "other-task-root",
+          name: "Other task screen",
+          parent: { kind: "page" },
+          size: { width: 400, height: 800 },
+        },
+        "chat-task-0002",
+      ),
+    ]);
+    const unrelated = mock.api.createRectangle() as unknown as MockNode;
+    unrelated.name = "Unrelated document layer";
+    const originalSelection = [mock.find("Other task screen")!];
+    (mock.api.currentPage as unknown as { selection: MockNode[] }).selection = originalSelection;
+    const storageBefore = JSON.stringify([...mock.storage.entries()]);
+    const pluginDataBefore = JSON.stringify(
+      mock.nodes.map((node) => [node.id, [...node.pluginData.entries()]]),
+    );
+    await executor(
+      taskNativeRequest({
+        type: "task-native-inspect",
+        requestId: "inspect-task-0001",
+        documentId: "file-test-56-page_current",
+        taskId,
+        refs: ["layers-root", "layers-title", "planned-missing"],
+      }),
+    );
+    const inspected = messages.at(-1);
+    expect(inspected).toMatchObject({
+      type: "task-native-inspection-result",
+      success: true,
+      taskId,
+      unresolvedRefs: [{ ref: "planned-missing", status: "missing" }],
+      truncated: false,
+    });
+    if (inspected?.type !== "task-native-inspection-result")
+      throw new Error("Task native hierarchy response was not sent.");
+    expect(inspected.nodes).toHaveLength(2);
+    expect(inspected.nodes?.map(({ name }) => name)).toEqual(["Task Screen", "Screen title"]);
+    expect(inspected.nodes?.[0]).toMatchObject({
+      type: "FRAME",
+      width: 390,
+      height: 844,
+      layoutMode: "VERTICAL",
+      itemSpacing: 8,
+      padding: { top: 16, right: 12, bottom: 16, left: 12 },
+    });
+    expect(inspected.nodes?.[1]).toMatchObject({
+      parentId: inspected.nodes?.[0]?.id,
+      type: "TEXT",
+    });
+    expect(JSON.stringify(inspected.nodes)).not.toContain("Private generated copy");
+    expect(JSON.stringify(inspected.nodes)).not.toContain("Unrelated document layer");
+    expect(JSON.stringify(inspected.nodes)).not.toContain("Other task screen");
+    expect(JSON.stringify([...mock.storage.entries()])).toBe(storageBefore);
+    expect(
+      JSON.stringify(mock.nodes.map((node) => [node.id, [...node.pluginData.entries()]])),
+    ).toBe(pluginDataBefore);
+    expect((mock.api.currentPage as unknown as { selection: MockNode[] }).selection).toEqual(
+      originalSelection,
+    );
+
+    const taskRoot = mock.find("Task Screen")!;
+    await executor(
+      taskNativeRequest({
+        type: "task-native-focus",
+        requestId: "focus-task-0001",
+        documentId: "file-test-56-page_current",
+        taskId,
+        nodeIds: [taskRoot.id],
+        mode: "select",
+      }),
+    );
+    expect(messages.at(-1)).toMatchObject({
+      type: "task-native-focus-result",
+      success: true,
+      nodeIds: [taskRoot.id],
+    });
+    expect((mock.api.currentPage as unknown as { selection: MockNode[] }).selection).toEqual([
+      taskRoot,
+    ]);
+    expect(mock.viewportFocusCalls).toEqual([[taskRoot.id]]);
+
+    await executor(
+      taskNativeRequest({
+        type: "task-native-focus",
+        requestId: "focus-other-task",
+        documentId: "file-test-56-page_current",
+        taskId,
+        nodeIds: [mock.find("Other task screen")!.id],
+        mode: "select",
+      }),
+    );
+    expect(messages.at(-1)).toMatchObject({
+      type: "task-native-focus-result",
+      success: false,
+    });
+    expect((mock.api.currentPage as unknown as { selection: MockNode[] }).selection).toEqual([
+      taskRoot,
+    ]);
+
+    await executor(
+      taskNativeRequest({
+        type: "task-native-focus",
+        requestId: "zoom-task-0001",
+        documentId: "file-test-56-page_current",
+        taskId,
+        nodeIds: [taskRoot.id],
+        mode: "zoom",
+      }),
+    );
+    expect(mock.viewportFocusCalls).toEqual([[taskRoot.id], [taskRoot.id]]);
+    expect((mock.api.currentPage as unknown as { selection: MockNode[] }).selection).toEqual([
+      taskRoot,
+    ]);
+  });
+
+  it("reports stale and deleted task refs and refuses inspection after a page change", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const taskId = "chat-task-0001";
+    await run(executor, [
+      operation(
+        "stale-root-create",
+        {
+          tool: "create_frame",
+          ref: "stale-root",
+          name: "Task root",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+        },
+        taskId,
+      ),
+      operation(
+        "stale-child-create",
+        {
+          tool: "create_text",
+          ref: "stale-child",
+          name: "Task child",
+          parent: { kind: "node", ref: "stale-root" },
+          text: "Layer",
+          size: { width: 100, height: 24 },
+          direction: "LTR",
+          horizontalSizing: "FIXED",
+          verticalSizing: "FIXED",
+        },
+        taskId,
+      ),
+    ]);
+    const child = mock.find("Task child")!;
+    const manualParent = mock.api.createFrame() as unknown as MockNode;
+    manualParent.name = "Unowned parent";
+    manualParent.appendChild(child);
+    const missing = mock.find("Task root")!;
+    missing.remove();
+    await executor(
+      taskNativeRequest({
+        type: "task-native-inspect",
+        requestId: "inspect-stale-refs",
+        documentId: "file-test-56-page_current",
+        taskId,
+        refs: ["stale-root", "stale-child"],
+      }),
+    );
+    expect(messages.at(-1)).toMatchObject({
+      type: "task-native-inspection-result",
+      success: true,
+      unresolvedRefs: [
+        { ref: "stale-root", status: "missing" },
+        { ref: "stale-child", status: "stale" },
+      ],
+    });
+
+    mock.switchCurrentPage();
+    await executor(
+      taskNativeRequest({
+        type: "task-native-inspect",
+        requestId: "inspect-wrong-page",
+        documentId: "file-test-56-page_current",
+        taskId,
+        refs: [],
+      }),
+    );
+    expect(messages.at(-1)).toMatchObject({
+      type: "task-native-inspection-result",
+      success: false,
+      error: expect.stringContaining("page changed"),
+    });
+  });
+
+  it("re-inspects precise transformed Auto Layout bounds and RTL text through the native mock executor", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const created = await run(executor, [
+      operation("geometry-root-create", {
+        tool: "create_frame",
+        ref: "geometry-root",
+        name: "Geometry root",
+        parent: { kind: "page" },
+        size: { width: 200.25, height: 100.5 },
+        x: 100.25,
+        y: 200.5,
+        fill: "#FFFFFF",
+        clipsContent: true,
+        autoLayout: {
+          direction: "horizontal",
+          gap: 6,
+          padding: { top: 10, right: 16, bottom: 10, left: 12 },
+        },
+      }),
+      operation("geometry-rtl-create", {
+        tool: "create_text",
+        ref: "geometry-rtl-copy",
+        name: "Persian copy",
+        parent: { kind: "node", ref: "geometry-root" },
+        text: "متن فارسی",
+        size: { width: 100.5, height: 23.5 },
+        direction: "RTL",
+        horizontalSizing: "FIXED",
+        verticalSizing: "FIXED",
+      }),
+    ]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const textNode = mock.find("Persian copy")!;
+    textNode.fills = [
+      {
+        type: "SOLID",
+        color: { r: 0.543138, g: 111 / 255, b: 125 / 255 },
+        opacity: 1,
+      },
+    ];
+    const inspected = await run(executor, [
+      operation("geometry-rtl-inspect", {
+        tool: "inspect_nodes",
+        refs: ["geometry-root"],
+        selection: false,
+        depth: 4,
+        maxNodes: 25,
+      }),
+    ]);
+    const result = resultFor(messages, inspected);
+    if (result?.type !== "tool-result") throw new Error("Missing native geometry inspection.");
+    const roots = result.results[0]?.data?.nodes as Array<Record<string, unknown>>;
+    const child = (roots[0]?.children as Array<Record<string, unknown>>)[0];
+    expect(roots[0]).toMatchObject({
+      x: 100.25,
+      y: 200.5,
+      width: 200.25,
+      height: 100.5,
+      bounds: { x: 100.25, y: 200.5, width: 200.25, height: 100.5 },
+      layoutMode: "HORIZONTAL",
+      padding: { top: 10, right: 16, bottom: 10, left: 12 },
+      clipsContent: true,
+    });
+    expect(child).toMatchObject({
+      x: 12,
+      y: 10,
+      width: 100.5,
+      height: 23.5,
+      bounds: { x: 112.25, y: 210.5, width: 100.5, height: 23.5 },
+      textAlignHorizontal: "RIGHT",
+      layoutSizingHorizontal: "FIXED",
+      textColor: "#8B6F7D",
+      textColorRGB: { r: 0.543138, g: 111 / 255, b: 125 / 255 },
+    });
+  });
+
+  it("repairs an accidental clipped-child size and verifies the measured native geometry immediately", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    let callIndex = 0;
+    const turn = (definitions: Array<[string, Record<string, unknown>]>) => {
+      const calls = parseResponsesFunctionCalls(
+        definitions.map(([name, args]) => ({
+          type: "function_call",
+          call_id: `clip_repair_call_${String(++callIndex).padStart(4, "0")}`,
+          name,
+          arguments: JSON.stringify(args),
+        })),
+      );
+      return {
+        kind: "tool_calls" as const,
+        calls,
+        functionCallItems: calls.map((call) => call.functionCall),
+        text: "",
+      };
+    };
+    const brief = {
+      platform: "mobile",
+      viewport: { width: 390, height: 844 },
+      brandDirection: "Minimal",
+      audience: "Shoppers",
+      content: ["Store"],
+      hierarchy: "Clear title and content",
+      typography: { family: "Inter", style: "Regular", headingSize: 28, bodySize: 14 },
+      spacingScale: [8, 16, 24],
+      radiusScale: [12, 16],
+      palette: {
+        source: "curated-default",
+        background: "#FFFFFF",
+        surface: "#FFFFFF",
+        primary: "#9B3F62",
+        accent: "#D4A373",
+        text: "#111111",
+        muted: "#666666",
+      },
+      imagePolicy: "labeled-native-fallback",
+      interactionPriorities: ["Browse products"],
+      readingDirection: "RTL",
+    };
+    const turns: AuthorizedChatTurn[] = [
+      turn([["get_document_context", {}]]),
+      turn([
+        [
+          "plan_canvas_task",
+          {
+            brief,
+            stages: [
+              {
+                title: "Store shell",
+                goal: "Keep the existing clipped layout and verify the correction",
+                logicalRefs: ["clip-root", "clip-child"],
+                completionCriteria: ["The native child is inside its clipping parent"],
+              },
+            ],
+          },
+        ],
+      ]),
+      turn([
+        [
+          "create_frame",
+          {
+            ref: "clip-root",
+            name: "Clipping parent",
+            parent: { kind: "page" },
+            size: { width: 100, height: 100 },
+            x: 0,
+            y: 0,
+            fill: "#FFFFFF",
+            clipsContent: true,
+          },
+        ],
+      ]),
+      turn([
+        [
+          "create_rectangle",
+          {
+            ref: "clip-child",
+            name: "Overflowing child",
+            parent: { kind: "node", ref: "clip-root" },
+            size: { width: 30, height: 20 },
+            x: 85,
+            y: 10,
+            fill: "#9B3F62",
+          },
+        ],
+      ]),
+      turn([["complete_canvas_stage", { summary: "Check native clipping" }]]),
+      turn([["set_properties", { ref: "clip-child", properties: { width: 15 } }]]),
+      turn([["complete_canvas_stage", { summary: "Finish the verified stage" }]]),
+      { kind: "done", text: "The child is within the clipping parent." },
+    ];
+    const nativeActions: string[] = [];
+    const task = ChatTaskSchema.parse({
+      version: 1,
+      id: "clip-repair-task-0001",
+      referenceScope: "task-v1",
+      documentId: "file-test-56-page_current",
+      prompt: "Build and verify the clipped shell.",
+      context: [],
+      stages: [],
+      ledger: [],
+      pending: [],
+      recent: [],
+      starts: [],
+      rounds: 0,
+      status: "ready",
+      text: "",
+    });
+    const dependencies = {
+      signal: new AbortController().signal,
+      progress: () => {},
+      model: async () => {
+        const next = turns.shift();
+        if (!next) throw new Error("No scripted clipping repair turn remains");
+        return next;
+      },
+      save: async () => {},
+      execute: async (operations: ReturnType<typeof operation>[]) => {
+        nativeActions.push(...operations.map(({ action }) => action.tool));
+        const batchId = `clip-repair-batch-${nativeActions.length}`;
+        await executor(
+          FigmaToolBatchSchema.parse({
+            type: "tool-execute",
+            protocolVersion: 1,
+            batchId,
+            operations,
+          }),
+        );
+        const result = resultFor(messages, batchId);
+        if (result?.type !== "tool-result") throw new Error("Missing clipped-child native result");
+        return result;
+      },
+      now: () => Date.now(),
+      wait: async () => {},
+    };
+    await runChatTask(task, dependencies);
+    const child = mock.find("Overflowing child")!;
+    const childId = child.id;
+    const childRef = child.getPluginData("fad.tool.logical-ref.v1");
+    expect(task.status).toBe("completed");
+    expect(task.stages[0]).toMatchObject({
+      verified: true,
+      qualityFindings: [],
+      repairOperationsAttempted: 1,
+      repairOperationsExecuted: 1,
+      repairFindingsResolved: 1,
+      verificationHistory: [
+        { findings: [{ code: "clipped-child", refs: [childRef] }] },
+        { findings: [], repairOperationIds: [expect.stringMatching(/op-/u)] },
+      ],
+    });
+    expect(child).toMatchObject({
+      id: childId,
+      width: 15,
+      x: 85,
+      parent: mock.find("Clipping parent"),
+    });
+    expect(mock.nodes).toHaveLength(2);
+    const repairIndex = nativeActions.lastIndexOf("set_properties");
+    expect(nativeActions[repairIndex + 1]).toBe("inspect_nodes");
+  });
+
   it("isolates store/header across tasks, reuses confirmed nodes after reload, and edits only inspected foreign refs", async () => {
     const mock = createMockApi();
     const messages: PluginToUIMessage[] = [];
@@ -727,7 +1218,7 @@ describe("safe Figma tool executor", () => {
       expect(batches[replay]).toEqual(
         batches.find((batch) => batch.some((item) => item.operationId === lostOperationIds?.[0])),
       );
-      expect(batches.every((batch) => batch.length <= 3)).toBe(true);
+      expect(batches.every((batch) => batch.length <= 10)).toBe(true);
       expect(waits.length).toBeGreaterThan(0);
       expect(
         messages
@@ -737,6 +1228,906 @@ describe("safe Figma tool executor", () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  it("reloads after a seven-mutation timeout and finishes Home and Product without duplicate nodes or touching existing content", async () => {
+    const mock = createMockApi();
+    const existing = mock.api.createFrame();
+    existing.name = "Untouched user content";
+    existing.resize(120, 80);
+    existing.x = 1_200;
+    existing.y = 40;
+    const existingBefore = {
+      id: existing.id,
+      name: existing.name,
+      x: existing.x,
+      y: existing.y,
+      width: existing.width,
+      height: existing.height,
+    };
+    const messages: PluginToUIMessage[] = [];
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    let callNumber = 0;
+    const turnFor = (definitions: Array<[string, Record<string, unknown>]>) => {
+      const calls = parseResponsesFunctionCalls(
+        definitions.map(([name, args]) => ({
+          type: "function_call",
+          call_id: `timeout_resume_${++callNumber}`,
+          name,
+          arguments: JSON.stringify(args),
+        })),
+      );
+      return {
+        kind: "tool_calls" as const,
+        calls,
+        functionCallItems: calls.map((call) => call.functionCall),
+        text: "",
+      };
+    };
+    const brief = {
+      platform: "mobile" as const,
+      viewport: { width: 390, height: 844 },
+      brandDirection: "فروشگاه مینیمال",
+      audience: "خریداران",
+      content: ["خانه", "محصولات"],
+      hierarchy: "عنوان واضح و محصول قابل ویرایش",
+      typography: { family: "Arial", style: "Regular", headingSize: 28, bodySize: 14 },
+      spacingScale: [8, 16],
+      radiusScale: [8, 16],
+      palette: {
+        source: "curated-default" as const,
+        background: "#FFFFFF",
+        surface: "#F8FAFC",
+        primary: "#111827",
+        accent: "#0F766E",
+        text: "#111827",
+        muted: "#4B5563",
+      },
+      imagePolicy: "labeled-native-fallback" as const,
+      interactionPriorities: ["خرید"],
+      readingDirection: "RTL" as const,
+    };
+    const homeRefs = [
+      "home-screen",
+      "home-header",
+      "home-title",
+      "home-nav",
+      "home-card",
+      "home-product-name",
+      "home-buy-button",
+      "home-footer",
+      "home-footer-label",
+    ];
+    const plan = turnFor([
+      [
+        "plan_canvas_task",
+        {
+          brief,
+          stages: [
+            {
+              title: "Home",
+              goal: "Create an editable Persian RTL Home screen",
+              logicalRefs: homeRefs,
+              completionCriteria: ["All Home refs are committed and verified"],
+            },
+            {
+              title: "Product",
+              goal: "Create an editable Persian RTL Product screen",
+              logicalRefs: ["product-screen", "product-title"],
+              completionCriteria: ["The Product screen and title are committed"],
+            },
+          ],
+        },
+      ],
+    ]);
+    const firstSeven = turnFor([
+      [
+        "create_frame",
+        {
+          ref: "home-screen",
+          name: "خانه فروشگاه",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+          fill: "#FFFFFF",
+        },
+      ],
+      [
+        "create_frame",
+        {
+          ref: "home-header",
+          name: "هدر خانه",
+          parent: { kind: "node", ref: "home-screen" },
+          size: { width: 342, height: 64 },
+          fill: "#F8FAFC",
+          x: 24,
+          y: 24,
+          autoLayout: { direction: "horizontal", gap: 8 },
+        },
+      ],
+      [
+        "create_text",
+        {
+          ref: "home-title",
+          name: "عنوان خانه",
+          parent: { kind: "node", ref: "home-header" },
+          text: "خانه فروشگاه",
+          size: { width: 180, height: 36 },
+          fontSize: 28,
+          color: "#111827",
+          direction: "RTL",
+          align: "RIGHT",
+        },
+      ],
+      [
+        "create_text",
+        {
+          ref: "home-nav",
+          name: "ناوبری خانه",
+          parent: { kind: "node", ref: "home-screen" },
+          text: "محصولات",
+          size: { width: 160, height: 32 },
+          fontSize: 14,
+          color: "#111827",
+          direction: "RTL",
+          align: "RIGHT",
+        },
+      ],
+      [
+        "create_frame",
+        {
+          ref: "home-card",
+          name: "کارت محصول خانه",
+          parent: { kind: "node", ref: "home-screen" },
+          size: { width: 342, height: 120 },
+          fill: "#F8FAFC",
+          cornerRadius: 12,
+          x: 24,
+          y: 120,
+          autoLayout: { direction: "vertical", gap: 8 },
+        },
+      ],
+      [
+        "create_text",
+        {
+          ref: "home-product-name",
+          name: "نام محصول",
+          parent: { kind: "node", ref: "home-card" },
+          text: "پیراهن ایرانی",
+          size: { width: 320, height: 32 },
+          fontSize: 16,
+          color: "#111827",
+          direction: "RTL",
+          align: "RIGHT",
+        },
+      ],
+      [
+        "create_frame",
+        {
+          ref: "home-buy-button",
+          name: "دکمه خرید",
+          parent: { kind: "node", ref: "home-screen" },
+          size: { width: 342, height: 48 },
+          fill: "#0F766E",
+          cornerRadius: 12,
+          x: 24,
+          y: 260,
+        },
+      ],
+    ]);
+    const timeoutDiagnostic = {
+      model: "account-model",
+      requestId: "chat-timeout-reload-01",
+      requestStartedAtMs: Date.now(),
+      requestPhase: "upstream_stream",
+      stage: "stream",
+      outcome: "timed_out",
+      timeoutKind: "idle",
+      timeoutSource: "upstream_inactivity",
+      terminationReason: "upstream_inactivity",
+      elapsedMs: 62_000,
+      idleMs: 60_000,
+      lastEvent: "response.output_item.done",
+      lastEventAtMs: Date.now() - 60_000,
+      lastEventAgeMs: 60_000,
+    } as const;
+    const firstScript: Array<AuthorizedChatTurn | Error> = [
+      turnFor([["get_document_context", {}]]),
+      plan,
+      firstSeven,
+      new CompanionClientError("request_timed_out", timeoutDiagnostic),
+    ];
+    const task = ChatTaskSchema.parse({
+      version: 1,
+      id: "home-product-timeout-01",
+      referenceScope: "task-v1",
+      documentId: "file-test-56-page_current",
+      prompt: "Create a Persian Home and Product experience.",
+      context: [],
+      stages: [],
+      ledger: [],
+      pending: [],
+      recent: [],
+      starts: [],
+      rounds: 0,
+      status: "ready",
+      text: "",
+    });
+    let saveNumber = 0;
+    let modelRequests = 0;
+    const batches: ReturnType<typeof operation>[][] = [];
+    const dependencies = (script: Array<AuthorizedChatTurn | Error>) => ({
+      signal: new AbortController().signal,
+      model: async () => {
+        modelRequests++;
+        const next = script.shift();
+        if (!next) throw new Error("No scripted timeout-resume turn remains.");
+        if (next instanceof Error) throw next;
+        return next;
+      },
+      save: async (checkpoint: typeof task) => {
+        const saved = await handleChatTaskStorage(mock.api, {
+          type: "chat-task-save",
+          requestId: `timeout-save-${++saveNumber}`,
+          documentId: checkpoint.documentId,
+          task: checkpoint,
+        });
+        if (!saved.success) throw new Error(saved.error);
+      },
+      progress: () => {},
+      wait: async () => {},
+      execute: async (operations: ReturnType<typeof operation>[]) => {
+        batches.push(operations);
+        const batchId = await run(executor, operations);
+        const result = resultFor(messages, batchId);
+        if (!result || result.type !== "tool-result")
+          throw new Error("Missing native confirmation.");
+        return result;
+      },
+    });
+
+    await expect(runChatTask(task, dependencies(firstScript))).rejects.toMatchObject({
+      category: "request_timed_out",
+    });
+    expect(modelRequests).toBe(4);
+    expect(batches).toHaveLength(2);
+    expect(batches[1]).toHaveLength(7);
+    expect(chatTaskCommittedOperationCount(task)).toBe(7);
+    expect(task.lastRequestDiagnostic).toMatchObject({
+      requestId: "chat-timeout-reload-01",
+      timeoutSource: "upstream_inactivity",
+      terminationReason: "upstream_inactivity",
+    });
+    const confirmedOperationIds = task.ledger
+      .filter((entry) => entry.status === "completed" && entry.category === "mutation")
+      .map((entry) => entry.operationId);
+    const confirmedNodeIds = mock.nodes.map((node) => node.id);
+
+    const loaded = await handleChatTaskStorage(mock.api, {
+      type: "chat-task-load",
+      requestId: "timeout-load-01",
+    });
+    if (!loaded.success || !loaded.task)
+      throw new Error("Timed-out task checkpoint was not saved.");
+    const restored = ChatTaskSchema.parse(JSON.parse(JSON.stringify(loaded.task)));
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const completion = (summary: string) => turnFor([["complete_canvas_stage", { summary }]]);
+    const resumeScript: Array<AuthorizedChatTurn | Error> = [
+      turnFor([
+        [
+          "create_frame",
+          {
+            ref: "home-footer",
+            name: "پاورقی خانه",
+            parent: { kind: "node", ref: "home-screen" },
+            size: { width: 342, height: 64 },
+            fill: "#FFFFFF",
+            x: 24,
+            y: 330,
+          },
+        ],
+        [
+          "create_text",
+          {
+            ref: "home-footer-label",
+            name: "متن پاورقی",
+            parent: { kind: "node", ref: "home-footer" },
+            text: "درباره فروشگاه",
+            size: { width: 320, height: 32 },
+            fontSize: 14,
+            color: "#111827",
+            direction: "RTL",
+            align: "RIGHT",
+          },
+        ],
+      ]),
+      completion("خانه تأیید شد"),
+      turnFor([
+        [
+          "create_frame",
+          {
+            ref: "product-screen",
+            name: "صفحه محصول",
+            parent: { kind: "page" },
+            size: { width: 390, height: 844 },
+            fill: "#FFFFFF",
+            autoLayout: { direction: "vertical", gap: 12 },
+          },
+        ],
+        [
+          "create_text",
+          {
+            ref: "product-title",
+            name: "عنوان محصول",
+            parent: { kind: "node", ref: "product-screen" },
+            text: "جزئیات محصول",
+            size: { width: 342, height: 40 },
+            fontSize: 24,
+            color: "#111827",
+            direction: "RTL",
+            align: "RIGHT",
+          },
+        ],
+      ]),
+      completion("محصول تأیید شد"),
+      { kind: "done", text: "خانه و محصول آماده هستند." },
+    ];
+    await runChatTask(restored, dependencies(resumeScript));
+
+    expect(restored.status).toBe("completed");
+    expect(chatTaskCommittedOperationCount(restored)).toBe(11);
+    expect(mock.nodes).toHaveLength(12);
+    expect(new Set(mock.nodes.map((node) => node.id)).size).toBe(12);
+    expect(
+      confirmedOperationIds.every((id) =>
+        restored.ledger.some((entry) => entry.operationId === id && entry.status === "completed"),
+      ),
+    ).toBe(true);
+    expect(mock.nodes.filter((node) => confirmedNodeIds.includes(node.id))).toHaveLength(8);
+    expect(mock.find("خانه فروشگاه")).toMatchObject({ type: "FRAME", width: 390, height: 844 });
+    expect(mock.find("عنوان خانه")).toMatchObject({
+      type: "TEXT",
+      characters: "خانه فروشگاه",
+      textAlignHorizontal: "RIGHT",
+    });
+    expect(mock.find("عنوان محصول")).toMatchObject({
+      type: "TEXT",
+      characters: "جزئیات محصول",
+      textAlignHorizontal: "RIGHT",
+    });
+    expect(mock.find("هدر خانه")?.layoutMode).toBe("HORIZONTAL");
+    expect(mock.find("کارت محصول خانه")?.layoutMode).toBe("VERTICAL");
+    expect(mock.find("صفحه محصول")?.layoutMode).toBe("VERTICAL");
+    expect({
+      id: existing.id,
+      name: existing.name,
+      x: existing.x,
+      y: existing.y,
+      width: existing.width,
+      height: existing.height,
+    }).toEqual(existingBefore);
+    expect(mock.nodes.filter((node) => node.name === "خانه فروشگاه")).toHaveLength(1);
+    expect(mock.nodes.filter((node) => node.name === "صفحه محصول")).toHaveLength(1);
+    expect(confirmedNodeIds).toContain(existing.id);
+  });
+
+  it("preserves exactly 22 confirmed native mutations across executor reload and chat Resume", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    let callIndex = 0;
+    const calls = (definitions: Array<[string, Record<string, unknown>]>) => {
+      const parsed = parseResponsesFunctionCalls(
+        definitions.map(([name, args]) => ({
+          type: "function_call",
+          call_id: `twenty_two_call_${String(++callIndex).padStart(4, "0")}`,
+          name,
+          arguments: JSON.stringify(args),
+        })),
+      );
+      return {
+        kind: "tool_calls" as const,
+        calls: parsed,
+        functionCallItems: parsed.map((call) => call.functionCall),
+        text: "",
+      };
+    };
+    const brief = {
+      platform: "mobile",
+      viewport: { width: 390, height: 844 },
+      brandDirection: "Minimal storefront",
+      audience: "Shoppers",
+      content: ["Products"],
+      hierarchy: "Clear",
+      typography: { family: "Inter", style: "Regular", headingSize: 28, bodySize: 14 },
+      spacingScale: [8, 12, 16, 24],
+      radiusScale: [12, 16, 20],
+      palette: {
+        source: "curated-default",
+        background: "#FBF7F4",
+        surface: "#FFFFFF",
+        primary: "#9B3F62",
+        accent: "#D4A373",
+        text: "#241B20",
+        muted: "#675D63",
+      },
+      imagePolicy: "labeled-native-fallback",
+      interactionPriorities: ["Purchase"],
+      readingDirection: "RTL",
+    };
+    const stageMutations = (start: number, count: number) =>
+      Array.from({ length: count }, (_, offset): [string, Record<string, unknown>] => {
+        const index = start + offset;
+        return [
+          "create_frame",
+          {
+            ref: `item-${String(index).padStart(2, "0")}`,
+            name: `Item ${index}`,
+            parent: { kind: "page" },
+            size: { width: 120, height: 80 },
+          },
+        ];
+      });
+    let turns: AuthorizedChatTurn[] = [
+      calls([["get_document_context", {}]]),
+      calls([
+        [
+          "plan_canvas_task",
+          {
+            brief,
+            stages: [
+              {
+                title: "Home",
+                goal: "Retain confirmed native layers",
+                logicalRefs: ["item-00"],
+                completionCriteria: ["The confirmed layer remains editable"],
+              },
+            ],
+          },
+        ],
+      ]),
+      calls(stageMutations(0, 10)),
+      calls(stageMutations(10, 10)),
+      calls(stageMutations(20, 2)),
+    ];
+    let controller = new AbortController();
+    let confirmedDuringFirstRun = 0;
+    let firstRun = true;
+    let batchNumber = 0;
+    const execute = async (operations: ReturnType<typeof operation>[]) => {
+      const batchId = `twenty-two-batch-${++batchNumber}`;
+      await executor(
+        FigmaToolBatchSchema.parse({
+          type: "tool-execute",
+          protocolVersion: 1,
+          batchId,
+          operations,
+        }),
+      );
+      const result = resultFor(messages, batchId);
+      if (!result || result.type !== "tool-result") throw new Error("Missing native result");
+      if (firstRun && result.committedOperationIds.length)
+        confirmedDuringFirstRun += result.committedOperationIds.length;
+      if (firstRun && confirmedDuringFirstRun === 22) controller.abort();
+      return result;
+    };
+    const dependencies = () => ({
+      signal: controller.signal,
+      progress: () => {},
+      model: async () => {
+        const next = turns.shift();
+        if (!next) throw new Error("No scripted 22-mutation continuation remains");
+        return next;
+      },
+      save: async () => {},
+      execute,
+      now: () => Date.now(),
+      wait: async () => {},
+    });
+    let task = ChatTaskSchema.parse({
+      version: 1,
+      id: "twenty-two-task-0001",
+      referenceScope: "task-v1",
+      documentId: "file-test-56-page_current",
+      prompt: "Create a product list and preserve confirmed layers across Resume.",
+      context: [],
+      stages: [],
+      ledger: [],
+      pending: [],
+      recent: [],
+      starts: [],
+      rounds: 0,
+      status: "ready",
+      text: "",
+    });
+    await expect(runChatTask(task, dependencies())).rejects.toThrow("Stopped");
+    expect(chatTaskCommittedOperationCount(task)).toBe(22);
+    expect(mock.nodes).toHaveLength(22);
+    const nativeIds = mock.nodes.map(({ id }) => id);
+    const operationIds = task.ledger
+      .filter(
+        ({ status, acknowledgementStatus }) =>
+          status === "completed" && acknowledgementStatus === "confirmed_mutation",
+      )
+      .map(({ operationId }) => operationId);
+    task = ChatTaskSchema.parse(JSON.parse(JSON.stringify(task)));
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    controller = new AbortController();
+    firstRun = false;
+    turns = [
+      calls([["complete_canvas_stage", { summary: "Resume the existing Home stage" }]]),
+      { kind: "done", text: "Home completed." },
+    ];
+    await runChatTask(task, dependencies());
+    expect(task.status).toBe("completed");
+    expect(chatTaskCommittedOperationCount(task)).toBe(22);
+    expect(
+      task.ledger.filter(({ operationId }) => operationIds.includes(operationId)),
+    ).toHaveLength(22);
+    expect(nativeIds.every((id) => mock.nodes.some((node) => node.id === id))).toBe(true);
+    expect(mock.nodes).toHaveLength(22);
+    expect(new Set(mock.nodes.map(({ id }) => id)).size).toBe(22);
+  });
+
+  it("resumes 25 committed operations across a 32-mutation segment and completes editable RTL Home and Product screens without duplicates", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    let callIndex = 0;
+    const callsTurn = (
+      definitions: Array<[string, Record<string, unknown>]>,
+    ): Extract<AuthorizedChatTurn, { kind: "tool_calls" }> => {
+      const calls = parseResponsesFunctionCalls(
+        definitions.map(([name, args]) => ({
+          type: "function_call",
+          call_id: `two_screen_call_${++callIndex}`,
+          name,
+          arguments: JSON.stringify(args),
+        })),
+      );
+      return {
+        kind: "tool_calls",
+        calls,
+        functionCallItems: calls.map((call) => call.functionCall),
+        text: "",
+      };
+    };
+    const frame = (
+      ref: string,
+      name: string,
+      parent: string | undefined,
+      width: number,
+      height: number,
+      direction: "horizontal" | "vertical" = "vertical",
+      fill = "#FFFFFF",
+    ): [string, Record<string, unknown>] => [
+      "create_frame",
+      {
+        ref,
+        name,
+        parent: parent ? { kind: "node", ref: parent } : { kind: "page" },
+        size: { width, height },
+        fill,
+        cornerRadius: parent ? 12 : 0,
+        autoLayout: { direction, gap: 8 },
+      },
+    ];
+    const text = (
+      ref: string,
+      name: string,
+      parent: string,
+      value: string,
+      width: number,
+      height = 32,
+      fontSize = 16,
+      color = "#241B20",
+    ): [string, Record<string, unknown>] => [
+      "create_text",
+      {
+        ref,
+        name,
+        parent: { kind: "node", ref: parent },
+        text: value,
+        size: { width, height },
+        color,
+        fontSize,
+        direction: "RTL",
+        align: "RIGHT",
+      },
+    ];
+    const setProperties = (
+      ref: string,
+      properties: Record<string, unknown>,
+    ): [string, Record<string, unknown>] => ["set_properties", { ref, properties }];
+    const homeRefs = [
+      "home-screen",
+      "home-header",
+      "home-search",
+      "home-categories",
+      "home-hero",
+      "home-card-a",
+      "home-card-b",
+      "home-price-a",
+      "home-price-b",
+      "home-buy-a",
+      "home-buy-b",
+    ];
+    const productRefs = [
+      "product-screen",
+      "product-gallery",
+      "product-title",
+      "product-price",
+      "product-sizes",
+      "product-colors",
+      "product-details",
+      "product-add",
+    ];
+    const brief = {
+      platform: "mobile",
+      viewport: { width: 390, height: 844 },
+      brandDirection: "فروشگاه پوشاک حرفه‌ای و مینیمال",
+      audience: "خریداران فارسی‌زبان",
+      content: ["خانه", "محصول", "قیمت تومان", "خرید"],
+      hierarchy: "عنوان و قیمت برجسته با کنترل‌های واضح",
+      typography: { family: "Arial", style: "Regular", headingSize: 28, bodySize: 14 },
+      spacingScale: [8, 12, 16, 24],
+      radiusScale: [12, 16, 20],
+      palette: {
+        source: "curated-default",
+        background: "#FBF7F4",
+        surface: "#FFFFFF",
+        primary: "#9B3F62",
+        accent: "#D4A373",
+        text: "#241B20",
+        muted: "#675D63",
+      },
+      imagePolicy: "labeled-native-fallback",
+      interactionPriorities: ["خرید", "افزودن به سبد"],
+      readingDirection: "RTL",
+    };
+    const turns: AuthorizedChatTurn[] = [
+      callsTurn([["get_document_context", {}]]),
+      callsTurn([
+        [
+          "plan_canvas_task",
+          {
+            brief,
+            stages: [
+              {
+                title: "Home",
+                goal: "ساخت صفحه خانه فروشگاه پوشاک",
+                logicalRefs: homeRefs,
+                completionCriteria: [
+                  "هدر، جست‌وجو، دسته‌بندی، هیرو، دو کارت، قیمت تومان و دکمه خرید به‌صورت RTL و Auto Layout قابل ویرایش باشند",
+                ],
+              },
+              {
+                title: "Product",
+                goal: "ساخت صفحه جزئیات محصول",
+                logicalRefs: productRefs,
+                completionCriteria: [
+                  "گالری جایگزین، عنوان، قیمت، سایز، رنگ، جزئیات و افزودن به سبد به‌صورت RTL و Auto Layout قابل ویرایش باشند",
+                ],
+              },
+            ],
+          },
+        ],
+      ]),
+      callsTurn([
+        frame("home-screen", "خانه فروشگاه", undefined, 390, 844, "vertical", "#FBF7F4"),
+        frame("home-header", "هدر و ناوبری", "home-screen", 342, 64, "horizontal"),
+        text("home-title", "عنوان فروشگاه", "home-header", "پوشاک رایان", 220, 40, 28),
+        frame("home-search", "جست‌وجو", "home-screen", 342, 48, "horizontal", "#FFFFFF"),
+      ]),
+      callsTurn([
+        text("home-search-label", "متن جست‌وجو", "home-search", "جست‌وجوی محصول", 300),
+        frame("home-categories", "دسته‌بندی‌ها", "home-screen", 342, 56, "horizontal"),
+        frame("home-hero", "بنر تبلیغاتی", "home-screen", 342, 128, "vertical", "#D4A373"),
+        text("home-hero-title", "عنوان بنر", "home-hero", "استایل تازه پاییز", 310, 40, 24),
+        frame("home-card-a", "کارت محصول اول", "home-screen", 342, 104),
+        text("home-price-a", "قیمت محصول اول", "home-card-a", "۲٬۴۹۰٬۰۰۰ تومان", 310),
+        frame("home-buy-a", "خرید محصول اول", "home-card-a", 310, 48, "horizontal", "#9B3F62"),
+        frame("home-card-b", "کارت محصول دوم", "home-screen", 342, 104),
+        text("home-price-b", "قیمت محصول دوم", "home-card-b", "۱٬۸۹۰٬۰۰۰ تومان", 310),
+        frame("home-buy-b", "خرید محصول دوم", "home-card-b", 310, 48, "horizontal", "#9B3F62"),
+      ]),
+      callsTurn([
+        text("home-nav-label", "ناوبری", "home-header", "خانه | محصولات", 110, 32, 14),
+        text("home-category-label", "برچسب دسته‌بندی", "home-categories", "زنانه | مردانه", 300),
+        text("home-card-a-title", "نام محصول اول", "home-card-a", "مانتوی لینن", 310),
+        text("home-buy-a-label", "متن خرید اول", "home-buy-a", "خرید", 280, 32, 16, "#FFFFFF"),
+        text("home-card-b-title", "نام محصول دوم", "home-card-b", "پیراهن نخی", 310),
+        text("home-buy-b-label", "متن خرید دوم", "home-buy-b", "خرید", 280, 32, 16, "#FFFFFF"),
+      ]),
+      callsTurn([
+        setProperties("home-screen", { name: "خانه فروشگاه" }),
+        setProperties("home-header", { cornerRadius: 12 }),
+        setProperties("home-search", { stroke: "#E7D8DF", strokeWeight: 1 }),
+        setProperties("home-hero", { cornerRadius: 20 }),
+        setProperties("home-categories", { cornerRadius: 12 }),
+      ]),
+      callsTurn([
+        setProperties("home-card-a", { cornerRadius: 16 }),
+        setProperties("home-card-b", { cornerRadius: 16 }),
+        setProperties("home-price-a", { fontSize: 16 }),
+        setProperties("home-price-b", { fontSize: 16 }),
+        setProperties("home-buy-a", { cornerRadius: 12 }),
+        setProperties("home-buy-b", { cornerRadius: 12 }),
+        setProperties("home-title", { fontSize: 28 }),
+        setProperties("home-nav-label", { fontSize: 14 }),
+        setProperties("home-card-a-title", { fontSize: 16 }),
+        setProperties("home-card-b-title", { fontSize: 16 }),
+      ]),
+      callsTurn([["complete_canvas_stage", { summary: "صفحه خانه کامل است" }]]),
+      callsTurn([
+        frame("product-screen", "صفحه محصول", undefined, 390, 844, "vertical", "#FBF7F4"),
+        frame("product-gallery", "جای تصویر محصول", "product-screen", 342, 260),
+        text(
+          "product-gallery-label",
+          "برچسب جایگزین تصویر",
+          "product-gallery",
+          "بدون عکس واقعی — جای تصویر قابل ویرایش",
+          310,
+          48,
+        ),
+        frame("product-info", "اطلاعات محصول", "product-screen", 342, 152),
+        text("product-title", "عنوان محصول", "product-info", "کت لینن زنانه", 310, 40, 28),
+        text("product-price", "قیمت محصول", "product-info", "۳٬۲۹۰٬۰۰۰ تومان", 310, 36, 20),
+        frame("product-variants", "انتخاب ویژگی", "product-screen", 342, 72, "horizontal"),
+        frame("product-sizes", "انتخاب سایز", "product-variants", 150, 48, "horizontal"),
+        frame("product-colors", "انتخاب رنگ", "product-variants", 150, 48, "horizontal"),
+        text(
+          "product-details",
+          "جزئیات محصول",
+          "product-screen",
+          "پارچه لینن سبک، برش آزاد و مناسب استفاده روزمره",
+          342,
+          72,
+        ),
+      ]),
+      callsTurn([
+        frame("product-add", "افزودن به سبد", "product-screen", 342, 52, "horizontal", "#9B3F62"),
+        text(
+          "product-add-label",
+          "متن افزودن",
+          "product-add",
+          "افزودن به سبد خرید",
+          300,
+          32,
+          16,
+          "#FFFFFF",
+        ),
+        text("product-size-label", "متن سایز", "product-sizes", "سایز: M", 120),
+        text("product-color-label", "متن رنگ", "product-colors", "رنگ: کرم", 120),
+      ]),
+      callsTurn([["complete_canvas_stage", { summary: "صفحه محصول کامل است" }]]),
+      { kind: "done", text: "هر دو صفحه کامل شدند." },
+    ];
+    let task = ChatTaskSchema.parse({
+      version: 1,
+      id: "two-screen-task-01",
+      referenceScope: "task-v1",
+      documentId: "file-test-56-page_current",
+      prompt: "دو صفحه حرفه‌ای فارسی Home و Product برای فروشگاه پوشاک بساز",
+      context: [],
+      stages: [],
+      ledger: [],
+      pending: [],
+      recent: [],
+      starts: [],
+      rounds: 0,
+      status: "ready",
+      text: "",
+    });
+    let controller = new AbortController();
+    let committedBeforeStop = 0;
+    let stopAfter25 = true;
+    let batch = 0;
+    let clock = Date.now();
+    const execute = async (operations: ReturnType<typeof operation>[]) => {
+      const batchId = `two-screen-batch-${++batch}`;
+      await executor(
+        FigmaToolBatchSchema.parse({
+          type: "tool-execute",
+          protocolVersion: 1,
+          batchId,
+          operations,
+        }),
+      );
+      const result = resultFor(messages, batchId);
+      if (!result || result.type !== "tool-result") throw new Error("Missing two-screen result");
+      committedBeforeStop += result.committedOperationIds.length;
+      if (stopAfter25 && committedBeforeStop === 25) {
+        stopAfter25 = false;
+        controller.abort();
+      }
+      return result;
+    };
+    const dependencies = () => ({
+      signal: controller.signal,
+      progress: () => {},
+      model: async () => {
+        const next = turns.shift();
+        if (!next) throw new Error("No scripted two-screen turn remains");
+        return next;
+      },
+      save: async () => {},
+      execute,
+      now: () => clock,
+      wait: async (duration: number) => {
+        clock += duration;
+      },
+    });
+
+    await expect(runChatTask(task, dependencies())).rejects.toThrow("Stopped");
+    expect(chatTaskCommittedOperationCount(task)).toBe(25);
+    expect(task.lifecycle).toBe("EXECUTING_STAGE");
+    expect(mock.nodes).toHaveLength(20);
+    const firstNodeIds = mock.nodes.map(({ id }) => id);
+
+    task = ChatTaskSchema.parse(JSON.parse(JSON.stringify(task)));
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    controller = new AbortController();
+    await runChatTask(task, dependencies());
+
+    expect(task.status).toBe("completed");
+    expect(task.lifecycle).toBe("TASK_COMPLETED");
+    expect(task.stages.map(({ completed }) => completed)).toEqual([true, true]);
+    expect(task.stages[0]).toMatchObject({
+      operations: 35,
+      segments: [
+        { index: 0, mutationCount: 32, confirmedMutations: 32, status: "confirmed" },
+        { index: 1, mutationCount: 3, confirmedMutations: 3, status: "confirmed" },
+      ],
+    });
+    expect(firstNodeIds.every((id) => mock.nodes.some((node) => node.id === id))).toBe(true);
+    expect(new Set(mock.nodes.map(({ id }) => id)).size).toBe(mock.nodes.length);
+    expect(mock.find("خانه فروشگاه")).toMatchObject({
+      type: "FRAME",
+      width: 390,
+      height: 844,
+      layoutMode: "VERTICAL",
+    });
+    expect(mock.find("صفحه محصول")).toMatchObject({
+      type: "FRAME",
+      width: 390,
+      height: 844,
+      layoutMode: "VERTICAL",
+    });
+    expect(mock.find("قیمت محصول اول")).toMatchObject({
+      type: "TEXT",
+      characters: "۲٬۴۹۰٬۰۰۰ تومان",
+      textAlignHorizontal: "RIGHT",
+    });
+    expect(mock.find("برچسب دسته‌بندی")).toMatchObject({ characters: "زنانه | مردانه" });
+    expect(mock.find("متن سایز")).toMatchObject({ characters: "سایز: M" });
+    expect(mock.find("متن رنگ")).toMatchObject({ characters: "رنگ: کرم" });
+    expect(mock.find("جزئیات محصول")).toBeDefined();
+    expect(
+      mock.nodes
+        .filter((node) => node.type === "TEXT")
+        .every((node) => node.textAlignHorizontal === "RIGHT"),
+    ).toBe(true);
+
+    const purchaseButton = mock.find("خرید محصول اول")!;
+    const purchaseId = purchaseButton.id;
+    const purchaseFill = JSON.stringify(purchaseButton.fills);
+    const nodeCount = mock.nodes.length;
+    const headerFill = JSON.stringify(mock.find("هدر و ناوبری")!.fills);
+    const editBatch = await run(executor, [
+      {
+        ...operation("two-screen-edit-001", {
+          tool: "set_properties",
+          ref: "home-buy-a",
+          properties: { fill: "#EC4899" },
+        }),
+        taskId: task.id,
+      },
+    ]);
+    expect(resultFor(messages, editBatch)).toMatchObject({ success: true });
+    expect(mock.nodes).toHaveLength(nodeCount);
+    expect(mock.find("خرید محصول اول")!.id).toBe(purchaseId);
+    expect(JSON.stringify(mock.find("خرید محصول اول")!.fills)).not.toBe(purchaseFill);
+    expect(JSON.stringify(mock.find("هدر و ناوبری")!.fills)).toBe(headerFill);
   });
 
   it("executes the native harness sequence without browser encoders or Web Crypto", async () => {
@@ -887,7 +2278,13 @@ describe("safe Figma tool executor", () => {
       ]);
       expect(resultFor(messages, oversizedBatch)).toMatchObject({
         success: false,
-        results: [{ error: expect.stringContaining("64 KiB safety limit") }],
+        results: [
+          {
+            acknowledgementStatus: "rejected",
+            error: expect.stringContaining("64 KiB safety limit"),
+          },
+          { acknowledgementStatus: "not_attempted" },
+        ],
       });
       expect(mock.nodes).toHaveLength(nodeCountWithUntrackedSelection);
 
@@ -1145,6 +2542,658 @@ describe("safe Figma tool executor", () => {
     expect(button.name).toBe("Changed after interruption");
   });
 
+  it("normalizes text FILL only when the live parent cannot accept native Auto Layout sizing", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const batch = await run(executor, [
+      operation("fill-page-text-001", {
+        tool: "create_text",
+        ref: "fill-page-text",
+        name: "Page text",
+        parent: { kind: "page" },
+        text: "Root content",
+        size: { width: 140, height: 28 },
+        horizontalSizing: "FILL",
+        verticalSizing: "HUG",
+      }),
+      operation("fill-frame-parent-1", {
+        tool: "create_frame",
+        ref: "fill-frame-parent",
+        name: "Normal frame parent",
+        parent: { kind: "page" },
+        size: { width: 240, height: 120 },
+      }),
+      operation("fill-frame-text-01", {
+        tool: "create_text",
+        ref: "fill-frame-text",
+        name: "Text in normal frame",
+        parent: { kind: "node", ref: "fill-frame-parent" },
+        text: "Stretch to frame width",
+        size: { width: 120, height: 28 },
+        horizontalSizing: "FILL",
+        verticalSizing: "HUG",
+      }),
+      operation("fill-auto-parent-01", {
+        tool: "create_frame",
+        ref: "fill-auto-parent",
+        name: "Auto Layout parent",
+        parent: { kind: "page" },
+        size: { width: 240, height: 120 },
+        autoLayout: { direction: "vertical" },
+      }),
+      operation("fill-auto-text-001", {
+        tool: "create_text",
+        ref: "fill-auto-text",
+        name: "Text in Auto Layout",
+        parent: { kind: "node", ref: "fill-auto-parent" },
+        text: "Native fill is valid",
+        size: { width: 120, height: 28 },
+        horizontalSizing: "FILL",
+        verticalSizing: "HUG",
+      }),
+    ]);
+
+    expect(resultFor(messages, batch)).toMatchObject({
+      success: true,
+      results: [
+        {
+          operationId: "fill-page-text-001",
+          data: {
+            node: { type: "TEXT" },
+            compatibilityNormalizations: [
+              {
+                toolName: "create_text",
+                nodeType: "TEXT",
+                fieldPath: "action.horizontalSizing",
+                requested: "FILL",
+                applied: "FIXED",
+                reason: "page_root_uses_explicit_geometry",
+                parentType: "PAGE",
+                parentLayoutMode: "NONE",
+                resolvedDimension: 140,
+              },
+            ],
+          },
+        },
+        {},
+        {
+          operationId: "fill-frame-text-01",
+          data: {
+            compatibilityNormalizations: [
+              {
+                fieldPath: "action.horizontalSizing",
+                reason: "non_auto_layout_parent_uses_content_box",
+                parentType: "FRAME",
+                parentLayoutMode: "NONE",
+                resolvedDimension: 240,
+              },
+            ],
+          },
+        },
+        {},
+        { operationId: "fill-auto-text-001", data: { node: { type: "TEXT" } } },
+      ],
+    });
+    expect(mock.find("Page text")).toMatchObject({
+      type: "TEXT",
+      width: 140,
+      layoutSizingHorizontal: "FIXED",
+      parent: mock.page,
+    });
+    expect(mock.find("Text in normal frame")).toMatchObject({
+      type: "TEXT",
+      width: 240,
+      layoutSizingHorizontal: "FIXED",
+      textAutoResize: "HEIGHT",
+    });
+    expect(mock.find("Text in Auto Layout")).toMatchObject({
+      type: "TEXT",
+      layoutSizingHorizontal: "FILL",
+      parent: mock.find("Auto Layout parent"),
+    });
+    const statusBatch = await run(executor, [
+      operation("fill-frame-text-status", {
+        tool: "get_operation_status",
+        operationId: "fill-frame-text-01",
+      }),
+    ]);
+    expect(resultFor(messages, statusBatch)).toMatchObject({
+      success: true,
+      results: [
+        {
+          data: {
+            result: {
+              data: {
+                compatibilityNormalizations: [
+                  {
+                    parentType: "FRAME",
+                    parentLayoutMode: "NONE",
+                    resolvedDimension: 240,
+                  },
+                ],
+              },
+            },
+          },
+        },
+      ],
+    });
+
+    const component = mock.api.createComponent() as unknown as MockNode;
+    component.name = "Component parent";
+    component.resize(180, 72);
+    mock.page.selection = [component];
+    const inspectBatch = await run(executor, [
+      operation("fill-component-inspect", {
+        tool: "inspect_nodes",
+        refs: [],
+        selection: true,
+        depth: 0,
+        maxNodes: 1,
+      }),
+    ]);
+    const inspectResult = resultFor(messages, inspectBatch);
+    if (inspectResult?.type !== "tool-result") throw new Error("Missing component inspection.");
+    const componentRef = inspectResult.results[0]?.data?.nodes;
+    if (!Array.isArray(componentRef) || typeof componentRef[0]?.ref !== "string")
+      throw new Error("Component inspection did not return a stable ref.");
+    const componentLayout = await run(executor, [
+      operation("fill-component-layout", {
+        tool: "set_auto_layout",
+        ref: componentRef[0].ref,
+        layout: { direction: "horizontal" },
+      }),
+    ]);
+    expect(resultFor(messages, componentLayout)).toMatchObject({ success: true });
+    const componentTextBatch = await run(executor, [
+      operation("fill-component-text", {
+        tool: "create_text",
+        ref: "fill-component-text",
+        name: "Text in component",
+        parent: { kind: "node", ref: componentRef[0].ref },
+        text: "Component fill",
+        size: { width: 100, height: 24 },
+        horizontalSizing: "FIXED",
+        verticalSizing: "FILL",
+      }),
+    ]);
+    expect(resultFor(messages, componentTextBatch)).toMatchObject({ success: true });
+    expect(mock.find("Text in component")).toMatchObject({
+      type: "TEXT",
+      layoutSizingVertical: "FILL",
+      parent: component,
+    });
+
+    const detachedParentBatch = await run(executor, [
+      operation("fill-detached-parent", {
+        tool: "create_frame",
+        ref: "fill-detached-parent",
+        name: "Detached parent",
+        parent: { kind: "page" },
+        size: { width: 160, height: 80 },
+      }),
+    ]);
+    expect(resultFor(messages, detachedParentBatch)).toMatchObject({ success: true });
+    mock.find("Detached parent")!.remove();
+    const activeNodeCount = mock.nodes.filter((node) => !node.removed).length;
+    const detachedTextBatch = await run(executor, [
+      operation("fill-detached-text", {
+        tool: "create_text",
+        ref: "fill-detached-text",
+        name: "Must not be created",
+        parent: { kind: "node", ref: "fill-detached-parent" },
+        text: "No stale parent",
+        size: { width: 100, height: 24 },
+        horizontalSizing: "FILL",
+      }),
+    ]);
+    expect(resultFor(messages, detachedTextBatch)).toMatchObject({
+      success: false,
+      results: [
+        { acknowledgementStatus: "rejected", data: { referenceResolution: { code: "stale" } } },
+      ],
+    });
+    expect(mock.nodes.filter((node) => !node.removed)).toHaveLength(activeNodeCount);
+  });
+
+  it("migrates v1 executor state to v2 without losing nodes and supports a reversible v1 export", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const created = await run(executor, [
+      operation("migration-create-001", {
+        tool: "create_text",
+        ref: "migration-text",
+        name: "Migration text",
+        parent: { kind: "page" },
+        text: "Preserve native node",
+        size: { width: 160, height: 28 },
+        horizontalSizing: "FILL",
+      }),
+    ]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const nodeId = mock.find("Migration text")?.id;
+    expect(nodeId).toBeDefined();
+
+    const entry = [...mock.storage.entries()].find(([key]) => key.includes("fad.figma-tools.v1"));
+    if (!entry) throw new Error("Executor did not persist its state.");
+    const [storageKey, currentState] = entry;
+    expect(currentState).toMatchObject({ version: 2 });
+    const legacyState = downgradeStoredToolStateForRollback(currentState);
+    expect(legacyState).toMatchObject({ version: 1 });
+    expect(legacyState.operations["migration-create-001"]?.result?.data ?? {}).not.toHaveProperty(
+      "compatibilityNormalizations",
+    );
+    mock.storage.set(storageKey, legacyState);
+
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const status = await run(executor, [
+      operation("migration-status-001", {
+        tool: "get_operation_status",
+        operationId: "migration-create-001",
+      }),
+    ]);
+    expect(resultFor(messages, status)).toMatchObject({ success: true });
+    expect(mock.storage.get(storageKey)).toMatchObject({ version: 2 });
+    expect(mock.find("Migration text")?.id).toBe(nodeId);
+    expect(mock.nodes.filter((node) => !node.removed)).toHaveLength(1);
+  });
+
+  it("reconciles a failed-ambiguous creation to its original native node without duplicating it", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const api = mock.api as unknown as { commitUndo: () => void };
+    const commitUndo = api.commitUndo;
+    let loseFirstAcknowledgement = true;
+    api.commitUndo = () => {
+      if (loseFirstAcknowledgement) {
+        loseFirstAcknowledgement = false;
+        throw new Error("Simulated post-mutation acknowledgement loss");
+      }
+      commitUndo();
+    };
+    const create = operation("ambiguous-create-001", {
+      tool: "create_frame",
+      ref: "ambiguous-created-frame",
+      name: "Original native frame",
+      parent: { kind: "page" },
+      size: { width: 240, height: 120 },
+    });
+
+    const interrupted = await run(executor, [create]);
+    const original = mock.find("Original native frame");
+    if (!original) throw new Error("The simulated interruption did not leave the native node.");
+    expect(resultFor(messages, interrupted)).toMatchObject({
+      success: false,
+      partialOperationIds: ["ambiguous-create-001"],
+      results: [{ acknowledgementStatus: "ambiguous" }],
+    });
+    const originalId = original.id;
+
+    const resumed = await run(executor, [create]);
+    expect(resultFor(messages, resumed)).toMatchObject({
+      success: true,
+      results: [
+        {
+          success: true,
+          replayed: true,
+          acknowledgementStatus: "confirmed_mutation",
+          logicalRef: "ambiguous-created-frame",
+        },
+      ],
+    });
+    expect(mock.find("Original native frame")?.id).toBe(originalId);
+    expect(mock.nodes.filter((node) => !node.removed)).toHaveLength(1);
+  });
+
+  it("centralizes incompatible target, parent, property, and local-style rejection before writes", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const created = await run(executor, [
+      operation("compat-target-0001", {
+        tool: "create_rectangle",
+        ref: "compat-target",
+        name: "Compatibility target",
+        parent: { kind: "page" },
+        size: { width: 100, height: 40 },
+      }),
+    ]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const nodeCount = mock.nodes.filter((node) => !node.removed).length;
+
+    const layoutBatch = await run(executor, [
+      operation("compat-layout-bad01", {
+        tool: "set_auto_layout",
+        ref: "compat-target",
+        layout: { direction: "vertical" },
+      }),
+    ]);
+    const propertyBatch = await run(executor, [
+      operation("compat-property-bad", {
+        tool: "set_properties",
+        ref: "compat-target",
+        properties: { text: "not editable text" },
+      }),
+    ]);
+    const styleBatch = await run(executor, [
+      operation("compat-style-bad-01", {
+        tool: "create_rectangle",
+        ref: "compat-style-missing",
+        name: "Must not be created",
+        parent: { kind: "page" },
+        size: { width: 20, height: 20 },
+        paintStyleId: "missing-local-paint-token",
+      }),
+    ]);
+    const parentBatch = await run(executor, [
+      operation("compat-parent-bad01", {
+        tool: "create_frame",
+        ref: "compat-parented-frame",
+        name: "Must not be created",
+        parent: { kind: "node", ref: "compat-target" },
+        size: { width: 20, height: 20 },
+      }),
+    ]);
+    expect(resultFor(messages, layoutBatch)).toMatchObject({
+      success: false,
+      results: [
+        {
+          acknowledgementStatus: "rejected",
+          data: { compatibilityFailure: { code: "unsupported_target_type" } },
+        },
+      ],
+    });
+    expect(resultFor(messages, propertyBatch)).toMatchObject({
+      success: false,
+      results: [
+        {
+          acknowledgementStatus: "rejected",
+          data: {
+            compatibilityFailure: {
+              code: "unsupported_property",
+              fieldPath: "action.properties.text",
+            },
+          },
+        },
+      ],
+    });
+    expect(resultFor(messages, styleBatch)).toMatchObject({
+      success: false,
+      results: [
+        {
+          acknowledgementStatus: "rejected",
+          data: {
+            compatibilityFailure: {
+              code: "style_not_found",
+              fieldPath: "action.paintStyleId",
+            },
+          },
+        },
+      ],
+    });
+    expect(resultFor(messages, parentBatch)).toMatchObject({
+      success: false,
+      results: [
+        {
+          acknowledgementStatus: "rejected",
+          data: {
+            compatibilityFailure: {
+              code: "unsupported_parent_type",
+              fieldPath: "action.parent",
+            },
+          },
+        },
+      ],
+    });
+    expect(mock.nodes.filter((node) => !node.removed)).toHaveLength(nodeCount);
+  });
+
+  it("maps non-layout HUG to editable text auto-resize and rejects incompatible axes without a native mutation", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const hugBatch = await run(executor, [
+      operation("text-hug-normalize", {
+        tool: "create_text",
+        ref: "text-hug",
+        name: "Hugging text",
+        parent: { kind: "page" },
+        text: "Native editable text",
+        size: { width: 120, height: 28 },
+        horizontalSizing: "HUG",
+        verticalSizing: "HUG",
+      }),
+    ]);
+    expect(resultFor(messages, hugBatch)).toMatchObject({
+      success: true,
+      results: [
+        {
+          data: {
+            compatibilityNormalizations: [
+              {
+                fieldPath: "action.textAutoResize",
+                requested: "HEIGHT",
+                applied: "WIDTH_AND_HEIGHT",
+                reason: "hug_sizing_uses_native_text_resize",
+                parentType: "PAGE",
+                parentLayoutMode: "NONE",
+              },
+            ],
+          },
+        },
+      ],
+    });
+    expect(mock.find("Hugging text")).toMatchObject({
+      type: "TEXT",
+      textAutoResize: "WIDTH_AND_HEIGHT",
+    });
+
+    const before = mock.nodes.filter((node) => !node.removed).length;
+    const incompatible = await run(executor, [
+      operation("text-hug-fixed-conflict", {
+        tool: "create_text",
+        ref: "text-hug-conflict",
+        name: "Incompatible sizing",
+        parent: { kind: "page" },
+        text: "Must not be created",
+        size: { width: 120, height: 28 },
+        horizontalSizing: "HUG",
+        verticalSizing: "FIXED",
+      }),
+    ]);
+    expect(resultFor(messages, incompatible)).toMatchObject({
+      success: false,
+      committedOperationIds: [],
+      results: [
+        {
+          acknowledgementStatus: "rejected",
+          data: {
+            compatibilityFailure: {
+              code: "text_sizing_requires_auto_layout",
+              fieldPath: "action.horizontalSizing",
+              nodeType: "TEXT",
+              parentType: "PAGE",
+              parentLayoutMode: "NONE",
+              permittedRemediations: ["establish_auto_layout_before_creation"],
+            },
+          },
+        },
+      ],
+    });
+    expect(mock.nodes.filter((node) => !node.removed)).toHaveLength(before);
+  });
+
+  it("runs root-text FILL through the task runner, plugin protocol adapter and native executor", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const turn = (
+      name: string,
+      args: Record<string, unknown>,
+      callId: string,
+    ): Extract<AuthorizedChatTurn, { kind: "tool_calls" }> => {
+      const calls = parseResponsesFunctionCalls([
+        {
+          type: "function_call",
+          call_id: callId,
+          name,
+          arguments: JSON.stringify(args),
+        },
+      ]);
+      return {
+        kind: "tool_calls",
+        calls,
+        functionCallItems: calls.map((call) => call.functionCall),
+        text: "",
+      };
+    };
+    const turns: AuthorizedChatTurn[] = [
+      turn(
+        "create_text",
+        {
+          ref: "runner-fill-text",
+          name: "Runner-created root text",
+          parent: { kind: "page" },
+          text: "Persian RTL content",
+          size: { width: 210, height: 32 },
+          direction: "RTL",
+          horizontalSizing: "FILL",
+          verticalSizing: "HUG",
+        },
+        "fill_runner_create_0001",
+      ),
+      turn(
+        "complete_canvas_stage",
+        { summary: "Required native text is complete." },
+        "fill_runner_complete_01",
+      ),
+      { kind: "done", text: "The requested editable text is ready." },
+    ];
+    const task = ChatTaskSchema.parse({
+      version: 1,
+      id: "fill-runner-test-01",
+      referenceScope: "task-v1",
+      documentId: "file-test-56-page_current",
+      prompt: "Create one editable root text node.",
+      lifecycle: "EXECUTING_STAGE",
+      context: [],
+      stages: [
+        {
+          title: "Editable text",
+          goal: "Create the requested native text layer.",
+          logicalRefs: ["runner-fill-text"],
+          completionCriteria: ["The text layer exists as editable native text."],
+          completed: false,
+          operations: 0,
+          rounds: 0,
+        },
+      ],
+      ledger: [],
+      pending: [],
+      recent: [],
+      starts: [],
+      rounds: 0,
+      status: "ready",
+      text: "",
+    });
+    let batchNumber = 0;
+    await runChatTask(task, {
+      signal: new AbortController().signal,
+      model: async () => {
+        const next = turns.shift();
+        if (!next) throw new Error("Missing scripted FILL integration turn.");
+        return next;
+      },
+      save: async () => {},
+      progress: () => {},
+      execute: async (operations) => {
+        const request = UIToPluginSchema.parse({
+          type: "tool-execute",
+          protocolVersion: 1,
+          batchId: `fill-runner-batch-${++batchNumber}`,
+          operations,
+        });
+        if (request.type !== "tool-execute") throw new Error("Invalid adapter request.");
+        await executor(request);
+        const result = resultFor(messages, request.batchId);
+        if (result?.type !== "tool-result") throw new Error("Missing executor acknowledgement.");
+        return result;
+      },
+    });
+
+    expect(task.status).toBe("completed");
+    expect(task.lifecycle).toBe("TASK_COMPLETED");
+    expect(task.stages[0]?.completed).toBe(true);
+    expect(chatTaskCommittedOperationCount(task)).toBe(1);
+    expect(mock.find("Runner-created root text")).toMatchObject({
+      type: "TEXT",
+      width: 210,
+      textAlignHorizontal: "RIGHT",
+      layoutSizingHorizontal: "FIXED",
+      parent: mock.page,
+    });
+    expect(task.ledger.find((entry) => entry.call.action.tool === "create_text")?.output).toContain(
+      "page_root_uses_explicit_geometry",
+    );
+  });
+
+  it("uses the parent layout mode at native dispatch time after font loading", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const parentBatch = await run(executor, [
+      operation("fill-late-parent", {
+        tool: "create_frame",
+        ref: "fill-late-parent",
+        name: "Late Auto Layout parent",
+        parent: { kind: "page" },
+        size: { width: 220, height: 90 },
+      }),
+    ]);
+    expect(resultFor(messages, parentBatch)).toMatchObject({ success: true });
+    const parent = mock.find("Late Auto Layout parent")!;
+    const originalLoadFont = mock.api.loadFontAsync.bind(mock.api);
+    let changedLayout = false;
+    (mock.api as unknown as { loadFontAsync: (font: FontName) => Promise<void> }).loadFontAsync =
+      async (font) => {
+        if (!changedLayout) {
+          changedLayout = true;
+          parent.layoutMode = "VERTICAL";
+        }
+        await originalLoadFont(font);
+      };
+
+    const textBatch = await run(executor, [
+      operation("fill-late-text", {
+        tool: "create_text",
+        ref: "fill-late-text",
+        name: "Text after parent layout change",
+        parent: { kind: "node", ref: "fill-late-parent" },
+        text: "Layout changed while font loaded",
+        size: { width: 100, height: 24 },
+        horizontalSizing: "FILL",
+        verticalSizing: "HUG",
+      }),
+    ]);
+    expect(resultFor(messages, textBatch)).toMatchObject({
+      success: true,
+      results: [
+        {
+          acknowledgementStatus: "confirmed_mutation",
+          data: { node: { type: "TEXT" } },
+        },
+      ],
+    });
+    expect(mock.find("Text after parent layout change")).toMatchObject({
+      type: "TEXT",
+      layoutSizingHorizontal: "FILL",
+      parent,
+    });
+    expect(mock.find("Late Auto Layout parent")?.layoutMode).toBe("VERTICAL");
+  });
+
   it("normalizes nested mixed Auto Layout sizing and rejects stretch conflicts only after deterministic local repair", async () => {
     const mock = createMockApi();
     const messages: PluginToUIMessage[] = [];
@@ -1300,6 +3349,391 @@ describe("safe Figma tool executor", () => {
     expect(existing.fills).toEqual([
       { type: "SOLID", color: { r: 15 / 255, g: 118 / 255, b: 110 / 255 } },
     ]);
+  });
+
+  it("appends a root node, verifies same-parent replays, and preserves native identity", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const created = await run(executor, [
+      operation("parent-root-0001", {
+        tool: "create_frame",
+        ref: "parent-target",
+        name: "Target frame",
+        parent: { kind: "page" },
+        size: { width: 300, height: 300 },
+      }),
+      operation("parent-child-0001", {
+        tool: "create_text",
+        ref: "parent-child",
+        name: "Editable label",
+        parent: { kind: "page" },
+        text: "متن قابل ویرایش",
+        size: { width: 180, height: 32 },
+      }),
+    ]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const child = mock.find("Editable label")!;
+    const parent = mock.find("Target frame")!;
+    const nodeCount = mock.nodes.length;
+    const append = operation("append-root-child-01", {
+      tool: "append_child",
+      childRef: "parent-child",
+      parentRef: "parent-target",
+    });
+    const appended = await run(executor, [append]);
+    expect(resultFor(messages, appended)).toMatchObject({
+      success: true,
+      committedOperationIds: [append.operationId],
+      results: [
+        {
+          acknowledgementStatus: "confirmed_mutation",
+          data: {
+            parenting: {
+              decision: "appended",
+              sourceParentCategory: "page_root",
+              expectedParentCategory: "frame",
+              actualParentCategory: "frame",
+            },
+          },
+        },
+      ],
+    });
+    expect(child.parent).toBe(parent);
+
+    const repeated = await run(executor, [
+      operation("append-same-parent-01", {
+        tool: "append_child",
+        childRef: "parent-child",
+        parentRef: "parent-target",
+      }),
+    ]);
+    expect(resultFor(messages, repeated)).toMatchObject({
+      success: true,
+      committedOperationIds: [],
+      results: [
+        {
+          success: true,
+          replayed: true,
+          acknowledgementStatus: "verified_idempotent_replay",
+          data: { reused: true, parenting: { decision: "already_parented" } },
+        },
+      ],
+    });
+    expect(child.parent).toBe(parent);
+    expect(child.characters).toBe("متن قابل ویرایش");
+    expect(mock.nodes).toHaveLength(nodeCount);
+  });
+
+  it("rejects implicit cross-parent appends and requires a fresh explicit reparent after a stale move", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const created = await run(executor, [
+      operation("move-parent-a-001", {
+        tool: "create_frame",
+        ref: "move-parent-a",
+        name: "Parent A",
+        parent: { kind: "page" },
+        size: { width: 300, height: 300 },
+      }),
+      operation("move-parent-b-001", {
+        tool: "create_frame",
+        ref: "move-parent-b",
+        name: "Parent B",
+        parent: { kind: "page" },
+        size: { width: 300, height: 300 },
+      }),
+      operation("move-child-native1", {
+        tool: "create_text",
+        ref: "move-child",
+        name: "User copy",
+        parent: { kind: "node", ref: "move-parent-a" },
+        text: "Keep this exact copy",
+        size: { width: 180, height: 32 },
+      }),
+    ]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const child = mock.find("User copy")!;
+    const parentA = mock.find("Parent A")!;
+    const parentB = mock.find("Parent B")!;
+    const implicitMove = await run(executor, [
+      operation("implicit-move-0001", {
+        tool: "append_child",
+        childRef: "move-child",
+        parentRef: "move-parent-b",
+      }),
+    ]);
+    expect(resultFor(messages, implicitMove)).toMatchObject({
+      success: false,
+      committedOperationIds: [],
+      results: [
+        {
+          acknowledgementStatus: "rejected",
+          data: { parenting: { decision: "rejected_non_root", actualParentCategory: "frame" } },
+        },
+      ],
+    });
+    expect(child.parent).toBe(parentA);
+
+    const explicitMove = await run(executor, [
+      operation("explicit-move-0001", {
+        tool: "reparent_node",
+        ref: "move-child",
+        parentRef: "move-parent-b",
+      }),
+    ]);
+    expect(resultFor(messages, explicitMove)).toMatchObject({
+      success: true,
+      committedOperationIds: ["explicit-move-0001"],
+      results: [
+        {
+          acknowledgementStatus: "confirmed_mutation",
+          data: { parenting: { decision: "reparented" } },
+        },
+      ],
+    });
+    expect(child.parent).toBe(parentB);
+    expect(child.characters).toBe("Keep this exact copy");
+
+    parentA.appendChild(child);
+    const staleReparent = await run(executor, [
+      operation("stale-move-attempt1", {
+        tool: "reparent_node",
+        ref: "move-child",
+        parentRef: "move-parent-b",
+      }),
+    ]);
+    expect(resultFor(messages, staleReparent)).toMatchObject({
+      success: false,
+      results: [
+        {
+          acknowledgementStatus: "ambiguous",
+          data: { parenting: { decision: "rejected_stale_or_ambiguous" } },
+        },
+      ],
+    });
+    expect(child.parent).toBe(parentA);
+    const inspected = await run(executor, [
+      operation("stale-move-inspect1", {
+        tool: "inspect_nodes",
+        refs: ["move-child"],
+        selection: false,
+      }),
+    ]);
+    expect(resultFor(messages, inspected)).toMatchObject({ success: true });
+    const authorizedMove = await run(executor, [
+      operation("fresh-move-attempt1", {
+        tool: "reparent_node",
+        ref: "move-child",
+        parentRef: "move-parent-b",
+      }),
+    ]);
+    expect(resultFor(messages, authorizedMove)).toMatchObject({ success: true });
+    expect(child.parent).toBe(parentB);
+  });
+
+  it("reconciles an append committed before its acknowledgement was saved, after executor reload", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const created = await run(executor, [
+      operation("lost-ack-parent-01", {
+        tool: "create_frame",
+        ref: "lost-ack-parent",
+        name: "Lost acknowledgement parent",
+        parent: { kind: "page" },
+        size: { width: 300, height: 300 },
+      }),
+      operation("lost-ack-child-001", {
+        tool: "create_rectangle",
+        ref: "lost-ack-child",
+        name: "Existing native shape",
+        parent: { kind: "page" },
+        size: { width: 100, height: 80 },
+        fill: "#0F766E",
+      }),
+    ]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const child = mock.find("Existing native shape")!;
+    const parent = mock.find("Lost acknowledgement parent")!;
+    const operationId = "lost-append-ack-01";
+    const append = operation(operationId, {
+      tool: "append_child",
+      childRef: "lost-ack-child",
+      parentRef: "lost-ack-parent",
+    });
+    const clientStorage = mock.api.clientStorage as unknown as {
+      setAsync: (key: string, value: unknown) => Promise<void>;
+    };
+    const save = clientStorage.setAsync.bind(clientStorage);
+    let failCompletedSave = true;
+    clientStorage.setAsync = async (key, value) => {
+      const state = value as { operations?: Record<string, { status?: string }> };
+      if (failCompletedSave && state.operations?.[operationId]?.status === "completed") {
+        failCompletedSave = false;
+        throw new Error("Simulated lost acknowledgement checkpoint");
+      }
+      await save(key, value);
+    };
+    const interrupted = await run(executor, [append]);
+    expect(resultFor(messages, interrupted)).toMatchObject({
+      success: false,
+      partialOperationIds: [operationId],
+      results: [
+        {
+          acknowledgementStatus: "ambiguous",
+          data: { parenting: { decision: "native_error" } },
+        },
+      ],
+    });
+    expect(child.parent).toBe(parent);
+
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const resumed = await run(executor, [append]);
+    expect(resultFor(messages, resumed)).toMatchObject({
+      success: true,
+      committedOperationIds: [operationId],
+      results: [
+        {
+          replayed: true,
+          acknowledgementStatus: "confirmed_mutation",
+          data: { parenting: { decision: "reconciled_commit" } },
+        },
+      ],
+    });
+    expect(child.parent).toBe(parent);
+    expect(mock.nodes).toHaveLength(2);
+  });
+
+  it("accounts for mixed partial parenting batches and explicit not-attempted operations", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const created = await run(executor, [
+      operation("mixed-parent-0001", {
+        tool: "create_frame",
+        ref: "mixed-parent",
+        name: "Mixed batch parent",
+        parent: { kind: "page" },
+        size: { width: 300, height: 300 },
+      }),
+      operation("mixed-other-00001", {
+        tool: "create_frame",
+        ref: "mixed-other",
+        name: "Other parent",
+        parent: { kind: "page" },
+        size: { width: 200, height: 200 },
+      }),
+      operation("mixed-root-child1", {
+        tool: "create_rectangle",
+        ref: "mixed-root-child",
+        name: "Root child",
+        parent: { kind: "page" },
+        size: { width: 40, height: 40 },
+        fill: "#123456",
+      }),
+      operation("mixed-nested-child1", {
+        tool: "create_rectangle",
+        ref: "mixed-nested-child",
+        name: "Nested child",
+        parent: { kind: "node", ref: "mixed-other" },
+        size: { width: 40, height: 40 },
+        fill: "#654321",
+      }),
+    ]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const rootChild = mock.find("Root child")!;
+    const nestedChild = mock.find("Nested child")!;
+    const parent = mock.find("Mixed batch parent")!;
+    const originalNestedParent = nestedChild.parent;
+    const first = operation("mixed-append-root01", {
+      tool: "append_child",
+      childRef: "mixed-root-child",
+      parentRef: "mixed-parent",
+    });
+    const second = operation("mixed-append-nested1", {
+      tool: "append_child",
+      childRef: "mixed-nested-child",
+      parentRef: "mixed-parent",
+    });
+    const third = operation("mixed-after-fail01", {
+      tool: "set_properties",
+      ref: "mixed-parent",
+      properties: { name: "Must remain untouched" },
+    });
+    const batch = await run(executor, [first, second, third]);
+    expect(resultFor(messages, batch)).toMatchObject({
+      success: false,
+      committedOperationIds: [first.operationId],
+      partialOperationIds: [],
+      results: [
+        {
+          operationId: first.operationId,
+          success: true,
+          acknowledgementStatus: "confirmed_mutation",
+        },
+        { operationId: second.operationId, success: false, acknowledgementStatus: "rejected" },
+        { operationId: third.operationId, success: false, acknowledgementStatus: "not_attempted" },
+      ],
+    });
+    expect(rootChild.parent).toBe(parent);
+    expect(nestedChild.parent).toBe(originalNestedParent);
+    expect(parent.name).toBe("Mixed batch parent");
+  });
+
+  it("reports stale and ambiguous logical refs in structured parenting diagnostics", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const created = await run(executor, [
+      operation("ambiguous-parent01", {
+        tool: "create_frame",
+        ref: "ambiguous-parent",
+        name: "Parent",
+        parent: { kind: "page" },
+        size: { width: 200, height: 200 },
+      }),
+      operation("ambiguous-child001", {
+        tool: "create_rectangle",
+        ref: "ambiguous-child",
+        name: "Child",
+        parent: { kind: "page" },
+        size: { width: 40, height: 40 },
+        fill: "#123456",
+      }),
+    ]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const child = mock.find("Child")!;
+    const duplicate = mock.api.createFrame() as unknown as MockNode;
+    duplicate.setPluginData(
+      "fad.tool.logical-ref.v1",
+      child.getPluginData("fad.tool.logical-ref.v1"),
+    );
+    const ambiguous = await run(executor, [
+      operation("append-ambiguous-01", {
+        tool: "append_child",
+        childRef: "ambiguous-child",
+        parentRef: "ambiguous-parent",
+      }),
+    ]);
+    expect(resultFor(messages, ambiguous)).toMatchObject({
+      success: false,
+      results: [
+        {
+          acknowledgementStatus: "rejected",
+          data: {
+            referenceResolution: { code: "ambiguous" },
+            parenting: {
+              sourceLogicalRef: "ambiguous-child",
+              targetLogicalRef: "ambiguous-parent",
+              decision: "rejected_stale_or_ambiguous",
+            },
+          },
+        },
+      ],
+    });
+    expect(child.parent).toBe(mock.page);
   });
 
   it("rejects stale refs, invalid parents and reparent cycles without moving unrelated content", async () => {

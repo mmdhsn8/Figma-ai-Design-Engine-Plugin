@@ -821,6 +821,7 @@ describe("Figma UI companion client", () => {
         requestId,
         "account-model",
         input,
+        "UNPLANNED",
         fetcher,
         undefined,
         (delta) => deltas.push(delta),
@@ -838,6 +839,7 @@ describe("Figma UI companion client", () => {
       requestId,
       model: "account-model",
       input,
+      lifecycle: "UNPLANNED",
     });
     expect(JSON.parse(JSON.stringify([...input, functionCall, functionCallOutput])).at(-1)).toEqual(
       functionCallOutput,
@@ -872,6 +874,7 @@ describe("Figma UI companion client", () => {
         requestId,
         "account-model",
         [{ role: "user", content: "Create a card" }],
+        "UNPLANNED",
         fetcher,
       ),
     ).resolves.toEqual({ kind: "tool_validation", issues });
@@ -913,6 +916,7 @@ describe("Figma UI companion client", () => {
         requestId,
         "account-model",
         [{ role: "user", content: "Inspect" }],
+        "UNPLANNED",
         fetcher,
       ),
     ).rejects.toMatchObject({ category: "response_invalid" });
@@ -944,6 +948,7 @@ describe("Figma UI companion client", () => {
         requestId,
         "account-model",
         [{ role: "user", content: "Say hello" }],
+        "UNPLANNED",
         fetcher,
         undefined,
         (delta) => deltas.push(delta),
@@ -994,6 +999,7 @@ describe("Figma UI companion client", () => {
         requestId,
         "account-model",
         [{ role: "user", content: "Create a page." }],
+        "UNPLANNED",
         fetcher,
       ),
     ).rejects.toMatchObject({
@@ -1006,6 +1012,99 @@ describe("Figma UI companion client", () => {
         chatState: "incomplete",
       },
     });
+  });
+
+  it("distinguishes local network interruption from a clean SSE EOF", async () => {
+    const requestId = "chat-network-fail-01";
+    const input = [{ role: "user" as const, content: "Continue the saved stage." }];
+    const interrupted = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("private socket detail");
+    });
+    const interruption = await streamAuthorizedChat(
+      "session-bearer",
+      requestId,
+      "account-model",
+      input,
+      "EXECUTING_STAGE",
+      interrupted,
+    ).catch((error: unknown) => error);
+    expect(interruption).toMatchObject({
+      category: "connection_failed",
+      diagnostic: {
+        requestId,
+        requestPhase: "companion_http",
+        terminationReason: "local_network_interruption",
+        outcome: "transport_error",
+      },
+    });
+    expect(JSON.stringify(interruption)).not.toContain("private socket detail");
+
+    const eof = vi.fn<typeof fetch>(
+      async () =>
+        new Response("", {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "X-FAD-Request-Id": requestId,
+            "X-FAD-Model": "account-model",
+          },
+        }),
+    );
+    await expect(
+      streamAuthorizedChat(
+        "session-bearer",
+        requestId,
+        "account-model",
+        input,
+        "EXECUTING_STAGE",
+        eof,
+      ),
+    ).rejects.toMatchObject({
+      category: "response_incomplete",
+      diagnostic: {
+        requestId,
+        requestPhase: "companion_sse",
+        terminationReason: "stream_eof",
+        outcome: "stream_ended_without_terminal",
+      },
+    });
+  });
+
+  it("propagates user cancellation through the SSE reader without retrying", async () => {
+    const requestId = "chat-user-stop-01";
+    const controller = new AbortController();
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response(new ReadableStream<Uint8Array>({}), {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "X-FAD-Request-Id": requestId,
+            "X-FAD-Model": "account-model",
+          },
+        }),
+    );
+    const pending = streamAuthorizedChat(
+      "session-bearer",
+      requestId,
+      "account-model",
+      [{ role: "user", content: "Continue the saved stage." }],
+      "EXECUTING_STAGE",
+      fetcher,
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({
+      category: "request_cancelled",
+      diagnostic: {
+        requestId,
+        requestPhase: "companion_sse",
+        terminationReason: "user_cancelled",
+        outcome: "cancelled",
+      },
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("rejects oversized local companion responses before parsing them", async () => {

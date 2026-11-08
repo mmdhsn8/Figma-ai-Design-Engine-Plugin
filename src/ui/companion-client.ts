@@ -8,6 +8,7 @@ import {
   ChatFunctionCallValidationIssueSchema,
   ChatFunctionCallSchema,
   ChatInputItemSchema,
+  type ChatLifecycleState,
   type ChatFunctionCall,
   type ChatFunctionCallValidationIssue,
   type ChatInputItem,
@@ -63,6 +64,35 @@ const ModelSchema = z
 const ModelListSchema = z.object({ models: z.array(ModelSchema).max(100) }).passthrough();
 export const InferenceDiagnosticSchema = z
   .object({
+    requestId: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{8,100}$/u)
+      .optional(),
+    requestStartedAtMs: z.number().int().nonnegative().optional(),
+    lastEventAtMs: z.number().int().nonnegative().optional(),
+    requestPhase: z
+      .enum(["upstream_headers", "upstream_stream", "companion_http", "companion_sse"])
+      .optional(),
+    terminationReason: z
+      .enum([
+        "upstream_inactivity",
+        "upstream_header_timeout",
+        "overall_deadline",
+        "local_network_interruption",
+        "upstream_transport_interruption",
+        "user_cancelled",
+        "http_failure",
+        "stream_eof",
+        "response_completed",
+        "upstream_response_failed",
+        "upstream_response_incomplete",
+        "invalid_event",
+        "transport_error",
+      ])
+      .optional(),
+    timeoutSource: z
+      .enum(["upstream_headers", "upstream_inactivity", "overall_deadline"])
+      .optional(),
     model: z
       .string()
       .min(1)
@@ -514,18 +544,41 @@ export async function streamAuthorizedChat(
   requestId: string,
   model: string,
   input: ChatInputItem[],
+  lifecycle: ChatLifecycleState,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
   onDelta?: (delta: string) => void,
   onProgress?: (elapsedMs: number) => void,
 ): Promise<AuthorizedChatTurn> {
-  const response = await fetchResponse(
-    "/v1/chat",
-    token,
-    { requestId, model, input },
-    fetcher,
-    signal,
-  );
+  const startedAt = performance.now();
+  const requestStartedAtMs = Date.now();
+  let response: Response;
+  try {
+    response = await fetchResponse(
+      "/v1/chat",
+      token,
+      { requestId, model, input, lifecycle },
+      fetcher,
+      signal,
+    );
+  } catch (error) {
+    if (error instanceof CompanionClientError && error.diagnostic) throw error;
+    const cancelled =
+      signal?.aborted ||
+      (error instanceof CompanionClientError && error.category === "request_cancelled");
+    throw new CompanionClientError(
+      cancelled ? "request_cancelled" : "connection_failed",
+      chatTransportDiagnostic(
+        requestId,
+        model,
+        requestStartedAtMs,
+        startedAt,
+        "companion_http",
+        cancelled ? "user_cancelled" : "local_network_interruption",
+        cancelled ? "cancelled" : "transport_error",
+      ),
+    );
+  }
   if (!response.ok) {
     const body = await readLimitedJson(response, signal);
     throwResponseError(body);
@@ -538,12 +591,24 @@ export async function streamAuthorizedChat(
     await response.body?.cancel().catch(() => undefined);
     throw new CompanionClientError("response_incomplete");
   }
-  return readAuthorizedChatStream(response, requestId, signal, onDelta, onProgress);
+  return readAuthorizedChatStream(
+    response,
+    requestId,
+    model,
+    startedAt,
+    requestStartedAtMs,
+    signal,
+    onDelta,
+    onProgress,
+  );
 }
 
 async function readAuthorizedChatStream(
   response: Response,
   requestId: string,
+  model: string,
+  startedAt: number,
+  requestStartedAtMs: number,
   signal?: AbortSignal,
   onDelta?: (delta: string) => void,
   onProgress?: (elapsedMs: number) => void,
@@ -590,6 +655,12 @@ async function readAuthorizedChatStream(
           requestId: z.string(),
           elapsedMs: z.number().int().nonnegative(),
           eventCount: z.number().int().nonnegative(),
+          requestPhase: z.enum(["upstream_headers", "upstream_stream"]).optional(),
+          lastEvent: z
+            .string()
+            .regex(/^[A-Za-z0-9_.-]{1,100}$/u)
+            .optional(),
+          lastEventAtMs: z.number().int().nonnegative().optional(),
         })
         .strict()
         .safeParse(payload);
@@ -669,6 +740,8 @@ async function readAuthorizedChatStream(
         .strict()
         .safeParse(payload);
       if (!parsed.success) throw new CompanionClientError("response_invalid");
+      if (parsed.data.diagnostic?.requestId && parsed.data.diagnostic.requestId !== requestId)
+        throw new CompanionClientError("response_invalid");
       throw new CompanionClientError(
         mapError(parsed.data.error),
         parsed.data.diagnostic,
@@ -680,7 +753,19 @@ async function readAuthorizedChatStream(
   };
   try {
     while (true) {
-      if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+      if (signal?.aborted)
+        throw new CompanionClientError(
+          "request_cancelled",
+          chatTransportDiagnostic(
+            requestId,
+            model,
+            requestStartedAtMs,
+            startedAt,
+            "companion_sse",
+            "user_cancelled",
+            "cancelled",
+          ),
+        );
       const { done, value } = await reader.read();
       if (done) break;
       bytes += value.byteLength;
@@ -700,13 +785,47 @@ async function readAuthorizedChatStream(
       const terminal = processFrame(buffer);
       if (terminal) return terminal;
     }
-    if (signal?.aborted) throw new CompanionClientError("request_cancelled");
-    throw new CompanionClientError("response_incomplete");
+    if (signal?.aborted)
+      throw new CompanionClientError(
+        "request_cancelled",
+        chatTransportDiagnostic(
+          requestId,
+          model,
+          requestStartedAtMs,
+          startedAt,
+          "companion_sse",
+          "user_cancelled",
+          "cancelled",
+        ),
+      );
+    throw new CompanionClientError(
+      "response_incomplete",
+      chatTransportDiagnostic(
+        requestId,
+        model,
+        requestStartedAtMs,
+        startedAt,
+        "companion_sse",
+        "stream_eof",
+        "stream_ended_without_terminal",
+      ),
+    );
   } catch (error) {
     await reader.cancel().catch(() => undefined);
     if (error instanceof CompanionClientError) throw error;
-    if (signal?.aborted) throw new CompanionClientError("request_cancelled");
-    throw new CompanionClientError("response_incomplete");
+    const cancelled = signal?.aborted;
+    throw new CompanionClientError(
+      cancelled ? "request_cancelled" : "connection_failed",
+      chatTransportDiagnostic(
+        requestId,
+        model,
+        requestStartedAtMs,
+        startedAt,
+        "companion_sse",
+        cancelled ? "user_cancelled" : "local_network_interruption",
+        cancelled ? "cancelled" : "transport_error",
+      ),
+    );
   } finally {
     signal?.removeEventListener("abort", cancelReader);
     await reader.cancel().catch(() => undefined);
@@ -724,6 +843,27 @@ function isRetryableStreamInterruption(error: unknown): error is CompanionClient
       error.diagnostic.outcome === "timed_out" &&
       error.diagnostic.timeoutKind === "idle")
   );
+}
+
+function chatTransportDiagnostic(
+  requestId: string,
+  model: string,
+  requestStartedAtMs: number,
+  startedAt: number,
+  requestPhase: "companion_http" | "companion_sse",
+  terminationReason: "local_network_interruption" | "user_cancelled" | "stream_eof",
+  outcome: "transport_error" | "cancelled" | "stream_ended_without_terminal",
+): InferenceDiagnostic {
+  return InferenceDiagnosticSchema.parse({
+    model: /^[A-Za-z0-9._:/-]{1,200}$/u.test(model) ? model : "unavailable",
+    requestId,
+    requestStartedAtMs,
+    requestPhase,
+    terminationReason,
+    stage: requestPhase === "companion_http" ? "http" : "stream",
+    outcome,
+    elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+  });
 }
 
 export async function disconnectChatGPT(token: string, fetcher: Fetcher = fetch): Promise<string> {

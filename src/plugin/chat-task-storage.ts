@@ -13,10 +13,18 @@ export async function handleChatTaskStorage(
   }
   const pageId = api.currentPage.id;
   const documentId = `${api.fileKey ?? local}-${pageId.replaceAll(":", "_")}`;
-  const key = `fad.chat-task.v1:${documentId}`;
+  const legacyKey = `fad.chat-task.v1:${documentId}`;
+  const key = message.chatId ? `fad.chat-task.v2:${documentId}:${message.chatId}` : legacyKey;
   try {
-    const task =
+    if (message.documentId && message.documentId !== documentId)
+      throw new Error("Document/page changed; reopen chat history on the original page.");
+    let task =
       message.type === "chat-task-load" ? await api.clientStorage.getAsync(key) : message.task;
+    if (message.type === "chat-task-load" && message.chatId && task == null) {
+      const legacy = await api.clientStorage.getAsync(legacyKey);
+      if (legacy && typeof legacy === "object" && "id" in legacy && legacy.id === message.chatId)
+        task = legacy;
+    }
     if (message.type === "chat-task-save" && message.documentId !== documentId)
       throw new Error("Document/page changed; return to the task's original page before resuming.");
     if (task != null) {
@@ -34,7 +42,10 @@ export async function handleChatTaskStorage(
     }
     if (api.currentPage.id !== pageId)
       throw new Error("Page changed while accessing the task checkpoint.");
-    if (message.type === "chat-task-save") await api.clientStorage.setAsync(key, task);
+    if (message.type === "chat-task-save") {
+      if (message.chatId && task == null) await api.clientStorage.deleteAsync(key);
+      else await api.clientStorage.setAsync(key, task);
+    }
     return {
       type: "chat-task-result",
       requestId: message.requestId,
