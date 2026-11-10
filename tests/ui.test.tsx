@@ -77,24 +77,22 @@ describe("plugin UI navigation and capability states", () => {
     expect(render("progress")).toContain("No task data for this chat");
   });
 
-  it("provides the bilingual AI Chat composer and a collapsed native developer harness", () => {
+  it("provides the bilingual AI Chat composer with More and model accordions", () => {
     const html = render("chat");
     expect(html).toContain("AI Chat");
     expect(html).toContain('id="chat-input"');
     expect(html).toContain("Shift+Enter for a new line");
     expect(html).toContain(">Send</button>");
     expect(html).toContain('role="log"');
-    expect(html).toContain('<details class="tool-harness">');
-    expect(html).not.toContain('<details class="tool-harness" open="">');
+    expect(html).toContain('<details class="chat-more-menu">');
+    expect(html).toContain('<details class="chat-model-menu" id="chat-model-menu">');
     expect(html).not.toContain("function_call");
     expect(html).not.toContain("tool-execute");
-    expect(html).toContain("Native operation harness");
-    expect(html).toContain("Current generation context");
-    expect(html).toContain("BRAND KIT");
-    expect(html).toContain("SKILLS");
-    expect(html).toContain("Create 390 × 844 frame");
-    expect(html).toContain("Change button color only");
-    expect(html).toContain("Safe invalid-layout check");
+    expect(html).not.toContain("Native operation harness");
+    expect(html).not.toContain("BRAND KIT");
+    expect(html).not.toContain("SKILLS");
+    expect(html).not.toContain("Existing layers are never replaced");
+    expect(html).not.toContain("Offline JSON");
     expect(html).not.toContain('id="json-input"');
   });
 
@@ -124,7 +122,7 @@ describe("plugin UI navigation and capability states", () => {
     expect(html).toContain("Phase 4 demo");
     expect(html).toContain("Validate JSON");
     expect(html).toContain("Generate in Figma");
-    expect(html).toContain("Offline JSON");
+    expect(html).not.toContain("Offline JSON");
     expect(parseDesignText(phase1Sample.trim()).success).toBe(true);
     expect(html).not.toContain("Companion &amp; ChatGPT");
   });

@@ -14,7 +14,7 @@ import {
   type PluginToUIMessage,
   type UIToPluginMessage,
 } from "../shared/messages";
-import { FigmaToolOperationSchema, type FigmaToolOperation } from "../shared/figma-tools";
+import type { FigmaToolOperation } from "../shared/figma-tools";
 import { type ChatInputItem } from "../shared/chat-tools";
 import {
   chatHistoryExportJson,
@@ -329,119 +329,7 @@ function createPairingVerifier(): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
-function developerToolOperation(operationId: string, action: unknown): FigmaToolOperation {
-  return FigmaToolOperationSchema.parse({
-    operationId,
-    idempotencyKey: `phase56:${operationId}`,
-    action,
-  });
-}
-
-const PHASE56_FRAME_REF = "phase56-mobile";
-const PHASE56_TITLE_REF = "phase56-title";
-const PHASE56_INPUT_REF = "phase56-input";
-const PHASE56_INPUT_TEXT_REF = "phase56-input-hint";
-const PHASE56_BUTTON_REF = "phase56-button";
-const PHASE56_BUTTON_TEXT_REF = "phase56-button-label";
 const TOOL_RESPONSE_TIMEOUT_MS = 45_000;
-
-function phase56FixtureOperations() {
-  return [
-    developerToolOperation("phase56-frame-0001", {
-      tool: "create_frame",
-      ref: PHASE56_FRAME_REF,
-      name: "Phase 5.6 · Persian mobile fixture",
-      parent: { kind: "page" },
-      size: { width: 390, height: 844 },
-      fill: "#F8FAFC",
-      cornerRadius: 28,
-      autoLayout: {
-        direction: "vertical",
-        gap: 20,
-        padding: { top: 32, right: 24, bottom: 24, left: 24 },
-        counterAlign: "MIN",
-      },
-    }),
-    developerToolOperation("phase56-title-0001", {
-      tool: "create_text",
-      ref: PHASE56_TITLE_REF,
-      name: "عنوان فارسی",
-      parent: { kind: "node", ref: PHASE56_FRAME_REF },
-      text: "فروشگاه شما",
-      size: { width: 342, height: 40 },
-      direction: "RTL",
-      font: { family: "Inter", style: "Regular" },
-      fontSize: 24,
-      horizontalSizing: "FILL",
-      verticalSizing: "HUG",
-    }),
-    developerToolOperation("phase56-input-0001", {
-      tool: "create_frame",
-      ref: PHASE56_INPUT_REF,
-      name: "فیلد جست‌وجو",
-      parent: { kind: "node", ref: PHASE56_FRAME_REF },
-      size: { width: 342, height: 54 },
-      fill: "#FFFFFF",
-      stroke: "#CBD5E1",
-      cornerRadius: 12,
-      autoLayout: {
-        direction: "horizontal",
-        gap: 8,
-        padding: { top: 8, right: 14, bottom: 8, left: 14 },
-        counterAlign: "CENTER",
-      },
-    }),
-    developerToolOperation("phase56-hint-0001", {
-      tool: "create_text",
-      ref: PHASE56_INPUT_TEXT_REF,
-      name: "متن راهنمای ورودی",
-      parent: { kind: "node", ref: PHASE56_INPUT_REF },
-      text: "جست‌وجوی محصول",
-      size: { width: 290, height: 24 },
-      direction: "RTL",
-      align: "RIGHT",
-      fontSize: 14,
-      color: "#64748B",
-      horizontalSizing: "FILL",
-      verticalSizing: "HUG",
-    }),
-    developerToolOperation("phase56-button-0001", {
-      tool: "create_frame",
-      ref: PHASE56_BUTTON_REF,
-      name: "دکمه جست‌وجو",
-      parent: { kind: "node", ref: PHASE56_FRAME_REF },
-      size: { width: 342, height: 52 },
-      fill: "#6841D8",
-      cornerRadius: 12,
-      autoLayout: {
-        direction: "horizontal",
-        gap: 8,
-        padding: { top: 8, right: 16, bottom: 8, left: 16 },
-        primaryAlign: "CENTER",
-        counterAlign: "CENTER",
-      },
-    }),
-    developerToolOperation("phase56-label-0001", {
-      tool: "create_text",
-      ref: PHASE56_BUTTON_TEXT_REF,
-      name: "برچسب دکمه",
-      parent: { kind: "node", ref: PHASE56_BUTTON_REF },
-      text: "جست‌وجو",
-      size: { width: 120, height: 24 },
-      direction: "RTL",
-      align: "CENTER",
-      fontSize: 16,
-      color: "#FFFFFF",
-      horizontalSizing: "HUG",
-      verticalSizing: "HUG",
-    }),
-    developerToolOperation("phase56-color-0001", {
-      tool: "set_properties",
-      ref: PHASE56_BUTTON_REF,
-      properties: { fill: "#0F766E" },
-    }),
-  ];
-}
 
 export default function App({ initialView = "home" }: { initialView?: PluginView } = {}) {
   const [navigation, dispatchNavigation] = useReducer(navigationReducer, {
@@ -449,6 +337,23 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     settingsOpen: false,
   });
   const moreMenuRef = useRef<HTMLDetailsElement>(null);
+  const modelMenuRef = useRef<HTMLDetailsElement>(null);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  useEffect(() => {
+    const closeAccordionsOutside = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+
+      const moreMenu = moreMenuRef.current;
+      if (moreMenu?.open && !moreMenu.contains(target)) moreMenu.open = false;
+
+      const modelMenu = modelMenuRef.current;
+      if (modelMenu?.open && !modelMenu.contains(target)) setModelMenuOpen(false);
+    };
+
+    document.addEventListener("pointerdown", closeAccordionsOutside);
+    return () => document.removeEventListener("pointerdown", closeAccordionsOutside);
+  }, []);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const drawerTriggerRef = useRef<HTMLButtonElement>(null);
   const drawerRef = useRef<HTMLElement>(null);
@@ -561,8 +466,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const [multiProgress, setMultiProgress] = useState<MultiScreenProgressMessage | null>(null);
   const [multiReport, setMultiReport] = useState<MultiScreenRenderResultMessage | null>(null);
   const [toolBusy, setToolBusy] = useState(false);
-  const [toolStatus, setToolStatus] = useState("Ready to run a local native-operation check.");
-  const [lastToolOperation, setLastToolOperation] = useState<FigmaToolOperation | null>(null);
   const toolBatchId = useRef<string | null>(null);
   const toolWatchdog = useRef<number | null>(null);
   const toolCompletion = useRef<{
@@ -843,7 +746,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     setChatInspectionBatchActive(false);
     if (cancel) postToPlugin({ type: "tool-cancel", protocolVersion: 1, batchId });
     setToolBusy(false);
-    setToolStatus(message);
   };
 
   useEffect(
@@ -899,7 +801,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               );
             }, TOOL_RESPONSE_TIMEOUT_MS);
           }
-          setToolStatus(`${message.index + 1}/${message.total} · ${message.message}`);
           if (chatRunning.current) setChatActivity(message.message);
         }
         return;
@@ -911,15 +812,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           toolBatchId.current = null;
           setChatInspectionBatchActive(false);
           setToolBusy(false);
-          const last = message.results.at(-1);
-          const replayCount = message.results.filter(({ replayed }) => replayed).length;
-          setToolStatus(
-            message.cancelled
-              ? `Cancelled between operations. ${message.committedOperationIds.length} operation(s) remain committed.`
-              : message.success
-                ? `${message.results.length} operation(s) completed; ${replayCount} idempotent replay(s), with no duplicate nodes.`
-                : `${last?.error ?? "The operation failed."}${message.committedOperationIds.length ? ` ${message.committedOperationIds.length} earlier operation(s) remain committed.` : ""}${message.partialOperationIds.length ? ` Inspect possible partial change(s): ${message.partialOperationIds.join(", ")}.` : ""}`,
-          );
           const completion = toolCompletion.current;
           if (completion?.batchId === message.batchId) {
             toolCompletion.current = null;
@@ -929,7 +821,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         return;
       }
       if (message.type === "tool-delete-consent-result") {
-        setToolStatus(message.message);
         return;
       }
       if (message.type === "companion-restore-ticket") {
@@ -1547,8 +1438,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     );
     if (completion) toolCompletion.current = { batchId, ...completion };
     setToolBusy(true);
-    if (!completion) setLastToolOperation(operations.at(-1) ?? null);
-    setToolStatus(`Starting ${operations.length} local operation(s)…`);
     toolWatchdog.current = window.setTimeout(() => {
       failToolBatch(
         batchId,
@@ -1734,20 +1623,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       setChatActivity("Pausing after the current discovery slice; progress is saved for Resume…");
   };
 
-  const runFixtureStep = (start: number, end: number) =>
-    runToolOperations(phase56FixtureOperations().slice(start, end));
-
-  const replayLastToolOperation = () => {
-    if (!lastToolOperation) return;
-    runToolOperations([lastToolOperation]);
-  };
-
   const cancelToolBatch = () => {
     const batchId = toolBatchId.current;
     if (!batchId) return;
-    setToolStatus(
-      "Cancellation requested; the active native operation will finish or time out before the batch stops.",
-    );
     if (!postToPlugin({ type: "tool-cancel", protocolVersion: 1, batchId }))
       failToolBatch(
         batchId,
@@ -2932,7 +2810,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   };
 
   const connectionSummary = getConnectionSummary(companionConnectionState, companionStatus);
-  const developerToolsBusy = toolBusy || chatBusy;
   const chatCanSubmit = chatReady && chatTaskLoaded && !toolBusy && !chatPendingTool;
   const navigateFromDrawer = (view: "home" | "chat" | "history") => {
     if (moreMenuRef.current) moreMenuRef.current.open = false;
@@ -3368,32 +3245,129 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               <span id="chat-help" className="sr-only">
                 Press Enter to send. Press Shift+Enter for a new line.
               </span>
-              <details
-                className="chat-more-menu"
-                ref={moreMenuRef}
-                onKeyDown={(event) => {
-                  if (event.key === "Escape" && moreMenuRef.current?.open) {
-                    event.preventDefault();
-                    moreMenuRef.current.open = false;
-                    event.currentTarget.querySelector("summary")?.focus();
-                  }
-                }}
-              >
-                <summary className="chat-more-trigger" aria-controls="more-options-panel">
-                  <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                    <circle cx="4" cy="10" r="1" />
-                    <circle cx="10" cy="10" r="1" />
-                    <circle cx="16" cy="10" r="1" />
-                  </svg>
-                  <span>More</span>
-                </summary>
-                <MoreOptionsAccordion
-                  onNavigate={(view) => {
-                    if (moreMenuRef.current) moreMenuRef.current.open = false;
-                    dispatchNavigation({ type: "navigate", view });
+              <div className="chat-composer-tools">
+                <details
+                  className="chat-more-menu"
+                  ref={moreMenuRef}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape" && moreMenuRef.current?.open) {
+                      event.preventDefault();
+                      moreMenuRef.current.open = false;
+                      event.currentTarget.querySelector("summary")?.focus();
+                    }
                   }}
-                />
-              </details>
+                >
+                  <summary
+                    className="chat-more-trigger"
+                    aria-controls="more-options-panel"
+                    onClick={() => {
+                      if (modelMenuRef.current) modelMenuRef.current.open = false;
+                      setModelMenuOpen(false);
+                    }}
+                  >
+                    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                      <circle cx="4" cy="10" r="1" />
+                      <circle cx="10" cy="10" r="1" />
+                      <circle cx="16" cy="10" r="1" />
+                    </svg>
+                    <span>More</span>
+                  </summary>
+                  <MoreOptionsAccordion
+                    onNavigate={(view) => {
+                      if (moreMenuRef.current) moreMenuRef.current.open = false;
+                      dispatchNavigation({ type: "navigate", view });
+                    }}
+                  />
+                </details>
+                <details
+                  className="chat-model-menu"
+                  id="chat-model-menu"
+                  ref={modelMenuRef}
+                  open={modelMenuOpen}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape" && modelMenuRef.current?.open) {
+                      event.preventDefault();
+                      setModelMenuOpen(false);
+                      event.currentTarget.querySelector("summary")?.focus();
+                    }
+                  }}
+                >
+                  <summary
+                    className="chat-model-shortcut"
+                    aria-controls="chat-model-options"
+                    aria-expanded={modelMenuOpen}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      if (!modelMenuOpen && moreMenuRef.current)
+                        moreMenuRef.current.open = false;
+                      setModelMenuOpen((open) => !open);
+                    }}
+                  >
+                    <small>MODEL</small>
+                    <strong>
+                      {companionModels.find(({ slug }) => slug === selectedCompanionModel)
+                        ?.displayName ??
+                        (selectedCompanionModel || "No model selected")}
+                    </strong>
+                  </summary>
+                  <div
+                    className="chat-model-options"
+                    id="chat-model-options"
+                    role="group"
+                    aria-label="Available models"
+                  >
+                    {companionModels.length > 0 ? (
+                      companionModels.map((model) => (
+                        <button
+                          className={`chat-model-option ${model.slug === selectedCompanionModel ? "is-selected" : ""}`}
+                          key={model.slug}
+                          type="button"
+                          aria-pressed={model.slug === selectedCompanionModel}
+                          onClick={() => {
+                            activeChatModel.current = model.slug;
+                            setSelectedCompanionModel(model.slug);
+                            setSmokeResult(null);
+                            setSmokeDiagnostic(null);
+                            setModelMenuOpen(false);
+                          }}
+                        >
+                          <span>{model.displayName}</span>
+                          {model.slug !== model.displayName && <small>{model.slug}</small>}
+                        </button>
+                      ))
+                    ) : (
+                      <div className="chat-model-options-state" role="status">
+                        <span>
+                          {companionToken
+                            ? getModelAvailabilityMessage(
+                                modelDiscovery,
+                                true,
+                                Boolean(companionStatus?.planUseAuthorized),
+                              )
+                            : "Connect an account in Settings to load available models."}
+                        </span>
+                        <button
+                          type="button"
+                          disabled={companionBusy}
+                          onClick={() => {
+                            if (companionToken) void discoverModels();
+                            else {
+                              setModelMenuOpen(false);
+                              dispatchNavigation({ type: "open-settings" });
+                            }
+                          }}
+                        >
+                          {companionToken
+                            ? modelDiscovery === "loading"
+                              ? "Loading models…"
+                              : "Load models"
+                            : "Open Settings"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </details>
+              </div>
               <button
                 type="submit"
                 className="primary-action"
@@ -3403,134 +3377,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               </button>
             </div>
           </form>
-          <div className="chat-context-summary" aria-label="Current generation context">
-            <button type="button" onClick={() => dispatchNavigation({ type: "open-settings" })}>
-              <small>MODEL</small>
-              <strong>
-                {companionModels.find(({ slug }) => slug === selectedCompanionModel)?.displayName ??
-                  (selectedCompanionModel || "No model selected")}
-              </strong>
-            </button>
-            <button
-              type="button"
-              onClick={() => dispatchNavigation({ type: "navigate", view: "brand-kit" })}
-            >
-              <small>BRAND KIT</small>
-              <strong>Not available yet</strong>
-            </button>
-            <button
-              type="button"
-              onClick={() => dispatchNavigation({ type: "navigate", view: "skills" })}
-            >
-              <small>SKILLS</small>
-              <strong>Not available yet</strong>
-            </button>
-          </div>
-          <details className="tool-harness">
-            <summary className="tool-harness-summary">
-              <span>
-                <span className="section-kicker">DEVELOPER ONLY</span>
-                <strong id="tool-harness-title">Native operation harness</strong>
-              </span>
-              <span className={`system-status ${toolBusy ? "" : "is-ready"}`}>
-                {toolBusy ? "Running" : "Ready"}
-              </span>
-            </summary>
-            <p className="tool-harness-copy">
-              Direct local executor checks. These buttons bypass the model and do not require JSON.
-            </p>
-            <div className="tool-harness-grid">
-              <button
-                type="button"
-                disabled={developerToolsBusy}
-                onClick={() => runFixtureStep(0, 1)}
-              >
-                1 · Create 390 × 844 frame
-              </button>
-              <button
-                type="button"
-                disabled={developerToolsBusy}
-                onClick={() => runFixtureStep(1, 2)}
-              >
-                2 · Add Persian title
-              </button>
-              <button
-                type="button"
-                disabled={developerToolsBusy}
-                onClick={() => runFixtureStep(2, 4)}
-              >
-                3 · Add editable input
-              </button>
-              <button
-                type="button"
-                disabled={developerToolsBusy}
-                onClick={() => runFixtureStep(4, 6)}
-              >
-                4 · Add button
-              </button>
-              <button
-                type="button"
-                disabled={developerToolsBusy}
-                onClick={() => runFixtureStep(6, 7)}
-              >
-                5 · Change button color only
-              </button>
-              <button
-                type="button"
-                disabled={developerToolsBusy}
-                onClick={() =>
-                  runToolOperations([
-                    developerToolOperation("phase56-invalid-layout", {
-                      tool: "set_auto_layout",
-                      ref: PHASE56_TITLE_REF,
-                      layout: { direction: "vertical" },
-                    }),
-                  ])
-                }
-              >
-                Safe invalid-layout check
-              </button>
-            </div>
-            <div className="tool-harness-actions">
-              <button
-                className="secondary-action"
-                type="button"
-                disabled={developerToolsBusy || !lastToolOperation}
-                onClick={replayLastToolOperation}
-              >
-                Replay last operation
-              </button>
-              <button
-                className="text-button muted"
-                type="button"
-                disabled={!toolBusy}
-                onClick={cancelToolBatch}
-              >
-                Cancel between operations
-              </button>
-              <button
-                className="text-button muted"
-                type="button"
-                disabled={developerToolsBusy}
-                onClick={() =>
-                  runToolOperations([
-                    developerToolOperation(`phase56-context-${Date.now()}`, {
-                      tool: "get_document_context",
-                    }),
-                  ])
-                }
-              >
-                Inspect page context
-              </button>
-            </div>
-            <p className="tool-harness-status" role="status" aria-live="polite">
-              {toolStatus}
-            </p>
-          </details>
-          <p className="tool-safety-note">
-            Existing layers are never replaced by this fixture. Delete and broad-replacement tools
-            require separate, scoped user consent and are not exposed here.
-          </p>
         </section>
       ) : activeView === "design" ? (
         <section className="design-home" aria-labelledby="design-title">
@@ -4934,14 +4780,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         />
       )}
 
-      <footer className="footer-note">
-        <span className="local-icon" aria-hidden="true">
-          ●
-        </span>
-        <span>Offline JSON</span>
-        <span className="footer-divider">·</span>
-        <span>Optional user-authorized companion · native editable layers</span>
-      </footer>
     </main>
   );
 }
