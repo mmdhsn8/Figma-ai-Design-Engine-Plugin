@@ -499,6 +499,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const chatModelInput = useRef<ChatInputItem[]>([]);
   const chatTask = useRef<ChatTask | null>(null);
   const [chatTaskSnapshot, setChatTaskSnapshot] = useState<ChatTask | null>(null);
+  const [chatTaskProgressCollapsed, setChatTaskProgressCollapsed] = useState(false);
   const [chatTaskLoaded, setChatTaskLoaded] = useState(false);
   const chatRunning = useRef(false);
   const chatStopRequested = useRef(false);
@@ -2811,6 +2812,33 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
   const connectionSummary = getConnectionSummary(companionConnectionState, companionStatus);
   const chatCanSubmit = chatReady && chatTaskLoaded && !toolBusy && !chatPendingTool;
+  const taskCapacity = chatTaskSnapshot ? chatTaskCapacityUsage(chatTaskSnapshot) : null;
+  const taskStageTotal = chatTaskSnapshot?.stages.length ?? 0;
+  const taskStageCompleted =
+    chatTaskSnapshot?.stages.filter((stage) => stage.completed).length ?? 0;
+  const taskProgressPercent = taskStageTotal
+    ? Math.round((taskStageCompleted / taskStageTotal) * 100)
+    : 0;
+  const taskCurrentStageIndex =
+    chatTaskSnapshot?.stages.findIndex((stage) => !stage.completed) ?? -1;
+  const taskProgressStatus = chatTaskSnapshot?.failure
+    ? "Needs attention"
+    : chatTaskSnapshot?.status === "completed"
+      ? "Complete"
+      : chatBusy
+        ? "Running"
+        : chatTaskSnapshot?.status === "stopped"
+          ? "Paused"
+          : "Ready";
+  const taskProgressStatusTone = chatTaskSnapshot?.failure
+    ? "attention"
+    : chatBusy
+      ? "running"
+      : chatTaskSnapshot?.status === "completed"
+        ? "complete"
+        : chatTaskSnapshot?.status === "stopped"
+          ? "paused"
+          : "ready";
   const navigateFromDrawer = (view: "home" | "chat" | "history") => {
     if (moreMenuRef.current) moreMenuRef.current.open = false;
     setDrawerOpen(false);
@@ -2823,7 +2851,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   };
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${activeView === "chat" && !settingsOpen ? "is-chat-view" : ""}`}>
       <header className="topbar">
         <div className="brand-mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none">
@@ -2854,7 +2882,11 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         {chatBusy && (
           <>
             {chatInspectionBatchActive && (
-              <button className="text-button muted topbar-action" type="button" onClick={pauseChatInspection}>
+              <button
+                className="text-button muted topbar-action"
+                type="button"
+                onClick={pauseChatInspection}
+              >
                 Pause inspection
               </button>
             )}
@@ -2977,7 +3009,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         />
       ) : activeView === "chat" ? (
         <section className="chat-home" aria-labelledby="chat-title">
-          <h1 id="chat-title" className="sr-only">AI Chat</h1>
+          <h1 id="chat-title" className="sr-only">
+            AI Chat
+          </h1>
           <div className="chat-toolbar">
             <button
               className="secondary-action chat-new-button"
@@ -2986,235 +3020,337 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               title={chatSwitchBlockReason ?? "Start a separate saved conversation."}
               onClick={() => void createNewChat()}
             >
-              <span className="chat-new-button-icon" aria-hidden="true">+</span>
+              <span className="chat-new-button-icon" aria-hidden="true">
+                +
+              </span>
               New chat
             </button>
           </div>
-          <div
-            className="chat-transcript"
-            role="log"
-            aria-live="polite"
-            aria-relevant="additions text"
-          >
-            {!chatMessages.length ? (
-              <div className="chat-welcome">
-                <span className="section-kicker">YOUR DESIGN ASSISTANT</span>
-                <h2>What would you like to make?</h2>
-                <p>
-                  Try “Create a mobile storefront frame” or “Make the title on my selected frame
-                  right-aligned.”
-                </p>
+          <div className="chat-scroll-region">
+            <div
+              className="chat-transcript"
+              role="log"
+              aria-live="polite"
+              aria-relevant="additions text"
+            >
+              {!chatMessages.length ? (
+                <div className="chat-welcome">
+                  <span className="section-kicker">YOUR DESIGN ASSISTANT</span>
+                  <h2>What would you like to make?</h2>
+                  <p>
+                    Try “Create a mobile storefront frame” or “Make the title on my selected frame
+                    right-aligned.”
+                  </p>
+                </div>
+              ) : (
+                chatMessages.map((message) => (
+                  <article className={`chat-message is-${message.role}`} key={message.id}>
+                    <span className="chat-message-role">
+                      {message.role === "user" ? "You" : "Assistant"}
+                    </span>
+                    {message.content && <p dir="auto">{message.content}</p>}
+                    {message.error && (
+                      <div className="chat-message-error" role="alert">
+                        <p>{safeChatProse(message.error)}</p>
+                        {chatRetryMessageId === message.id && (
+                          <button
+                            type="button"
+                            className="secondary-action"
+                            disabled={chatBusy || toolBusy}
+                            onClick={() => void sendChatMessage(true)}
+                          >
+                            {chatTaskSnapshot ? chatTaskRetryLabel(chatTaskSnapshot) : "Resume"}
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </article>
+                ))
+              )}
+            </div>
+            {chatActivity && (
+              <div className="chat-activity" role="status" aria-live="polite">
+                <span
+                  className={chatBusy ? "chat-activity-dot is-active" : "chat-activity-dot"}
+                  aria-hidden="true"
+                />
+                <span>{safeChatProse(chatActivity)}</span>
               </div>
-            ) : (
-              chatMessages.map((message) => (
-                <article className={`chat-message is-${message.role}`} key={message.id}>
-                  <span className="chat-message-role">
-                    {message.role === "user" ? "You" : "Assistant"}
-                  </span>
-                  {message.content && <p dir="auto">{message.content}</p>}
-                  {message.error && (
-                    <div className="chat-message-error" role="alert">
-                      <p>{safeChatProse(message.error)}</p>
-                      {chatRetryMessageId === message.id && (
-                        <button
-                          type="button"
-                          className="secondary-action"
-                          disabled={chatBusy || toolBusy}
-                          onClick={() => void sendChatMessage(true)}
-                        >
-                          {chatTaskSnapshot ? chatTaskRetryLabel(chatTaskSnapshot) : "Resume"}
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </article>
-              ))
             )}
           </div>
           {chatTaskSnapshot && (
-            <section className="chat-task-progress" aria-label="Canvas task progress">
-              <p role="status">{chatTaskProgress(chatTaskSnapshot)}</p>
-              <ol>
-                {chatTaskSnapshot.stages.map((stage, index) => (
-                  <li key={`${index}-${stage.title}`}>
-                    {stage.completed ? "✓" : "○"} {stage.title}
-                  </li>
-                ))}
-              </ol>
-              <div className="task-detail-links">
-                <button
-                  type="button"
-                  className="text-button"
-                  onClick={() => dispatchNavigation({ type: "navigate", view: "progress" })}
+            <section
+              className={`chat-task-progress ${chatTaskProgressCollapsed ? "is-collapsed" : ""}`}
+              aria-label="Canvas task progress"
+            >
+              <div className="chat-task-progress-heading">
+                <div className="chat-task-progress-copy">
+                  <span className="chat-task-progress-eyebrow">Task progress</span>
+                  <strong>
+                    {taskStageCompleted} of {taskStageTotal} stages complete
+                  </strong>
+                </div>
+                <span
+                  className={`chat-task-progress-status is-${taskProgressStatusTone}`}
+                  role="status"
+                  aria-live="polite"
                 >
-                  Generation Progress
-                </button>
+                  <span aria-hidden="true" />
+                  {taskProgressStatus}
+                </span>
                 <button
+                  className="chat-task-progress-toggle"
                   type="button"
-                  className="text-button"
-                  onClick={() => dispatchNavigation({ type: "navigate", view: "results" })}
+                  aria-label={
+                    chatTaskProgressCollapsed ? "Expand task progress" : "Collapse task progress"
+                  }
+                  aria-expanded={!chatTaskProgressCollapsed}
+                  title={
+                    chatTaskProgressCollapsed ? "Expand task progress" : "Collapse task progress"
+                  }
+                  onClick={() => setChatTaskProgressCollapsed((collapsed) => !collapsed)}
                 >
-                  Results
-                </button>
-                <button
-                  type="button"
-                  className="text-button"
-                  onClick={() => dispatchNavigation({ type: "navigate", view: "layers" })}
-                >
-                  Layers & Structure
-                </button>
-                <button
-                  type="button"
-                  className="text-button"
-                  onClick={() => dispatchNavigation({ type: "navigate", view: "activity" })}
-                >
-                  Activity & Diagnostics
+                  <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="m4 6 4 4 4-4" />
+                  </svg>
                 </button>
               </div>
-              {!chatBusy && chatTaskSnapshot.status !== "completed" && (
-                <button
-                  type="button"
-                  className="secondary-action"
-                  disabled={!chatReady || toolBusy || chatSwitchBusy}
-                  onClick={() => void sendChatMessage(true)}
-                >
-                  {chatTaskRetryLabel(chatTaskSnapshot)}
-                </button>
-              )}
-              <small>
-                Task {chatTaskSnapshot.id} ·{" "}
-                {chatTaskSnapshot.rounds + chatTaskSnapshot.roundBreakdown.modelRetries} model
-                requests · {chatTaskSnapshot.batches} batches · {chatTaskSnapshot.lastResponseCalls}{" "}
-                calls in last response · {chatTaskCapacityUsage(chatTaskSnapshot).mutations}/
-                {chatTaskCapacityUsage(chatTaskSnapshot).mutationCapacity} mutations ·{" "}
-                {chatTaskCapacityUsage(chatTaskSnapshot).readOnlyOperations} read-only ·{" "}
-                {chatTaskCapacityUsage(chatTaskSnapshot).verificationOperations} verification
-              </small>
-              <small>
-                State: {chatTaskSnapshot.lifecycle} · Lifecycle:{" "}
-                {chatTaskSnapshot.roundBreakdown.planning} planning ·{" "}
-                {chatTaskSnapshot.roundBreakdown.execution} execution ·{" "}
-                {chatTaskSnapshot.roundBreakdown.inspection} inspection ·{" "}
-                {chatTaskSnapshot.roundBreakdown.completion} completion ·{" "}
-                {chatTaskSnapshot.roundBreakdown.correction} correction ·{" "}
-                {chatTaskSnapshot.roundBreakdown.modelRetries} model retries ·{" "}
-                {chatTaskSnapshot.lifecycleTransitions} state transitions
-              </small>
-              {chatTaskSnapshot.failure && (
+              {!chatTaskProgressCollapsed && (
                 <>
-                  <p role="alert">
-                    Safe diagnostic: {chatTaskSnapshot.failure.category}/
-                    {chatTaskSnapshot.failure.code}
-                    {chatTaskSnapshot.failure.operationId
-                      ? ` · operation ${chatTaskSnapshot.failure.operationId}`
-                      : ""}
-                    {` · ${chatTaskSnapshot.failure.committedOperations} committed canvas operations. `}
-                    Inspect the failed stage before retrying; confirmed work is retained.
-                  </p>
-                  {chatTaskSnapshot.lastRequestDiagnostic && (
-                    <small>
-                      Request {chatTaskSnapshot.lastRequestDiagnostic.requestId} ·{" "}
-                      {chatTaskSnapshot.lastRequestDiagnostic.requestPhase ?? "unknown phase"} ·{" "}
-                      {chatTaskSnapshot.lastRequestDiagnostic.timeoutSource ??
-                        chatTaskSnapshot.lastRequestDiagnostic.terminationReason ??
-                        chatTaskSnapshot.lastRequestDiagnostic.outcome}
-                      {chatTaskSnapshot.lastRequestDiagnostic.elapsedMs !== undefined
-                        ? ` · ${chatTaskSnapshot.lastRequestDiagnostic.elapsedMs} ms elapsed`
-                        : ""}
-                      {chatTaskSnapshot.lastRequestDiagnostic.lastEventAtMs !== undefined
-                        ? ` · last event at ${chatTaskSnapshot.lastRequestDiagnostic.lastEventAtMs}`
-                        : ""}
-                    </small>
-                  )}
-                  {(() => {
-                    const stage = chatTaskSnapshot.stages.find((item) => !item.completed);
-                    return stage?.verificationHistory.length ? (
-                      <div
-                        className="chat-quality-diagnostic"
-                        aria-label="Structural quality diagnostic"
+                  <div
+                    className="chat-task-progress-track"
+                    role="progressbar"
+                    aria-label="Task stages completed"
+                    aria-valuemin={0}
+                    aria-valuemax={Math.max(taskStageTotal, 1)}
+                    aria-valuenow={taskStageCompleted}
+                    aria-valuetext={`${taskStageCompleted} of ${taskStageTotal} stages complete`}
+                  >
+                    <span style={{ width: `${taskProgressPercent}%` }} />
+                  </div>
+                  <div className="chat-task-progress-metrics" aria-label="Task summary">
+                    <div>
+                      <span>Pending</span>
+                      <strong>{Math.max(taskStageTotal - taskStageCompleted, 0)}</strong>
+                    </div>
+                    <div>
+                      <span>Mutations</span>
+                      <strong>{taskCapacity?.mutations ?? 0}</strong>
+                    </div>
+                    <div>
+                      <span>Read-only</span>
+                      <strong>{taskCapacity?.readOnlyOperations ?? 0}</strong>
+                    </div>
+                  </div>
+                  <ul className="chat-task-stages" aria-label="Task stages">
+                    {chatTaskSnapshot.stages.map((stage, index) => (
+                      <li
+                        className={`chat-task-stage ${stage.completed ? "is-complete" : index === taskCurrentStageIndex ? "is-current" : ""}`}
+                        key={`${index}-${stage.title}`}
+                        aria-current={index === taskCurrentStageIndex ? "step" : undefined}
                       >
-                        <p>
-                          Structural checks: {stage.verificationHistory.length} · repair attempts:{" "}
-                          {stage.repairOperationsAttempted} · confirmed mutations:{" "}
-                          {stage.repairOperationsExecuted} · findings resolved:{" "}
-                          {stage.repairFindingsResolved ?? 0}
-                        </p>
-                        {stage.qualityFindings.length > 0 && (
-                          <ul>
-                            {stage.qualityFindings.map((finding, index) => (
-                              <li key={`${finding.code}-${index}`}>
-                                <strong>{finding.code}</strong>
-                                {finding.refs.length ? ` · refs: ${finding.refs.join(", ")}` : ""}
-                                {` · expected ${finding.expected} · actual ${finding.actual}`}
-                              </li>
-                            ))}
-                          </ul>
-                        )}
-                        <small>
-                          Repair operations attempted:{" "}
-                          {stage.repairOperationsAttempted > 0 ? "yes" : "no"}
-                          {` · native mutations confirmed: ${stage.repairOperationsExecuted > 0 ? "yes" : "no"}`}
-                        </small>
-                      </div>
-                    ) : null;
-                  })()}
-                  <button
-                    type="button"
-                    className="secondary-action"
-                    onClick={() => {
-                      void copyDiagnosticJson(chatTaskDiagnosticJson(chatTaskSnapshot))
-                        .then((method) =>
-                          setChatActivity(
-                            method === "clipboard"
-                              ? "Sanitized diagnostic copied to the clipboard."
-                              : "Sanitized diagnostic copied using the plugin UI fallback.",
-                          ),
-                        )
-                        .catch(() =>
-                          setChatActivity(
-                            "Copy failed. Use Download diagnostic JSON; no task or canvas data was changed.",
-                          ),
-                        );
-                    }}
-                  >
-                    Copy sanitized diagnostic
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-action"
-                    onClick={() => {
-                      try {
-                        downloadDiagnosticJson(
-                          chatTaskDiagnosticJson(chatTaskSnapshot),
-                          `figma-ai-diagnostic-${chatTaskSnapshot.id.replace(/[^A-Za-z0-9_-]/gu, "_")}.json`,
-                        );
-                        setChatActivity("Sanitized diagnostic JSON download started.");
-                      } catch {
-                        setChatActivity(
-                          "Diagnostic download failed; the task and canvas were not changed.",
-                        );
-                      }
-                    }}
-                  >
-                    Download diagnostic JSON
-                  </button>
+                        <span className="chat-task-stage-indicator" aria-hidden="true">
+                          {stage.completed ? "✓" : index + 1}
+                        </span>
+                        <span className="chat-task-stage-title">{stage.title}</span>
+                        <span className="chat-task-stage-state">
+                          {stage.completed
+                            ? "Done"
+                            : index === taskCurrentStageIndex
+                              ? chatBusy
+                                ? "Active"
+                                : "Next"
+                              : "Pending"}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="task-detail-links">
+                    <button
+                      type="button"
+                      className="task-detail-link"
+                      onClick={() => dispatchNavigation({ type: "navigate", view: "progress" })}
+                    >
+                      <span>Generation progress</span>
+                      <span aria-hidden="true">›</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="task-detail-link"
+                      onClick={() => dispatchNavigation({ type: "navigate", view: "results" })}
+                    >
+                      <span>Results</span>
+                      <span aria-hidden="true">›</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="task-detail-link"
+                      onClick={() => dispatchNavigation({ type: "navigate", view: "layers" })}
+                    >
+                      <span>Layers &amp; structure</span>
+                      <span aria-hidden="true">›</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="task-detail-link"
+                      onClick={() => dispatchNavigation({ type: "navigate", view: "activity" })}
+                    >
+                      <span>Activity &amp; diagnostics</span>
+                      <span aria-hidden="true">›</span>
+                    </button>
+                  </div>
+                  <div className="chat-task-progress-actions">
+                    {!chatBusy && chatTaskSnapshot.status !== "completed" && (
+                      <button
+                        type="button"
+                        className="secondary-action chat-task-resume"
+                        disabled={!chatReady || toolBusy || chatSwitchBusy}
+                        onClick={() => void sendChatMessage(true)}
+                      >
+                        {chatTaskRetryLabel(chatTaskSnapshot)}
+                      </button>
+                    )}
+                    {chatBusy && (
+                      <button
+                        type="button"
+                        className="secondary-action chat-task-stop"
+                        onClick={stopChat}
+                      >
+                        Stop task
+                      </button>
+                    )}
+                  </div>
+                  <details className="chat-task-diagnostics">
+                    <summary>Technical details</summary>
+                    <div className="chat-task-diagnostics-content">
+                      <small>
+                        Task {chatTaskSnapshot.id} ·{" "}
+                        {chatTaskSnapshot.rounds + chatTaskSnapshot.roundBreakdown.modelRetries}{" "}
+                        model requests · {chatTaskSnapshot.batches} batches ·{" "}
+                        {chatTaskSnapshot.lastResponseCalls} calls in last response ·{" "}
+                        {taskCapacity?.mutations ?? 0}/{taskCapacity?.mutationCapacity ?? 0}{" "}
+                        mutations · {taskCapacity?.readOnlyOperations ?? 0} read-only ·{" "}
+                        {taskCapacity?.verificationOperations ?? 0} verification
+                      </small>
+                      <small>
+                        State: {chatTaskSnapshot.lifecycle} · Lifecycle:{" "}
+                        {chatTaskSnapshot.roundBreakdown.planning} planning ·{" "}
+                        {chatTaskSnapshot.roundBreakdown.execution} execution ·{" "}
+                        {chatTaskSnapshot.roundBreakdown.inspection} inspection ·{" "}
+                        {chatTaskSnapshot.roundBreakdown.completion} completion ·{" "}
+                        {chatTaskSnapshot.roundBreakdown.correction} correction ·{" "}
+                        {chatTaskSnapshot.roundBreakdown.modelRetries} model retries ·{" "}
+                        {chatTaskSnapshot.lifecycleTransitions} state transitions
+                      </small>
+                      {chatTaskSnapshot.failure && (
+                        <>
+                          <p role="alert">
+                            Safe diagnostic: {chatTaskSnapshot.failure.category}/
+                            {chatTaskSnapshot.failure.code}
+                            {chatTaskSnapshot.failure.operationId
+                              ? ` · operation ${chatTaskSnapshot.failure.operationId}`
+                              : ""}
+                            {` · ${chatTaskSnapshot.failure.committedOperations} committed canvas operations. `}
+                            Inspect the failed stage before retrying; confirmed work is retained.
+                          </p>
+                          {chatTaskSnapshot.lastRequestDiagnostic && (
+                            <small>
+                              Request {chatTaskSnapshot.lastRequestDiagnostic.requestId} ·{" "}
+                              {chatTaskSnapshot.lastRequestDiagnostic.requestPhase ??
+                                "unknown phase"}{" "}
+                              ·{" "}
+                              {chatTaskSnapshot.lastRequestDiagnostic.timeoutSource ??
+                                chatTaskSnapshot.lastRequestDiagnostic.terminationReason ??
+                                chatTaskSnapshot.lastRequestDiagnostic.outcome}
+                              {chatTaskSnapshot.lastRequestDiagnostic.elapsedMs !== undefined
+                                ? ` · ${chatTaskSnapshot.lastRequestDiagnostic.elapsedMs} ms elapsed`
+                                : ""}
+                              {chatTaskSnapshot.lastRequestDiagnostic.lastEventAtMs !== undefined
+                                ? ` · last event at ${chatTaskSnapshot.lastRequestDiagnostic.lastEventAtMs}`
+                                : ""}
+                            </small>
+                          )}
+                          {(() => {
+                            const stage = chatTaskSnapshot.stages.find((item) => !item.completed);
+                            return stage?.verificationHistory.length ? (
+                              <div
+                                className="chat-quality-diagnostic"
+                                aria-label="Structural quality diagnostic"
+                              >
+                                <p>
+                                  Structural checks: {stage.verificationHistory.length} · repair
+                                  attempts: {stage.repairOperationsAttempted} · confirmed mutations:{" "}
+                                  {stage.repairOperationsExecuted} · findings resolved:{" "}
+                                  {stage.repairFindingsResolved ?? 0}
+                                </p>
+                                {stage.qualityFindings.length > 0 && (
+                                  <ul>
+                                    {stage.qualityFindings.map((finding, index) => (
+                                      <li key={`${finding.code}-${index}`}>
+                                        <strong>{finding.code}</strong>
+                                        {finding.refs.length
+                                          ? ` · refs: ${finding.refs.join(", ")}`
+                                          : ""}
+                                        {` · expected ${finding.expected} · actual ${finding.actual}`}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                )}
+                                <small>
+                                  Repair operations attempted:{" "}
+                                  {stage.repairOperationsAttempted > 0 ? "yes" : "no"}
+                                  {` · native mutations confirmed: ${stage.repairOperationsExecuted > 0 ? "yes" : "no"}`}
+                                </small>
+                              </div>
+                            ) : null;
+                          })()}
+                          <button
+                            type="button"
+                            className="secondary-action"
+                            onClick={() => {
+                              void copyDiagnosticJson(chatTaskDiagnosticJson(chatTaskSnapshot))
+                                .then((method) =>
+                                  setChatActivity(
+                                    method === "clipboard"
+                                      ? "Sanitized diagnostic copied to the clipboard."
+                                      : "Sanitized diagnostic copied using the plugin UI fallback.",
+                                  ),
+                                )
+                                .catch(() =>
+                                  setChatActivity(
+                                    "Copy failed. Use Download diagnostic JSON; no task or canvas data was changed.",
+                                  ),
+                                );
+                            }}
+                          >
+                            Copy sanitized diagnostic
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-action"
+                            onClick={() => {
+                              try {
+                                downloadDiagnosticJson(
+                                  chatTaskDiagnosticJson(chatTaskSnapshot),
+                                  `figma-ai-diagnostic-${chatTaskSnapshot.id.replace(/[^A-Za-z0-9_-]/gu, "_")}.json`,
+                                );
+                                setChatActivity("Sanitized diagnostic JSON download started.");
+                              } catch {
+                                setChatActivity(
+                                  "Diagnostic download failed; the task and canvas were not changed.",
+                                );
+                              }
+                            }}
+                          >
+                            Download diagnostic JSON
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </details>
                 </>
               )}
-              {chatBusy && (
-                <button type="button" className="secondary-action" onClick={stopChat}>
-                  Stop
-                </button>
-              )}
             </section>
-          )}
-          {chatActivity && (
-            <div className="chat-activity" role="status" aria-live="polite">
-              <span
-                className={chatBusy ? "chat-activity-dot is-active" : "chat-activity-dot"}
-                aria-hidden="true"
-              />
-              <span>{safeChatProse(chatActivity)}</span>
-            </div>
           )}
           <form
             className="chat-composer"
@@ -3298,8 +3434,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                     aria-expanded={modelMenuOpen}
                     onClick={(event) => {
                       event.preventDefault();
-                      if (!modelMenuOpen && moreMenuRef.current)
-                        moreMenuRef.current.open = false;
+                      if (!modelMenuOpen && moreMenuRef.current) moreMenuRef.current.open = false;
                       setModelMenuOpen((open) => !open);
                     }}
                   >
@@ -4779,7 +4914,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           onConfirm={() => void deleteConversation()}
         />
       )}
-
     </main>
   );
 }

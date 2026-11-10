@@ -1442,9 +1442,11 @@ body {
 
 textarea#chat-input {
   width: 100%;
+  height: 76px;
   min-height: 76px;
-  max-height: 190px;
+  max-height: min(50vh, 360px);
   resize: vertical;
+  overflow-y: auto;
   padding: 9px 10px;
   border: 1px solid #383a43;
   border-radius: 7px;
@@ -3575,7 +3577,7 @@ body {
   background: rgba(16, 23, 43, 0.97);
 }
 .chat-composer textarea {
-  min-height: 74px;
+  min-height: 76px;
   color: #edf0ff;
 }
 .chat-composer-footer span {
@@ -3718,6 +3720,533 @@ body {
   .history-actions button {
     font-size: 9px;
   }
+}
+
+/* Keep chat controls anchored while the conversation and task details scroll. */
+html:has(.app-shell.is-chat-view),
+body:has(.app-shell.is-chat-view) {
+  height: 100%;
+  overflow: hidden;
+}
+
+body:has(.app-shell.is-chat-view) #root {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.app-shell.is-chat-view {
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.app-shell.is-chat-view > .topbar {
+  flex: 0 0 auto;
+}
+
+.app-shell.is-chat-view > .chat-home {
+  min-height: 0;
+  flex: 1 1 auto;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.app-shell.is-chat-view .chat-toolbar,
+.app-shell.is-chat-view .chat-composer {
+  flex: 0 0 auto;
+}
+
+.app-shell.is-chat-view .chat-task-progress {
+  min-height: 0;
+  max-height: min(38vh, 320px);
+  flex: 0 1 auto;
+  overflow: auto;
+  scrollbar-color: #584c85 transparent;
+}
+
+.chat-task-progress-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.chat-task-progress-heading > p {
+  min-width: 0;
+  flex: 1 1 auto;
+  margin: 0 0 8px;
+}
+
+.chat-task-progress-toggle {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  flex: 0 0 28px;
+  place-items: center;
+  margin: -4px -4px 0 0;
+  padding: 0;
+  border: 1px solid #354263;
+  border-radius: 7px;
+  color: #d4beff;
+  background: #17213b;
+  cursor: pointer;
+}
+
+.chat-task-progress-toggle:hover {
+  border-color: #7659bd;
+  background: #242145;
+}
+
+.chat-task-progress-toggle:focus-visible {
+  outline: 2px solid #b7aef8;
+  outline-offset: 2px;
+}
+
+.chat-task-progress-toggle svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+  transition: transform 0.16s ease;
+}
+
+.chat-task-progress.is-collapsed {
+  padding: 7px 9px;
+}
+
+.chat-task-progress.is-collapsed .chat-task-progress-heading > p {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.chat-task-progress.is-collapsed .chat-task-progress-toggle svg {
+  transform: rotate(180deg);
+}
+
+.app-shell.is-chat-view .chat-task-progress {
+  padding: 10px;
+  border-color: #354366;
+  background: linear-gradient(145deg, rgba(22, 30, 56, 0.98), rgba(16, 23, 43, 0.98));
+  box-shadow: 0 8px 22px rgba(3, 8, 23, 0.16);
+}
+
+.app-shell.is-chat-view .chat-task-progress-heading {
+  align-items: center;
+  gap: 7px;
+}
+
+.chat-task-progress-copy {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 2px;
+}
+
+.chat-task-progress-eyebrow {
+  color: #929fbe;
+  font-size: 8px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+  line-height: 12px;
+  text-transform: uppercase;
+}
+
+.chat-task-progress-copy > strong {
+  overflow: hidden;
+  color: #f3f4ff;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-task-progress-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  min-height: 22px;
+  padding: 0 7px;
+  border: 1px solid #35445f;
+  border-radius: 999px;
+  color: #c6cee2;
+  background: rgba(35, 46, 70, 0.62);
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+.chat-task-progress-status > span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #8c9ab7;
+}
+
+.chat-task-progress-status.is-running {
+  border-color: #4b4380;
+  color: #d9ccff;
+  background: rgba(85, 67, 143, 0.2);
+}
+
+.chat-task-progress-status.is-running > span {
+  background: #b99cff;
+  box-shadow: 0 0 0 3px rgba(185, 156, 255, 0.12);
+}
+
+.chat-task-progress-status.is-complete {
+  border-color: #286252;
+  color: #a4ead0;
+  background: rgba(22, 113, 84, 0.15);
+}
+
+.chat-task-progress-status.is-complete > span {
+  background: #58d1a4;
+}
+
+.chat-task-progress-status.is-attention {
+  border-color: #79513c;
+  color: #ffd0a3;
+  background: rgba(135, 77, 39, 0.17);
+}
+
+.chat-task-progress-status.is-attention > span {
+  background: #f0a66c;
+}
+
+.chat-task-progress-status.is-paused {
+  border-color: #625a3b;
+  color: #e8d99a;
+  background: rgba(122, 102, 39, 0.15);
+}
+
+.chat-task-progress-status.is-paused > span {
+  background: #e0c75e;
+}
+
+.app-shell.is-chat-view .chat-task-progress-toggle {
+  margin: 0;
+}
+
+.chat-task-progress-track {
+  height: 4px;
+  overflow: hidden;
+  margin: 9px 0;
+  border-radius: 999px;
+  background: #29334e;
+}
+
+.chat-task-progress-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #8970e9, #55c9b0);
+  transition: width 180ms ease;
+}
+
+.chat-task-progress-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 9px;
+}
+
+.chat-task-progress-metrics > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid rgba(57, 71, 105, 0.72);
+  border-radius: 7px;
+  background: rgba(12, 19, 37, 0.52);
+}
+
+.chat-task-progress-metrics span {
+  overflow: hidden;
+  color: #aab5cf;
+  font-size: 9px;
+  line-height: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-task-progress-metrics strong {
+  color: #f1f2ff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 14px;
+}
+
+.chat-task-stages {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chat-task-stage {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  min-height: 31px;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: #c5cee2;
+  background: rgba(11, 18, 35, 0.45);
+}
+
+.chat-task-stage.is-current {
+  border-color: rgba(123, 102, 197, 0.62);
+  color: #ece8ff;
+  background: rgba(91, 72, 149, 0.16);
+}
+
+.chat-task-stage-indicator {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border: 1px solid #53617e;
+  border-radius: 50%;
+  color: #9eabc5;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.chat-task-stage.is-complete .chat-task-stage-indicator {
+  border-color: #32816b;
+  color: #9be2c7;
+  background: rgba(35, 135, 103, 0.2);
+}
+
+.chat-task-stage.is-current .chat-task-stage-indicator {
+  border-color: #9278df;
+  color: #e2d8ff;
+  background: rgba(123, 96, 197, 0.28);
+}
+
+.chat-task-stage-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+}
+
+.chat-task-stage-state {
+  color: #909db8;
+  font-size: 8px;
+  font-weight: 650;
+  line-height: 12px;
+  white-space: nowrap;
+}
+
+.chat-task-stage.is-complete .chat-task-stage-state {
+  color: #83d6b9;
+}
+
+.chat-task-stage.is-current .chat-task-stage-state {
+  color: #c5b5ff;
+}
+
+.app-shell.is-chat-view .task-detail-links {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+  margin-top: 8px;
+  padding: 0;
+  border: 0;
+}
+
+.task-detail-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+  min-height: 29px;
+  padding: 0 7px;
+  border: 1px solid #34415f;
+  border-radius: 7px;
+  color: #cbd4eb;
+  background: rgba(15, 23, 43, 0.72);
+  cursor: pointer;
+  font: inherit;
+  font-size: 9px;
+  line-height: 13px;
+  text-align: start;
+}
+
+.task-detail-link > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-detail-link > span:last-child {
+  color: #9f8be8;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.task-detail-link:hover {
+  border-color: #7868b5;
+  color: #f0edff;
+  background: #202746;
+}
+
+.task-detail-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.chat-task-progress-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.chat-task-resume,
+.chat-task-stop {
+  min-height: 29px;
+  margin: 0;
+  padding: 0 9px;
+  font-size: 9px;
+}
+
+.chat-task-resume:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.chat-task-stop {
+  border-color: #704958;
+  color: #f0b8c4;
+}
+
+.chat-task-diagnostics {
+  margin-top: 8px;
+  border-top: 1px solid rgba(59, 72, 104, 0.7);
+  color: #9eabc5;
+}
+
+.chat-task-diagnostics > summary {
+  width: fit-content;
+  padding: 7px 1px 2px;
+  color: #aeb9d2;
+  cursor: pointer;
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 14px;
+  list-style-position: inside;
+}
+
+.chat-task-diagnostics > summary:hover {
+  color: #e1d8ff;
+}
+
+.chat-task-diagnostics-content {
+  display: grid;
+  gap: 3px;
+  padding: 3px 2px 0;
+}
+
+.chat-task-diagnostics-content > small {
+  margin: 0 0 4px;
+  color: #aab4cc;
+  font-size: 9px;
+  line-height: 14px;
+}
+
+.chat-task-diagnostics-content > p[role="alert"] {
+  margin: 3px 0 5px;
+  padding: 7px;
+  border-inline-start: 2px solid #d78964;
+  border-radius: 0 6px 6px 0;
+  color: #ffd0b1;
+  background: rgba(145, 76, 45, 0.14);
+  font-size: 9px;
+  line-height: 14px;
+}
+
+.chat-task-diagnostics-content .chat-quality-diagnostic {
+  margin: 4px 0;
+  font-size: 9px;
+}
+
+.chat-task-diagnostics-content .secondary-action {
+  justify-self: start;
+  min-height: 28px;
+  margin-top: 3px;
+  font-size: 9px;
+}
+
+.chat-task-progress.is-collapsed .chat-task-progress-copy > strong {
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 380px) {
+  .app-shell.is-chat-view .chat-task-progress {
+    padding: 8px;
+  }
+
+  .chat-task-progress-status {
+    gap: 4px;
+    padding: 0 6px;
+    font-size: 8px;
+  }
+
+  .chat-task-stage {
+    grid-template-columns: 19px minmax(0, 1fr) auto;
+    gap: 5px;
+    padding-inline: 5px;
+  }
+
+  .task-detail-link {
+    padding-inline: 5px;
+    font-size: 8px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-task-progress-track > span {
+    transition: none;
+  }
+}
+
+.app-shell.is-chat-view .chat-scroll-region {
+  min-height: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: #584c85 transparent;
+}
+
+.app-shell.is-chat-view .chat-transcript {
+  min-height: 0;
+  max-height: none;
+  flex: 0 0 auto;
+  overflow: visible;
 }
 
 @media (prefers-reduced-motion: reduce) {
