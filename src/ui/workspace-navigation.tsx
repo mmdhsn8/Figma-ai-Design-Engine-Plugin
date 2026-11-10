@@ -4,7 +4,6 @@ const primaryItems: Array<{ view: PluginView; label: string; icon: string }> = [
   { view: "home", label: "Home", icon: "⌂" },
   { view: "chat", label: "Chat", icon: "✦" },
   { view: "history", label: "History", icon: "◷" },
-  { view: "more", label: "More", icon: "•••" },
 ];
 
 export function PrimaryNavigation({
@@ -14,7 +13,7 @@ export function PrimaryNavigation({
   activeView: PluginView;
   onNavigate: (view: PluginView) => void;
 }) {
-  const primaryView = primaryItems.some(({ view }) => view === activeView) ? activeView : "more";
+  const primaryView = primaryItems.some(({ view }) => view === activeView) ? activeView : undefined;
   return (
     <nav className="primary-nav" aria-label="Main navigation">
       {primaryItems.map(({ view, label, icon }) => (
@@ -66,6 +65,62 @@ const moreItems: Array<{ view: PluginView; title: string; description: string }>
   { view: "help", title: "Help & Guide", description: "How this plugin handles native changes" },
   { view: "about", title: "About", description: "Version and project information" },
 ];
+
+const moreOptionIcons: Record<PluginView, string> = {
+  design: "✦",
+  progress: "◷",
+  results: "✓",
+  layers: "▱",
+  "brand-kit": "◈",
+  skills: "✧",
+  system: "▦",
+  assets: "▧",
+  activity: "≋",
+  quality: "⬡",
+  json: "{}",
+  help: "?",
+  about: "ⓘ",
+  home: "⌂",
+  chat: "✦",
+  history: "◷",
+  more: "•••",
+  "brand-kit-create": "◈",
+  "skill-detail": "✧",
+  "skill-add": "+",
+  settings: "⚙",
+};
+
+export function MoreOptionsAccordion({
+  onNavigate,
+}: {
+  onNavigate: (view: PluginView) => void;
+}) {
+  return (
+    <div
+      className="more-options-panel"
+      id="more-options-panel"
+      role="region"
+      aria-label="More options"
+    >
+      {moreItems.map((item) => (
+        <button
+          className="more-option"
+          key={item.view}
+          type="button"
+          onClick={() => onNavigate(item.view)}
+        >
+          <span className="more-option-icon" aria-hidden="true">
+            {moreOptionIcons[item.view]}
+          </span>
+          <span className="more-option-copy">
+            <span>{item.title}</span>
+            <small>{item.description}</small>
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
 
 export function MoreMenu({ onNavigate }: { onNavigate: (view: PluginView) => void }) {
   return (

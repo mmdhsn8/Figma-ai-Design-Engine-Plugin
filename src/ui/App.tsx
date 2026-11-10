@@ -36,7 +36,7 @@ import { chatHistoryBridge, chatTaskBridge } from "./chat-task-bridge";
 import { ChatHistoryView } from "./chat-history-view";
 import { ChatDeleteDialog } from "./chat-delete-dialog";
 import { HomeDashboard } from "./home-dashboard";
-import { MoreMenu, PrimaryNavigation } from "./workspace-navigation";
+import { MoreMenu, MoreOptionsAccordion, PrimaryNavigation } from "./workspace-navigation";
 import { WorkspaceDetailView } from "./workspace-detail-view";
 import type { PluginView } from "./workspace-routes";
 export type { PluginView } from "./workspace-routes";
@@ -448,6 +448,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     activeView: initialView,
     settingsOpen: false,
   });
+  const moreMenuRef = useRef<HTMLDetailsElement>(null);
   const { activeView, settingsOpen } = navigation;
   const [prompt, setPrompt] = useState("");
   const [generationTarget, setGenerationTarget] = useState<GenerationTarget>("mobile");
@@ -2934,27 +2935,36 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             Cancel operation
           </button>
         )}
-        <span
-          className={`connection-chip ${companionToken ? "is-connected" : ""} ${
-            companionConnectionState === "offline"
-              ? "is-offline"
-              : connectionSummary === "Reconnecting"
-                ? "is-reconnecting"
-                : connectionSummary === "Sign-in required"
-                  ? "is-sign-in-required"
-                  : ""
-          }`}
-          aria-live="polite"
-          aria-label={`Connection status: ${connectionSummary}`}
+        <details
+          className="topbar-more"
+          ref={moreMenuRef}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && moreMenuRef.current?.open) {
+              event.preventDefault();
+              moreMenuRef.current.open = false;
+              event.currentTarget.querySelector("summary")?.focus();
+            }
+          }}
         >
-          <span className="connection-dot" aria-hidden="true" />
-          <span>{connectionSummary}</span>
-        </span>
+          <summary className="topbar-more-trigger" aria-controls="more-options-panel">
+            <span className="topbar-more-icon" aria-hidden="true">•••</span>
+            <span>More</span>
+          </summary>
+          <MoreOptionsAccordion
+            onNavigate={(view) => {
+              if (moreMenuRef.current) moreMenuRef.current.open = false;
+              dispatchNavigation({ type: "navigate", view });
+            }}
+          />
+        </details>
         <button
           className={`settings-button ${settingsOpen ? "is-active" : ""}`}
           type="button"
           aria-pressed={settingsOpen}
-          onClick={() => dispatchNavigation({ type: "toggle-settings" })}
+          onClick={() => {
+            if (moreMenuRef.current) moreMenuRef.current.open = false;
+            dispatchNavigation({ type: "toggle-settings" });
+          }}
         >
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path d="M8.3 2.5h3.4l.5 1.8 1.6.9 1.8-.5 1.7 2.9-1.3 1.4v1.8l1.3 1.4-1.7 2.9-1.8-.5-1.6.9-.5 1.8H8.3l-.5-1.8-1.6-.9-1.8.5-1.7-2.9L4 10.8V9l-1.3-1.4 1.7-2.9 1.8.5 1.6-.9.5-1.8Z" />
@@ -2967,7 +2977,10 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       {!settingsOpen && (
         <PrimaryNavigation
           activeView={activeView}
-          onNavigate={(view) => dispatchNavigation({ type: "navigate", view })}
+          onNavigate={(view) => {
+            if (moreMenuRef.current) moreMenuRef.current.open = false;
+            dispatchNavigation({ type: "navigate", view });
+          }}
         />
       )}
 
@@ -3044,48 +3057,17 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         />
       ) : activeView === "chat" ? (
         <section className="chat-home" aria-labelledby="chat-title">
-          <div className="page-heading">
-            <div>
-              <span className="page-eyebrow">AUTHENTICATED · NATIVE FIGMA TOOLS</span>
-              <h1 id="chat-title">AI Chat</h1>
-              <p className="page-description">
-                Describe a change in Persian or English. Canvas operations are validated locally
-                before they run.
-              </p>
-            </div>
+          <h1 id="chat-title" className="sr-only">AI Chat</h1>
+          <div className="chat-toolbar">
             <button
-              className="text-button muted"
+              className="secondary-action chat-new-button"
               type="button"
-              disabled={
-                !canSwitchChats ||
-                (Boolean(activeChatId) && !chatMessages.length && !chatTaskSnapshot)
-              }
+              disabled={!canSwitchChats}
+              title={chatSwitchBlockReason ?? "Start a separate saved conversation."}
               onClick={() => void createNewChat()}
             >
+              <span className="chat-new-button-icon" aria-hidden="true">+</span>
               New chat
-            </button>
-          </div>
-          <div className="chat-context-summary" aria-label="Current generation context">
-            <button type="button" onClick={() => dispatchNavigation({ type: "open-settings" })}>
-              <small>MODEL</small>
-              <strong>
-                {companionModels.find(({ slug }) => slug === selectedCompanionModel)?.displayName ??
-                  (selectedCompanionModel || "No model selected")}
-              </strong>
-            </button>
-            <button
-              type="button"
-              onClick={() => dispatchNavigation({ type: "navigate", view: "brand-kit" })}
-            >
-              <small>BRAND KIT</small>
-              <strong>Not available yet</strong>
-            </button>
-            <button
-              type="button"
-              onClick={() => dispatchNavigation({ type: "navigate", view: "skills" })}
-            >
-              <small>SKILLS</small>
-              <strong>Not available yet</strong>
             </button>
           </div>
           <div
@@ -3340,11 +3322,24 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               aria-describedby="chat-help"
             />
             <div className="chat-composer-footer">
-              <span id="chat-help">
-                Enter to send · Shift+Enter for a new line
-                {!chatReady &&
-                  ` · ${inferenceEligibility.eligible ? "Select an authenticated model in Settings." : inferenceEligibility.message}`}
-                {toolBusy && " · Wait for the active native operation to finish."}
+              <span id="chat-help" className="sr-only">
+                Press Enter to send. Press Shift+Enter for a new line.
+              </span>
+              <span
+                className={`connection-chip chat-connection-chip ${companionToken ? "is-connected" : ""} ${
+                  companionConnectionState === "offline"
+                    ? "is-offline"
+                    : connectionSummary === "Reconnecting"
+                      ? "is-reconnecting"
+                      : connectionSummary === "Sign-in required"
+                        ? "is-sign-in-required"
+                        : ""
+                }`}
+                aria-live="polite"
+                aria-label={`Connection status: ${connectionSummary}`}
+              >
+                <span className="connection-dot" aria-hidden="true" />
+                <span>{connectionSummary}</span>
               </span>
               <button
                 type="submit"
@@ -3355,6 +3350,29 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               </button>
             </div>
           </form>
+          <div className="chat-context-summary" aria-label="Current generation context">
+            <button type="button" onClick={() => dispatchNavigation({ type: "open-settings" })}>
+              <small>MODEL</small>
+              <strong>
+                {companionModels.find(({ slug }) => slug === selectedCompanionModel)?.displayName ??
+                  (selectedCompanionModel || "No model selected")}
+              </strong>
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatchNavigation({ type: "navigate", view: "brand-kit" })}
+            >
+              <small>BRAND KIT</small>
+              <strong>Not available yet</strong>
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatchNavigation({ type: "navigate", view: "skills" })}
+            >
+              <small>SKILLS</small>
+              <strong>Not available yet</strong>
+            </button>
+          </div>
           <details className="tool-harness">
             <summary className="tool-harness-summary">
               <span>

@@ -1062,6 +1062,113 @@ body {
   font-size: 10px;
   cursor: pointer;
 }
+.topbar-more {
+  position: relative;
+  z-index: 30;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+.topbar-more-trigger {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid #303858;
+  border-radius: 9px;
+  color: #cbd2e8;
+  background: #141b30;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.topbar-more-trigger::-webkit-details-marker {
+  display: none;
+}
+.topbar-more-trigger::marker {
+  content: "";
+}
+.topbar-more-trigger:hover,
+.topbar-more[open] > .topbar-more-trigger {
+  border-color: #7659bd;
+  color: #f0d8ff;
+  background: #211c3a;
+}
+.topbar-more-icon {
+  color: #d8c6ff;
+  font-size: 9px;
+  letter-spacing: 1px;
+  line-height: 1;
+}
+.more-options-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 60;
+  display: grid;
+  width: min(300px, calc(100vw - 28px));
+  max-height: min(65vh, 440px);
+  gap: 5px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid #354263;
+  border-radius: 12px;
+  background: #11192d;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42);
+}
+.more-option {
+  min-width: 0;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid #293654;
+  border-radius: 8px;
+  text-align: left;
+  background: #151e36;
+  cursor: pointer;
+}
+.more-option-icon {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  flex: 0 0 30px;
+  place-items: center;
+  border: 1px solid #3c4266;
+  border-radius: 9px;
+  color: #cdb7ff;
+  background: linear-gradient(145deg, #272447, #1a2540);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+}
+.more-option-copy {
+  min-width: 0;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 3px;
+}
+.more-option:hover {
+  border-color: #7054a9;
+  background: #192441;
+}
+.more-option-copy > span {
+  color: #e7eaff;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 14px;
+}
+.more-option small {
+  color: #9ba8c5;
+  font-size: 9px;
+  line-height: 12px;
+}
 
 .settings-button:hover,
 .settings-button.is-active {
@@ -1333,6 +1440,11 @@ textarea#chat-input::placeholder {
 
 .chat-composer-footer > span {
   min-width: 0;
+}
+.chat-composer-footer .chat-connection-chip {
+  flex: 0 1 auto;
+  max-width: 145px;
+  margin-left: 0;
 }
 
 .chat-composer-footer .primary-action {
@@ -2164,7 +2276,7 @@ textarea.prompt-input::placeholder {
     font-size: 11px;
   }
 
-  .connection-chip {
+  .topbar .connection-chip {
     grid-column: 1;
     grid-row: 2;
     width: fit-content;
@@ -3418,6 +3530,42 @@ body {
 .settings-view {
   gap: 13px;
 }
+.chat-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 40px;
+}
+.chat-new-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 13px;
+  border-color: #51427f;
+  border-radius: 11px;
+  color: #e5ddff;
+  background: linear-gradient(135deg, #211d3b, #171d35);
+  box-shadow: 0 3px 10px rgba(102, 75, 179, 0.16);
+  white-space: nowrap;
+}
+.chat-new-button:hover:not(:disabled) {
+  border-color: #8067c4;
+  background: linear-gradient(135deg, #2a2350, #1b2543);
+}
+.chat-new-button-icon {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border: 1px solid rgba(198, 179, 255, 0.56);
+  border-radius: 50%;
+  color: #d4c6ff;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1;
+}
 .chat-transcript {
   max-height: 37vh;
   border-radius: 13px;
@@ -3543,7 +3691,7 @@ body {
   }
   .topbar {
     display: grid;
-    grid-template-columns: 32px minmax(0, 1fr) auto;
+    grid-template-columns: 32px minmax(0, 1fr) auto auto;
     row-gap: 6px;
     column-gap: 8px;
   }
@@ -3561,14 +3709,18 @@ body {
   .brand-subtitle {
     font-size: 9px;
   }
-  .connection-chip {
+  .topbar .connection-chip {
     grid-column: 1 / 3;
     grid-row: 2;
     max-width: 100%;
     margin-left: 0;
   }
-  .settings-button {
+  .topbar-more {
     grid-column: 3;
+    grid-row: 1;
+  }
+  .settings-button {
+    grid-column: 4;
     grid-row: 1;
   }
   .topbar-action {
