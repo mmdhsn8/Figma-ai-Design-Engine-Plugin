@@ -1,36 +1,94 @@
+import type { RefObject } from "react";
 import type { PluginView } from "./workspace-routes";
 
-const primaryItems: Array<{ view: PluginView; label: string; icon: string }> = [
-  { view: "home", label: "Home", icon: "⌂" },
-  { view: "chat", label: "Chat", icon: "✦" },
-  { view: "history", label: "History", icon: "◷" },
-];
-
-export function PrimaryNavigation({
+export function NavigationDrawer({
   activeView,
+  settingsOpen,
+  drawerRef,
+  closeButtonRef,
+  onClose,
   onNavigate,
+  onOpenSettings,
 }: {
   activeView: PluginView;
-  onNavigate: (view: PluginView) => void;
+  settingsOpen: boolean;
+  drawerRef: RefObject<HTMLElement>;
+  closeButtonRef: RefObject<HTMLButtonElement>;
+  onClose: () => void;
+  onNavigate: (view: "home" | "chat" | "history") => void;
+  onOpenSettings: () => void;
 }) {
-  const primaryView = primaryItems.some(({ view }) => view === activeView) ? activeView : undefined;
   return (
-    <nav className="primary-nav" aria-label="Main navigation">
-      {primaryItems.map(({ view, label, icon }) => (
-        <button
-          className={`nav-item ${primaryView === view ? "is-active" : ""}`}
-          key={view}
-          type="button"
-          aria-current={primaryView === view ? "page" : undefined}
-          onClick={() => onNavigate(view)}
-        >
-          <span className="nav-icon" aria-hidden="true">
-            {icon}
-          </span>
-          <span>{label}</span>
-        </button>
-      ))}
-    </nav>
+    <div
+      className="navigation-drawer-backdrop"
+      role="presentation"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <aside
+        className="navigation-drawer"
+        id="navigation-drawer"
+        ref={drawerRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="navigation-drawer-title"
+      >
+        <header className="navigation-drawer-header">
+          <div>
+            <span className="section-kicker">PAGES</span>
+            <h2 id="navigation-drawer-title">Navigate</h2>
+          </div>
+          <button
+            className="navigation-drawer-close"
+            ref={closeButtonRef}
+            type="button"
+            aria-label="Close navigation drawer"
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </header>
+        <nav className="navigation-drawer-links" aria-label="Plugin pages">
+          <button
+            className={`navigation-drawer-link ${settingsOpen ? "is-active" : ""}`}
+            type="button"
+            aria-current={settingsOpen ? "page" : undefined}
+            onClick={onOpenSettings}
+          >
+            <span className="navigation-drawer-icon" aria-hidden="true">⚙</span>
+            <span>Settings</span>
+          </button>
+          <button
+            className={`navigation-drawer-link ${!settingsOpen && activeView === "home" ? "is-active" : ""}`}
+            type="button"
+            aria-current={!settingsOpen && activeView === "home" ? "page" : undefined}
+            onClick={() => onNavigate("home")}
+          >
+            <span className="navigation-drawer-icon" aria-hidden="true">⌂</span>
+            <span>Home</span>
+          </button>
+          <button
+            className={`navigation-drawer-link ${!settingsOpen && activeView === "chat" ? "is-active" : ""}`}
+            type="button"
+            aria-current={!settingsOpen && activeView === "chat" ? "page" : undefined}
+            onClick={() => onNavigate("chat")}
+          >
+            <span className="navigation-drawer-icon" aria-hidden="true">✦</span>
+            <span>Chat</span>
+          </button>
+          <button
+            className={`navigation-drawer-link ${!settingsOpen && activeView === "history" ? "is-active" : ""}`}
+            type="button"
+            aria-current={!settingsOpen && activeView === "history" ? "page" : undefined}
+            onClick={() => onNavigate("history")}
+          >
+            <span className="navigation-drawer-icon" aria-hidden="true">◷</span>
+            <span>History</span>
+          </button>
+        </nav>
+      </aside>
+    </div>
   );
 }
 

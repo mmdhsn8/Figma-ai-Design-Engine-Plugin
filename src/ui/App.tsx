@@ -36,7 +36,7 @@ import { chatHistoryBridge, chatTaskBridge } from "./chat-task-bridge";
 import { ChatHistoryView } from "./chat-history-view";
 import { ChatDeleteDialog } from "./chat-delete-dialog";
 import { HomeDashboard } from "./home-dashboard";
-import { MoreMenu, MoreOptionsAccordion, PrimaryNavigation } from "./workspace-navigation";
+import { MoreMenu, MoreOptionsAccordion, NavigationDrawer } from "./workspace-navigation";
 import { WorkspaceDetailView } from "./workspace-detail-view";
 import type { PluginView } from "./workspace-routes";
 export type { PluginView } from "./workspace-routes";
@@ -449,6 +449,40 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     settingsOpen: false,
   });
   const moreMenuRef = useRef<HTMLDetailsElement>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const drawerTriggerRef = useRef<HTMLButtonElement>(null);
+  const drawerRef = useRef<HTMLElement>(null);
+  const drawerCloseButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!drawerOpen) return;
+    const drawerTrigger = drawerTriggerRef.current;
+    const focusFrame = window.requestAnimationFrame(() => drawerCloseButtonRef.current?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setDrawerOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = drawerRef.current?.querySelectorAll<HTMLElement>("button:not([disabled])");
+      if (!focusable?.length) return;
+      const first = focusable[0]!;
+      const last = focusable[focusable.length - 1]!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      window.removeEventListener("keydown", onKeyDown);
+      drawerTrigger?.focus();
+    };
+  }, [drawerOpen]);
   const { activeView, settingsOpen } = navigation;
   const [prompt, setPrompt] = useState("");
   const [generationTarget, setGenerationTarget] = useState<GenerationTarget>("mobile");
@@ -2900,6 +2934,16 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const connectionSummary = getConnectionSummary(companionConnectionState, companionStatus);
   const developerToolsBusy = toolBusy || chatBusy;
   const chatCanSubmit = chatReady && chatTaskLoaded && !toolBusy && !chatPendingTool;
+  const navigateFromDrawer = (view: "home" | "chat" | "history") => {
+    if (moreMenuRef.current) moreMenuRef.current.open = false;
+    setDrawerOpen(false);
+    dispatchNavigation({ type: "navigate", view });
+  };
+  const openSettingsFromDrawer = () => {
+    if (moreMenuRef.current) moreMenuRef.current.open = false;
+    setDrawerOpen(false);
+    dispatchNavigation({ type: "open-settings" });
+  };
 
   return (
     <main className="app-shell">
@@ -2914,6 +2958,22 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           <div className="brand-title">Figma AI Design Engine</div>
           <div className="brand-subtitle">Structured, editable design workflows</div>
         </div>
+        <span
+          className={`connection-chip topbar-connection-chip ${companionToken ? "is-connected" : ""} ${
+            companionConnectionState === "offline"
+              ? "is-offline"
+              : connectionSummary === "Reconnecting"
+                ? "is-reconnecting"
+                : connectionSummary === "Sign-in required"
+                  ? "is-sign-in-required"
+                  : ""
+          }`}
+          aria-live="polite"
+          aria-label={`Connection status: ${connectionSummary}`}
+        >
+          <span className="connection-dot" aria-hidden="true" />
+          <span>{connectionSummary}</span>
+        </span>
         {chatBusy && (
           <>
             {chatInspectionBatchActive && (
@@ -2935,52 +2995,35 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             Cancel operation
           </button>
         )}
-        <details
-          className="topbar-more"
-          ref={moreMenuRef}
-          onKeyDown={(event) => {
-            if (event.key === "Escape" && moreMenuRef.current?.open) {
-              event.preventDefault();
-              moreMenuRef.current.open = false;
-              event.currentTarget.querySelector("summary")?.focus();
-            }
-          }}
-        >
-          <summary className="topbar-more-trigger" aria-controls="more-options-panel">
-            <span className="topbar-more-icon" aria-hidden="true">•••</span>
-            <span>More</span>
-          </summary>
-          <MoreOptionsAccordion
-            onNavigate={(view) => {
-              if (moreMenuRef.current) moreMenuRef.current.open = false;
-              dispatchNavigation({ type: "navigate", view });
-            }}
-          />
-        </details>
         <button
-          className={`settings-button ${settingsOpen ? "is-active" : ""}`}
+          className={`drawer-button ${drawerOpen ? "is-active" : ""}`}
+          ref={drawerTriggerRef}
           type="button"
-          aria-pressed={settingsOpen}
+          aria-expanded={drawerOpen}
+          aria-controls={drawerOpen ? "navigation-drawer" : undefined}
+          aria-haspopup="dialog"
+          aria-label="Open page drawer"
           onClick={() => {
             if (moreMenuRef.current) moreMenuRef.current.open = false;
-            dispatchNavigation({ type: "toggle-settings" });
+            setDrawerOpen((open) => !open);
           }}
         >
-          <svg viewBox="0 0 20 20" aria-hidden="true">
-            <path d="M8.3 2.5h3.4l.5 1.8 1.6.9 1.8-.5 1.7 2.9-1.3 1.4v1.8l1.3 1.4-1.7 2.9-1.8-.5-1.6.9-.5 1.8H8.3l-.5-1.8-1.6-.9-1.8.5-1.7-2.9L4 10.8V9l-1.3-1.4 1.7-2.9 1.8.5 1.6-.9.5-1.8Z" />
-            <circle cx="10" cy="9.9" r="2.2" />
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <path d="M3 5h14M3 10h14M3 15h14" />
           </svg>
-          <span>{settingsOpen ? "Close" : "Settings"}</span>
+          <span>Menu</span>
         </button>
       </header>
 
-      {!settingsOpen && (
-        <PrimaryNavigation
+      {drawerOpen && (
+        <NavigationDrawer
           activeView={activeView}
-          onNavigate={(view) => {
-            if (moreMenuRef.current) moreMenuRef.current.open = false;
-            dispatchNavigation({ type: "navigate", view });
-          }}
+          settingsOpen={settingsOpen}
+          drawerRef={drawerRef}
+          closeButtonRef={drawerCloseButtonRef}
+          onClose={() => setDrawerOpen(false)}
+          onNavigate={navigateFromDrawer}
+          onOpenSettings={openSettingsFromDrawer}
         />
       )}
 
@@ -3325,22 +3368,32 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               <span id="chat-help" className="sr-only">
                 Press Enter to send. Press Shift+Enter for a new line.
               </span>
-              <span
-                className={`connection-chip chat-connection-chip ${companionToken ? "is-connected" : ""} ${
-                  companionConnectionState === "offline"
-                    ? "is-offline"
-                    : connectionSummary === "Reconnecting"
-                      ? "is-reconnecting"
-                      : connectionSummary === "Sign-in required"
-                        ? "is-sign-in-required"
-                        : ""
-                }`}
-                aria-live="polite"
-                aria-label={`Connection status: ${connectionSummary}`}
+              <details
+                className="chat-more-menu"
+                ref={moreMenuRef}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape" && moreMenuRef.current?.open) {
+                    event.preventDefault();
+                    moreMenuRef.current.open = false;
+                    event.currentTarget.querySelector("summary")?.focus();
+                  }
+                }}
               >
-                <span className="connection-dot" aria-hidden="true" />
-                <span>{connectionSummary}</span>
-              </span>
+                <summary className="chat-more-trigger" aria-controls="more-options-panel">
+                  <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                    <circle cx="4" cy="10" r="1" />
+                    <circle cx="10" cy="10" r="1" />
+                    <circle cx="16" cy="10" r="1" />
+                  </svg>
+                  <span>More</span>
+                </summary>
+                <MoreOptionsAccordion
+                  onNavigate={(view) => {
+                    if (moreMenuRef.current) moreMenuRef.current.open = false;
+                    dispatchNavigation({ type: "navigate", view });
+                  }}
+                />
+              </details>
               <button
                 type="submit"
                 className="primary-action"

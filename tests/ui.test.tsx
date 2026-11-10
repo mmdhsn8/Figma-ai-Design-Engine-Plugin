@@ -27,14 +27,12 @@ function status(auth: CompanionStatus["auth"]): CompanionStatus {
 }
 
 describe("plugin UI navigation and capability states", () => {
-  it("keeps secondary routes under More and exposes the four primary navigation buttons", () => {
+  it("moves page navigation into the drawer and removes the top tabs", () => {
     const html = render();
 
-    expect(html).toContain('<nav class="primary-nav" aria-label="Main navigation">');
-    expect(html).toContain('aria-current="page"');
-    for (const label of ["Home", "Chat", "History", "More"]) {
-      expect(html).toContain(`>${label}</span>`);
-    }
+    expect(html).toContain('aria-label="Open page drawer"');
+    expect(html).toContain('aria-haspopup="dialog"');
+    expect(html).not.toContain('<nav class="primary-nav" aria-label="Main navigation">');
   });
 
   it("renders the navy Home dashboard and all advanced destinations in More", () => {
