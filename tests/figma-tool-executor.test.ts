@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { FigmaToolOperationSchema, FigmaToolBatchSchema } from "../src/shared/figma-tools";
+import { FigmaToolOperationSchema, FigmaToolBatchSchema, DOCUMENT_DISCOVERY_LIMITS } from "../src/shared/figma-tools";
 import {
   UIToPluginSchema,
   type PluginToUIMessage,
@@ -14,7 +14,7 @@ import { parseResponsesFunctionCalls } from "../src/shared/chat-tools";
 import { utf8Bytes } from "../src/shared/generation-limits";
 import { ChatTaskSchema, chatTaskCommittedOperationCount } from "../src/shared/chat-task";
 import { handleChatTaskStorage } from "../src/plugin/chat-task-storage";
-import { runChatTask } from "../src/ui/chat-task";
+import { chatTaskInput, runChatTask } from "../src/ui/chat-task";
 import { CompanionClientError, type AuthorizedChatTurn } from "../src/ui/companion-client";
 
 import { createMockApi, type MockNode } from "./figma-mock";
@@ -42,6 +42,14 @@ async function run(
   await executor(batch);
   return batch.batchId;
 }
+
+function legacyToolState(mock: ReturnType<typeof createMockApi>) {
+  const entry = [...mock.storage.entries()].find(([key]) => key.includes("fad.figma-tools.v1"));
+  if (!entry) throw new Error("Executor did not persist its state.");
+  return { key: entry[0], state: downgradeStoredToolStateForRollback(entry[1]) };
+}
+
+const TOOL_STATE_STORAGE_KEY = "fad.figma-tools.v1:file-test-56:page_current";
 
 function resultFor(messages: PluginToUIMessage[], batchId: string) {
   return [...messages]
@@ -213,6 +221,720 @@ describe("safe Figma tool executor", () => {
     ]);
   });
 
+  it.each([12, 100])("progressively discovers and natively inspects %i Charm matches without round trips or mutations", async (frameCount) => {
+    const mock = createMockApi();
+    const original = mock.api.currentPage;
+    const pages = [original, mock.otherPage as unknown as PageNode];
+    for (let index = 0; index < frameCount; index++) {
+      const frame = mock.api.createFrame() as unknown as MockNode;
+      frame.name = "Charm " + pages[index % pages.length]!.id + " screen " + index;
+      frame.x = index * 12;
+      frame.resize(390, 844);
+      if (index % pages.length === 1) mock.otherPage.appendChild(frame);
+    }
+    mock.page.selection = [mock.nodes[0]!];
+    const originalSelection = [...mock.page.selection];
+    const snapshot = () => mock.nodes.map((node) => ({
+      id: node.id, name: node.name, parent: node.parent?.id,
+      x: node.x, y: node.y, width: node.width, height: node.height,
+      fills: structuredClone(node.fills), layoutMode: node.layoutMode,
+    }));
+    const before = snapshot();
+    const switchCountBefore = mock.getSetCurrentPageCalls();
+    const create = vi.spyOn(mock.api, "createFrame");
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const task = ChatTaskSchema.parse({
+      version: 1, id: "readonly-charm-acceptance", documentId: "file-test-56-page_current",
+      prompt: "Find and inspect all existing Charm frames without selecting any frame or changing the canvas.",
+      context: [], stages: [], ledger: [], pending: [], recent: [], starts: [], rounds: 0,
+      status: "ready", text: "",
+    });
+    let modelRequests = 0;
+    await runChatTask(task, {
+      signal: new AbortController().signal,
+      save: async (checkpoint) => { ChatTaskSchema.parse(checkpoint); },
+      progress: () => {},
+      model: async () => {
+        modelRequests++;
+        if (!task.intent)
+          return {
+            kind: "tool_calls",
+            calls: parseResponsesFunctionCalls([{
+              type: "function_call", call_id: "readonly_classify_" + frameCount,
+              name: "classify_canvas_intent",
+              arguments: JSON.stringify({ intent: "inspect", targetName: "Charm" }),
+            }]),
+            functionCallItems: [], text: "",
+          };
+        throw new Error("The deterministic native scan must not ask the model for another tool call.");
+      },
+      execute: async (operations) => {
+        expect(operations).toHaveLength(1);
+        expect(operations[0]!.action).toMatchObject({ tool: "get_document_context", query: "Charm", readOnlyInspection: true });
+        const batchId = await run(executor, operations);
+        const result = resultFor(messages, batchId);
+        if (result?.type !== "tool-result") throw new Error("Missing native scan result.");
+        expect(result.success).toBe(true);
+        expect(result.cancelled).toBe(false);
+        expect(result.committedOperationIds).toEqual([]);
+        const data = result.results[0]!.data!;
+        expect(data.discovery).toMatchObject({
+          matchStatus: "ambiguous",
+          matchCount: frameCount,
+          framesInspected: frameCount,
+          truncated: false,
+          complete: true,
+          nativeInspection: { complete: true, framesInspected: frameCount, framesExpected: frameCount },
+        });
+        expect((data.frames as Array<Record<string, unknown>>).length).toBeLessThanOrEqual(8);
+        expect(mock.api.currentPage.id).toBe(original.id);
+        expect(mock.page.selection).toEqual(originalSelection);
+        expect(mock.otherPage.selection).toEqual([]);
+        return result;
+      },
+    });
+    expect(task.status).toBe("completed");
+    expect(task.rounds).toBe(1);
+    expect(modelRequests).toBe(1);
+    expect(task.stages).toEqual([]);
+    expect(task.inspectionOutcome).toBe("COMPLETED");
+    expect(task.inspectionSummary).toMatchObject({
+      pagesScanned: 2,
+      framesDiscovered: frameCount,
+      matchingFrames: frameCount,
+      framesInspected: frameCount,
+      complete: true,
+      canvasMutations: 0,
+    });
+    expect(chatTaskCommittedOperationCount(task)).toBe(0);
+    expect(create).not.toHaveBeenCalled();
+    expect(snapshot()).toEqual(before);
+    expect(mock.getSetCurrentPageCalls()).toBe(switchCountBefore);
+    expect(task.ledger.filter(({ call }) => call.action.tool === "get_document_context")).toHaveLength(1);
+    expect(task.ledger.some(({ call }) => call.action.tool === "inspect_nodes")).toBe(false);
+    const savedEvidence = JSON.stringify(chatTaskInput({ ...task, recent: [] }));
+    expect(savedEvidence).toContain(before[0]!.name);
+    const escapedQuote = String.fromCharCode(92, 34);
+    expect(savedEvidence).toContain(escapedQuote + "verified" + escapedQuote + ":true");
+    expect(task.text).toContain("Canvas mutations: 0.");
+  });
+
+  it("reports an exhaustive progressive no-match scan as complete", async () => {
+    const mock = createMockApi();
+    for (let index = 0; index < 130; index++) mock.api.createFrame().name = `Unrelated ${index}`;
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const batchId = await run(executor, [operation("truncated-readonly-discovery", { tool: "get_document_context", query: "Charm" })]);
+    expect(resultFor(messages, batchId)).toMatchObject({
+      success: true, committedOperationIds: [],
+      results: [{ data: { frames: [], discovery: { matchStatus: "no_match", truncated: false, complete: true, matchCount: 0 } } }],
+    });
+  });
+
+  it.each([3, 30, 100, 400, 501])("progressively scans all %i pages and finds a match on the last page", async (pageCount) => {
+    const mock = createMockApi();
+    const pages = [mock.page as unknown as PageNode, mock.otherPage as unknown as PageNode];
+    while (pages.length < pageCount) pages.push(mock.addPage("Page " + (pages.length + 1)) as unknown as PageNode);
+    const lastPage = pages[pages.length - 1] as unknown as { appendChild(node: MockNode): void };
+    const target = mock.api.createFrame() as unknown as MockNode;
+    target.name = "Charm Home on the last page";
+    target.resize(390, 844);
+    lastPage.appendChild(target);
+    const selectionNode = mock.api.createRectangle() as unknown as MockNode;
+    selectionNode.name = "Keep selection";
+    mock.page.selection = [selectionNode];
+    const originalSelection = [...mock.page.selection];
+    const originalPageId = mock.api.currentPage.id;
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const batchId = await run(executor, [operation("scale-pages-" + pageCount, {
+      tool: "get_document_context", query: "Charm", readOnlyInspection: true,
+    })]);
+    const result = resultFor(messages, batchId);
+    expect(result?.type).toBe("tool-result");
+    if (result?.type !== "tool-result") throw new Error("Missing progressive discovery result.");
+    const data = result.results[0]!.data!;
+    expect(data.discovery).toMatchObject({
+      pagesVisited: pageCount,
+      pagesAvailable: pageCount,
+      pagesRemaining: 0,
+      matchCount: 1,
+      framesInspected: 1,
+      complete: true,
+      truncated: false,
+    });
+    expect((data.discovery as Record<string, number>).sliceCount).toBeGreaterThanOrEqual(pageCount);
+    expect((data.discovery as Record<string, number>).maxNodesPerSliceObserved)
+      .toBeLessThanOrEqual(DOCUMENT_DISCOVERY_LIMITS.nodesPerSlice);
+    expect(data.frames).toMatchObject([{ nodeId: target.id, pageId: pages[pageCount - 1]!.id, nativeInspected: true }]);
+    expect((data.profiling as { transferPayloadBytes: number }).transferPayloadBytes).toBeLessThan(7_500);
+    expect(mock.api.currentPage.id).toBe(originalPageId);
+    expect(mock.page.selection).toEqual(originalSelection);
+    expect(mock.getSetCurrentPageCalls()).toBe(0);
+    expect(result.committedOperationIds).toEqual([]);
+  }, 30_000);
+
+  it("bounds page listeners and invalidates every cached page through the global fallback", async () => {
+    const mock = createMockApi();
+    const pages = [mock.page as unknown as PageNode, mock.otherPage as unknown as PageNode];
+    while (pages.length < 70) pages.push(mock.addPage("Tracked page " + (pages.length + 1)) as unknown as PageNode);
+    const lastPage = pages[69] as unknown as { appendChild(node: MockNode): void };
+    const target = mock.api.createFrame() as unknown as MockNode;
+    target.name = "Charm last tracked frame";
+    lastPage.appendChild(target);
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const read = async (operationId: string) => {
+      const batchId = await run(executor, [operation(operationId, {
+        tool: "get_document_context", query: "Charm", readOnlyInspection: true,
+      })]);
+      const result = resultFor(messages, batchId);
+      if (result?.type !== "tool-result") throw new Error("Missing bounded-listener discovery result.");
+      return result.results[0]!.data!;
+    };
+
+    const first = await read("bounded-listener-first");
+    expect(first.discovery).toMatchObject({
+      pagesVisited: 70,
+      complete: true,
+      matchCount: 1,
+      trackedPageListeners: DOCUMENT_DISCOVERY_LIMITS.pageChangeListeners,
+      globalInvalidationFallback: true,
+    });
+    expect((first.discovery as Record<string, number>).loadedPageCacheEntries)
+      .toBeLessThanOrEqual(DOCUMENT_DISCOVERY_LIMITS.pageCacheEntries);
+
+    target.name = "Renamed target";
+    mock.emitPageChange(pages[69]!.id);
+    const refreshed = await read("bounded-listener-after-change");
+    expect(refreshed.discovery).toMatchObject({
+      pagesVisited: 70,
+      complete: true,
+      matchCount: 0,
+      invalidatedPages: 70,
+      globalInvalidationFallback: true,
+    });
+    expect(refreshed.frames).toEqual([]);
+  }, 30_000);
+
+  it("bounds slices and serialized output on a component-heavy page with thousands of nodes", async () => {
+    const mock = createMockApi();
+    const frameCount = 1_000;
+    for (let index = 0; index < frameCount; index++) {
+      const frame = mock.api.createFrame() as unknown as MockNode;
+      frame.name = "Charm component " + index;
+      for (let childIndex = 0; childIndex < 3; childIndex++) {
+        const child = mock.api.createRectangle() as unknown as MockNode;
+        child.name = "Layer " + childIndex;
+        frame.appendChild(child);
+      }
+    }
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const batchId = await run(executor, [operation("scale-heavy-page", {
+      tool: "get_document_context", query: "Charm", readOnlyInspection: true,
+    })]);
+    const result = resultFor(messages, batchId);
+    expect(result?.type).toBe("tool-result");
+    if (result?.type !== "tool-result") throw new Error("Missing component-heavy discovery result.");
+    const data = result.results[0]!.data!;
+    expect(data.discovery).toMatchObject({
+      nodesVisited: frameCount * 4,
+      framesDiscovered: frameCount,
+      matchCount: frameCount,
+      framesInspected: frameCount,
+      complete: true,
+      truncated: false,
+      nativeInspection: { complete: true, framesInspected: frameCount, framesExpected: frameCount },
+    });
+    expect((data.discovery as Record<string, number>).sliceCount).toBeGreaterThan(1);
+    expect((data.discovery as Record<string, number>).maxNodesPerSliceObserved)
+      .toBeLessThanOrEqual(DOCUMENT_DISCOVERY_LIMITS.nodesPerSlice);
+    expect((data.frames as unknown[]).length).toBeLessThanOrEqual(DOCUMENT_DISCOVERY_LIMITS.resultFrames);
+    expect((data.profiling as { transferPayloadBytes: number }).transferPayloadBytes).toBeLessThan(7_500);
+    expect(result.committedOperationIds).toEqual([]);
+  }, 30_000);
+
+  it("pauses at a committed page boundary and resumes from saved discovery evidence", async () => {
+    const mock = createMockApi();
+    const pages = [mock.page as unknown as PageNode, mock.otherPage as unknown as PageNode];
+    while (pages.length < 30) pages.push(mock.addPage("Resume page " + (pages.length + 1)) as unknown as PageNode);
+    const target = mock.api.createFrame() as unknown as MockNode;
+    target.name = "Charm final screen";
+    (pages[29] as unknown as { appendChild(node: MockNode): void }).appendChild(target);
+    const messages: PluginToUIMessage[] = [];
+    let pauseSent = false;
+    const executor = createFigmaToolExecutor(mock.api, (message) => {
+      messages.push(message);
+      if (message.type === "tool-progress" && !pauseSent && message.message.includes("Progressive discovery")) {
+        pauseSent = true;
+        void executor({ type: "tool-pause", protocolVersion: 1, batchId: message.batchId });
+      }
+    });
+    const firstBatch = await run(executor, [operation("resume-discovery-pause", {
+      tool: "get_document_context", query: "Charm", readOnlyInspection: true,
+    })]);
+    const paused = resultFor(messages, firstBatch);
+    expect(paused?.type).toBe("tool-result");
+    if (paused?.type !== "tool-result") throw new Error("Missing paused discovery result.");
+    expect(paused.results[0]!.data!.discovery).toMatchObject({
+      paused: true,
+      complete: false,
+      continuationAvailable: true,
+      pagesVisited: 10,
+      pagesRemaining: 20,
+    });
+
+    const resumedBatch = await run(executor, [operation("resume-discovery-continue", {
+      tool: "get_document_context", query: "Charm", readOnlyInspection: true,
+    })]);
+    const resumed = resultFor(messages, resumedBatch);
+    expect(resumed?.type).toBe("tool-result");
+    if (resumed?.type !== "tool-result") throw new Error("Missing resumed discovery result.");
+    expect(resumed.results[0]!.data!.discovery).toMatchObject({
+      pagesVisited: 30,
+      pagesRemaining: 0,
+      matchCount: 1,
+      framesInspected: 1,
+      complete: true,
+      revalidatedAfterRestart: false,
+    });
+    expect(resumed.committedOperationIds).toEqual([]);
+  }, 15_000);
+
+  it("revalidates persisted discovery after executor restart and never reuses a stale match", async () => {
+    const mock = createMockApi();
+    const frame = mock.api.createFrame() as unknown as MockNode;
+    frame.name = "Charm Home";
+    const messages: PluginToUIMessage[] = [];
+    const read = async (executor: ReturnType<typeof createFigmaToolExecutor>, operationId: string) => {
+      const batchId = await run(executor, [operation(operationId, {
+        tool: "get_document_context", query: "Charm", readOnlyInspection: true,
+      })]);
+      const result = resultFor(messages, batchId);
+      if (result?.type !== "tool-result") throw new Error("Missing stale-cache validation result.");
+      return result.results[0]!.data!;
+    };
+    const first = await read(createFigmaToolExecutor(mock.api, (message) => messages.push(message)), "stale-cache-before-restart");
+    expect(first.discovery).toMatchObject({ complete: true, matchCount: 1, revalidatedAfterRestart: false });
+    frame.name = "Renamed Home";
+
+    const afterRestart = await read(
+      createFigmaToolExecutor(mock.api, (message) => messages.push(message)),
+      "stale-cache-after-restart",
+    );
+    expect(afterRestart.discovery).toMatchObject({
+      complete: true,
+      matchCount: 0,
+      matchStatus: "no_match",
+      revalidatedAfterRestart: true,
+    });
+    expect(afterRestart.frames).toEqual([]);
+  });
+
+  it("evicts only completed discovery cursors within the cache entry budget", async () => {
+    const mock = createMockApi();
+    mock.storage.set("fad.chat-task.checkpoint.keep", { preserved: true });
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const firstQuery = "absent-cache-query-0";
+    let firstCursorKey: string | undefined;
+    for (let index = 0; index <= DOCUMENT_DISCOVERY_LIMITS.cacheEntries; index++) {
+      const query = index === 0 ? firstQuery : "absent-cache-query-" + index;
+      const batchId = await run(executor, [operation("cache-evict-" + index, {
+        tool: "get_document_context", query, readOnlyInspection: true,
+      })]);
+      expect(resultFor(messages, batchId)).toMatchObject({ type: "tool-result", success: true });
+      if (index === 0)
+        firstCursorKey = [...mock.storage.keys()].find(
+          (key) => key.startsWith("fad.document-discovery.v1:") && !key.includes(":index:"),
+        );
+    }
+    const cachedCursorKeys = [...mock.storage.keys()].filter(
+      (key) => key.startsWith("fad.document-discovery.v1:") && !key.includes(":index:"),
+    );
+    expect(cachedCursorKeys).toHaveLength(DOCUMENT_DISCOVERY_LIMITS.cacheEntries);
+    expect(firstCursorKey).toBeDefined();
+    expect(cachedCursorKeys).not.toContain(firstCursorKey);
+    expect(mock.storage.get("fad.chat-task.checkpoint.keep")).toEqual({ preserved: true });
+  });
+
+  it("returns honest partial coverage when discovery storage is unavailable", async () => {
+    const mock = createMockApi();
+    const target = mock.api.createFrame() as unknown as MockNode;
+    target.name = "Charm Home";
+    const storage = mock.api.clientStorage;
+    const originalSetAsync = storage.setAsync.bind(storage);
+    storage.setAsync = async (key, value) => {
+      if (key.startsWith("fad.document-discovery.v1:")) throw new Error("mock storage quota");
+      return originalSetAsync(key, value);
+    };
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const batchId = await run(executor, [operation("cache-quota-partial", {
+      tool: "get_document_context", query: "Charm", readOnlyInspection: true,
+    })]);
+    const result = resultFor(messages, batchId);
+    expect(result).toMatchObject({ type: "tool-result", success: true, committedOperationIds: [] });
+    if (result?.type !== "tool-result") throw new Error("Missing quota-limited result.");
+    expect(result.results[0]!.data!.discovery).toMatchObject({
+      complete: false,
+      truncated: true,
+      continuationAvailable: false,
+      truncationReason: "discovery_checkpoint_unavailable",
+      matchCount: 1,
+      framesInspected: 1,
+    });
+  });
+
+  it("reports an inaccessible page as partial and retries it from the saved cursor", async () => {
+    const mock = createMockApi();
+    const inaccessible = mock.addPage("Temporarily unavailable") as unknown as PageNode & { loadCalls: number };
+    let shouldFail = true;
+    (inaccessible as unknown as { loadAsync(): Promise<void> }).loadAsync = async () => {
+      (inaccessible as unknown as { loadCalls: number }).loadCalls++;
+      if (shouldFail) throw new Error("mock access denied");
+    };
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const read = async (operationId: string) => {
+      const batchId = await run(executor, [operation(operationId, {
+        tool: "get_document_context", query: "Charm", readOnlyInspection: true,
+      })]);
+      const result = resultFor(messages, batchId);
+      if (result?.type !== "tool-result") throw new Error("Missing inaccessible-page result.");
+      return result.results[0]!.data!;
+    };
+    const partial = await read("inaccessible-page-first");
+    expect(partial.discovery).toMatchObject({
+      complete: false,
+      truncated: true,
+      continuationAvailable: true,
+      inaccessiblePages: 1,
+      inaccessiblePageSamples: [{ id: inaccessible.id, reason: "page_load_failed" }],
+    });
+    shouldFail = false;
+    const recovered = await read("inaccessible-page-retry");
+    expect(recovered.discovery).toMatchObject({
+      complete: true,
+      truncated: false,
+      continuationAvailable: false,
+      inaccessiblePages: 0,
+      pagesVisited: 3,
+      matchStatus: "no_match",
+    });
+  });
+
+  it("caches bounded discovery across result windows and invalidates on page changes", async () => {
+    const mock = createMockApi();
+    const frame = mock.api.createFrame() as unknown as MockNode;
+    frame.name = "Charm Home";
+    frame.resize(390, 844);
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const read = async (operationId: string) => {
+      const batchId = await run(executor, [
+        operation(operationId, {
+          tool: "get_document_context",
+          query: "Charm",
+          readOnlyInspection: true,
+        }),
+      ]);
+      const result = resultFor(messages, batchId);
+      if (result?.type !== "tool-result") throw new Error("Missing tool result.");
+      return result.results[0]!.data!;
+    };
+
+    const first = await read("cache-first-read");
+    const second = await read("cache-second-read");
+    expect(first.discovery).toMatchObject({ cacheHit: false, framesDiscovered: 1 });
+    expect(second.discovery).toMatchObject({
+      cacheHit: true, cacheHits: 1, cacheLookups: 2, cacheHitRate: 0.5, framesDiscovered: 1,
+    });
+    expect(second.profiling).toMatchObject({
+      nativeExecutionMs: expect.any(Number),
+      resultSerializationMs: expect.any(Number),
+      resultPayloadBytes: expect.any(Number),
+      transferPayloadBytes: expect.any(Number),
+    });
+    expect((second.profiling as { transferPayloadBytes: number }).transferPayloadBytes).toBeLessThan(7_500);
+
+    frame.name = "Charm Home Updated";
+    mock.emitPageChange("page:current");
+    const refreshed = await read("cache-after-change");
+    expect(refreshed.discovery).toMatchObject({ cacheHit: false, framesDiscovered: 1 });
+    expect(refreshed.frames).toMatchObject([{ name: "Charm Home Updated" }]);
+  });
+
+  it("persists inspection-only refs without tagging canvas nodes or the document root", async () => {
+    const mock = createMockApi();
+    const originalDocumentId = mock.api.root.getPluginData("fad.document-id");
+    const frame = mock.api.createFrame() as unknown as MockNode;
+    frame.name = "Charm Home";
+    frame.resize(390, 844);
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const discoveryBatch = await run(executor, [
+      operation("inspection-only-discovery", {
+        tool: "get_document_context",
+        query: "Charm",
+        readOnlyInspection: true,
+      }),
+    ]);
+    const discovery = resultFor(messages, discoveryBatch);
+    if (discovery?.type !== "tool-result") throw new Error("Missing discovery result.");
+    const ref = (discovery.results[0]!.data!.frames as Array<{ ref: string }>)[0]!.ref;
+    expect(ref).toMatch(/^inspection-/u);
+    expect(frame.getPluginData("fad.tool.logical-ref.v1")).toBe("");
+    expect(mock.api.root.getPluginData("fad.document-id")).toBe(originalDocumentId);
+
+    const inspect = async (target: ReturnType<typeof createFigmaToolExecutor>, operationId: string) => {
+      const batchId = await run(target, [
+        operation(operationId, {
+          tool: "inspect_nodes",
+          pageId: "page:current",
+          refs: [ref],
+          selection: false,
+          readOnlyInspection: true,
+        }),
+      ]);
+      return resultFor(messages, batchId);
+    };
+    expect(await inspect(executor, "inspection-only-read")).toMatchObject({
+      success: true,
+      committedOperationIds: [],
+      results: [{ data: { pageId: "page:current", nodes: [{ name: "Charm Home" }] } }],
+    });
+    expect(frame.getPluginData("fad.tool.logical-ref.v1")).toBe("");
+    expect(mock.api.root.getPluginData("fad.document-id")).toBe(originalDocumentId);
+
+    const reopened = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    expect(await inspect(reopened, "inspection-only-resume")).toMatchObject({ success: true });
+    expect(frame.fills).toEqual([]);
+    expect(frame.getPluginData("fad.tool.logical-ref.v1")).toBe("");
+    expect(mock.api.root.getPluginData("fad.document-id")).toBe(originalDocumentId);
+  });
+
+  it("refuses to use persisted inspection-only refs for mutations", async () => {
+    const mock = createMockApi();
+    mock.api.root.setPluginData("fad.document-id", "inspection-only-safety-test");
+    const frame = mock.api.createFrame() as unknown as MockNode;
+    frame.name = "Charm Home";
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const discoveryBatch = await run(executor, [
+      operation("inspection-only-safety-discovery", {
+        tool: "get_document_context",
+        query: "Charm",
+        readOnlyInspection: true,
+      }),
+    ]);
+    const discovery = resultFor(messages, discoveryBatch);
+    if (discovery?.type !== "tool-result") throw new Error("Missing discovery result.");
+    const ref = (discovery.results[0]!.data!.frames as Array<{ ref: string }>)[0]!.ref;
+    const editBatch = await run(executor, [
+      operation("inspection-only-edit-reject", {
+        tool: "set_properties",
+        ref,
+        properties: { fill: "#000000" },
+      }),
+    ]);
+    expect(resultFor(messages, editBatch)).toMatchObject({
+      success: false,
+      committedOperationIds: [],
+      results: [{ data: { referenceResolution: { code: "inspection_only_reference" } } }],
+    });
+    expect(frame.fills).toEqual([]);
+    expect(frame.getPluginData("fad.tool.logical-ref.v1")).toBe("");
+  });
+
+  it("cancels a yielding native discovery and restores the original page", async () => {
+    const mock = createMockApi();
+    for (let index = 0; index < 250; index++)
+      mock.api.createFrame().name = "Frame " + index;
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const batchId = "cancel-discovery-test";
+    const batch = FigmaToolBatchSchema.parse({
+      type: "tool-execute",
+      protocolVersion: 1,
+      batchId,
+      operations: [
+        operation("cancel-discovery-op", {
+          tool: "get_document_context",
+          query: "Frame",
+          readOnlyInspection: true,
+        }),
+      ],
+    });
+    const running = executor(batch);
+    setTimeout(() => {
+      void executor({ type: "tool-cancel", protocolVersion: 1, batchId });
+    }, 0);
+    await running;
+    const result = resultFor(messages, batchId);
+    expect(result).toMatchObject({ type: "tool-result", success: false, cancelled: true });
+    expect(mock.api.currentPage.id).toBe(mock.page.id);
+    expect(result?.type === "tool-result" ? result.committedOperationIds : []).toEqual([]);
+  });
+
+  it("propagates cancellation during an unresolved page load without loading later pages", async () => {
+    const mock = createMockApi();
+    const slowPage = mock.addPage("Slow page") as unknown as PageNode & { loadCalls: number };
+    const laterPage = mock.addPage("Later page") as unknown as PageNode & { loadCalls: number };
+    let loadStartedResolve!: () => void;
+    const loadStarted = new Promise<void>((resolve) => { loadStartedResolve = resolve; });
+    (slowPage as unknown as { loadAsync(): Promise<void> }).loadAsync = () => {
+      loadStartedResolve();
+      return new Promise<void>(() => undefined);
+    };
+    const originalPageId = mock.api.currentPage.id;
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const batchId = "cancel-page-load-test";
+    const batch = FigmaToolBatchSchema.parse({
+      type: "tool-execute", protocolVersion: 1, batchId,
+      operations: [operation("cancel-page-load-op", {
+        tool: "get_document_context", query: "Charm", readOnlyInspection: true,
+      })],
+    });
+    const running = executor(batch);
+    await loadStarted;
+    await executor({ type: "tool-cancel", protocolVersion: 1, batchId });
+    await running;
+    expect(resultFor(messages, batchId)).toMatchObject({ type: "tool-result", success: false, cancelled: true });
+    expect((laterPage as unknown as { loadCalls: number }).loadCalls).toBe(0);
+    expect(mock.api.currentPage.id).toBe(originalPageId);
+  });
+
+  it("discovers an unselected prior-chat frame on another page and edits it after executor reload", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const original = mock.api.currentPage;
+    await mock.api.setCurrentPageAsync(mock.otherPage as unknown as PageNode);
+    const home = mock.api.createFrame() as unknown as MockNode;
+    home.name = "Charm — Home";
+    home.resize(390, 844);
+    home.setPluginData("fad.tool.task-id.v1", "chat-task-old-0001");
+    home.setPluginData("fad.design.task-id.v1", "chat-task-old-0001");
+    home.setPluginData("fad.design.chat-id.v1", "chat-history-old-01");
+    home.setPluginData("fad.design.name.v1", "Charm");
+    const cart = mock.api.createFrame() as unknown as MockNode;
+    cart.name = "Charm — Cart";
+    cart.resize(390, 844);
+    cart.setPluginData("fad.design.task-id.v1", "chat-task-old-0001");
+    cart.setPluginData("fad.design.chat-id.v1", "chat-history-old-01");
+    cart.setPluginData("fad.design.name.v1", "Charm");
+    await mock.api.setCurrentPageAsync(original);
+    const originalNodeId = home.id;
+
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const discoveryBatch = await run(executor, [
+      operation(
+        "crosspage-discover-01",
+        { tool: "get_document_context", query: "Charm — Home" },
+        "chat-task-new-01",
+      ),
+    ]);
+    const discovery = resultFor(messages, discoveryBatch);
+    expect(discovery?.type).toBe("tool-result");
+    if (discovery?.type !== "tool-result") throw new Error("Document discovery failed.");
+    const data = discovery.results[0]?.data;
+    expect(data?.discovery).toMatchObject({
+      pagesVisited: 2,
+      truncated: false,
+      query: "Charm — Home",
+      matchStatus: "unique",
+      matchCount: 1,
+    });
+    expect(utf8Bytes(JSON.stringify(discovery.results[0]))).toBeLessThan(7_500);
+    const target = (data?.frames as Array<Record<string, unknown>>).find(
+      (frame) => frame.name === "Charm — Home",
+    );
+    expect(target).toMatchObject({
+      pageId: "page:other",
+      pageName: "Other Page",
+      projectName: "Charm",
+      taskId: "chat-task-old-0001",
+      chatId: "chat-history-old-01",
+      editable: true,
+    });
+    expect(typeof target?.ref).toBe("string");
+    expect(mock.api.currentPage.id).toBe(original.id);
+    expect(mock.page.selection).toEqual([]);
+
+    const ambiguousBatch = await run(executor, [
+      operation(
+        "crosspage-discover-02",
+        { tool: "get_document_context", query: "Charm" },
+        "chat-task-new-01",
+      ),
+    ]);
+    expect(resultFor(messages, ambiguousBatch)).toMatchObject({
+      type: "tool-result",
+      success: true,
+      results: [
+        {
+          data: {
+            discovery: { matchStatus: "ambiguous", matchCount: 2 },
+            frames: expect.arrayContaining([
+              expect.objectContaining({ name: "Charm — Home" }),
+              expect.objectContaining({ name: "Charm — Cart" }),
+            ]),
+          },
+        },
+      ],
+    });
+    const missingBatch = await run(executor, [
+      operation(
+        "crosspage-discover-03",
+        { tool: "get_document_context", query: "No Such Design" },
+        "chat-task-new-01",
+      ),
+    ]);
+    expect(resultFor(messages, missingBatch)).toMatchObject({
+      type: "tool-result",
+      success: true,
+      results: [{ data: { discovery: { matchStatus: "no_match", matchCount: 0 }, frames: [] } }],
+    });
+
+    // A fresh executor has no in-memory ref map; recovery must use persisted plugin/client data.
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const ref = target!.ref as string;
+    const taskId = "chat-task-new-01";
+    const inspectBatch = await run(executor, [
+      operation(
+        "crosspage-inspect-01",
+        { tool: "inspect_nodes", pageId: "page:other", refs: [ref], depth: 1, maxNodes: 25 },
+        taskId,
+      ),
+    ]);
+    expect(resultFor(messages, inspectBatch)).toMatchObject({
+      type: "tool-result",
+      success: true,
+      results: [{ success: true, data: { pageId: "page:other", nodes: [{ ref }] } }],
+    });
+
+    const editBatch = await run(executor, [
+      operation(
+        "crosspage-edit-01",
+        { tool: "set_properties", pageId: "page:other", ref, properties: { name: "Charm — Home improved" } },
+        taskId,
+      ),
+    ]);
+    expect(resultFor(messages, editBatch)).toMatchObject({
+      type: "tool-result",
+      success: true,
+      committedOperationIds: ["crosspage-edit-01"],
+    });
+    expect(home.id).toBe(originalNodeId);
+    expect(home.name).toBe("Charm — Home improved");
+    expect(mock.otherPage.children).toHaveLength(2);
+    expect(mock.api.currentPage.id).toBe(original.id);
+    expect(mock.page.selection).toEqual([]);
+  });
+
   it("reports stale and deleted task refs and refuses inspection after a page change", async () => {
     const mock = createMockApi();
     const messages: PluginToUIMessage[] = [];
@@ -286,6 +1008,153 @@ describe("safe Figma tool executor", () => {
       error: expect.stringContaining("page changed"),
     });
   });
+
+  it("rebuilds a missing task alias only from its unique, confirmed native creation", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const taskId = "chat-recover-0001";
+    const created = await run(executor, [
+      operation(
+        "recover-create-001",
+        {
+          tool: "create_frame",
+          ref: "recover-screen",
+          name: "Recovery screen",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+        },
+        taskId,
+      ),
+    ]);
+    const createdResult = resultFor(messages, created);
+    if (createdResult?.type !== "tool-result") throw new Error("Missing creation result.");
+    const canonicalRef = createdResult.results[0]?.logicalRef;
+    expect(typeof canonicalRef).toBe("string");
+    expect(mock.nodes).toHaveLength(1);
+
+    const saved = mock.storage.get(TOOL_STATE_STORAGE_KEY) as {
+      refs: Record<string, unknown>;
+      operations: Record<string, unknown>;
+      version: number;
+    };
+    mock.storage.set(TOOL_STATE_STORAGE_KEY, { ...saved, refs: {} });
+
+    const inspected = await run(executor, [
+      operation(
+        "recover-inspect-001",
+        {
+          tool: "inspect_nodes",
+          refs: ["recover-screen"],
+          selection: false,
+          depth: 0,
+          maxNodes: 1,
+        },
+        taskId,
+      ),
+    ]);
+    expect(resultFor(messages, inspected)).toMatchObject({
+      success: true,
+      results: [{ success: true, data: { nodes: [{ ref: canonicalRef }] } }],
+    });
+    expect(mock.storage.get(TOOL_STATE_STORAGE_KEY)).toMatchObject({
+      refs: {
+        [canonicalRef as string]: expect.arrayContaining([
+          expect.any(String),
+          expect.any(String),
+          expect.anything(),
+          "FRAME",
+          expect.any(String),
+          taskId,
+          "recover-screen",
+          "recover-create-001",
+        ]),
+      },
+    });
+    expect(mock.nodes).toHaveLength(1);
+
+    const otherTask = await run(executor, [
+      operation(
+        "recover-other-task",
+        {
+          tool: "inspect_nodes",
+          refs: ["recover-screen"],
+          selection: false,
+          depth: 0,
+          maxNodes: 1,
+        },
+        "chat-other-0001",
+      ),
+    ]);
+    expect(resultFor(messages, otherTask)).toMatchObject({
+      success: false,
+      results: [
+        {
+          success: false,
+          data: { referenceResolution: { code: "missing_or_uninspected" } },
+        },
+      ],
+    });
+    expect(mock.nodes).toHaveLength(1);
+  });
+
+  it.each(["failed", "running"] as const)(
+    "re-executes the same read-only inspection ID after a persisted %s state",
+    async (priorStatus) => {
+      const mock = createMockApi();
+      const messages: PluginToUIMessage[] = [];
+      const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+      const taskId = "chat-inspect-retry-01";
+      await run(executor, [
+        operation(
+          "inspect-retry-create",
+          {
+            tool: "create_frame",
+            ref: "retry-screen",
+            name: "Retry screen",
+            parent: { kind: "page" },
+            size: { width: 390, height: 844 },
+          },
+          taskId,
+        ),
+      ]);
+      const inspect = operation(
+        "inspect-retry-operation",
+        {
+          tool: "inspect_nodes",
+          refs: ["retry-screen"],
+          selection: false,
+          depth: 0,
+          maxNodes: 1,
+        },
+        taskId,
+      );
+      vi.spyOn(mock.api, "getNodeByIdAsync").mockRejectedValueOnce(
+        new Error("temporary read failure"),
+      );
+      const failedBatch = await run(executor, [inspect]);
+      expect(resultFor(messages, failedBatch)).toMatchObject({
+        success: false,
+        results: [{ success: false, error: "temporary read failure" }],
+      });
+
+      if (priorStatus === "running") {
+        const legacy = downgradeStoredToolStateForRollback(
+          mock.storage.get(TOOL_STATE_STORAGE_KEY),
+        );
+        legacy.operations[inspect.operationId]!.status = "running";
+        delete legacy.operations[inspect.operationId]!.result;
+        mock.storage.set(TOOL_STATE_STORAGE_KEY, legacy);
+      }
+
+      const retryBatch = await run(executor, [inspect]);
+      expect(resultFor(messages, retryBatch)).toMatchObject({
+        success: true,
+        results: [{ success: true, acknowledgementStatus: "read_only" }],
+      });
+      expect(mock.nodes).toHaveLength(1);
+    },
+  );
 
   it("re-inspects precise transformed Auto Layout bounds and RTL text through the native mock executor", async () => {
     const mock = createMockApi();
@@ -465,6 +1334,7 @@ describe("safe Figma tool executor", () => {
     const task = ChatTaskSchema.parse({
       version: 1,
       id: "clip-repair-task-0001",
+      intent: "create",
       referenceScope: "task-v1",
       documentId: "file-test-56-page_current",
       prompt: "Build and verify the clipped shell.",
@@ -628,31 +1498,14 @@ describe("safe Figma tool executor", () => {
     if (creation?.type !== "tool-result") throw new Error("Missing create result");
     const canonicalRef = creation.results[0]?.logicalRef;
     expect(canonicalRef).toBeDefined();
-    const persisted = [...mock.storage.values()].find(
-      (value) => typeof value === "object" && value !== null && "refs" in value,
-    ) as {
-      refs: Record<
-        string,
-        {
-          nodeId: string;
-          pageId: string;
-          parentId?: string;
-          nodeType?: string;
-          creationFingerprint?: string;
-          taskId?: string;
-          alias?: string;
-          creationOperationId?: string;
-        }
-      >;
-      operations: Record<string, unknown>;
-    };
+    const persisted = legacyToolState(mock);
     const secondNode = mock.api.createFrame();
     secondNode.name = "Second candidate";
     secondNode.setPluginData("fad.tool.logical-ref.v1", "task-second-candidate");
     secondNode.setPluginData("fad.tool.task-id.v1", "candidate-task-01");
     secondNode.setPluginData("fad.tool.operation-id.v1", "candidate-store-002");
     secondNode.setPluginData("fad.tool.operation-fingerprint.v1", "a".repeat(32));
-    persisted.refs["task-second-candidate"] = {
+    persisted.state.refs["task-second-candidate"] = {
       nodeId: secondNode.id,
       pageId: "page:current",
       parentId: "page:current",
@@ -662,7 +1515,7 @@ describe("safe Figma tool executor", () => {
       alias: "store",
       creationOperationId: "candidate-store-002",
     };
-    persisted.operations["candidate-store-002"] = {
+    persisted.state.operations["candidate-store-002"] = {
       operationId: "candidate-store-002",
       taskId: "candidate-task-01",
       creationRef: "task-second-candidate",
@@ -677,6 +1530,7 @@ describe("safe Figma tool executor", () => {
         logicalRef: "task-second-candidate",
       },
     };
+    mock.storage.set(persisted.key, persisted.state);
 
     const ambiguous = await run(executor, [
       {
@@ -764,11 +1618,7 @@ describe("safe Figma tool executor", () => {
     if (canonicalRef?.type !== "tool-result") throw new Error("Missing creation result");
     const childRef = canonicalRef.results[2]?.logicalRef;
     const child = mock.find("Child")!;
-    const state = [...mock.storage.values()].find(
-      (value) => typeof value === "object" && value !== null && "refs" in value,
-    ) as {
-      refs: Record<string, { creationFingerprint?: string }>;
-    };
+    const { state } = legacyToolState(mock);
     const fingerprint = state.refs[childRef!]?.creationFingerprint;
     expect(fingerprint).toBeDefined();
     child.setPluginData("fad.tool.operation-fingerprint.v1", "f".repeat(32));
@@ -860,11 +1710,7 @@ describe("safe Figma tool executor", () => {
     ]);
     expect(resultFor(messages, moved)).toMatchObject({ success: true });
     expect(child.parent?.id).toBe(rootB.id);
-    const state = [...mock.storage.values()].find(
-      (value) => typeof value === "object" && value !== null && "refs" in value,
-    ) as {
-      refs: Record<string, { taskId?: string; alias?: string; nodeId: string; parentId?: string }>;
-    };
+    const { state } = legacyToolState(mock);
     const childEntry = Object.values(state.refs).find(
       (entry) => entry.taskId === taskId && entry.alias === "child",
     );
@@ -925,14 +1771,11 @@ describe("safe Figma tool executor", () => {
     });
 
     await run(executor, [create("uncertain-footer1", "footer")]);
-    const key = [...mock.storage.keys()][0]!;
-    const state = mock.storage.get(key) as {
-      operations: Record<string, { status: string }>;
-      refs: Record<string, { alias?: string }>;
-    };
+    const { key, state } = legacyToolState(mock);
     state.operations["uncertain-footer1"]!.status = "running";
     const footerRef = Object.keys(state.refs).find((ref) => state.refs[ref]?.alias === "footer")!;
     delete state.refs[footerRef];
+    mock.storage.set(key, state);
     const interrupted = await run(executor, [create("uncertain-footer2", "footer")]);
     expect(resultFor(messages, interrupted)).toMatchObject({
       success: false,
@@ -1146,6 +1989,7 @@ describe("safe Figma tool executor", () => {
     const current = ChatTaskSchema.parse({
       version: 1,
       id: "storefront-task-0001",
+      intent: "create",
       referenceScope: "task-v1",
       documentId: "file-test-56-page_current",
       prompt:
@@ -1439,6 +2283,7 @@ describe("safe Figma tool executor", () => {
     const task = ChatTaskSchema.parse({
       version: 1,
       id: "home-product-timeout-01",
+      intent: "create",
       referenceScope: "task-v1",
       documentId: "file-test-56-page_current",
       prompt: "Create a Persian Home and Product experience.",
@@ -1726,6 +2571,7 @@ describe("safe Figma tool executor", () => {
     let task = ChatTaskSchema.parse({
       version: 1,
       id: "twenty-two-task-0001",
+      intent: "create",
       referenceScope: "task-v1",
       documentId: "file-test-56-page_current",
       prompt: "Create a product list and preserve confirmed layers across Resume.",
@@ -2005,6 +2851,7 @@ describe("safe Figma tool executor", () => {
     let task = ChatTaskSchema.parse({
       version: 1,
       id: "two-screen-task-01",
+      intent: "create",
       referenceScope: "task-v1",
       documentId: "file-test-56-page_current",
       prompt: "دو صفحه حرفه‌ای فارسی Home و Product برای فروشگاه پوشاک بساز",
@@ -2528,11 +3375,10 @@ describe("safe Figma tool executor", () => {
     const uncertainBatch = await run(reloaded, [uncertainEdit]);
     expect(resultFor(messages, uncertainBatch)).toMatchObject({ success: true });
     const storageKey = [...mock.storage.keys()][0]!;
-    const savedState = mock.storage.get(storageKey) as {
-      operations: Record<string, { status: string; result?: unknown }>;
-    };
+    const savedState = legacyToolState(mock).state;
     savedState.operations[uncertainEdit.operationId]!.status = "running";
     delete savedState.operations[uncertainEdit.operationId]!.result;
+    mock.storage.set(storageKey, savedState);
     button.name = "Changed after interruption";
     const uncertainReplay = await run(reloaded, [uncertainEdit]);
     expect(resultFor(messages, uncertainReplay)).toMatchObject({
@@ -2756,7 +3602,7 @@ describe("safe Figma tool executor", () => {
     expect(mock.nodes.filter((node) => !node.removed)).toHaveLength(activeNodeCount);
   });
 
-  it("migrates v1 executor state to v2 without losing nodes and supports a reversible v1 export", async () => {
+  it("migrates v1 executor state to v3 without losing nodes and supports a reversible v1 export", async () => {
     const mock = createMockApi();
     const messages: PluginToUIMessage[] = [];
     let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
@@ -2778,7 +3624,7 @@ describe("safe Figma tool executor", () => {
     const entry = [...mock.storage.entries()].find(([key]) => key.includes("fad.figma-tools.v1"));
     if (!entry) throw new Error("Executor did not persist its state.");
     const [storageKey, currentState] = entry;
-    expect(currentState).toMatchObject({ version: 2 });
+    expect(currentState).toMatchObject({ version: 3 });
     const legacyState = downgradeStoredToolStateForRollback(currentState);
     expect(legacyState).toMatchObject({ version: 1 });
     expect(legacyState.operations["migration-create-001"]?.result?.data ?? {}).not.toHaveProperty(
@@ -2794,9 +3640,178 @@ describe("safe Figma tool executor", () => {
       }),
     ]);
     expect(resultFor(messages, status)).toMatchObject({ success: true });
-    expect(mock.storage.get(storageKey)).toMatchObject({ version: 2 });
+    expect(mock.storage.get(storageKey)).toMatchObject({ version: 3 });
     expect(mock.find("Migration text")?.id).toBe(nodeId);
     expect(mock.nodes.filter((node) => !node.removed)).toHaveLength(1);
+  });
+
+  it("migrates a legacy state larger than 256 KiB without losing operation history", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const operations = Object.fromEntries(
+      Array.from({ length: 300 }, (_, index) => {
+        const id = `legacy-migration-${String(index).padStart(4, "0")}`;
+        return [
+          id,
+          {
+            operationId: id,
+            idempotencyKey: `idem:${id}`,
+            fingerprint: "a".repeat(32),
+            status: "completed",
+            updatedAt: index,
+            result: {
+              operationId: id,
+              success: true,
+              replayed: false,
+              summary: "s".repeat(280),
+              error: "e".repeat(360),
+            },
+          },
+        ];
+      }),
+    );
+    const legacy = { version: 1, refs: {}, operations };
+    expect(utf8Bytes(JSON.stringify(legacy))).toBeGreaterThan(256 * 1024);
+    mock.storage.set(TOOL_STATE_STORAGE_KEY, legacy);
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+
+    const status = await run(executor, [
+      operation("legacy-migration-status", {
+        tool: "get_operation_status",
+        operationId: "legacy-migration-0000",
+      }),
+    ]);
+
+    expect(resultFor(messages, status)).toMatchObject({ success: true });
+    const migrated = mock.storage.get(TOOL_STATE_STORAGE_KEY) as {
+      version: number;
+      operations: Record<string, unknown>;
+    };
+    expect(migrated.version).toBe(3);
+    expect(migrated.operations["legacy-migration-0000"]).toBeDefined();
+    expect(Object.keys(migrated.operations)).toHaveLength(301);
+  });
+
+  it("migrates a legacy state over 4 MiB and allows a new design with over 20,000 refs", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const refs = Object.fromEntries(
+      Array.from({ length: 20_500 }, (_, index) => [
+        `legacy-ref-${index}`,
+        {
+          nodeId: `node-${index}`,
+          pageId: "p".repeat(200),
+        },
+      ]),
+    );
+    const legacy = { version: 2, refs, operations: {} };
+    expect(utf8Bytes(JSON.stringify(legacy))).toBeGreaterThan(4 * 1024 * 1024);
+    mock.storage.set(TOOL_STATE_STORAGE_KEY, legacy);
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+
+    const created = await run(executor, [
+      operation("legacy-migration-create", {
+        tool: "create_frame",
+        ref: "new-design-frame",
+        name: "New design despite history",
+        parent: { kind: "page" },
+        size: { width: 240, height: 160 },
+      }),
+    ]);
+
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const migrated = mock.storage.get(TOOL_STATE_STORAGE_KEY) as {
+      version: number;
+      refs: Record<string, unknown>;
+    };
+    expect(migrated.version).toBe(3);
+    expect(Object.keys(migrated.refs)).toHaveLength(20_501);
+    expect(mock.find("New design despite history")).toBeDefined();
+  });
+
+  it("loads and saves a v3 state larger than 256 KiB without limiting operation history", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const operations: Record<string, unknown> = {};
+    for (let index = 0; index < 400; index++) {
+      const id = `reserve-seed-${String(index).padStart(4, "0")}`;
+      operations[id] = [
+        id,
+        `idem:${id}`,
+        "a".repeat(32),
+        "completed",
+        index,
+        null,
+        null,
+        null,
+        null,
+        [id, true, false, "read_only", null, null, "e".repeat(400), "s".repeat(300)],
+      ];
+    }
+    const saved = { version: 3, refs: {}, operations };
+    expect(utf8Bytes(JSON.stringify(saved))).toBeGreaterThan(256 * 1024);
+    mock.storage.set(TOOL_STATE_STORAGE_KEY, saved);
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+
+    const created = await run(executor, [
+      operation("large-state-new-create-01", {
+        tool: "create_frame",
+        ref: "unlimited-create",
+        name: "Created beyond the old state limit",
+        parent: { kind: "page" },
+        size: { width: 100, height: 80 },
+      }),
+    ]);
+
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const persisted = mock.storage.get(TOOL_STATE_STORAGE_KEY) as {
+      version: number;
+      refs: Record<string, unknown>;
+      operations: Record<string, unknown>;
+    };
+    expect(persisted.version).toBe(3);
+    expect(Object.keys(persisted.refs)).toHaveLength(1);
+    expect(Object.keys(persisted.operations)).toHaveLength(401);
+    expect(utf8Bytes(JSON.stringify(persisted))).toBeGreaterThan(256 * 1024);
+    expect(mock.find("Created beyond the old state limit")).toBeDefined();
+  });
+
+  it("preserves the previous state and skips native mutation when Figma rejects a write", async () => {
+    const mock = createMockApi();
+    const previous = { version: 3, refs: {}, operations: {} };
+    const original = JSON.stringify(previous);
+    mock.storage.set(TOOL_STATE_STORAGE_KEY, previous);
+    (
+      mock.api as unknown as {
+        clientStorage: { setAsync: (key: string, value: unknown) => Promise<void> };
+      }
+    ).clientStorage.setAsync = async () => {
+      throw new Error("Simulated Figma storage quota failure");
+    };
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+
+    const failed = await run(executor, [
+      operation("storage-reject-create", {
+        tool: "create_frame",
+        ref: "storage-reject-frame",
+        name: "Must not be created",
+        parent: { kind: "page" },
+        size: { width: 100, height: 80 },
+      }),
+    ]);
+
+    expect(resultFor(messages, failed)).toMatchObject({
+      success: false,
+      results: [
+        {
+          acknowledgementStatus: "not_attempted",
+          data: { toolStateDiagnostic: { category: "storage_unavailable", location: "save" } },
+        },
+      ],
+    });
+    expect(JSON.stringify(mock.storage.get(TOOL_STATE_STORAGE_KEY))).toBe(original);
+    expect(mock.find("Must not be created")).toBeUndefined();
   });
 
   it("reconciles a failed-ambiguous creation to its original native node without duplicating it", async () => {
@@ -3569,8 +4584,12 @@ describe("safe Figma tool executor", () => {
     const save = clientStorage.setAsync.bind(clientStorage);
     let failCompletedSave = true;
     clientStorage.setAsync = async (key, value) => {
-      const state = value as { operations?: Record<string, { status?: string }> };
-      if (failCompletedSave && state.operations?.[operationId]?.status === "completed") {
+      const state = value as { operations?: Record<string, unknown[]> };
+      if (
+        failCompletedSave &&
+        Array.isArray(state.operations?.[operationId]) &&
+        state.operations[operationId]![3] === "completed"
+      ) {
         failCompletedSave = false;
         throw new Error("Simulated lost acknowledgement checkpoint");
       }
@@ -3942,7 +4961,18 @@ describe("safe Figma tool executor", () => {
     const batchId = await run(executor, [request]);
     expect(resultFor(messages, batchId)).toMatchObject({
       success: false,
-      results: [{ success: false, error: expect.stringContaining("Tool state read timed out") }],
+      results: [
+        {
+          success: false,
+          acknowledgementStatus: "not_attempted",
+          data: {
+            toolStateDiagnostic: {
+              category: "storage_unavailable",
+              location: "load",
+            },
+          },
+        },
+      ],
     });
     expect(mock.find("Must not be created")).toBeUndefined();
   });

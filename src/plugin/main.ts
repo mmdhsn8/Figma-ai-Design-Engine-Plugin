@@ -5,6 +5,7 @@ import {
   type PluginToUIMessage,
   type UIToPluginMessage,
 } from "../shared/messages";
+import { FigmaToolStateDiagnosticSchema } from "../shared/figma-tools";
 import type { DesignSpec } from "../shared/schema";
 import type { MultiScreenSpec } from "../shared/multi-screen-schema";
 import { renderDesign, renderMultiScreenDesign } from "./renderer";
@@ -35,6 +36,11 @@ function reportToolExecutorFailure(
   const details = (
     error instanceof Error ? error.message : "The plugin executor failed unexpectedly."
   ).slice(0, 400);
+  const diagnostic =
+    error && typeof error === "object" && "diagnostic" in error
+      ? FigmaToolStateDiagnosticSchema.safeParse(error.diagnostic)
+      : undefined;
+  const toolStateDiagnostic = diagnostic?.success ? diagnostic.data : undefined;
   if (message.type === "tool-delete-consent") {
     send({
       type: "tool-delete-consent-result",
@@ -42,6 +48,7 @@ function reportToolExecutorFailure(
       requestId: message.requestId,
       success: false,
       message: details.slice(0, 300),
+      ...(toolStateDiagnostic ? { toolStateDiagnostic } : {}),
     });
     return;
   }
@@ -85,6 +92,7 @@ function reportToolExecutorFailure(
           ? "ambiguous"
           : "not_attempted",
       error: index === 0 ? details : "Not attempted after the plugin executor stopped.",
+      ...(index === 0 && toolStateDiagnostic ? { data: { toolStateDiagnostic } } : {}),
     })),
   });
 }
@@ -131,6 +139,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
   if (
     message.data.type === "tool-execute" ||
     message.data.type === "tool-cancel" ||
+    message.data.type === "tool-pause" ||
     message.data.type === "tool-delete-consent" ||
     message.data.type === "task-native-inspect" ||
     message.data.type === "task-native-focus"

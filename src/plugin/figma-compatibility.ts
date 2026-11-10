@@ -322,16 +322,37 @@ export function normalizeAutoLayout(
   });
 
   const verticalLayout = action.layout.direction === "vertical";
-  const primaryFill = childRules.some(
-    ({ rule }) => rule.grow === 1 || (verticalLayout ? rule.vertical : rule.horizontal) === "FILL",
+  const unlistedChildren = (target as FrameNode | ComponentNode).children.filter(
+    (node) =>
+      !childRules.some((child) => child.node.id === node.id) &&
+      (!("layoutPositioning" in node) || node.layoutPositioning !== "ABSOLUTE"),
   );
-  const counterFill = childRules.some(
-    ({ rule }) =>
-      rule.align === "STRETCH" || (verticalLayout ? rule.horizontal : rule.vertical) === "FILL",
-  );
+  const primaryFill =
+    unlistedChildren.some(
+      (node) =>
+        "layoutSizingVertical" in node &&
+        (verticalLayout ? node.layoutSizingVertical : node.layoutSizingHorizontal) === "FILL",
+    ) ||
+    childRules.some(
+      ({ rule }) =>
+        rule.grow === 1 || (verticalLayout ? rule.vertical : rule.horizontal) === "FILL",
+    );
+  const counterFill =
+    unlistedChildren.some(
+      (node) =>
+        "layoutSizingVertical" in node &&
+        (verticalLayout ? node.layoutSizingHorizontal : node.layoutSizingVertical) === "FILL",
+    ) ||
+    childRules.some(
+      ({ rule }) =>
+        rule.align === "STRETCH" || (verticalLayout ? rule.horizontal : rule.vertical) === "FILL",
+    );
   const layout = {
     ...action.layout,
-    primarySizing: primaryFill ? ("FIXED" as const) : action.layout.primarySizing,
+    primarySizing: primaryFill
+      ? ("FIXED" as const)
+      : (action.layout.primarySizing ??
+        (target.parent?.type !== "PAGE" && verticalLayout ? "AUTO" : "FIXED")),
     counterSizing: counterFill ? ("FIXED" as const) : action.layout.counterSizing,
   };
   const normalizedStretchRefs = childRules
@@ -343,7 +364,7 @@ export function normalizeAutoLayout(
     )
     .map(({ rule }) => rule.ref);
   const normalizations: CompatibilityNormalization[] = [];
-  if (layout.primarySizing !== action.layout.primarySizing)
+  if (action.layout.primarySizing && layout.primarySizing !== action.layout.primarySizing)
     normalizations.push(
       normalization({
         toolName: "set_auto_layout",

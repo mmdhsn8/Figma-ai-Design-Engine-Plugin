@@ -193,6 +193,7 @@ describe("loopback companion", () => {
     const task = ChatTaskSchema.parse({
       version: 1,
       id: "store-mobile-task-01",
+      intent: "create",
       referenceScope: "task-v1",
       documentId: "file-test-56-page_current",
       prompt: "Create one mobile storefront root frame.",
@@ -269,9 +270,9 @@ describe("loopback companion", () => {
     expect(chatTaskCommittedOperationCount(restored)).toBe(1);
     const storedState = [...mock.storage.values()].find(
       (value) => typeof value === "object" && value !== null && "refs" in value,
-    ) as { refs: Record<string, { inspectedByTaskId?: string; alias?: string; taskId?: string }> };
-    expect(storedState.refs.store_mobile?.inspectedByTaskId).toBe(task.id);
-    expect(Object.values(storedState.refs).some((entry) => entry.alias === "store_mobile")).toBe(
+    ) as { refs: Record<string, unknown[]> };
+    expect(storedState.refs.store_mobile?.[8]).toBe(task.id);
+    expect(Object.values(storedState.refs).some((entry) => entry[6] === "store_mobile")).toBe(
       true,
     );
 
@@ -444,6 +445,7 @@ describe("loopback companion", () => {
     const task = ChatTaskSchema.parse({
       version: 1,
       id: "stability-task-01",
+      intent: "create",
       referenceScope: "task-v1",
       documentId: "file-test-56-page_current",
       prompt:
@@ -537,12 +539,13 @@ describe("loopback companion", () => {
     const secondPurchase = mock.find("Purchase button 1")!;
     const firstPurchaseRef = firstPurchase.getPluginData("fad.tool.logical-ref.v1");
     const secondPurchaseRef = secondPurchase.getPluginData("fad.tool.logical-ref.v1");
+    const storeRef = mock.find("Store")!.getPluginData("fad.tool.logical-ref.v1");
     responses.push(
-      { outputItems: [call("get_document_context", {})] },
       {
         outputItems: [
           call("plan_canvas_task", {
             brief,
+            targetRefs: [storeRef, firstPurchaseRef, secondPurchaseRef],
             stages: [
               {
                 ...stage,
@@ -551,14 +554,6 @@ describe("loopback companion", () => {
                 logicalRefs: [firstPurchaseRef, secondPurchaseRef],
               },
             ],
-          }),
-        ],
-      },
-      {
-        outputItems: [
-          call("inspect_nodes", {
-            refs: [firstPurchaseRef, secondPurchaseRef],
-            selection: false,
           }),
         ],
       },
@@ -580,6 +575,8 @@ describe("loopback companion", () => {
     const followup = ChatTaskSchema.parse({
       ...task,
       id: "stability-edit-01",
+      intent: "edit",
+      targetName: "Store",
       prompt: "رنگ دکمه‌های خرید را صورتی کن؛ بقیه عناصر تغییر نکنند.",
       stages: [],
       ledger: [],
@@ -888,6 +885,7 @@ describe("loopback companion", () => {
     let task = ChatTaskSchema.parse({
       version: 1,
       id: taskId,
+      intent: "create",
       referenceScope: "task-v1",
       documentId,
       prompt: "Create a three-stage editable mobile layout.",
@@ -1214,6 +1212,50 @@ describe("loopback companion", () => {
     expect(await final.text()).toContain("صفحهٔ فروشگاه آماده است.");
     expect(JSON.parse(harness.responsesRequest!.body).input).toEqual(finalInput);
   }, 20_000);
+
+  it("serves INSPECTING through HTTP/SSE with only read-only tools and distinct availability/schema failures", async () => {
+    const call = (name: string, args: unknown) => ({
+      type: "function_call", call_id: "readonly_http_call", name, arguments: JSON.stringify(args),
+    });
+    const harness = await createHarness({ chatResponses: [
+      { outputItems: [call("get_document_context", { query: "Charm", offset: 8 })] },
+      { outputItems: [call("classify_canvas_intent", { intent: "inspect" })] },
+      { outputItems: [call("inspect_nodes", { refs: ["charm-home"], maxNodes: "wrong" })] },
+      { outputItems: [call("plan_canvas_task", {
+        brief: {
+          platform: "mobile", viewport: { width: 390, height: 844 },
+          brandDirection: "Charm", audience: "Shoppers", content: ["Home"], hierarchy: "Heading first",
+          typography: { family: "Arial", style: "Regular", headingSize: 28, bodySize: 14 },
+          spacingScale: [8, 16], radiusScale: [8, 16],
+          palette: { source: "curated-default", background: "#FFFFFF", surface: "#FFFFFF", primary: "#222222", accent: "#AA3366", text: "#222222", muted: "#555555" },
+          imagePolicy: "labeled-native-fallback", interactionPriorities: ["Home"], readingDirection: "RTL",
+        },
+        stages: [{ title: "Unwanted plan", goal: "Create an unwanted frame", logicalRefs: ["charm-home"], completionCriteria: ["Frame exists"] }],
+      })] },
+      { text: "Verified existing Charm frames; no mutations.", outputItems: [] },
+    ] });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const send = (index: number) => request(harness.handle, "/v1/chat", {
+      token, body: {
+        requestId: `readonly-http-${index}`, model: "account-model", lifecycle: "INSPECTING",
+        input: [{ role: "user", content: "Find and inspect all existing Charm frames; no selection or changes." }],
+      },
+    });
+    const discovery = await send(1);
+    expect(await discovery.text()).toContain('"name":"get_document_context"');
+    const upstream = JSON.parse(harness.responsesRequest!.body);
+    expect(upstream.tools.map(({ name }: { name: string }) => name)).toEqual(["get_document_context", "inspect_nodes"]);
+    expect(upstream.instructions).toContain("no mutation plan is needed or allowed");
+    expect(await (await send(2)).text()).toContain("tool_not_available_for_state");
+    const schema = await (await send(3)).text();
+    expect(schema).toContain("tool_validation");
+    expect(schema).toContain("invalid_type");
+    expect(schema).not.toContain("tool_not_available_for_state");
+    expect(await (await send(4)).text()).toContain("tool_not_available_for_state");
+    const completed = await send(5);
+    expect(await completed.text()).toContain("Verified existing Charm frames");
+  });
 
   it("uses completed message text, displays refusals, and reports truly empty completed output", async () => {
     const messageCases = [

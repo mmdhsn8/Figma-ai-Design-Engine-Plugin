@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile, stat } from "node:fs/promises";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createCompanionServer } from "../dist-companion/companion/server.js";
 import { createDraftStore } from "../dist-companion/companion/draft-store.js";
 import {
@@ -19,6 +21,38 @@ const uiEndMarker = quote === "`" ? "</html>\n`" : `</html>\\n${quote}`;
 const uiEnd = pluginBundle.indexOf(uiEndMarker, uiStart);
 const pkg = await readJson("package.json");
 const manifest = await readJson("manifest.json");
+if (process.env.APPDATA) {
+  let settings;
+  try {
+    settings = JSON.parse(
+      await readFile(resolve(process.env.APPDATA, "Figma", "settings.json"), "utf8"),
+    );
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const registrations = [];
+  const visit = (value) => {
+    if (!value || typeof value !== "object") return;
+    if (value.lastKnownPluginId === manifest.id && typeof value.manifestPath === "string")
+      registrations.push(resolve(value.manifestPath));
+    Object.values(value).forEach(visit);
+  };
+  visit(settings);
+  if (registrations.length) {
+    const registeredPaths = [...new Set(registrations.map((path) => path.toLowerCase()))];
+    assert.equal(
+      registeredPaths.length,
+      1,
+      "Multiple development manifests have this plugin ID; resolve the active Figma registration before claiming runtime verification.",
+    );
+    assert.equal(
+      registeredPaths[0],
+      fileURLToPath(new URL("manifest.json", root)).toLowerCase(),
+      `Figma Desktop registers a different project: ${registrations.join(", ")}. Rebuild its manifest-loaded outputs instead.`,
+    );
+    console.log(`Figma Desktop manifest registration verified: ${registrations[0]}`);
+  }
+}
 assert.match(
   pkg.scripts.companion,
   /tsc -p tsconfig\.companion\.json && node dist-companion\/companion\/main\.js/u,
@@ -41,7 +75,35 @@ assert.ok(
   pluginBundle.includes("tool-execute"),
   "Plugin bundle is missing the versioned tool protocol.",
 );
+assert.ok(
+  controllerBundle.includes("structural_verification") &&
+    controllerBundle.includes("native_hierarchy_measurement") &&
+    controllerBundle.includes("measured_foreground_contrast"),
+  "Registered plugin controller is missing complete native QA and deterministic repair planning.",
+);
+assert.ok(
+  uiHtml.includes("native-quality-repair-v1") && uiHtml.includes("native_quality_unrepairable"),
+  "Registered UI is missing repair dispatch and versioned diagnostics.",
+);
 assert.ok(uiHtml.includes("AI Chat"), "UI bundle is missing the AI Chat navigation entry.");
+assert.ok(
+  uiHtml.includes("Inspection status:") &&
+    uiHtml.includes("read_only_inspection_confirmed") &&
+    controllerBundle.includes("pagesVisited") &&
+    controllerBundle.includes("continuationAvailable") &&
+    controllerBundle.includes("discovery_cursor_stalled") &&
+    companionServer.includes("deterministic progressive inspection controller"),
+  "Registered artifacts are missing the read-only discovery completion fix.",
+);
+assert.ok(
+  controllerBundle.includes("exactNameMatchCount") &&
+    controllerBundle.includes("fad.document-discovery.v1") &&
+    uiHtml.includes("EDIT_TARGETING") &&
+    uiHtml.includes("EDIT_PLANNING") &&
+    uiHtml.includes("target_not_inspected") &&
+    uiHtml.includes("targetRefs"),
+  "Registered artifacts are missing deterministic edit target verification and planning gates.",
+);
 assert.ok(
   uiHtml.includes("Native operation harness"),
   "UI bundle is missing the local developer harness.",
@@ -80,6 +142,7 @@ for (const [source, output] of [
   ["src/shared/generation-transaction.ts", "dist-companion/shared/generation-transaction.js"],
   ["src/shared/generation-limits.ts", "dist-companion/shared/generation-limits.js"],
   ["src/shared/chat-tools.ts", "dist-companion/shared/chat-tools.js"],
+  ["src/shared/figma-tools.ts", "dist-companion/shared/figma-tools.js"],
   ["src/companion/draft-store.ts", "dist-companion/companion/draft-store.js"],
   ["src/ui/App.tsx", "dist/ui.html"],
   ["src/ui/chat-history-view.tsx", "dist/ui.html"],
@@ -98,6 +161,11 @@ for (const [source, output] of [
   ["src/plugin/chat-task-storage.ts", "dist/plugin.js"],
   ["src/plugin/generation-controller.ts", "dist/plugin.js"],
   ["src/plugin/figma-tool-executor.ts", "dist/plugin.js"],
+  ["src/plugin/auto-layout-repair.ts", "dist/plugin.js"],
+  ["src/shared/native-quality-repair.ts", "dist/plugin.js"],
+  ["src/shared/native-quality-repair.ts", "dist/ui.html"],
+  ["src/shared/native-visual-quality.ts", "dist/plugin.js"],
+  ["src/shared/native-visual-quality.ts", "dist/ui.html"],
   ["src/shared/figma-tools.ts", "dist/plugin.js"],
   ["src/shared/messages.ts", "dist/plugin.js"],
   ["src/shared/messages.ts", "dist/ui.html"],

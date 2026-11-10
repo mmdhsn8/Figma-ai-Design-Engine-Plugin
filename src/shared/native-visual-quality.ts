@@ -7,6 +7,7 @@ export interface NativeVisualColor {
 }
 
 export interface NativeVisualNode {
+  ownedByTask?: boolean;
   ref?: string;
   type: string;
   name: string;
@@ -282,6 +283,86 @@ function composite(foreground: Color, background: Color, alpha: number): Color {
   };
 }
 
+export function nativeTextContrastCorrection(
+  roots: NativeVisualNode[],
+  ref: string,
+  palette: string[],
+) {
+  let result: { color?: string; reason: string } = { reason: "effective_background_unavailable" };
+  const visit = (node: NativeVisualNode, background?: Color, opacity = 1): void => {
+    const alpha = opacity * (node.opacity ?? 1);
+    if (node.ref === ref && node.type === "TEXT" && background) {
+      const foreground = colorChannels(node.textColor, node.textColorRGB);
+      if (!foreground) {
+        result = { reason: "solid_foreground_unavailable" };
+        return;
+      }
+      const threshold = (node.fontSize ?? 0) >= 24 ? 3 : 4.5;
+      const hex = (color: Color) =>
+        `#${[color.r, color.g, color.b]
+          .map((channel) =>
+            Math.round(channel * 255)
+              .toString(16)
+              .padStart(2, "0"),
+          )
+          .join("")}`.toUpperCase();
+      const passes = (value: string) => {
+        const color = colorChannels(value);
+        // The native color operation writes an opaque paint, retaining node and ancestor opacity.
+        return (
+          color && contrastRatio(composite(color, background!, alpha), background!) >= threshold
+        );
+      };
+      const distance = (value: string) => {
+        const color = colorChannels(value)!;
+        return (
+          (color.r - foreground.r) ** 2 +
+          (color.g - foreground.g) ** 2 +
+          (color.b - foreground.b) ** 2
+        );
+      };
+      const candidates = palette.filter((value) => colorChannels(value) && passes(value));
+      if (!candidates.length)
+        for (const endpoint of [0, 1]) {
+          if (!passes(endpoint === 0 ? "#000000" : "#FFFFFF")) continue;
+          let low = 0,
+            high = 1;
+          const blend = (amount: number) =>
+            hex({
+              r: foreground.r + (endpoint - foreground.r) * amount,
+              g: foreground.g + (endpoint - foreground.g) * amount,
+              b: foreground.b + (endpoint - foreground.b) * amount,
+            });
+          for (let step = 0; step < 16; step++) {
+            const middle = (low + high) / 2;
+            if (passes(blend(middle))) high = middle;
+            else low = middle;
+          }
+          candidates.push(blend(high));
+        }
+      const color = candidates.sort((a, b) => distance(a) - distance(b) || a.localeCompare(b))[0];
+      result = color
+        ? { color, reason: "measured_foreground_contrast" }
+        : { reason: "opacity_prevents_required_contrast" };
+    }
+    const fill = colorChannels(node.fill, node.fillRGB);
+    const fillAlpha = (node.fillOpacity ?? 1) * (node.opacity ?? 1);
+    const nextBackground = fill
+      ? background
+        ? composite(fill, background, fillAlpha)
+        : fillAlpha >= 0.999
+          ? fill
+          : undefined
+      : background;
+    for (const child of node.children ?? []) visit(child, nextBackground, alpha);
+  };
+  const nested = new Set(
+    roots.flatMap((node) => flatten(node.children ?? [])).map((node) => node.ref),
+  );
+  roots.filter((node) => !node.ref || !nested.has(node.ref)).forEach((node) => visit(node));
+  return result;
+}
+
 function overflowAmount(parent: NativeVisualNode, child: NativeVisualNode): number {
   const relative = childBoundsInParent(parent, child);
   const outer = relative
@@ -340,15 +421,42 @@ export function auditNativeSection(
         expected: "visible=true",
         actual: "visible=false",
       });
-    if (parent?.clipsContent && !contains(parent, node))
+    if (parent?.clipsContent && !contains(parent, node)) {
+      const flow = (parent.children ?? []).filter(
+        (child) => child.visible && child.layoutPositioning !== "ABSOLUTE",
+      );
+      const gaps = Math.max(0, flow.length - 1) * (parent.itemSpacing ?? 0);
       findings.push({
         code: "clipped-child",
         ref: node.ref,
         message: `“${node.name}” is clipped by a parent with clipsContent enabled; geometry alone cannot determine whether that clip is intentional.`,
-        expected: JSON.stringify({ parent: rect(parent), clipsContent: true }),
+        expected: JSON.stringify({
+          parentRef: parent.ref,
+          parent: rect(parent),
+          clipsContent: true,
+        }),
         actual: JSON.stringify({
+          parentRef: parent.ref,
           child: bounds,
           overflow: overflowAmount(parent, node),
+          measurement:
+            parent.absoluteTransform && node.absoluteTransform
+              ? "parent-local-transform"
+              : "absolute-bounds",
+          available: {
+            width: parent.width - (parent.padding?.left ?? 0) - (parent.padding?.right ?? 0),
+            height: parent.height - (parent.padding?.top ?? 0) - (parent.padding?.bottom ?? 0),
+          },
+          required: {
+            width:
+              parent.layoutMode === "HORIZONTAL"
+                ? flow.reduce((sum, child) => sum + child.width, 0) + gaps
+                : Math.max(0, ...flow.map((child) => child.width)),
+            height:
+              parent.layoutMode === "VERTICAL"
+                ? flow.reduce((sum, child) => sum + child.height, 0) + gaps
+                : Math.max(0, ...flow.map((child) => child.height)),
+          },
           classification:
             parent.layoutMode &&
             parent.layoutMode !== "NONE" &&
@@ -360,10 +468,13 @@ export function auditNativeSection(
             padding: parent.padding,
             primarySizing: parent.primaryAxisSizingMode,
             counterSizing: parent.counterAxisSizingMode,
+            horizontal: parent.layoutSizingHorizontal,
+            vertical: parent.layoutSizingVertical,
           },
           childLayoutPositioning: node.layoutPositioning ?? "AUTO",
         }),
       });
+    }
     if (node.type === "TEXT" && !node.text?.trim())
       findings.push({
         code: "empty-text",
@@ -392,7 +503,7 @@ export function auditNativeSection(
         });
     }
     const children = node.children ?? [];
-    if (node.layoutMode !== "NONE") {
+    if (node.layoutMode === "VERTICAL" || node.layoutMode === "HORIZONTAL") {
       for (let first = 0; first < children.length; first++)
         for (let second = first + 1; second < children.length; second++)
           if (
@@ -439,8 +550,25 @@ export function auditNativeSection(
       : inheritedBackground;
     children.forEach((child) => visit(child, node, background, effectiveOpacity));
   };
-  roots.forEach((node) => visit(node));
-  return findings;
+  const nestedRefs = new Set(
+    roots
+      .flatMap((node) => flatten(node.children ?? []))
+      .flatMap((node) => (node.ref ? [node.ref] : [])),
+  );
+  roots.filter((node) => !node.ref || !nestedRefs.has(node.ref)).forEach((node) => visit(node));
+  return [
+    ...new Map(
+      findings.map((finding) => [
+        JSON.stringify([
+          finding.code,
+          [...(finding.refs ?? (finding.ref ? [finding.ref] : []))].sort(),
+          finding.expected,
+          finding.actual,
+        ]),
+        finding,
+      ]),
+    ).values(),
+  ];
 }
 
 export function auditStorefrontDesign(input: StorefrontQualityInput): NativeVisualFinding[] {

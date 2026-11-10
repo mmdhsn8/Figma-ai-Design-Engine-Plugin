@@ -10,10 +10,12 @@ import {
 import {
   FigmaToolBatchSchema,
   FigmaToolCancelSchema,
+  FigmaToolPauseSchema,
   FigmaToolDeleteConsentSchema,
   FigmaToolBatchResultSchema,
   FigmaToolDeleteConsentResultSchema,
   FigmaToolProgressSchema,
+  FigmaToolStateDiagnosticSchema,
 } from "./figma-tools";
 
 const RequestSchema = z.object({
@@ -215,6 +217,7 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
     .strict(),
   FigmaToolBatchSchema,
   FigmaToolCancelSchema,
+  FigmaToolPauseSchema,
   FigmaToolDeleteConsentSchema,
   z
     .object({
@@ -308,6 +311,8 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       success: z.boolean(),
       documentId: z.string().max(300),
       task: ChatTaskSchema.nullable().optional(),
+      errorCategory: z.enum(["checkpoint_storage"]).optional(),
+      errorCode: z.string().regex(/^[a-z_]{1,80}$/u).optional(),
       error: z.string().max(500).optional(),
     })
     .strict(),
@@ -320,6 +325,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       nodes: z.array(TaskNativeNodeSchema).max(500).optional(),
       unresolvedRefs: z.array(TaskNativeUnresolvedRefSchema).max(500).optional(),
       truncated: z.boolean().optional(),
+      toolStateDiagnostic: FigmaToolStateDiagnosticSchema.optional(),
       error: z.string().max(500).optional(),
     })
     .strict(),

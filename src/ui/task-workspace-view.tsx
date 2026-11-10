@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import {
   chatTaskCommittedOperationCount,
   mutationAccounting,
+  chatTaskRetryLabel,
   type ChatTask,
 } from "../shared/chat-task";
 import type { PluginToUIMessage } from "../shared/messages";
@@ -237,7 +238,7 @@ export function GenerationProgressView({
           </button>
         ) : task.status !== "completed" ? (
           <button className="primary-action" type="button" disabled={!canResume} onClick={onResume}>
-            {task.status === "failed" ? "Retry Failed Stage" : "Resume saved task"}
+            {chatTaskRetryLabel(task)}
           </button>
         ) : null}
       </div>

@@ -25,7 +25,12 @@ import {
   type ChatHistoryConversation,
   type ChatHistoryMessage,
 } from "../shared/chat-history";
-import { type ChatTask, chatTaskCapacityUsage, chatTaskProgress } from "../shared/chat-task";
+import {
+  type ChatTask,
+  chatTaskCapacityUsage,
+  chatTaskProgress,
+  chatTaskRetryLabel,
+} from "../shared/chat-task";
 import { runChatTask, chatTaskInput } from "./chat-task";
 import { chatHistoryBridge, chatTaskBridge } from "./chat-task-bridge";
 import { ChatHistoryView } from "./chat-history-view";
@@ -149,6 +154,14 @@ function messagesForTask(task: ChatTask): ChatMessage[] {
         : {}),
     },
   ];
+}
+
+function reconcileTaskMessageError(messages: ChatMessage[], task: ChatTask | null): ChatMessage[] {
+  if (!task) return messages;
+  return messages.map((message) => {
+    if (message.id !== task.id) return message;
+    return { ...message, error: task.error };
+  });
 }
 
 function modelContextFromMessages(messages: ChatMessage[]): ChatInputItem[] {
@@ -540,6 +553,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     chatHistoryRef.current = chatHistory;
   }, [chatHistory]);
   const [chatBusy, setChatBusy] = useState(false);
+  const [chatInspectionBatchActive, setChatInspectionBatchActive] = useState(false);
   const [chatActivity, setChatActivity] = useState("");
   const [chatPendingTool, setChatPendingTool] = useState(false);
   const [chatRetryMessageId, setChatRetryMessageId] = useState<string | null>(null);
@@ -672,7 +686,10 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         }
         if (!active) return;
         const selectedConversation = conversations.find(({ id }) => id === selected);
-        const messages = selectedConversation?.messages ?? (task ? messagesForTask(task) : []);
+        const messages = reconcileTaskMessageError(
+          selectedConversation?.messages ?? (task ? messagesForTask(task) : []),
+          task,
+        );
         activeChatIdRef.current = selected;
         activeChatModel.current = selectedConversation?.model ?? "";
         setActiveChatId(selected);
@@ -788,6 +805,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     if (toolWatchdog.current !== null) window.clearTimeout(toolWatchdog.current);
     toolWatchdog.current = null;
     toolBatchId.current = null;
+    setChatInspectionBatchActive(false);
     if (cancel) postToPlugin({ type: "tool-cancel", protocolVersion: 1, batchId });
     setToolBusy(false);
     setToolStatus(message);
@@ -837,6 +855,15 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         return;
       if (message.type === "tool-progress") {
         if (toolBatchId.current === message.batchId) {
+          if (message.status === "running") {
+            if (toolWatchdog.current !== null) window.clearTimeout(toolWatchdog.current);
+            toolWatchdog.current = window.setTimeout(() => {
+              failToolBatch(
+                message.batchId,
+                "The native task stopped reporting progress. Cancellation was requested; its last durable inspection cursor is retained.",
+              );
+            }, TOOL_RESPONSE_TIMEOUT_MS);
+          }
           setToolStatus(`${message.index + 1}/${message.total} · ${message.message}`);
           if (chatRunning.current) setChatActivity(message.message);
         }
@@ -847,6 +874,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           if (toolWatchdog.current !== null) window.clearTimeout(toolWatchdog.current);
           toolWatchdog.current = null;
           toolBatchId.current = null;
+          setChatInspectionBatchActive(false);
           setToolBusy(false);
           const last = message.results.at(-1);
           const replayCount = message.results.filter(({ replayed }) => replayed).length;
@@ -1259,8 +1287,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     setChatTaskLoaded(true);
     setChatPendingTool(Boolean(task && task.status !== "completed"));
     setChatRetryMessageId(task && task.status !== "completed" ? task.id : null);
-    setChatMessages(conversation.messages);
-    chatModelInput.current = modelContextFromMessages(conversation.messages);
+    const messages = reconcileTaskMessageError(conversation.messages, task);
+    setChatMessages(messages);
+    chatModelInput.current = modelContextFromMessages(messages);
     setChatActivity("");
     setSelectedCompanionModel(conversation.model ?? "");
     dispatchNavigation({ type: "navigate", view: "chat" });
@@ -1478,6 +1507,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     }
     const batchId = `phase56-batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     toolBatchId.current = batchId;
+    setChatInspectionBatchActive(
+      Boolean(completion && ["inspect", "explain"].includes(chatTask.current?.intent ?? "")),
+    );
     if (completion) toolCompletion.current = { batchId, ...completion };
     setToolBusy(true);
     if (!completion) setLastToolOperation(operations.at(-1) ?? null);
@@ -1536,10 +1568,12 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         chatTask.current = {
           version: 1,
           id,
+          chatId: taskChatId,
           referenceScope: "task-v1",
           documentId: loaded.documentId,
           prompt: text,
           lifecycle: "UNPLANNED",
+          modelRoundTrace: [],
           context: chatTask.current?.documentId === loaded.documentId ? chatModelInput.current : [],
           stages: [],
           ledger: [],
@@ -1656,6 +1690,13 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     chatAbort.current?.abort();
     if (toolBatchId.current) cancelToolBatch();
     setChatActivity("Stopping; the current native operation will finish or time out…");
+  };
+
+  const pauseChatInspection = () => {
+    const batchId = toolBatchId.current;
+    if (!batchId || !["inspect", "explain"].includes(chatTask.current?.intent ?? "")) return;
+    if (postToPlugin({ type: "tool-pause", protocolVersion: 1, batchId }))
+      setChatActivity("Pausing after the current discovery slice; progress is saved for Resume…");
   };
 
   const runFixtureStep = (start: number, end: number) =>
@@ -2873,9 +2914,16 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           <div className="brand-subtitle">Structured, editable design workflows</div>
         </div>
         {chatBusy && (
-          <button className="text-button muted topbar-action" type="button" onClick={stopChat}>
-            Stop chat
-          </button>
+          <>
+            {chatInspectionBatchActive && (
+              <button className="text-button muted topbar-action" type="button" onClick={pauseChatInspection}>
+                Pause inspection
+              </button>
+            )}
+            <button className="text-button muted topbar-action" type="button" onClick={stopChat}>
+              Stop chat
+            </button>
+          </>
         )}
         {toolBusy && !chatBusy && (
           <button
@@ -3072,7 +3120,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                           disabled={chatBusy || toolBusy}
                           onClick={() => void sendChatMessage(true)}
                         >
-                          {chatTaskSnapshot?.status === "failed" ? "Retry Failed Stage" : "Resume"}
+                          {chatTaskSnapshot ? chatTaskRetryLabel(chatTaskSnapshot) : "Resume"}
                         </button>
                       )}
                     </div>
@@ -3128,9 +3176,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                   disabled={!chatReady || toolBusy || chatSwitchBusy}
                   onClick={() => void sendChatMessage(true)}
                 >
-                  {chatTaskSnapshot.status === "failed"
-                    ? "Retry failed stage"
-                    : "Resume saved task"}
+                  {chatTaskRetryLabel(chatTaskSnapshot)}
                 </button>
               )}
               <small>

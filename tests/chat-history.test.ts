@@ -142,6 +142,7 @@ function scopedTask(api: PluginAPI, id: string, status: ChatTask["status"] = "re
     documentId,
     prompt: "Create an editable mobile storefront.",
     lifecycle: "UNPLANNED",
+    modelRoundTrace: [],
     context: [],
     stages: [],
     ledger: [],

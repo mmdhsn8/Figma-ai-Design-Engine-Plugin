@@ -59,6 +59,8 @@ export async function handleChatTaskStorage(
       requestId: message.requestId,
       success: false,
       documentId,
+      errorCategory: "checkpoint_storage",
+      errorCode: message.type === "chat-task-load" ? "checkpoint_load_failed" : "checkpoint_save_failed",
       error: (error instanceof Error ? error.message : "Task checkpoint is unavailable.").slice(
         0,
         500,

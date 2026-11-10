@@ -1,15 +1,24 @@
 import { z } from "zod";
 import {
+  AutoLayoutRepairReportSchema,
   FigmaToolAcknowledgementSchema,
   FigmaToolCompatibilityFailureSchema,
   FigmaToolCompatibilityNormalizationSchema,
   FigmaToolParentingDiagnosticSchema,
+  FigmaToolStateDiagnosticSchema,
   type FigmaToolAction,
   type FigmaToolBatch,
   type FigmaToolOperation,
   type FigmaToolParentingDiagnostic,
 } from "../shared/figma-tools";
 import { FigmaCompatibilityError, figmaCompatibilityEngine } from "./figma-compatibility";
+import { createProgressiveDiscoveryScanner } from "./document-discovery";
+import { repairAutoLayoutHierarchy } from "./auto-layout-repair";
+import { auditNativeSection, type NativeVisualNode } from "../shared/native-visual-quality";
+import {
+  planNativeQualityRepairs,
+  NATIVE_REPAIR_PIPELINE_VERSION,
+} from "../shared/native-quality-repair";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
 import { utf8Bytes } from "../shared/generation-limits";
 import { planCanvasPlacements } from "./canvas-placement";
@@ -20,9 +29,11 @@ const REF_PLUGIN_KEY = "fad.tool.logical-ref.v1";
 const OP_PLUGIN_KEY = "fad.tool.operation-id.v1";
 const FINGERPRINT_PLUGIN_KEY = "fad.tool.operation-fingerprint.v1";
 const TASK_PLUGIN_KEY = "fad.tool.task-id.v1";
+const DESIGN_NAME_PLUGIN_KEY = "fad.design.name.v1";
+const DESIGN_CHAT_PLUGIN_KEY = "fad.design.chat-id.v1";
+const DESIGN_TASK_PLUGIN_KEY = "fad.design.task-id.v1";
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 48 * 1024;
-const MAX_STORED_OPERATIONS = 400;
 const OPERATION_TIMEOUT_MS = 10_000;
 const ReferenceCandidateSchema = z
   .object({
@@ -46,6 +57,9 @@ const StoredStateDataSchema = z
           alias: z.string().max(80).optional(),
           creationOperationId: z.string().max(100).optional(),
           inspectedByTaskId: z.string().max(60).optional(),
+          inspectionOnly: z.boolean().optional(),
+          existingTarget: z.boolean().optional(),
+          ownershipFingerprint: z.string().length(32).optional(),
         })
         .strict(),
     ),
@@ -74,12 +88,14 @@ const StoredStateDataSchema = z
               data: z
                 .object({
                   reused: z.boolean().optional(),
+                  overflowRepair: z.array(AutoLayoutRepairReportSchema).optional(),
                   parenting: FigmaToolParentingDiagnosticSchema.optional(),
                   compatibilityNormalizations: z
                     .array(FigmaToolCompatibilityNormalizationSchema)
                     .max(3)
                     .optional(),
                   compatibilityFailure: FigmaToolCompatibilityFailureSchema.optional(),
+                  toolStateDiagnostic: FigmaToolStateDiagnosticSchema.optional(),
                   referenceResolution: z
                     .object({
                       code: z.string().max(60),
@@ -87,7 +103,12 @@ const StoredStateDataSchema = z
                       stage: z.literal("reference_resolution"),
                       alternatives: z.array(z.string().max(150)).max(3),
                       candidates: z.array(ReferenceCandidateSchema).max(3).optional(),
-                      candidateCount: z.number().int().min(0).max(500).optional(),
+                      candidateCount: z
+                        .number()
+                        .int()
+                        .min(0)
+                        .max(Number.MAX_SAFE_INTEGER)
+                        .optional(),
                     })
                     .strict()
                     .optional(),
@@ -105,16 +126,271 @@ const StoredStateDataSchema = z
 
 const StoredStateV1Schema = StoredStateDataSchema.extend({ version: z.literal(1) }).strict();
 const StoredStateV2Schema = StoredStateDataSchema.extend({ version: z.literal(2) }).strict();
+const StoredOperationResultDataSchema = z
+  .object({
+    reused: z.boolean().optional(),
+    overflowRepair: z.array(AutoLayoutRepairReportSchema).optional(),
+    parenting: FigmaToolParentingDiagnosticSchema.optional(),
+    compatibilityNormalizations: z
+      .array(FigmaToolCompatibilityNormalizationSchema)
+      .max(3)
+      .optional(),
+    compatibilityFailure: FigmaToolCompatibilityFailureSchema.optional(),
+    toolStateDiagnostic: FigmaToolStateDiagnosticSchema.optional(),
+    referenceResolution: z
+      .object({
+        code: z.string().max(60),
+        ref: z.string().max(80),
+        stage: z.literal("reference_resolution"),
+        alternatives: z.array(z.string().max(150)).max(3),
+        candidates: z.array(ReferenceCandidateSchema).max(3).optional(),
+        candidateCount: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+const StoredStateV3Schema = z
+  .object({
+    version: z.literal(3),
+    refs: z.record(
+      z.string().max(80),
+      z.union([
+        z.tuple([
+          z.string().max(100),
+          z.string().max(200),
+          z.string().max(100).nullable(),
+          z.string().max(20).nullable(),
+          z.string().length(32).nullable(),
+          z.string().max(60).nullable(),
+          z.string().max(80).nullable(),
+          z.string().max(100).nullable(),
+          z.string().max(60).nullable(),
+        ]),
+        z.tuple([
+          z.string().max(100),
+          z.string().max(200),
+          z.string().max(100).nullable(),
+          z.string().max(20).nullable(),
+          z.string().length(32).nullable(),
+          z.string().max(60).nullable(),
+          z.string().max(80).nullable(),
+          z.string().max(100).nullable(),
+          z.string().max(60).nullable(),
+          z.literal(true),
+        ]),
+        z.tuple([
+          z.string().max(100),
+          z.string().max(200),
+          z.string().max(100).nullable(),
+          z.string().max(20).nullable(),
+          z.string().length(32).nullable(),
+          z.string().max(60).nullable(),
+          z.string().max(80).nullable(),
+          z.string().max(100).nullable(),
+          z.string().max(60).nullable(),
+          z.literal(true).nullable(),
+          z.literal(true).nullable(),
+          z.string().length(32).nullable(),
+        ]),
+      ]),
+    ),
+    operations: z.record(
+      z.string().max(100),
+      z.tuple([
+        z.string().max(100),
+        z.string().max(120),
+        z.string().length(32),
+        z.enum(["running", "completed", "failed"]),
+        z.number().int().nonnegative(),
+        z.string().max(60).nullable(),
+        z.string().max(80).nullable(),
+        z.string().max(100).nullable(),
+        z.string().max(100).nullable(),
+        z
+          .tuple([
+            z.string().max(100),
+            z.boolean(),
+            z.boolean(),
+            FigmaToolAcknowledgementSchema.nullable(),
+            z.string().max(80).nullable(),
+            StoredOperationResultDataSchema.nullable(),
+            z.string().max(400).nullable(),
+            z.string().max(300).nullable(),
+          ])
+          .nullable(),
+      ]),
+    ),
+  })
+  .strict();
 const StoredStateSchema = z.discriminatedUnion("version", [
   StoredStateV1Schema,
   StoredStateV2Schema,
+  StoredStateV3Schema,
 ]);
 
 type StoredState = z.infer<typeof StoredStateV2Schema>;
 type StoredOperationResult = NonNullable<StoredState["operations"][string]["result"]>;
+type ToolStateDiagnostic = z.infer<typeof FigmaToolStateDiagnosticSchema>;
+
+class ToolStateError extends Error {
+  constructor(
+    message: string,
+    readonly diagnostic: ToolStateDiagnostic,
+  ) {
+    super(message);
+  }
+}
+
+function expandStoredState(state: z.infer<typeof StoredStateSchema>): StoredState {
+  if (state.version === 1 || state.version === 2)
+    return StoredStateV2Schema.parse({ ...state, version: 2 });
+  return StoredStateV2Schema.parse({
+    version: 2,
+    refs: Object.fromEntries(
+      Object.entries(state.refs).map(([ref, values]) => [
+        ref,
+        {
+          nodeId: values[0],
+          pageId: values[1],
+          ...(values[2] !== null ? { parentId: values[2] } : {}),
+          ...(values[3] !== null ? { nodeType: values[3] } : {}),
+          ...(values[4] !== null ? { creationFingerprint: values[4] } : {}),
+          ...(values[5] !== null ? { taskId: values[5] } : {}),
+          ...(values[6] !== null ? { alias: values[6] } : {}),
+          ...(values[7] !== null ? { creationOperationId: values[7] } : {}),
+          ...(values[8] !== null ? { inspectedByTaskId: values[8] } : {}),
+          ...((values as readonly unknown[])[9] === true ? { inspectionOnly: true } : {}),
+          ...((values as readonly unknown[])[10] === true ? { existingTarget: true } : {}),
+          ...(typeof (values as readonly unknown[])[11] === "string"
+            ? { ownershipFingerprint: (values as readonly unknown[])[11] as string }
+            : {}),
+        },
+      ]),
+    ),
+    operations: Object.fromEntries(
+      Object.entries(state.operations).map(([operationKey, values]) => {
+        const [
+          operationId,
+          idempotencyKey,
+          fingerprint,
+          status,
+          updatedAt,
+          taskId,
+          creationRef,
+          parentingSourceParentId,
+          parentingTargetParentId,
+          resultValues,
+        ] = values;
+        const result = resultValues
+          ? {
+              operationId: resultValues[0],
+              success: resultValues[1],
+              replayed: resultValues[2],
+              ...(resultValues[3] !== null ? { acknowledgementStatus: resultValues[3] } : {}),
+              ...(resultValues[4] !== null ? { logicalRef: resultValues[4] } : {}),
+              ...(resultValues[5] ? { data: resultValues[5] } : {}),
+              ...(resultValues[6] !== null ? { error: resultValues[6] } : {}),
+              ...(resultValues[7] !== null ? { summary: resultValues[7] } : {}),
+            }
+          : undefined;
+        return [
+          operationKey,
+          {
+            operationId,
+            idempotencyKey,
+            fingerprint,
+            status,
+            updatedAt,
+            ...(taskId !== null ? { taskId } : {}),
+            ...(creationRef !== null ? { creationRef } : {}),
+            ...(parentingSourceParentId !== null ? { parentingSourceParentId } : {}),
+            ...(parentingTargetParentId !== null ? { parentingTargetParentId } : {}),
+            ...(result ? { result } : {}),
+          },
+        ];
+      }),
+    ),
+  });
+}
+
+function compactStoredState(state: StoredState) {
+  return StoredStateV3Schema.parse({
+    version: 3,
+    refs: Object.fromEntries(
+      Object.entries(state.refs).map(([ref, entry]) => [
+        ref,
+        [
+          entry.nodeId,
+          entry.pageId,
+          entry.parentId ?? null,
+          entry.nodeType ?? null,
+          entry.creationFingerprint ?? null,
+          entry.taskId ?? null,
+          entry.alias ?? null,
+          entry.creationOperationId ?? null,
+          entry.inspectedByTaskId ?? null,
+          ...(entry.inspectionOnly ? [true] : []),
+          ...(entry.existingTarget || entry.ownershipFingerprint
+            ? [entry.inspectionOnly ? true : null, entry.existingTarget ? true : null, entry.ownershipFingerprint ?? null]
+            : []),
+        ],
+      ]),
+    ),
+    operations: Object.fromEntries(
+      Object.entries(state.operations).map(([operationKey, entry]) => [
+        operationKey,
+        [
+          entry.operationId,
+          entry.idempotencyKey,
+          entry.fingerprint,
+          entry.status,
+          entry.updatedAt,
+          entry.taskId ?? null,
+          entry.creationRef ?? null,
+          entry.parentingSourceParentId ?? null,
+          entry.parentingTargetParentId ?? null,
+          entry.result
+            ? [
+                entry.result.operationId,
+                entry.result.success,
+                entry.result.replayed,
+                entry.result.acknowledgementStatus ?? null,
+                entry.result.logicalRef ?? null,
+                entry.result.data ?? null,
+                entry.result.error ?? null,
+                entry.result.summary ?? null,
+              ]
+            : null,
+        ],
+      ]),
+    ),
+  });
+}
+
+function toolStateError(
+  category: ToolStateDiagnostic["category"],
+  location: ToolStateDiagnostic["location"],
+  schemaVersion: number | null,
+): ToolStateError {
+  const diagnostic = FigmaToolStateDiagnosticSchema.parse({
+    category,
+    location,
+    schemaVersion:
+      schemaVersion !== null && schemaVersion >= 1 && schemaVersion <= 3 ? schemaVersion : null,
+    serializedBytes: null,
+  });
+  const message =
+    category === "storage_unavailable"
+      ? "Figma plugin storage could not read or save tool state; the previous saved state was preserved."
+      : category === "invalid_schema"
+        ? "Saved Figma tool state has an unsupported or invalid schema; existing data was preserved."
+        : "Saved Figma tool state could not be read safely; existing data was preserved.";
+  return new ToolStateError(message, diagnostic);
+}
 
 export function downgradeStoredToolStateForRollback(input: unknown) {
-  const state = StoredStateV2Schema.parse(input);
+  const state = expandStoredState(StoredStateSchema.parse(input));
   const operations = Object.fromEntries(
     Object.entries(state.operations).map(([id, operation]) => {
       if (!operation.result?.data) return [id, operation];
@@ -262,7 +538,11 @@ function parentingDiagnostic(
   });
 }
 
-function resolveTaskAction(state: StoredState, operation: FigmaToolOperation): FigmaToolAction {
+function resolveTaskAction(
+  state: StoredState,
+  operation: FigmaToolOperation,
+  recoverMissingTaskRef?: (taskId: string, ref: string) => string | undefined,
+): FigmaToolAction {
   const taskId = operation.taskId!;
   const action = operation.action;
   const confirmed = (ref: string, entry: StoredState["refs"][string], inspecting: boolean) => {
@@ -294,7 +574,22 @@ function resolveTaskAction(state: StoredState, operation: FigmaToolOperation): F
       confirmed(own[0]![0], own[0]![1], inspecting);
       return own[0]![0];
     }
-    if (!entry) throw new ReferenceResolutionError("missing_or_uninspected", ref);
+    if (!entry) {
+      const recoveredRef = recoverMissingTaskRef?.(taskId, ref);
+      const recovered = recoveredRef ? state.refs[recoveredRef] : undefined;
+      if (!recoveredRef || !recovered)
+        throw new ReferenceResolutionError("missing_or_uninspected", ref);
+      confirmed(recoveredRef, recovered, inspecting);
+      return recoveredRef;
+    }
+    if (entry.taskId !== taskId && entry.inspectedByTaskId !== taskId) {
+      const recoveredRef = recoverMissingTaskRef?.(taskId, ref);
+      const recovered = recoveredRef ? state.refs[recoveredRef] : undefined;
+      if (recoveredRef && recovered) {
+        confirmed(recoveredRef, recovered, inspecting);
+        return recoveredRef;
+      }
+    }
     if (!inspecting && entry.taskId !== taskId && entry.inspectedByTaskId !== taskId)
       throw new ReferenceResolutionError("inspection_required", ref);
     confirmed(ref, entry, inspecting);
@@ -416,6 +711,23 @@ function fingerprint(input: string): string {
   return hashes.map((hash) => hash.toString(16).padStart(8, "0")).join("");
 }
 
+function existingNodeOwnershipFingerprint(node: SceneNode | null): string | undefined {
+  if (!node) return undefined;
+  const ownershipKeys = [
+    "fad.tool.task-id.v1",
+    "fad.design.task-id.v1",
+    "fad.design.chat-id.v1",
+    "fad.design.name.v1",
+    "fad.generation.commit",
+    "fad.multi-screen.batch-id",
+    "fad.multi-screen.screen-id",
+    "fad.tool.operation-id.v1",
+  ];
+  const values = ownershipKeys.map((key) => node.getPluginData(key));
+  if (!values.some(Boolean)) return undefined;
+  return fingerprint(JSON.stringify(values));
+}
+
 function belongsToPage(node: BaseNode, page: PageNode): boolean {
   let current: BaseNode | null = node;
   while (current && current.type !== "PAGE") current = current.parent;
@@ -492,6 +804,7 @@ function summarizeNode(node: SceneNode, ref?: string) {
     width: node.width,
     height: node.height,
     visible: node.visible,
+    locked: node.locked,
     ...(bounds
       ? {
           bounds: {
@@ -587,7 +900,11 @@ function randomLocalRef(): string {
 }
 
 function compactResult(result: OperationResult): StoredOperationResult {
+  const overflowRepair = AutoLayoutRepairReportSchema.array().safeParse(
+    result.data?.overflowRepair,
+  );
   const data = {
+    ...(overflowRepair.success ? { overflowRepair: overflowRepair.data } : {}),
     ...(result.data?.reused ? { reused: true } : {}),
     ...(result.data?.parenting
       ? { parenting: FigmaToolParentingDiagnosticSchema.parse(result.data.parenting) }
@@ -603,6 +920,13 @@ function compactResult(result: OperationResult): StoredOperationResult {
       ? {
           compatibilityFailure: FigmaToolCompatibilityFailureSchema.parse(
             result.data.compatibilityFailure,
+          ),
+        }
+      : {}),
+    ...(result.data?.toolStateDiagnostic
+      ? {
+          toolStateDiagnostic: FigmaToolStateDiagnosticSchema.parse(
+            result.data.toolStateDiagnostic,
           ),
         }
       : {}),
@@ -659,56 +983,78 @@ export function createFigmaToolExecutor(
     withTimeout(promise, label, operationTimeoutMs);
   let queue: Promise<void> = Promise.resolve();
   let pendingBatches = 0;
-  const cancellation = new Map<string, { cancelled: boolean }>();
+  const cancellation = new Map<string, { cancelled: boolean; pauseRequested: boolean }>();
   const deleteConsents = new Map<string, { token: string; ref: string; expiresAt: number }>();
   const startedOperations: number[] = [];
+  type DiscoverySnapshot = {
+    pages: Array<{ id: string; name: string; current: boolean }>;
+    frames: Array<Record<string, unknown>>;
+    discovery: Record<string, unknown>;
+  };
+  const progressiveScanner = createProgressiveDiscoveryScanner(api);
 
-  const documentPageKey = (pageId = api.currentPage.id): string => {
+  const documentPageKey = (
+    pageId = api.currentPage.id,
+    initializeDocumentIdentity = true,
+  ): string => {
     let documentId = api.root.getPluginData("fad.document-id");
-    if (!documentId) {
+    if (!documentId && initializeDocumentIdentity) {
       documentId = `doc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
       api.root.setPluginData("fad.document-id", documentId);
     }
-    const fileId = api.fileKey ?? documentId;
+    const fileId = api.fileKey ?? documentId ?? api.root.id;
     return `${STORAGE_PREFIX}:${fileId}:${pageId.replaceAll(":", "_")}`;
   };
 
-  const loadState = async (pageId = api.currentPage.id): Promise<StoredState> => {
-    const raw: unknown = await timed(
-      api.clientStorage.getAsync(documentPageKey(pageId)),
-      "Tool state read",
-    );
-    if (raw === undefined) return { version: 2, refs: {}, operations: {} };
-    let serialized: string;
+  const writeStoredState = async (
+    state: z.infer<typeof StoredStateV3Schema>,
+    pageId: string,
+    initializeDocumentIdentity = true,
+  ): Promise<void> => {
     try {
-      serialized = JSON.stringify(raw);
+      await timed(
+        api.clientStorage.setAsync(documentPageKey(pageId, initializeDocumentIdentity), state),
+        "Tool state save",
+      );
     } catch {
-      throw new Error("Saved tool references are not readable; refusing to resolve them.");
+      throw toolStateError("storage_unavailable", "save", 3);
     }
-    if (!serialized || utf8Bytes(serialized) > 256 * 1024)
-      throw new Error("Saved tool state exceeds its safety limit; refusing to resolve it.");
-    const parsed = StoredStateSchema.safeParse(raw);
-    if (!parsed.success)
-      throw new Error("Saved tool references are invalid; refusing to resolve them.");
-    if (
-      Object.keys(parsed.data.refs).length > 500 ||
-      Object.keys(parsed.data.operations).length > 400
-    )
-      throw new Error("Saved tool state exceeds its record limit; refusing to resolve it.");
-    return parsed.data.version === 1 ? { ...parsed.data, version: 2 } : parsed.data;
   };
 
-  const saveState = async (state: StoredState, pageId = api.currentPage.id): Promise<void> => {
-    const operations = Object.fromEntries(
-      Object.entries(state.operations)
-        .sort(([, a], [, b]) => b.updatedAt - a.updatedAt)
-        .slice(0, MAX_STORED_OPERATIONS),
-    );
-    await timed(
-      api.clientStorage.setAsync(documentPageKey(pageId), { ...state, operations }),
-      "Tool state save",
-    );
+  const loadState = async (
+    pageId = api.currentPage.id,
+    readOnlyInspection = false,
+  ): Promise<StoredState> => {
+    let raw: unknown;
+    try {
+      raw = await timed(
+        api.clientStorage.getAsync(documentPageKey(pageId, !readOnlyInspection)),
+        "Tool state read",
+      );
+    } catch {
+      throw toolStateError("storage_unavailable", "load", null);
+    }
+    if (raw === undefined) return { version: 2, refs: {}, operations: {} };
+    const schemaVersion =
+      raw && typeof raw === "object" && "version" in raw && typeof raw.version === "number"
+        ? raw.version
+        : null;
+    let parsed: ReturnType<typeof StoredStateSchema.safeParse>;
+    try {
+      parsed = StoredStateSchema.safeParse(raw);
+    } catch {
+      throw toolStateError("corrupted_state", "load", schemaVersion);
+    }
+    if (!parsed.success) throw toolStateError("invalid_schema", "load", schemaVersion);
+    return expandStoredState(parsed.data);
   };
+
+  const saveState = async (
+    state: StoredState,
+    pageId = api.currentPage.id,
+    readOnlyInspection = false,
+  ): Promise<void> =>
+    writeStoredState(compactStoredState(state), pageId, !readOnlyInspection);
 
   const assertTaskPageScope = (documentId: string, pageId: string, taskId: string): void => {
     const localDocumentId = api.root.getPluginData("fad.document-id");
@@ -867,6 +1213,7 @@ export function createFigmaToolExecutor(
     ref: string,
     pageId = api.currentPage.id,
     allowParentChange = false,
+    allowInspectionOnly = false,
   ): Promise<SceneNode> => {
     if (api.currentPage.id !== pageId)
       throw new Error(
@@ -880,6 +1227,8 @@ export function createFigmaToolExecutor(
         : undefined);
     if (!entry || entry.pageId !== pageId)
       throw new ReferenceResolutionError("missing_or_other_page", ref);
+    if (entry.inspectionOnly && !allowInspectionOnly)
+      throw new ReferenceResolutionError("inspection_only_reference", ref);
     const node = await timed(api.getNodeByIdAsync(entry.nodeId), "Node reference lookup");
     if (
       api.currentPage.id !== pageId ||
@@ -887,8 +1236,11 @@ export function createFigmaToolExecutor(
       !("type" in node) ||
       node.type === "DOCUMENT" ||
       node.type === "PAGE" ||
+      (entry.existingTarget &&
+        (!entry.ownershipFingerprint ||
+          existingNodeOwnershipFingerprint(node as SceneNode) !== entry.ownershipFingerprint)) ||
       !belongsToPage(node, api.currentPage) ||
-      (node as SceneNode).getPluginData(REF_PLUGIN_KEY) !== ref ||
+      (!entry.inspectionOnly && !entry.existingTarget && (node as SceneNode).getPluginData(REF_PLUGIN_KEY) !== ref) ||
       (!allowParentChange && entry.parentId && (node as SceneNode).parent?.id !== entry.parentId) ||
       (entry.nodeType && (node as SceneNode).type !== entry.nodeType) ||
       (creationFingerprint &&
@@ -899,6 +1251,8 @@ export function createFigmaToolExecutor(
     )
       throw new ReferenceResolutionError("stale", ref);
     if (
+      !entry.inspectionOnly &&
+      !entry.existingTarget &&
       api.currentPage.findAll((candidate) => candidate.getPluginData(REF_PLUGIN_KEY) === ref)
         .length !== 1
     )
@@ -935,18 +1289,41 @@ export function createFigmaToolExecutor(
     node: SceneNode,
     pageId: string,
     taskId?: string,
+    inspectionOnly = false,
   ): string => {
-    if (api.currentPage.id !== pageId || !belongsToPage(node, api.currentPage))
-      throw new Error(
-        "Figma page changed during inspection; no other page was tagged or inspected.",
-      );
-    const existing = Object.entries(state.refs).find(
-      ([, entry]) => entry.nodeId === node.id && entry.pageId === pageId,
+    const referencePage = api.root.children.find((page) => page.id === pageId);
+    const crossPageTarget = !inspectionOnly && api.currentPage.id !== pageId;
+    const ownershipFingerprint = !inspectionOnly ? existingNodeOwnershipFingerprint(node) : undefined;
+    const persistentExisting = Object.entries(state.refs).find(
+      ([, entry]) =>
+        entry.nodeId === node.id && entry.pageId === pageId && entry.inspectionOnly !== true,
     );
+    const existingTarget = crossPageTarget || persistentExisting?.[1].existingTarget === true;
+    if (
+      !referencePage ||
+      !belongsToPage(node, referencePage) ||
+      (existingTarget && !ownershipFingerprint)
+    )
+      throw new Error(
+        "Cross-page target has no verified ownership metadata; no node was tagged or inspected.",
+      );
+    const inspectionExisting = inspectionOnly
+      ? Object.entries(state.refs).find(
+          ([, entry]) =>
+            entry.nodeId === node.id && entry.pageId === pageId && entry.inspectionOnly === true,
+        )
+      : undefined;
+    const existing = inspectionOnly ? inspectionExisting : persistentExisting;
     if (existing) {
-      if (node.getPluginData(REF_PLUGIN_KEY) !== existing[0])
+      if (
+        existing[1].existingTarget
+          ? existing[1].ownershipFingerprint !== ownershipFingerprint
+          : !existing[1].inspectionOnly && node.getPluginData(REF_PLUGIN_KEY) !== existing[0]
+      )
         throw new ReferenceResolutionError("stale", existing[0]);
       if (
+        !existing[1].inspectionOnly &&
+        !existing[1].existingTarget &&
         api.currentPage.findAll(
           (candidate) => candidate.getPluginData(REF_PLUGIN_KEY) === existing[0],
         ).length !== 1
@@ -957,10 +1334,6 @@ export function createFigmaToolExecutor(
       existing[1].nodeType = node.type;
       return existing[0];
     }
-    if (Object.keys(state.refs).length >= 500)
-      throw new Error(
-        "This page already has 500 retained logical references; inspection stopped safely.",
-      );
     const storedRef = node.getPluginData(REF_PLUGIN_KEY);
     if (storedRef && state.refs[storedRef])
       throw new ReferenceResolutionError("ambiguous", storedRef);
@@ -973,18 +1346,55 @@ export function createFigmaToolExecutor(
     const ref =
       storedRef && /^[A-Za-z][A-Za-z0-9._-]{0,79}$/u.test(storedRef) && !state.refs[storedRef]
         ? storedRef
-        : `inspected-${randomLocalRef()}`;
-    node.setPluginData(REF_PLUGIN_KEY, ref);
+        : `${inspectionOnly ? "inspection" : "inspected"}-${randomLocalRef()}`;
+    if (!inspectionOnly && !existingTarget) node.setPluginData(REF_PLUGIN_KEY, ref);
     state.refs[ref] = {
       nodeId: node.id,
       pageId,
       parentId: node.parent?.id,
       nodeType: node.type,
+      ...(inspectionOnly ? { inspectionOnly: true } : {}),
+      ...(existingTarget && ownershipFingerprint ? { existingTarget: true, ownershipFingerprint } : {}),
       ...(taskId ? { inspectedByTaskId: taskId } : {}),
     };
     return ref;
   };
 
+  const discoverDocumentFrames = async (
+    state: StoredState,
+    isCancelled: () => boolean = () => false,
+    inspectionOnlyRefs = false,
+    query?: string,
+    taskId?: string,
+    requestedPageId?: string,
+    isPauseRequested: () => boolean = () => false,
+    reportProgress: (message: string) => void = () => undefined,
+  ): Promise<DiscoverySnapshot> =>
+    progressiveScanner({
+      api,
+      documentKey: api.fileKey ?? api.root.id,
+      query,
+      taskId,
+      pageId: requestedPageId,
+      inspectionOnly: inspectionOnlyRefs,
+      isCancelled,
+      isPauseRequested,
+      progress: reportProgress,
+      loadState: async (pageId, readOnly) =>
+        pageId === api.currentPage.id
+          ? (state as unknown as Record<string, unknown>)
+          : ((await loadState(pageId, readOnly)) as unknown as Record<string, unknown>),
+      saveState: async (saved, pageId, readOnly) =>
+        saveState(saved as unknown as StoredState, pageId, readOnly),
+      registerInspectionRef: (saved, node, pageId, currentTaskId, inspectionOnly) =>
+        registerLogicalRef(
+          saved as unknown as StoredState,
+          node,
+          pageId,
+          currentTaskId,
+          inspectionOnly === true,
+        ),
+    });
   const loadFont = async (requested: FontName): Promise<{ font: FontName; fallback: boolean }> => {
     const fonts = await timed(api.listAvailableFontsAsync(), "Font discovery");
     const available = fonts
@@ -1010,6 +1420,9 @@ export function createFigmaToolExecutor(
     pageId: string,
     markNativeMutation: () => void,
     requestedAction: FigmaToolAction = operation.action,
+    isCancelled: () => boolean = () => false,
+    isPauseRequested: () => boolean = () => false,
+    reportProgress: (message: string) => void = () => undefined,
   ): Promise<{
     summary: string;
     logicalRef?: string;
@@ -1023,17 +1436,64 @@ export function createFigmaToolExecutor(
       );
     const action = operation.action;
     if (action.tool === "get_document_context") {
-      const selection = api.currentPage.selection.slice(0, 10).map((node) => summarizeNode(node));
-      const [paintStyles, textStyles] = await Promise.all([
-        timed(api.getLocalPaintStylesAsync(), "Paint token lookup"),
-        timed(api.getLocalTextStylesAsync(), "Text token lookup"),
-      ]);
-      const [variables, collections] = await Promise.all([
-        timed(api.variables.getLocalVariablesAsync(), "Local variable token lookup"),
-        timed(api.variables.getLocalVariableCollectionsAsync(), "Variable collection lookup"),
-      ]);
+      const pageName = api.currentPage.name;
+      const currentPageId = api.currentPage.id;
+      const selection = action.readOnlyInspection === false
+        ? []
+        : api.currentPage.selection.slice(0, 10).map((node) => summarizeNode(node));
+      const [paintStyles, textStyles, variables, collections] =
+        (action.offset ?? 0) === 0
+          ? await Promise.all([
+              timed(api.getLocalPaintStylesAsync(), "Paint token lookup"),
+              timed(api.getLocalTextStylesAsync(), "Text token lookup"),
+              timed(api.variables.getLocalVariablesAsync(), "Local variable token lookup"),
+              timed(api.variables.getLocalVariableCollectionsAsync(), "Variable collection lookup"),
+            ])
+          : [[], [], [], []];
       if (api.currentPage.id !== pageId)
         throw new Error("Figma page changed while reading context; no other page was inspected.");
+      const discovery = await discoverDocumentFrames(
+        state,
+        isCancelled,
+        action.readOnlyInspection === true,
+        action.query,
+        operation.taskId,
+        action.pageId,
+        isPauseRequested,
+        reportProgress,
+      );
+      const query = action.query?.trim();
+      const discoveryData = discovery.discovery;
+      const totalMatches =
+        typeof discoveryData.matchCount === "number" ? discoveryData.matchCount : discovery.frames.length;
+      const matchStatus =
+        typeof discoveryData.matchStatus === "string" ? discoveryData.matchStatus : "not_queried";
+      const publicFrames = discovery.frames.map((frame) => ({
+        pageId: frame.pageId,
+        pageName: frame.pageName,
+        ...(frame.ref ? { ref: frame.ref } : {}),
+        ...(frame.nodeId ? { nodeId: frame.nodeId } : {}),
+        type: frame.type,
+        name: frame.name,
+        ...(frame.parentName ? { parentName: frame.parentName } : {}),
+        depth: frame.depth,
+        x: frame.x,
+        y: frame.y,
+        width: frame.width,
+        height: frame.height,
+        visible: frame.visible,
+        locked: frame.locked,
+        editable: frame.editable,
+        ...(frame.projectName ? { projectName: frame.projectName } : {}),
+        ...(frame.taskId ? { taskId: frame.taskId } : {}),
+        ...(frame.ownerTaskId ? { ownerTaskId: frame.ownerTaskId } : {}),
+        ...(frame.chatId ? { chatId: frame.chatId } : {}),
+        ...(frame.generationId ? { generationId: frame.generationId } : {}),
+        ...(frame.screenId ? { screenId: frame.screenId } : {}),
+        ...(frame.nativeInspected === true
+          ? { nativeInspected: true, nativeInspection: frame.nativeInspection }
+          : {}),
+      }));
       const collectionNames = new Map(
         collections.map(({ id, name, defaultModeId }) => [id, { name, defaultModeId }]),
       );
@@ -1062,37 +1522,155 @@ export function createFigmaToolExecutor(
             : {}),
         };
       });
-      return {
-        summary: `Current page “${api.currentPage.name}” has ${api.currentPage.children.length} top-level layers and ${api.currentPage.selection.length} selected layer(s).`,
-        data: {
-          page: { name: api.currentPage.name },
-          viewport: { center: api.viewport.center },
-          selection,
-          logicalReferences: Object.entries(state.refs)
-            .slice(0, 50)
-            .map(([ref, entry]) => ({
-              ref,
-              ...(entry.taskId ? { taskId: entry.taskId, alias: entry.alias } : {}),
-              instruction: "Inspect this ref before editing; availability is not yet verified.",
-            })),
-          tokens: {
-            paintStyles: paintStyles
-              .slice(0, 20)
-              .map(({ id, name }) => ({ id, name: name.slice(0, 100) })),
-            textStyles: textStyles
-              .slice(0, 20)
-              .map(({ id, name }) => ({ id, name: name.slice(0, 100) })),
-            variables: variableTokens,
-          },
+      const returnedMatchCount = publicFrames.length;
+      const summary = query
+        ? `Query “${query.slice(0, 100)}” matched ${totalMatches} frame/component target(s) (${matchStatus}); scanned ${String(discoveryData.pagesVisited ?? 0)}/${String(discoveryData.pagesAvailable ?? 0)} pages${discoveryData.truncated === true ? " with partial coverage" : " completely"}.`
+        : `Discovered ${String(discoveryData.framesDiscovered ?? 0)} frame/component target(s) across ${String(discoveryData.pagesVisited ?? 0)} scanned page(s)${discoveryData.truncated === true ? " with partial coverage" : " completely"}.`;
+      const data: Record<string, unknown> = {
+        document: { id: api.fileKey ?? api.root.getPluginData("fad.document-id") },
+        page: { id: currentPageId, name: pageName },
+        pages: discovery.pages,
+        frames: publicFrames,
+        discovery: {
+          ...discovery.discovery,
+          ...(query ? { query, matchStatus, matchCount: totalMatches } : {}),
+          returnedFrameCount: returnedMatchCount,
+          offset: 0,
+        },
+        viewport: { center: api.viewport.center },
+        selection: selection.slice(0, 3),
+        logicalReferences: action.readOnlyInspection === false
+          ? []
+          : Object.entries(state.refs)
+              .slice(0, 12)
+              .map(([ref, entry]) => ({
+            ref,
+            ...(entry.taskId ? { taskId: entry.taskId, alias: entry.alias } : {}),
+            instruction:
+              "Historical page ref; inspect before an explicit edit. It is not a requirement for a new design.",
+              })),
+        tokens: {
+          paintStyles: paintStyles
+            .slice(0, 8)
+            .map(({ id, name }) => ({ id, name: name.slice(0, 80) })),
+          textStyles: textStyles
+            .slice(0, 8)
+            .map(({ id, name }) => ({ id, name: name.slice(0, 80) })),
+          variables: variableTokens.slice(0, 8),
         },
       };
+      const response = () => JSON.stringify({ summary, data });
+      const serializationStarted = Date.now();
+      while (utf8Bytes(response()) > 7_000) {
+        const tokens = data.tokens as {
+          paintStyles: unknown[];
+          textStyles: unknown[];
+          variables: unknown[];
+        };
+        if (tokens.variables.length) tokens.variables.pop();
+        else if (tokens.paintStyles.length) tokens.paintStyles.pop();
+        else if (tokens.textStyles.length) tokens.textStyles.pop();
+        else if ((data.logicalReferences as unknown[]).length)
+          (data.logicalReferences as unknown[]).pop();
+        else if ((data.selection as unknown[]).length) (data.selection as unknown[]).pop();
+        else if ((data.frames as unknown[]).length) {
+          (data.frames as unknown[]).pop();
+          data.discovery = {
+            ...(data.discovery as Record<string, unknown>),
+            sampleFramesTruncated: true,
+            returnedFrameCount: (data.frames as unknown[]).length,
+          };
+        } else if ((data.pages as unknown[]).length > 1) (data.pages as unknown[]).pop();
+        else break;
+      }
+      (data.discovery as Record<string, unknown>).serializationMs = Math.max(
+        0,
+        Date.now() - serializationStarted,
+      );
+      return { summary, data };
     }
     if (action.tool === "inspect_nodes") {
       const roots = action.refs.length
-        ? await Promise.all(action.refs.map((ref) => resolveRef(state, ref, pageId, true)))
+        ? await Promise.all(
+            action.refs.map((ref) =>
+              resolveRef(
+                state,
+                ref,
+                pageId,
+                action.readOnlyInspection !== true,
+                action.readOnlyInspection === true,
+              ),
+            ),
+          )
         : api.currentPage.selection;
       if (api.currentPage.id !== pageId)
         throw new Error("Figma page changed while resolving inspection targets.");
+      if (action.purpose === "structural_verification") {
+        let nodeCount = 0;
+        const snapshot = (node: SceneNode): NativeVisualNode => {
+          nodeCount++;
+          const ref = registerLogicalRef(
+            state,
+            node,
+            pageId,
+            operation.taskId,
+            action.readOnlyInspection === true,
+          );
+          return {
+            ...summarizeNode(node, ref),
+            ownedByTask: Boolean(
+              operation.taskId && node.getPluginData(TASK_PLUGIN_KEY) === operation.taskId,
+            ),
+            children: directChildren(node).map(snapshot),
+          } as NativeVisualNode;
+        };
+        const qualityRoots = roots.map((node) => {
+          while (
+            operation.taskId &&
+            node.parent &&
+            node.parent.type !== "PAGE" &&
+            node.parent.type !== "DOCUMENT" &&
+            node.parent.getPluginData(TASK_PLUGIN_KEY) === operation.taskId
+          )
+            node = node.parent as SceneNode;
+          return node;
+        });
+        const rootIds = new Set(qualityRoots.map((node) => node.id));
+        const independentRoots = [
+          ...new Map(qualityRoots.map((node) => [node.id, node])).values(),
+        ].filter((node) => {
+          let ancestor = node.parent;
+          while (ancestor && ancestor.type !== "PAGE" && ancestor.type !== "DOCUMENT") {
+            if (rootIds.has(ancestor.id)) return false;
+            ancestor = ancestor.parent;
+          }
+          return true;
+        });
+        // Full native QA returns compact findings without expanding raw-node exposure limits.
+        const nodes = independentRoots.map(snapshot);
+        const findings = auditNativeSection(nodes, action.refs);
+        return {
+          summary: `Verified ${nodeCount} native layers; ${findings.length} structural finding(s).`,
+          data: {
+            pageId,
+            repairPipelineVersion: NATIVE_REPAIR_PIPELINE_VERSION,
+            nodes: [],
+            qualityCoverage: { complete: true, nodeCount, findingCount: findings.length },
+            qualityFindings: findings.slice(0, 24).map((finding) => ({
+              code: finding.code,
+              refs: finding.refs ?? (finding.ref ? [finding.ref] : []),
+              expected: finding.expected.slice(0, 300),
+              actual: finding.actual.slice(0, 1_000),
+            })),
+            nativeRepairPlan: planNativeQualityRepairs(
+              nodes,
+              findings.slice(0, 24),
+              action.palette ?? [],
+              Boolean(operation.taskId),
+            ),
+          },
+        };
+      }
       const summariesById = new Map<string, Record<string, unknown>>();
       const result: Array<Record<string, unknown>> = [];
       const queue: Array<{ node: SceneNode; depth: number; summary: Record<string, unknown> }> = [];
@@ -1100,7 +1678,13 @@ export function createFigmaToolExecutor(
         const existing = summariesById.get(node.id);
         if (existing) return existing;
         if (result.length >= action.maxNodes) return undefined;
-        const ref = registerLogicalRef(state, node, pageId, operation.taskId);
+        const ref = registerLogicalRef(
+          state,
+          node,
+          pageId,
+          operation.taskId,
+          action.readOnlyInspection === true,
+        );
         const summary = summarizeNode(node, ref) as Record<string, unknown>;
         summariesById.set(node.id, summary);
         result.push(summary);
@@ -1122,7 +1706,7 @@ export function createFigmaToolExecutor(
       }
       return {
         summary: `Inspected ${result.length} node(s) within depth ${action.depth}.`,
-        data: { nodes: rootNodes },
+        data: { pageId, nodes: rootNodes },
       };
     }
     if (action.tool === "get_operation_status") {
@@ -1197,10 +1781,6 @@ export function createFigmaToolExecutor(
         api.currentPage.findAll((node) => node.getPluginData(REF_PLUGIN_KEY) === action.ref).length
       )
         throw new ReferenceResolutionError("unregistered_existing_node", action.ref);
-      if (Object.keys(state.refs).length >= 500)
-        throw new Error(
-          "This page already has 500 retained logical references; start a new page-scoped tool session.",
-        );
       const parent = figmaCompatibilityEngine.requireCreationParent(
         action,
         await resolveParent(state, action.parent, pageId),
@@ -1264,8 +1844,8 @@ export function createFigmaToolExecutor(
             text.lineHeight = { unit: "PIXELS", value: action.lineHeight };
           if (action.letterSpacing !== undefined)
             text.letterSpacing = { unit: "PIXELS", value: action.letterSpacing };
-          text.textAutoResize = textAction.textAutoResize;
           text.resize(textAction.size.width, textAction.size.height);
+          text.textAutoResize = textAction.textAutoResize;
         } else if (action.tool === "create_frame") {
           markNativeMutation();
           const frame = api.createFrame();
@@ -1284,7 +1864,8 @@ export function createFigmaToolExecutor(
           if (action.clipsContent !== undefined) frame.clipsContent = action.clipsContent;
           if (paintStyle)
             await timed(frame.setFillStyleIdAsync(paintStyle.id), "Paint token apply");
-          if (action.autoLayout) applyLayout(frame, action.autoLayout);
+          if (action.autoLayout)
+            applyLayout(frame, action.autoLayout, action.parent.kind === "node");
         } else {
           markNativeMutation();
           const rectangle = api.createRectangle();
@@ -1304,7 +1885,15 @@ export function createFigmaToolExecutor(
             await timed(rectangle.setFillStyleIdAsync(paintStyle.id), "Paint token apply");
         }
         created = createdNode!;
-        if (operation.taskId) created.setPluginData(TASK_PLUGIN_KEY, operation.taskId);
+        if (operation.taskId) {
+          created.setPluginData(TASK_PLUGIN_KEY, operation.taskId);
+          if (action.parent.kind === "page") {
+            created.setPluginData(DESIGN_TASK_PLUGIN_KEY, operation.taskId);
+            if (operation.chatId) created.setPluginData(DESIGN_CHAT_PLUGIN_KEY, operation.chatId);
+            if (operation.designName)
+              created.setPluginData(DESIGN_NAME_PLUGIN_KEY, operation.designName);
+          }
+        }
         const isActualPageParent = actualParent.type === "PAGE";
         if (!isActualPageParent) actualParent.appendChild(created);
         if (isActualPageParent && placement)
@@ -1373,8 +1962,31 @@ export function createFigmaToolExecutor(
         })),
       );
       const compatible = figmaCompatibilityEngine.normalizeAutoLayout(action, node, childNodes);
+      if (
+        action.repairOverflow &&
+        (!operation.taskId || node.getPluginData(TASK_PLUGIN_KEY) !== operation.taskId)
+      )
+        throw new Error(
+          "Hierarchy repair requires a current task-owned frame; external nodes are unchanged.",
+        );
       if (api.currentPage.id !== pageId)
         throw new Error("Figma page changed before Auto Layout was applied.");
+      if (action.repairOverflow) {
+        let changed = false;
+        const overflowRepair = repairAutoLayoutHierarchy(node, operation.taskId!, () => {
+          changed = true;
+          markNativeMutation();
+        });
+        return {
+          summary: changed
+            ? "Grew undersized task-owned vertical containers using native HUG; fresh structural verification is required."
+            : "No safe hierarchy sizing change was available; existing layout was preserved. Inspect remaining findings and repair stop reasons.",
+          ...(!changed
+            ? { replayed: true, acknowledgementStatus: "verified_idempotent_replay" as const }
+            : {}),
+          data: { overflowRepair, ...(!changed ? { reused: true } : {}) },
+        };
+      }
       markNativeMutation();
       applyLayout(node as FrameNode | ComponentNode, compatible.layout);
       for (const { rule, node: child, horizontal, vertical } of compatible.children) {
@@ -1658,9 +2270,14 @@ export function createFigmaToolExecutor(
     throw new Error("Unsupported Figma tool.");
   };
 
-  const applyLayout = (frame: FrameNode | ComponentNode, layout: ToolLayout) => {
+  const applyLayout = (
+    frame: FrameNode | ComponentNode,
+    layout: ToolLayout,
+    nested = frame.parent?.type !== "PAGE",
+  ) => {
     frame.layoutMode = layout.direction === "horizontal" ? "HORIZONTAL" : "VERTICAL";
-    frame.primaryAxisSizingMode = layout.primarySizing;
+    frame.primaryAxisSizingMode =
+      layout.primarySizing ?? (nested && layout.direction === "vertical" ? "AUTO" : "FIXED");
     frame.counterAxisSizingMode = layout.counterSizing;
     frame.primaryAxisAlignItems = layout.primaryAlign;
     frame.counterAxisAlignItems = layout.counterAlign;
@@ -1671,16 +2288,106 @@ export function createFigmaToolExecutor(
     frame.paddingLeft = layout.padding.left;
   };
 
+  const recoverTaskReference = (
+    state: StoredState,
+    taskId: string,
+    ref: string,
+    pageId: string,
+  ): string | undefined => {
+    if (api.currentPage.id !== pageId) return undefined;
+    const possibleRefs = new Set([ref, `task-${fingerprint(`${taskId}:${ref}`)}`]);
+    const recovered: Array<{
+      ref: string;
+      node: SceneNode;
+      operationId: string;
+      fingerprint: string;
+    }> = [];
+    for (const canonicalRef of possibleRefs) {
+      const taggedNodes = api.currentPage.findAll(
+        (node) => node.getPluginData(REF_PLUGIN_KEY) === canonicalRef,
+      );
+      if (taggedNodes.length > 1)
+        throw new ReferenceResolutionError(
+          "ambiguous",
+          ref,
+          [{ canonicalRef, provenance: "current_task_alias" }],
+          taggedNodes.length,
+        );
+      const node = taggedNodes[0];
+      if (
+        !node ||
+        node.getPluginData(TASK_PLUGIN_KEY) !== taskId ||
+        !belongsToPage(node, api.currentPage)
+      )
+        continue;
+      const operationId = node.getPluginData(OP_PLUGIN_KEY);
+      const nodeFingerprint = node.getPluginData(FINGERPRINT_PLUGIN_KEY);
+      const creation = operationId ? state.operations[operationId] : undefined;
+      if (
+        !operationId ||
+        !nodeFingerprint ||
+        api.currentPage.findAll(
+          (candidate) => candidate.getPluginData(OP_PLUGIN_KEY) === operationId,
+        ).length !== 1 ||
+        !creation ||
+        creation.status !== "completed" ||
+        creation.taskId !== taskId ||
+        creation.creationRef !== canonicalRef ||
+        creation.fingerprint !== nodeFingerprint ||
+        !creation.result?.success ||
+        creation.result.logicalRef !== canonicalRef ||
+        !["FRAME", "TEXT", "RECTANGLE"].includes(node.type)
+      )
+        continue;
+      recovered.push({ ref: canonicalRef, node, operationId, fingerprint: nodeFingerprint });
+    }
+    if (recovered.length > 1)
+      throw new ReferenceResolutionError(
+        "ambiguous",
+        ref,
+        recovered.slice(0, 3).map(({ ref: canonicalRef }) => ({
+          canonicalRef,
+          provenance: "current_task_alias" as const,
+        })),
+        recovered.length,
+      );
+    const match = recovered[0];
+    if (!match) return undefined;
+    const alias = match.ref === ref ? undefined : ref;
+    state.refs[match.ref] = {
+      nodeId: match.node.id,
+      pageId,
+      parentId: match.node.parent?.id,
+      nodeType: match.node.type,
+      creationFingerprint: match.fingerprint,
+      taskId,
+      ...(alias ? { alias } : {}),
+      creationOperationId: match.operationId,
+    };
+    return match.ref;
+  };
+
   const executeOperation = async (
     state: StoredState,
     operation: FigmaToolOperation,
     pageId: string,
+    isCancelled: () => boolean = () => false,
+    isPauseRequested: () => boolean = () => false,
+    reportProgress: (message: string) => void = () => undefined,
   ): Promise<OperationResult> => {
     const requestedAction = operation.action;
+    const readOnlyInspection =
+      (requestedAction.tool === "get_document_context" || requestedAction.tool === "inspect_nodes") &&
+      requestedAction.readOnlyInspection === true;
     const alias = isCreation(operation.action) ? operation.action.ref : undefined;
     if (operation.taskId) {
       try {
-        operation = { ...operation, action: resolveTaskAction(state, operation) };
+        operation = {
+          ...operation,
+          action: resolveTaskAction(state, operation, (taskId, ref) =>
+            recoverTaskReference(state, taskId, ref, pageId),
+          ),
+        };
       } catch (error) {
         if (!(error instanceof ReferenceResolutionError)) throw error;
         const result = referenceFailure(operation.operationId, error);
@@ -1743,7 +2450,14 @@ export function createFigmaToolExecutor(
           return referenceFailure(operation.operationId, error);
         }
       }
-      if (prior.status === "completed" && prior.result)
+      const refreshNativeVerification =
+        operation.action.tool === "inspect_nodes" &&
+        operation.action.purpose === "structural_verification";
+      const retryReadOnlyInspection =
+        (operation.action.tool === "inspect_nodes" ||
+          operation.action.tool === "get_document_context") &&
+        prior.status !== "completed";
+      if (prior.status === "completed" && prior.result && !refreshNativeVerification)
         return {
           ...(prior.result as unknown as OperationResult),
           replayed: true,
@@ -1783,7 +2497,7 @@ export function createFigmaToolExecutor(
             const targetEntry = state.refs[recoveryAction.parentRef];
             if (childEntry && targetEntry) childEntry.parentId = targetEntry.nodeId;
           }
-          await saveState(state, pageId);
+          await saveState(state, pageId, readOnlyInspection);
           return result;
         };
         try {
@@ -1902,6 +2616,7 @@ export function createFigmaToolExecutor(
       if (prior.status === "failed" && prior.result)
         if (
           !resumeParenting &&
+          !retryReadOnlyInspection &&
           !(prior.result.acknowledgementStatus === "ambiguous" && isCreation(operation.action))
         )
           return {
@@ -1975,7 +2690,7 @@ export function createFigmaToolExecutor(
             updatedAt: Date.now(),
             result: compactResult(result),
           };
-          await saveState(state, pageId);
+          await saveState(state, pageId, readOnlyInspection);
           return result;
         }
         const result: OperationResult = {
@@ -1992,10 +2707,15 @@ export function createFigmaToolExecutor(
           updatedAt: Date.now(),
           result: compactResult(result),
         };
-        await saveState(state, pageId);
+        await saveState(state, pageId, readOnlyInspection);
         return result;
       }
-      if (prior.status === "running" && !resumeParenting) {
+      if (
+        prior.status === "running" &&
+        !resumeParenting &&
+        !refreshNativeVerification &&
+        !retryReadOnlyInspection
+      ) {
         const result: OperationResult = {
           operationId: operation.operationId,
           success: false,
@@ -2010,7 +2730,7 @@ export function createFigmaToolExecutor(
           updatedAt: Date.now(),
           result: compactResult(result),
         };
-        await saveState(state, pageId);
+        await saveState(state, pageId, readOnlyInspection);
         return result;
       }
     }
@@ -2091,7 +2811,7 @@ export function createFigmaToolExecutor(
           updatedAt: Date.now(),
           result: compactResult(result),
         };
-        await saveState(state, pageId);
+        await saveState(state, pageId, readOnlyInspection);
         return result;
       }
     }
@@ -2135,7 +2855,7 @@ export function createFigmaToolExecutor(
       ...(parentingTargetParentId ? { parentingTargetParentId } : {}),
     };
     try {
-      await saveState(state, pageId);
+      await saveState(state, pageId, readOnlyInspection);
     } catch (error) {
       return {
         operationId: operation.operationId,
@@ -2146,6 +2866,9 @@ export function createFigmaToolExecutor(
           ? `Operation intent was not confirmed in storage; no native mutation was started. ${error.message}`
           : "Operation intent was not confirmed in storage; no native mutation was started."
         ).slice(0, 400),
+        ...(error instanceof ToolStateError
+          ? { data: { toolStateDiagnostic: error.diagnostic } }
+          : {}),
       };
     }
     let result: OperationResult;
@@ -2160,6 +2883,9 @@ export function createFigmaToolExecutor(
           nativeMutationStarted = true;
         },
         requestedAction,
+        isCancelled,
+        isPauseRequested,
+        reportProgress,
       );
       successfulOutput = output;
       result = {
@@ -2210,7 +2936,7 @@ export function createFigmaToolExecutor(
         updatedAt: Date.now(),
         result: compactResult(result),
       };
-      await saveState(state, pageId);
+      await saveState(state, pageId, readOnlyInspection);
     } catch (error) {
       result = {
         operationId: operation.operationId,
@@ -2231,28 +2957,43 @@ export function createFigmaToolExecutor(
           0,
           400,
         ),
-        ...(error instanceof ParentingOperationError
+        ...(error instanceof ToolStateError
           ? {
               data: {
-                ...(error.referenceResolution ?? {}),
-                parenting: error.diagnostic,
-              },
-            }
-          : error instanceof ReferenceResolutionError
-            ? { data: referenceFailure(operation.operationId, error).data }
-            : error instanceof FigmaCompatibilityError
-              ? { data: { compatibilityFailure: error.diagnostic } }
-              : successfulOutput?.data?.parenting
-                ? {
-                    data: {
+                ...(successfulOutput?.data?.parenting
+                  ? {
                       parenting: FigmaToolParentingDiagnosticSchema.parse({
                         ...successfulOutput.data.parenting,
                         decision: "native_error",
                         acknowledgementStatus: "ambiguous",
                       }),
-                    },
-                  }
-                : {}),
+                    }
+                  : {}),
+                toolStateDiagnostic: error.diagnostic,
+              },
+            }
+          : error instanceof ParentingOperationError
+            ? {
+                data: {
+                  ...(error.referenceResolution ?? {}),
+                  parenting: error.diagnostic,
+                },
+              }
+            : error instanceof ReferenceResolutionError
+              ? { data: referenceFailure(operation.operationId, error).data }
+              : error instanceof FigmaCompatibilityError
+                ? { data: { compatibilityFailure: error.diagnostic } }
+                : successfulOutput?.data?.parenting
+                  ? {
+                      data: {
+                        parenting: FigmaToolParentingDiagnosticSchema.parse({
+                          ...successfulOutput.data.parenting,
+                          decision: "native_error",
+                          acknowledgementStatus: "ambiguous",
+                        }),
+                      },
+                    }
+                  : {}),
       };
       state.operations[operation.operationId] = {
         ...state.operations[operation.operationId]!,
@@ -2260,21 +3001,54 @@ export function createFigmaToolExecutor(
         updatedAt: Date.now(),
         result: compactResult(result),
       };
-      await saveState(state, pageId);
+      await saveState(state, pageId, readOnlyInspection);
     }
     return result;
   };
 
   const executeBatch = async (
     batch: FigmaToolBatch,
-    token: { cancelled: boolean },
+    token: { cancelled: boolean; pauseRequested: boolean },
   ): Promise<void> => {
     const results: OperationResult[] = [];
     const committedOperationIds: string[] = [];
     const partialOperationIds: string[] = [];
+    const originalPage = api.currentPage;
+    let activePageId = originalPage.id;
     let currentOperation: FigmaToolOperation | undefined;
+    const sendResult = (success: boolean, cancelled: boolean) => {
+      const message = () => ({
+        type: "tool-result" as const,
+        protocolVersion: 1 as const,
+        batchId: batch.batchId,
+        success,
+        cancelled,
+        committedOperationIds,
+        partialOperationIds,
+        results: results.slice(0, 10),
+      });
+      let transferPayloadBytes = 0;
+      let resultMessage = message();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        for (const result of resultMessage.results) {
+          if (!result.data) continue;
+          const profiling = result.data.profiling;
+          result.data.profiling = {
+            ...(profiling && typeof profiling === "object"
+              ? profiling as Record<string, unknown>
+              : {}),
+            transferPayloadBytes,
+          };
+        }
+        resultMessage = message();
+        const nextBytes = utf8Bytes(JSON.stringify(resultMessage));
+        if (nextBytes === transferPayloadBytes) break;
+        transferPayloadBytes = nextBytes;
+      }
+      send(resultMessage);
+    };
     try {
-      const pageId = api.currentPage.id;
+      const pageId = originalPage.id;
       const parsed = JSON.stringify(batch);
       const duplicatedIds =
         new Set(batch.operations.map(({ operationId }) => operationId)).size !==
@@ -2306,7 +3080,6 @@ export function createFigmaToolExecutor(
         });
         return;
       }
-      let state = await loadState(pageId);
       for (const [index, operation] of batch.operations.entries()) {
         if (token.cancelled) break;
         send({
@@ -2319,8 +3092,63 @@ export function createFigmaToolExecutor(
           status: "running",
           message: `Running ${operation.action.tool.replaceAll("_", " ")}…`,
         });
+        if (api.currentPage.id !== activePageId)
+          throw new Error(
+            "The active Figma page changed before the next operation; nothing else was applied.",
+          );
+        const requestedPageId = "pageId" in operation.action ? operation.action.pageId : undefined;
+        const operationPageId =
+          operation.action.tool === "get_document_context" ? pageId : requestedPageId ?? pageId;
+        const targetPage = api.root.children.find(({ id }) => id === operationPageId);
+        if (!targetPage)
+          throw new Error("The requested page is not available in this Figma document.");
+        if (api.currentPage.id !== operationPageId) {
+          try {
+            await timed(api.setCurrentPageAsync(targetPage), "Target page load");
+          } catch (error) {
+            if (api.currentPage.id === operationPageId) activePageId = operationPageId;
+            throw error;
+          }
+          if (api.currentPage.id !== operationPageId)
+            throw new Error("Figma did not activate the target page; no operation was started.");
+          activePageId = operationPageId;
+        }
+        const readOnlyInspection =
+          (operation.action.tool === "get_document_context" || operation.action.tool === "inspect_nodes") &&
+          operation.action.readOnlyInspection === true;
+        const state = await loadState(operationPageId, readOnlyInspection);
         currentOperation = operation;
-        const result = await executeOperation(state, operation, pageId);
+        const nativeStartedAt = Date.now();
+        const result = await executeOperation(
+          state,
+          operation,
+          operationPageId,
+          () => token.cancelled,
+          () => token.pauseRequested,
+          (message) =>
+            send({
+              type: "tool-progress",
+              protocolVersion: 1,
+              batchId: batch.batchId,
+              operationId: operation.operationId,
+              index,
+              total: batch.operations.length,
+              status: "running",
+              message: message.slice(0, 300),
+            }),
+        );
+        const nativeExecutionMs = Math.max(0, Date.now() - nativeStartedAt);
+        const resultSerializationStartedAt = Date.now();
+        const resultPayloadBytes = utf8Bytes(JSON.stringify(result));
+        const resultSerializationMs = Math.max(0, Date.now() - resultSerializationStartedAt);
+        result.data = {
+          ...(result.data ?? {}),
+          profiling: {
+            nativeExecutionMs,
+            resultSerializationMs,
+            resultPayloadBytes,
+          },
+        };
         currentOperation = undefined;
         results.push(result);
         boundResults(results);
@@ -2338,14 +3166,15 @@ export function createFigmaToolExecutor(
           operationId: operation.operationId,
           index,
           total: batch.operations.length,
-          status: result.success ? "completed" : "failed",
-          message: result.success
-            ? (result.summary ?? "Operation completed.")
-            : (result.error ?? "Operation failed."),
+          status: token.cancelled ? "cancelled" : result.success ? "completed" : "failed",
+          message: token.cancelled
+            ? "Cancelled; no further native operations will be scheduled."
+            : result.success
+              ? (result.summary ?? "Operation completed.")
+              : (result.error ?? "Operation failed."),
           ...(result.logicalRef ? { logicalRef: result.logicalRef } : {}),
         });
         if (!result.success) break;
-        state = await loadState(pageId);
       }
       const cancelled = token.cancelled;
       const nextIndex = results.length;
@@ -2372,19 +3201,12 @@ export function createFigmaToolExecutor(
             ? "Not attempted because the batch was cancelled before this operation."
             : "Not attempted because an earlier operation failed; confirmed work was retained.",
         });
-      send({
-        type: "tool-result",
-        protocolVersion: 1,
-        batchId: batch.batchId,
-        success:
-          !cancelled &&
+      sendResult(
+        !cancelled &&
           results.length === batch.operations.length &&
           results.every(({ success }) => success),
         cancelled,
-        committedOperationIds,
-        partialOperationIds,
-        results: results.slice(0, 10),
-      });
+      );
     } catch (error) {
       const operation = currentOperation ?? batch.operations[results.length];
       const acknowledgementStatus = currentOperation
@@ -2404,6 +3226,9 @@ export function createFigmaToolExecutor(
             0,
             400,
           ),
+          ...(error instanceof ToolStateError
+            ? { data: { toolStateDiagnostic: error.diagnostic } }
+            : {}),
         });
       for (const notAttempted of batch.operations.slice(results.length))
         results.push({
@@ -2414,16 +3239,15 @@ export function createFigmaToolExecutor(
           error: "Not attempted after the batch stopped before this operation.",
         });
       boundResults(results);
-      send({
-        type: "tool-result",
-        protocolVersion: 1,
-        batchId: batch.batchId,
-        success: false,
-        cancelled: token.cancelled,
-        committedOperationIds,
-        partialOperationIds,
-        results: results.slice(0, 10),
-      });
+      sendResult(false, token.cancelled);
+    } finally {
+      if (activePageId !== originalPage.id && api.currentPage.id === activePageId) {
+        try {
+          await timed(api.setCurrentPageAsync(originalPage), "Restore original page");
+        } catch {
+          // Do not override a later user page change or turn a committed operation into a retry.
+        }
+      }
     }
   };
 
@@ -2434,6 +3258,7 @@ export function createFigmaToolExecutor(
         type:
           | "tool-execute"
           | "tool-cancel"
+          | "tool-pause"
           | "tool-delete-consent"
           | "task-native-inspect"
           | "task-native-focus";
@@ -2460,6 +3285,7 @@ export function createFigmaToolExecutor(
             ? error.message
             : "Native layers could not be read."
           ).slice(0, 500),
+          ...(error instanceof ToolStateError ? { toolStateDiagnostic: error.diagnostic } : {}),
         });
       }
       return;
@@ -2491,6 +3317,11 @@ export function createFigmaToolExecutor(
       if (active) active.cancelled = true;
       return;
     }
+    if (message.type === "tool-pause") {
+      const active = cancellation.get(message.batchId);
+      if (active) active.pauseRequested = true;
+      return;
+    }
     if (message.type === "tool-delete-consent") {
       try {
         const pageId = api.currentPage.id;
@@ -2520,6 +3351,7 @@ export function createFigmaToolExecutor(
             ? error.message
             : "Deletion consent could not be issued."
           ).slice(0, 300),
+          ...(error instanceof ToolStateError ? { toolStateDiagnostic: error.diagnostic } : {}),
         });
       }
       return;
@@ -2546,7 +3378,7 @@ export function createFigmaToolExecutor(
       });
       return;
     }
-    const token = { cancelled: false };
+    const token = { cancelled: false, pauseRequested: false };
     cancellation.set(message.batchId, token);
     pendingBatches++;
     const next = queue

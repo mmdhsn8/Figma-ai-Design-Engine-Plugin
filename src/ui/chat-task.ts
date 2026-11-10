@@ -3,6 +3,7 @@ import {
   parseResponsesFunctionCalls,
   modelPlanStages,
   CHAT_PLAN_VERSION,
+  chatFunctionToolsForState,
   type ChatLifecycleState,
   type ChatInputItem,
 } from "../shared/chat-tools";
@@ -10,6 +11,9 @@ import {
   FigmaToolBatchSchema,
   INSPECT_NODES_LIMITS,
   FigmaToolOperationSchema,
+  FigmaToolStateDiagnosticSchema,
+  type FigmaToolStateDiagnostic,
+  type FigmaToolAction,
   type FigmaToolOperation,
 } from "../shared/figma-tools";
 import { type PluginToUIMessage } from "../shared/messages";
@@ -28,6 +32,8 @@ import {
   CHAT_TASK_MAX_VERIFICATION_OPERATIONS,
   CHAT_TASK_MAX_VALIDATION_CORRECTIONS,
   ChatRequestDiagnosticSchema,
+  SAFE_REFERENCE_CODES,
+  type ChatTaskFailurePhase,
   ChatTaskSchema,
   chatTaskCapacityUsage,
   chatTaskCommittedOperationCount,
@@ -38,6 +44,11 @@ import {
   type ChatTask,
 } from "../shared/chat-task";
 import type { AuthorizedChatTurn } from "./companion-client";
+import {
+  NativeVerificationResultSchema,
+  planNativeQualityRepairs,
+  type NativeRepairDecision,
+} from "../shared/native-quality-repair";
 
 type Result = Extract<PluginToUIMessage, { type: "tool-result" }>;
 type Dependencies = {
@@ -78,6 +89,16 @@ function safeRequestDiagnostic(error: unknown) {
     if (diagnostic[key] !== undefined) safe[key] = diagnostic[key];
   const parsed = ChatRequestDiagnosticSchema.safeParse(safe);
   return parsed.success ? parsed.data : undefined;
+}
+
+function toolStateFailureCode(category: FigmaToolStateDiagnostic["category"]) {
+  return {
+    state_too_large: "tool_state_too_large",
+    record_limit: "tool_state_record_limit",
+    invalid_schema: "tool_state_invalid_schema",
+    corrupted_state: "tool_state_corrupted_state",
+    storage_unavailable: "tool_state_storage_unavailable",
+  }[category];
 }
 
 export function waitForChatCapacity(ms: number, signal: AbortSignal): Promise<void> {
@@ -178,6 +199,1320 @@ function syncCapacityAccounting(task: ChatTask): void {
   }
 }
 
+type ReadOnlyDiscovery = {
+  query?: string;
+  offset: number;
+  pageId?: string;
+  discovery: Record<string, unknown>;
+  pages: Array<Record<string, unknown>>;
+  frames: Array<Record<string, unknown>>;
+  ledgerIndex: number;
+};
+
+function normalizeInspectionQuery(query?: string): string {
+  return query?.normalize("NFKC").toLocaleLowerCase().replace(/\s+/gu, " ").trim() ?? "";
+}
+
+function stableFingerprint(value: unknown): string {
+  const input = JSON.stringify(value);
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index++) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function inspectionActionKey(action: FigmaToolAction): string | undefined {
+  if (action.tool === "get_document_context")
+    return JSON.stringify([
+      "get_document_context",
+      normalizeInspectionQuery(action.query),
+      action.offset ?? 0,
+      action.readOnlyInspection === true,
+    ]);
+  if (action.tool === "inspect_nodes")
+    return JSON.stringify([
+      "inspect_nodes",
+      action.pageId ?? "",
+      [...action.refs].sort(),
+      action.selection,
+      action.depth,
+      action.maxNodes,
+      action.readOnlyInspection === true,
+    ]);
+  return undefined;
+}
+
+function inspectionResultFingerprint(entry: ChatTask["ledger"][number]): string | undefined {
+  try {
+    const payload = JSON.parse(entry.output ?? "{}");
+    if (entry.call.action.tool === "get_document_context")
+      return stableFingerprint({
+        success: payload.success,
+        data: payload.data
+          ? {
+              pages: payload.data.pages,
+              frames: payload.data.frames,
+              discovery: payload.data.discovery,
+            }
+          : undefined,
+        error: payload.success ? undefined : payload.error,
+      });
+    if (entry.call.action.tool === "inspect_nodes")
+      return stableFingerprint({
+        success: payload.success,
+        pageId: payload.data?.pageId,
+        nodes: payload.data?.nodes,
+        error: payload.success ? undefined : payload.error,
+      });
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+// Keep the latest bounded discovery run and verified identities in the durable task ledger.
+function readOnlyCheckpoint(task: ChatTask) {
+  const inspected = new Map<string, Record<string, unknown>>();
+  const attemptedRefs = new Set<string>();
+  const failedRefs = new Set<string>();
+  const runs = new Map<string, ReadOnlyDiscovery[]>();
+  const actionResults = new Map<string, string>();
+  let repeatedOperations = 0;
+  let contextFailures = 0;
+  let inspectFailures = 0;
+  for (const [ledgerIndex, entry] of task.ledger.entries()) {
+    const action = entry.call.action;
+    if (action.tool !== "get_document_context" && action.tool !== "inspect_nodes") continue;
+    const actionKey = inspectionActionKey(action);
+    const resultFingerprint = inspectionResultFingerprint(entry);
+    if (actionKey && resultFingerprint) {
+      const prior = actionResults.get(actionKey);
+      if (prior === resultFingerprint) repeatedOperations++;
+      actionResults.set(actionKey, resultFingerprint);
+    }
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = JSON.parse(entry.output ?? "{}");
+    } catch {
+      // A malformed native result cannot count as evidence or semantic progress.
+    }
+    if (action.tool === "inspect_nodes")
+      for (const ref of action.refs)
+        attemptedRefs.add(JSON.stringify([action.pageId ?? "", ref]));
+    if (entry.status !== "completed" || payload.success !== true || !payload.data) {
+      if (action.tool === "get_document_context") contextFailures++;
+      else {
+        inspectFailures++;
+        for (const ref of action.refs)
+          failedRefs.add(JSON.stringify([action.pageId ?? "", ref]));
+      }
+      continue;
+    }
+    const data = payload.data as Record<string, unknown>;
+    if (action.tool === "get_document_context") {
+      if (!Array.isArray(data.frames) || !data.discovery || typeof data.discovery !== "object") continue;
+      const page = data.page as { id?: string } | undefined;
+      const query = action.query?.trim();
+      const offset = action.offset ?? 0;
+      const queryKey = normalizeInspectionQuery(query);
+      const run = runs.get(queryKey) ?? [];
+      const discovery = data.discovery as Record<string, unknown>;
+      const item: ReadOnlyDiscovery = {
+        ...(query ? { query } : {}),
+        offset,
+        ...(typeof page?.id === "string" ? { pageId: page.id } : {}),
+        discovery,
+        pages: Array.isArray(data.pages)
+          ? data.pages.filter((value): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value)))
+          : [],
+        frames: data.frames.filter((value): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value))),
+        ledgerIndex,
+      };
+      if (offset === 0) {
+        runs.set(queryKey, [item]);
+      } else {
+        const previous = run.at(-1);
+        if (previous && previous.discovery.nextOffset === offset) {
+          run.push(item);
+          runs.set(queryKey, run);
+        }
+      }
+    } else {
+      const pageId =
+        action.pageId ?? (typeof data.pageId === "string" ? data.pageId : undefined);
+      if (!pageId || !Array.isArray(data.nodes)) continue;
+      for (const node of data.nodes) {
+        if (
+          !node ||
+          typeof node.ref !== "string" ||
+          typeof node.name !== "string" ||
+          ![node.x, node.y, node.width, node.height].every(Number.isFinite) ||
+          node.width <= 0 ||
+          node.height <= 0
+        )
+          continue;
+        inspected.set(JSON.stringify([pageId, node.ref]), node);
+      }
+    }
+  }
+  const discoveries = [...runs.values()].flat();
+  const frames = new Map<string, Record<string, unknown>>();
+  for (const discovery of discoveries) {
+    for (const frame of discovery.frames) {
+      if (typeof frame.pageId !== "string" || typeof frame.name !== "string") continue;
+      const identity =
+        typeof frame.ref === "string"
+          ? frame.ref
+          : JSON.stringify([frame.name, frame.type, frame.x, frame.y, frame.width, frame.height]);
+      frames.set(JSON.stringify([frame.pageId, identity]), frame);
+    }
+  }
+  const results: Array<Record<string, unknown> & { verified: boolean; inspectionAttempted: boolean }> = [
+    ...frames.entries(),
+  ].map(([, frame]) => {
+    const pageId = String(frame.pageId);
+    const inspectionKey = JSON.stringify([pageId, frame.ref]);
+    const node = typeof frame.ref === "string" ? inspected.get(inspectionKey) : undefined;
+    const sameSnapshot =
+      node &&
+      (["type", "x", "y", "width", "height"] as const).every(
+        (field) => frame[field] === undefined || node[field] === undefined || frame[field] === node[field],
+      );
+    const nativeInspected = frame.nativeInspected === true;
+    return {
+      ...Object.fromEntries(
+        ["ref", "pageId", "pageName", "name", "type", "x", "y", "width", "height", "parentName", "depth", "editable"]
+          .filter((field) => frame[field] !== undefined)
+          .map((field) => [field, frame[field]]),
+      ),
+      ...(sameSnapshot
+        ? Object.fromEntries(
+            ["name", "type", "x", "y", "width", "height", "layoutMode"]
+              .filter((field) => node?.[field] !== undefined)
+              .map((field) => [field, node?.[field]]),
+          )
+        : {}),
+      ...(nativeInspected ? { nativeInspected: true } : {}),
+      verified: Boolean(sameSnapshot || nativeInspected),
+      inspectionAttempted:
+        typeof frame.ref === "string" && attemptedRefs.has(JSON.stringify([pageId, frame.ref])),
+    };
+  });
+  const latestByQuery = new Map<string, ReadOnlyDiscovery[]>();
+  for (const [queryKey, run] of runs) latestByQuery.set(queryKey, run);
+  const pendingOffsets = [...latestByQuery.values()].flatMap((run) => {
+    const latest = run.at(-1);
+    if (!latest || typeof latest.discovery.nextOffset !== "number") return [];
+    const nextOffset = latest.discovery.nextOffset;
+    return run.some((item) => item.offset === nextOffset)
+      ? []
+      : [{ query: latest.query, offset: nextOffset }];
+  });
+  return {
+    discoveries,
+    frames: results,
+    pages: [...new Map(
+      discoveries.flatMap(({ pages: pageSummaries }) =>
+        pageSummaries.flatMap((page) => typeof page.id === "string" ? [[page.id, page] as const] : []),
+      ),
+    ).values()],
+    pendingOffsets,
+    uninspectedRefs: results
+      .filter((frame) => typeof frame.ref === "string" && !frame.verified)
+      .map((frame) => ({
+        ref: frame.ref,
+        pageId: frame.pageId,
+        attempted: frame.inspectionAttempted,
+        failed: failedRefs.has(JSON.stringify([frame.pageId, frame.ref])),
+      })),
+    contextFailures,
+    inspectFailures,
+    repeatedOperations,
+    attemptedRefs,
+    failedRefs,
+  };
+}
+
+const MAX_AUTONOMOUS_INSPECTION_OPERATIONS = 48;
+const AUTONOMOUS_INSPECTION_REFS_PER_CALL = INSPECT_NODES_LIMITS.refs;
+
+type ReadOnlyCheckpoint = ReturnType<typeof readOnlyCheckpoint>;
+type ReadOnlyTerminalOutcome = "COMPLETED" | "PARTIAL" | "NO_MATCH" | "BLOCKED" | "FAILED";
+type ReadOnlyPlan =
+  | { action: FigmaToolAction; progress: string }
+  | { paused: true; reason: string }
+  | { outcome: ReadOnlyTerminalOutcome; reason?: string };
+
+function framesForDiscoveryRun(
+  checkpoint: ReadOnlyCheckpoint,
+  queryKey: string,
+): Array<Record<string, unknown> & { verified: boolean; inspectionAttempted: boolean }> {
+  const identities = new Set(
+    checkpoint.discoveries
+      .filter((discovery) => normalizeInspectionQuery(discovery.query) === queryKey)
+      .flatMap((discovery) =>
+        discovery.frames.flatMap((frame) =>
+          typeof frame.pageId !== "string"
+            ? []
+            : [
+                JSON.stringify([
+                  frame.pageId,
+                  typeof frame.ref === "string"
+                    ? frame.ref
+                    : JSON.stringify([
+                        frame.name,
+                        frame.type,
+                        frame.x,
+                        frame.y,
+                        frame.width,
+                        frame.height,
+                      ]),
+                ]),
+              ],
+        ),
+      ),
+  );
+  return checkpoint.frames.filter((frame) =>
+    identities.has(
+      JSON.stringify([
+        frame.pageId,
+        typeof frame.ref === "string"
+          ? frame.ref
+          : JSON.stringify([frame.name, frame.type, frame.x, frame.y, frame.width, frame.height]),
+      ]),
+    ),
+  );
+}
+
+function nextReadOnlyOperation(
+  task: ChatTask,
+  checkpoint: ReadOnlyCheckpoint,
+  options: { forceFreshDiscovery: boolean; initialLedgerLength: number },
+): ReadOnlyPlan {
+  const query = task.targetName?.trim() || undefined;
+  const queryKey = normalizeInspectionQuery(query);
+  const run = checkpoint.discoveries.filter(
+    (discovery) => normalizeInspectionQuery(discovery.query) === queryKey,
+  );
+  const newOffsetZeroAttempt = task.ledger.some((entry, index) => {
+    const action = entry.call.action;
+    return (
+      index >= options.initialLedgerLength &&
+      action.tool === "get_document_context" &&
+      normalizeInspectionQuery(action.query) === queryKey &&
+      (action.offset ?? 0) === 0
+    );
+  });
+  if (options.forceFreshDiscovery && !newOffsetZeroAttempt)
+    return {
+      action: { tool: "get_document_context", ...(query ? { query } : {}), readOnlyInspection: true },
+      progress: "Resuming the saved progressive discovery cursor and revalidating accessible pages…",
+    };
+  if (
+    options.forceFreshDiscovery &&
+    newOffsetZeroAttempt &&
+    !run.some(({ ledgerIndex }) => ledgerIndex >= options.initialLedgerLength)
+  ) {
+    const priorEvidence = framesForDiscoveryRun(checkpoint, queryKey).some((frame) => frame.verified);
+    return {
+      outcome: priorEvidence ? "PARTIAL" : "BLOCKED",
+      reason: "Fresh discovery could not be verified while resuming the saved inspection.",
+    };
+  }
+
+  if (!run.length) {
+    const failedInitialDiscovery = task.ledger.some((entry) => {
+      const action = entry.call.action;
+      return (
+        action.tool === "get_document_context" &&
+        normalizeInspectionQuery(action.query) === queryKey &&
+        (action.offset ?? 0) === 0 &&
+        entry.status === "failed"
+      );
+    });
+    if (!failedInitialDiscovery)
+      return {
+        action: { tool: "get_document_context", ...(query ? { query } : {}), readOnlyInspection: true },
+        progress: "Starting a progressive scan of all accessible pages…",
+      };
+    return { outcome: "BLOCKED", reason: "The initial bounded document discovery failed." };
+  }
+
+  const currentFrames = framesForDiscoveryRun(checkpoint, queryKey);
+  const targets = currentFrames
+    .filter(
+      (frame) =>
+        typeof frame.ref === "string" &&
+        typeof frame.pageId === "string" &&
+        !frame.verified &&
+        !frame.inspectionAttempted,
+    )
+    .sort(
+      (left, right) =>
+        String(left.pageId).localeCompare(String(right.pageId)) ||
+        String(left.name).localeCompare(String(right.name)) ||
+        String(left.ref).localeCompare(String(right.ref)),
+    );
+  if (targets.length) {
+    const first = targets[0]!;
+    const pageId = String(first.pageId);
+    const refs = targets
+      .filter((frame) => frame.pageId === pageId)
+      .slice(0, AUTONOMOUS_INSPECTION_REFS_PER_CALL)
+      .map((frame) => String(frame.ref));
+    return {
+      action: {
+        tool: "inspect_nodes",
+        pageId,
+        readOnlyInspection: true,
+        refs,
+        selection: false,
+        depth: INSPECT_NODES_LIMITS.depth.default,
+        maxNodes: INSPECT_NODES_LIMITS.maxNodes.default,
+      },
+      progress:
+        "Inspecting " +
+        refs.length +
+        " discovered frame" +
+        (refs.length === 1 ? "" : "s") +
+        " on " +
+        String(first.pageName ?? pageId) +
+        "…",
+    };
+  }
+
+  const latest = run.at(-1)!;
+  if (latest.discovery.paused === true)
+    return { paused: true, reason: "The native scan paused at a saved slice boundary." };
+  const nextOffset = latest.discovery.nextOffset;
+  if (typeof nextOffset === "number") {
+    if (nextOffset <= latest.offset)
+      return {
+        outcome: "PARTIAL",
+        reason: "The legacy discovery offset did not advance.",
+      };
+    const offsetAttempted = task.ledger.some((entry) => {
+      const action = entry.call.action;
+      return (
+        action.tool === "get_document_context" &&
+        normalizeInspectionQuery(action.query) === queryKey &&
+        action.offset === nextOffset
+      );
+    });
+    if (!offsetAttempted)
+      return {
+        action: {
+          tool: "get_document_context",
+          ...(query ? { query } : {}),
+          offset: nextOffset,
+          readOnlyInspection: true,
+        },
+        progress: "Reading the next matching frame window at offset " + nextOffset + "…",
+      };
+  }
+
+  const failedAtCursor =
+    typeof nextOffset === "number" &&
+    task.ledger.some((entry) => {
+      const action = entry.call.action;
+      return (
+        action.tool === "get_document_context" &&
+        normalizeInspectionQuery(action.query) === queryKey &&
+        action.offset === nextOffset &&
+        entry.status === "failed"
+      );
+    });
+  const discoveryTruncated = run.some(({ discovery }) =>
+    discovery.truncated === true ||
+    discovery.complete === false ||
+    (typeof discovery.pagesVisited === "number" &&
+      discovery.pagesVisited === 0 &&
+      typeof discovery.pagesAvailable === "number" &&
+      discovery.pagesAvailable > 0) ||
+    (typeof discovery.pagesRemaining === "number" && discovery.pagesRemaining > 0),
+  );
+  const hasUninspectable = currentFrames.some(
+    (frame) => typeof frame.ref !== "string" && frame.nativeInspected !== true,
+  );
+  const hasUninspected = currentFrames.some((frame) => !frame.verified);
+  const inspectionFailures = task.ledger.filter(
+    (entry) => {
+      const action = entry.call.action;
+      return (
+        action.tool === "inspect_nodes" &&
+        entry.status === "failed" &&
+        action.refs.some((ref) =>
+          currentFrames.some((frame) => frame.ref === ref && frame.pageId === action.pageId),
+        )
+      );
+    },
+  ).length;
+  if (
+    discoveryTruncated ||
+    failedAtCursor ||
+    hasUninspectable ||
+    hasUninspected ||
+    inspectionFailures > 0
+  )
+    return {
+      outcome:
+        inspectionFailures > 0 && !currentFrames.some((frame) => frame.verified)
+          ? "FAILED"
+          : currentFrames.some((frame) => frame.verified)
+            ? "PARTIAL"
+            : "BLOCKED",
+      reason: discoveryTruncated
+        ? "Progressive discovery stopped before the requested accessible scope was complete" +
+          (typeof latest.discovery.truncationReason === "string"
+            ? " (" + latest.discovery.truncationReason.replaceAll("_", " ") + ")."
+            : ".")
+        : failedAtCursor
+          ? "A later discovery window could not be read."
+          : hasUninspectable
+            ? "Some discovered frames have no safe logical reference."
+            : "One or more discovered frames could not be verified natively.",
+    };
+
+  const nativeInspection =
+    latest.discovery.nativeInspection && typeof latest.discovery.nativeInspection === "object"
+      ? (latest.discovery.nativeInspection as Record<string, unknown>)
+      : undefined;
+  if (
+    !discoveryTruncated &&
+    nativeInspection?.complete === true &&
+    typeof nativeInspection.framesInspected === "number" &&
+    typeof nativeInspection.framesExpected === "number" &&
+    nativeInspection.framesInspected === nativeInspection.framesExpected
+  )
+    return {
+      outcome: nativeInspection.framesExpected === 0 ? "NO_MATCH" : "COMPLETED",
+    };
+  if (currentFrames.length === 0) {
+    const lastDiscovery = latest.discovery;
+    if (typeof lastDiscovery.matchCount === "number" && lastDiscovery.matchCount > 0)
+      return { outcome: "PARTIAL", reason: "Matching targets were found, but no bounded native inspection sample could be retained." };
+    if (lastDiscovery.complete === true && lastDiscovery.truncated !== true)
+      return { outcome: "NO_MATCH" };
+    return { outcome: "PARTIAL", reason: "The requested scope was not fully scanned." };
+  }
+  const nativeReadOnlyOperations = task.ledger.filter(
+    (entry) =>
+      entry.call.action.tool === "get_document_context" ||
+      entry.call.action.tool === "inspect_nodes",
+  ).length;
+  if (nativeReadOnlyOperations >= MAX_AUTONOMOUS_INSPECTION_OPERATIONS)
+    return {
+      outcome: currentFrames.some((frame) => frame.verified) ? "PARTIAL" : "BLOCKED",
+      reason:
+        "The " +
+        MAX_AUTONOMOUS_INSPECTION_OPERATIONS +
+        "-operation autonomous inspection budget was reached.",
+    };
+  return { outcome: "COMPLETED" };
+}
+
+function readOnlyInspectionSummary(
+  task: ChatTask,
+  checkpoint: ReadOnlyCheckpoint,
+): NonNullable<ChatTask["inspectionSummary"]> {
+  const queryKey = normalizeInspectionQuery(task.targetName);
+  const run = checkpoint.discoveries.filter(
+    (discovery) => normalizeInspectionQuery(discovery.query) === queryKey,
+  );
+  const frames = framesForDiscoveryRun(checkpoint, queryKey);
+  const discoveries = run.map(({ discovery }) => discovery);
+  const pages = [
+    ...new Map(
+      run.flatMap(({ pages: pageSummaries }) =>
+        pageSummaries.flatMap((page) =>
+          typeof page.id === "string" ? [[page.id, page] as const] : [],
+        ),
+      ),
+    ).values(),
+  ];
+  const latest = discoveries.at(-1);
+  const latestNativeInspection =
+    latest?.nativeInspection && typeof latest.nativeInspection === "object"
+      ? (latest.nativeInspection as Record<string, unknown>)
+      : undefined;
+  const reportedFrameCount = discoveries.reduce(
+    (max, discovery) =>
+      Math.max(
+        max,
+        typeof discovery.framesDiscovered === "number"
+          ? discovery.framesDiscovered
+          : typeof discovery.matchCount === "number"
+            ? discovery.matchCount
+            : 0,
+      ),
+    0,
+  );
+  const pagesScanned = discoveries.reduce(
+    (max, discovery) =>
+      Math.max(max, typeof discovery.pagesVisited === "number" ? discovery.pagesVisited : 0),
+    pages.length,
+  );
+  const pagesAvailable = discoveries.reduce(
+    (max, discovery) =>
+      Math.max(max, typeof discovery.pagesAvailable === "number" ? discovery.pagesAvailable : 0),
+    pages.length,
+  );
+  const nativeResults = task.ledger.flatMap((entry) => {
+    if (entry.call.action.tool !== "get_document_context" && entry.call.action.tool !== "inspect_nodes")
+      return [];
+    try {
+      const payload = JSON.parse(entry.output ?? "{}");
+      return payload && typeof payload === "object" ? [payload as Record<string, unknown>] : [];
+    } catch {
+      return [];
+    }
+  });
+  const sumProfile = (field: string) =>
+    nativeResults.reduce((total, result) => {
+      const profiling = result.data && typeof result.data === "object"
+        ? (result.data as Record<string, unknown>).profiling
+        : undefined;
+      const value = profiling && typeof profiling === "object"
+        ? (profiling as Record<string, unknown>)[field]
+        : undefined;
+      return total + (typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0);
+    }, 0);
+  const profileValues = (field: string) =>
+    nativeResults.flatMap((result) => {
+      const profiling = result.data && typeof result.data === "object"
+        ? (result.data as Record<string, unknown>).profiling
+        : undefined;
+      const value = profiling && typeof profiling === "object"
+        ? (profiling as Record<string, unknown>)[field]
+        : undefined;
+      return typeof value === "number" && Number.isFinite(value) ? [Math.max(0, value)] : [];
+    });
+  const resultPayloadSizes = profileValues("resultPayloadBytes");
+  const transferPayloadSizes = profileValues("transferPayloadBytes");
+  const discoveryPerformance = run.reduce(
+    (total, { discovery, frames: resultFrames }) => {
+      if (discovery.cacheHit !== true) {
+        total.pagesLoaded += typeof discovery.pagesVisited === "number" ? Math.max(0, discovery.pagesVisited) : 0;
+        total.nodesVisited += typeof discovery.nodesVisited === "number" ? Math.max(0, discovery.nodesVisited) : 0;
+      } else total.discoveryCacheHits++;
+      total.framesReturned += resultFrames.length;
+      return total;
+    },
+    { pagesLoaded: 0, nodesVisited: 0, framesReturned: 0, discoveryCacheHits: 0 },
+  );
+  const modelTrace = task.modelRoundTrace ?? [];
+  const uiRenderProfile =
+    typeof window !== "undefined"
+      ? (window as Window & { __fadUiRenderProfile?: { commits?: number; actualDurationMs?: number } })
+          .__fadUiRenderProfile
+      : undefined;
+  return {
+    pagesScanned,
+    pagesAvailable: Math.max(0, pagesAvailable),
+    scope:
+      latest?.scope === "exact_node" || latest?.scope === "requested_page"
+        ? latest.scope
+        : "all_accessible_pages",
+    pagesRemaining: Math.max(
+      0,
+      typeof latest?.pagesRemaining === "number" ? latest.pagesRemaining : pagesAvailable - pagesScanned,
+    ),
+    framesDiscovered: Math.max(reportedFrameCount, frames.length),
+    matchingFrames: discoveries.reduce(
+        (max, discovery) =>
+          Math.max(max, typeof discovery.matchCount === "number" ? discovery.matchCount : 0),
+        task.targetName ? 0 : frames.length,
+    ),
+    framesInspected:
+      typeof latestNativeInspection?.framesInspected === "number"
+        ? latestNativeInspection.framesInspected
+        : frames.filter((frame) => frame.verified).length,
+    uninspectedFrames: Math.max(
+      0,
+      (typeof latestNativeInspection?.framesExpected === "number"
+        ? latestNativeInspection.framesExpected
+        : discoveries.reduce(
+            (max, discovery) =>
+              Math.max(max, typeof discovery.matchCount === "number" ? discovery.matchCount : 0),
+            0,
+          )) -
+        (typeof latestNativeInspection?.framesInspected === "number"
+          ? latestNativeInspection.framesInspected
+          : frames.filter((frame) => frame.verified).length),
+    ),
+    inaccessiblePages: typeof latest?.inaccessiblePages === "number" ? latest.inaccessiblePages : 0,
+    inaccessiblePageSamples: Array.isArray(latest?.inaccessiblePageSamples)
+      ? latest.inaccessiblePageSamples.flatMap((page) =>
+          page && typeof page === "object" && typeof (page as Record<string, unknown>).id === "string"
+            ? [{
+                id: String((page as Record<string, unknown>).id).slice(0, 200),
+                name: typeof (page as Record<string, unknown>).name === "string"
+                  ? String((page as Record<string, unknown>).name).slice(0, 100)
+                  : "",
+                ...(typeof (page as Record<string, unknown>).reason === "string"
+                  ? { reason: String((page as Record<string, unknown>).reason).slice(0, 100) }
+                  : {}),
+              }]
+            : [],
+        ).slice(0, 24)
+      : [],
+    complete: latest?.complete === true && latest.truncated !== true,
+    continuationAvailable: latest?.continuationAvailable === true,
+    ...(typeof latest?.truncationReason === "string" ? { truncationReason: latest.truncationReason.slice(0, 160) } : {}),
+    truncated:
+      discoveries.some(
+        (discovery) =>
+          discovery.truncated === true ||
+          discovery.complete === false,
+      ) ||
+      checkpoint.pendingOffsets.length > 0,
+    nativeOperations: Math.min(
+      CHAT_TASK_MAX_READ_ONLY_OPERATIONS,
+      task.ledger.filter(
+        (entry) =>
+          entry.call.action.tool === "get_document_context" ||
+          entry.call.action.tool === "inspect_nodes",
+      ).length,
+    ),
+    repeatedOperations: Math.min(
+      CHAT_TASK_MAX_READ_ONLY_OPERATIONS,
+      checkpoint.repeatedOperations,
+    ),
+    nativePerformance: {
+      pagesLoaded:
+        discoveryPerformance.pagesLoaded,
+      loadedPageCacheEntries: typeof latest?.loadedPageCacheEntries === "number" ? latest.loadedPageCacheEntries : 0,
+      trackedPageListeners: typeof latest?.trackedPageListeners === "number" ? latest.trackedPageListeners : 0,
+      globalInvalidationFallback: latest?.globalInvalidationFallback === true,
+      discoveryCacheEntries: typeof latest?.discoveryCacheEntries === "number" ? latest.discoveryCacheEntries : 0,
+      discoveryCacheBytes: typeof latest?.discoveryCacheBytes === "number" ? latest.discoveryCacheBytes : 0,
+      nodesVisited: discoveryPerformance.nodesVisited,
+      framesReturned:
+        typeof latest?.framesReturned === "number" ? latest.framesReturned : discoveryPerformance.framesReturned,
+      slices: typeof latest?.sliceCount === "number" ? latest.sliceCount : 0,
+      nodesPerSliceBudget: typeof latest?.nodesPerSliceBudget === "number" ? latest.nodesPerSliceBudget : 128,
+      pagesPerCheckpoint: typeof latest?.pagesPerCheckpoint === "number" ? latest.pagesPerCheckpoint : 32,
+      pagesPerYield: typeof latest?.pagesPerYield === "number" ? latest.pagesPerYield : 4,
+      maxNodesPerSliceObserved:
+        typeof latest?.maxNodesPerSliceObserved === "number" ? latest.maxNodesPerSliceObserved : 0,
+      targetSliceMs: typeof latest?.targetSliceMs === "number" ? latest.targetSliceMs : 35,
+      hardSliceMs: typeof latest?.hardSliceMs === "number" ? latest.hardSliceMs : 100,
+      averageSliceMs: typeof latest?.averageSliceMs === "number" ? latest.averageSliceMs : 0,
+      maxSliceMs: typeof latest?.maxSliceMs === "number" ? latest.maxSliceMs : 0,
+      pageLoadMs: run.reduce(
+        (total, { discovery }) => total + (discovery.cacheHit === true ? 0 : typeof discovery.pageLoadMs === "number" ? discovery.pageLoadMs : 0),
+        0,
+      ),
+      scanElapsedMs: run.reduce(
+        (total, { discovery }) => total + (discovery.cacheHit === true ? 0 : typeof discovery.scanElapsedMs === "number" ? discovery.scanElapsedMs : 0),
+        0,
+      ),
+      cacheHit: latest?.cacheHit === true,
+      revalidatedAfterRestart: latest?.revalidatedAfterRestart === true,
+      discoveryCacheHits: Math.min(
+        CHAT_TASK_MAX_READ_ONLY_OPERATIONS,
+        discoveryPerformance.discoveryCacheHits,
+      ),
+      discoveryCacheLookups: Math.min(
+        CHAT_TASK_MAX_READ_ONLY_OPERATIONS,
+        typeof latest?.cacheLookups === "number" ? latest.cacheLookups : run.length,
+      ),
+      discoveryCacheHitRate:
+        typeof latest?.cacheHitRate === "number"
+          ? latest.cacheHitRate
+          : run.length ? discoveryPerformance.discoveryCacheHits / run.length : 0,
+      nativeExecutionMs: Math.min(86_400_000, sumProfile("nativeExecutionMs")),
+      resultSerializationMs: Math.min(86_400_000, sumProfile("resultSerializationMs")),
+      resultPayloadBytes: Math.min(10_000_000, sumProfile("resultPayloadBytes")),
+      transferPayloadBytes: Math.min(10_000_000, sumProfile("transferPayloadBytes")),
+      resultPayloadBytesPeak: Math.min(10_000_000, Math.max(0, ...resultPayloadSizes)),
+      transferPayloadBytesPeak: Math.min(10_000_000, Math.max(0, ...transferPayloadSizes)),
+      payloadSamples: Math.min(CHAT_TASK_MAX_READ_ONLY_OPERATIONS, Math.max(resultPayloadSizes.length, transferPayloadSizes.length)),
+      modelRequests: Math.min(100, task.rounds + (task.roundBreakdown?.modelRetries ?? 0)),
+      modelLatencyMs: Math.min(
+        86_400_000,
+        modelTrace.reduce((total, round) => total + (round.durationMs ?? 0), 0),
+      ),
+      modelInputBytes: Math.min(
+        10_000_000,
+        modelTrace.reduce((total, round) => total + (round.inputBytes ?? 0), 0),
+      ),
+      uiRenderCommits: Math.min(
+        10_000,
+        Number.isFinite(uiRenderProfile?.commits) ? Math.max(0, Math.round(uiRenderProfile!.commits!)) : 0,
+      ),
+      uiRenderDurationMs: Math.min(
+        86_400_000,
+        Number.isFinite(uiRenderProfile?.actualDurationMs)
+          ? Math.max(0, Math.round(uiRenderProfile!.actualDurationMs!))
+          : 0,
+      ),
+    },
+    canvasMutations: 0,
+  };
+}
+
+function readOnlyInspectionReport(
+  task: ChatTask,
+  checkpoint: ReadOnlyCheckpoint,
+  outcome: NonNullable<ChatTask["inspectionOutcome"]>,
+  reason?: string,
+): string {
+  const summary = task.inspectionSummary ?? readOnlyInspectionSummary(task, checkpoint);
+  const queryKey = normalizeInspectionQuery(task.targetName);
+  const run = checkpoint.discoveries.filter(
+    (discovery) => normalizeInspectionQuery(discovery.query) === queryKey,
+  );
+  const verified = framesForDiscoveryRun(checkpoint, queryKey).filter((frame) => frame.verified);
+  const pages = [
+    ...new Map(
+      run.flatMap(({ pages: pageSummaries }) =>
+        pageSummaries.flatMap((page) =>
+          typeof page.id === "string" ? [[page.id, page] as const] : [],
+        ),
+      ),
+    ).values(),
+  ]
+    .map((page) => {
+      const name = typeof page.name === "string" ? page.name : "";
+      const id = typeof page.id === "string" ? page.id : "";
+      return name && id ? name + " (" + id + ")" : name || id;
+    })
+    .filter(Boolean);
+  const statusText: Record<typeof outcome, string> = {
+    COMPLETED: "Complete across the requested accessible scope",
+    PARTIAL: "Partial; some of the requested scope could not be verified",
+    NO_MATCH: "Complete search; no matching frames were found",
+    BLOCKED: "Blocked; required discovery or native evidence was unavailable",
+    CANCELLED: "Cancelled",
+    FAILED: "Failed; native inspection could not be completed",
+  };
+  const lines = [
+    "Inspection status: " + statusText[outcome] + ".",
+    "Search scope: " + summary.scope.replaceAll("_", " ") + ".",
+    "Pages scanned: " +
+      summary.pagesScanned +
+      (summary.pagesAvailable > summary.pagesScanned
+        ? " of " + summary.pagesAvailable + " available"
+        : "") +
+      ".",
+    "Frames discovered: " + summary.framesDiscovered + ".",
+    "Matching frames: " + summary.matchingFrames + ".",
+    "Frames inspected natively: " + summary.framesInspected + ".",
+    "Frames not inspected: " + summary.uninspectedFrames + ".",
+    "Scan coverage: " + (summary.complete ? "complete" : "partial") +
+      (summary.pagesRemaining ? "; " + summary.pagesRemaining + " pages remain" : "") +
+      (summary.inaccessiblePages ? "; " + summary.inaccessiblePages + " page(s) were inaccessible" : "") +
+      (summary.continuationAvailable ? "; a saved continuation is available" : "") + ".",
+    "Inspection work: " + summary.nativeOperations + " native operations; " +
+      summary.nativePerformance.pagesLoaded + " pages loaded; " +
+      summary.nativePerformance.nodesVisited + " nodes visited; " +
+      summary.nativePerformance.slices + " slices (maximum " +
+      summary.nativePerformance.maxNodesPerSliceObserved + "/" +
+      summary.nativePerformance.nodesPerSliceBudget + " work units per slice; average " + summary.nativePerformance.averageSliceMs +
+      " ms, maximum " + summary.nativePerformance.maxSliceMs + " ms; yield at least every " +
+      summary.nativePerformance.pagesPerYield + " pages and checkpoint every " +
+      summary.nativePerformance.pagesPerCheckpoint + " pages); " +
+      summary.nativePerformance.scanElapsedMs + " ms in traversal; " +
+      summary.nativePerformance.pageLoadMs + " ms loading pages; " +
+      summary.nativePerformance.nativeExecutionMs + " ms native execution; " +
+      summary.nativePerformance.resultPayloadBytes + " result bytes; " +
+      summary.nativePerformance.transferPayloadBytes + " transfer bytes.",
+    "Discovery cache: " + summary.nativePerformance.discoveryCacheHits + "/" +
+      summary.nativePerformance.discoveryCacheLookups + " hits (" +
+      Math.round(summary.nativePerformance.discoveryCacheHitRate * 100) + "% hit rate); " +
+      "revalidated after restart: " + (summary.nativePerformance.revalidatedAfterRestart ? "yes." : "no."),
+    "Resident discovery memory: " + summary.nativePerformance.loadedPageCacheEntries + "/64 tracked loaded-page IDs; " +
+      summary.nativePerformance.trackedPageListeners + "/64 page listeners; " +
+      summary.nativePerformance.discoveryCacheEntries + "/12 cursors (" +
+      summary.nativePerformance.discoveryCacheBytes + " bytes); global invalidation fallback " +
+      (summary.nativePerformance.globalInvalidationFallback ? "active." : "inactive."),
+    "Payload sizes: peak " + summary.nativePerformance.resultPayloadBytesPeak + " result bytes and " +
+      summary.nativePerformance.transferPayloadBytesPeak + " transfer bytes across " +
+      summary.nativePerformance.payloadSamples + " native replies.",
+    "Model requests: " + summary.nativePerformance.modelRequests + "; " +
+      summary.nativePerformance.modelLatencyMs + " ms total Companion/model time; " +
+      summary.nativePerformance.modelInputBytes + " input bytes.",
+    "UI rendering: " + summary.nativePerformance.uiRenderCommits + " React commits; " +
+      summary.nativePerformance.uiRenderDurationMs + " ms aggregate render time.",
+  ];
+  if (pages.length)
+    lines.push(
+      "Pages visited" + (pages.length < summary.pagesScanned ? " (sample)" : "") + ": " +
+        pages.join(", ") + ".",
+    );
+  if (summary.inaccessiblePageSamples.length)
+    lines.push(
+      "Inaccessible page sample: " +
+        summary.inaccessiblePageSamples
+          .map(({ name, id, reason }) => `${name || id} (${id}${reason ? ", " + reason.replaceAll("_", " ") : ""})`)
+          .join(", ") +
+        ".",
+    );
+  if (verified.length) {
+    lines.push("Verified frames:");
+    for (const frame of verified.slice(0, 60)) {
+      const page =
+        typeof frame.pageName === "string" ? frame.pageName : String(frame.pageId ?? "Unknown page");
+      const name = typeof frame.name === "string" ? frame.name.slice(0, 80) : "Unnamed frame";
+      const geometry = [frame.width, frame.height].every(Number.isFinite)
+        ? Math.round(Number(frame.width)) + " × " + Math.round(Number(frame.height))
+        : "dimensions unavailable";
+      const location = [frame.x, frame.y].every(Number.isFinite)
+        ? " at (" + Math.round(Number(frame.x)) + ", " + Math.round(Number(frame.y)) + ")"
+        : "";
+      const line = "• " + page + " / " + name + " — " + geometry + location + ".";
+      if (lines.join("\n").length + line.length > 7_400) {
+        lines.push("Additional verified frames omitted from this short report: " + (verified.length - lines.length + 6) + ".");
+        break;
+      }
+      lines.push(line);
+    }
+  }
+  if (summary.truncated)
+    lines.push("Coverage is partial; the report does not claim an exhaustive scan.");
+  if (summary.truncationReason)
+    lines.push("Scan stop reason: " + summary.truncationReason.replaceAll("_", " ") + ".");
+  if (summary.nativePerformance.revalidatedAfterRestart)
+    lines.push("A previous executor cursor was stale, so accessible pages were revalidated from the start.");
+  if (reason) lines.push("Limitation: " + reason.slice(0, 300));
+  lines.push("Canvas mutations: 0.");
+  return lines.join("\n").slice(0, 8_000);
+}
+
+function autonomousInspectionCall(task: ChatTask, action: FigmaToolAction) {
+  const { tool, ...args } = action;
+  return parseResponsesFunctionCalls([
+    {
+      type: "function_call",
+      call_id: "readonly_" + task.id + "_" + (task.ledger.length + 1) + "_" + (task.rounds + 1),
+      name: tool,
+      arguments: JSON.stringify(args),
+    },
+  ])[0]!;
+}
+
+function autonomousEditTargetCall(task: ChatTask, action: FigmaToolAction) {
+  const { tool, ...args } = action;
+  return parseResponsesFunctionCalls([
+    {
+      type: "function_call",
+      call_id: EDIT_TARGET_CALL_PREFIX + task.id + "_" + (task.ledger.length + 1) + "_" + (task.rounds + 1),
+      name: tool,
+      arguments: JSON.stringify(args),
+    },
+  ])[0]!;
+}
+
+const EDIT_TARGET_CALL_PREFIX = "edit_target_";
+
+function editTargetQuery(task: ChatTask): string | undefined {
+  if (task.targetName?.trim()) return task.targetName.trim().slice(0, 100);
+  const stopWords = new Set([
+    "a", "an", "the", "existing", "design", "redesign", "improve", "update", "change",
+    "make", "better", "please", "of", "for", "in", "on", "page", "screen", "frame",
+    "safhe", "safheye", "ro", "behtar", "kon", "konid", "tarahi", "tarahie", "design", "ye",
+    "یک", "را", "رو", "بهتر", "کن", "کنید", "طراحی", "صفحه", "موجود", "فعلی", "لطفا", "برای",
+  ]);
+  const terms = task.prompt
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((term) => term.length > 1 && !stopWords.has(term))
+    .slice(-8);
+  const query = terms.join(" ").trim();
+  return query ? query.slice(0, 100) : undefined;
+}
+
+function ledgerPayload(entry: ChatTask["ledger"][number]): Record<string, unknown> | undefined {
+  try {
+    const payload: unknown = JSON.parse(entry.output ?? "{}");
+    return payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function inspectEvidenceTree(nodes: unknown[]): {
+  verifiedRefs: string[];
+  nativeEvidence: string;
+  root?: Record<string, unknown>;
+} {
+  const fields = [
+    "ref", "type", "name", "x", "y", "width", "height", "visible", "locked", "fill", "stroke",
+    "opacity", "cornerRadius", "text", "fontSize", "textColor", "textAlignHorizontal", "fontFamily",
+    "fontStyle", "lineHeight", "letterSpacing", "layoutMode", "itemSpacing", "paddingTop",
+    "paddingRight", "paddingBottom", "paddingLeft",
+  ];
+  const rows: Array<Record<string, unknown>> = [];
+  const visit = (value: unknown, parentRef?: string) => {
+    if (rows.length >= 25 || !value || typeof value !== "object" || Array.isArray(value)) return;
+    const node = value as Record<string, unknown>;
+    const row = Object.fromEntries(fields.filter((field) => node[field] !== undefined).map((field) => [field, node[field]]));
+    if (parentRef) row.parentRef = parentRef;
+    rows.push(row);
+    if (Array.isArray(node.children))
+      for (const child of node.children) visit(child, typeof node.ref === "string" ? node.ref : parentRef);
+  };
+  for (const node of nodes) visit(node);
+  return {
+    verifiedRefs: [...new Set(rows.flatMap((row) => typeof row.ref === "string" ? [row.ref] : []))].slice(0, 25),
+    nativeEvidence: JSON.stringify(rows).slice(0, 16_000),
+    ...(nodes[0] && typeof nodes[0] === "object" && !Array.isArray(nodes[0])
+      ? { root: nodes[0] as Record<string, unknown> }
+      : {}),
+  };
+}
+
+function editTargetFromInspection(
+  task: ChatTask,
+  entry: ChatTask["ledger"][number],
+  resultData: Record<string, unknown>,
+): NonNullable<ChatTask["editTarget"]> | undefined {
+  if (entry.call.action.tool !== "inspect_nodes" || entry.call.action.refs.length !== 1) return undefined;
+  const ref = entry.call.action.refs[0]!;
+  const actionPageId = entry.call.action.pageId;
+  const saved = task.editTarget?.ref === ref && task.editTarget.pageId === actionPageId ? task.editTarget : undefined;
+  const discoveryEntry = [...task.ledger].reverse().find((candidate) => {
+    if (candidate.status !== "completed" || candidate.call.action.tool !== "get_document_context") return false;
+    const query = saved?.query ?? editTargetQuery(task);
+    return normalizeInspectionQuery(candidate.call.action.query) === normalizeInspectionQuery(query);
+  });
+  const discoveryPayload = discoveryEntry ? ledgerPayload(discoveryEntry) : undefined;
+  const discoveryData = discoveryPayload?.data && typeof discoveryPayload.data === "object"
+    ? discoveryPayload.data as Record<string, unknown>
+    : undefined;
+  const discoverySummary = discoveryData?.discovery && typeof discoveryData.discovery === "object"
+    ? discoveryData.discovery as Record<string, unknown>
+    : undefined;
+  const exactNameCount = discoverySummary?.exactNameMatchCount;
+  const frame = saved
+    ? { ...saved }
+    : (Array.isArray(discoveryData?.frames)
+        ? discoveryData.frames.find((candidate) => candidate && typeof candidate === "object" &&
+            (candidate as Record<string, unknown>).ref === ref &&
+            (candidate as Record<string, unknown>).pageId === actionPageId &&
+            (exactNameCount !== 1 || typeof (candidate as Record<string, unknown>).name === "string" &&
+              normalizeInspectionQuery(String((candidate as Record<string, unknown>).name)) === normalizeInspectionQuery(String(discoverySummary?.query ?? task.targetName ?? ""))))
+        : undefined) as Record<string, unknown> | undefined;
+  const roots = Array.isArray(resultData.nodes) ? resultData.nodes : [];
+  const inspected = inspectEvidenceTree(roots);
+  const root = inspected.root;
+  if (
+    !frame || !root || root.ref !== ref || resultData.pageId !== actionPageId ||
+    !inspected.verifiedRefs.includes(ref) ||
+    (typeof frame.nodeId !== "string" && typeof saved?.nodeId !== "string") ||
+    (typeof frame.type === "string" && frame.type !== root.type) ||
+    (typeof frame.name === "string" && frame.name !== root.name) ||
+    !["x", "y", "width", "height"].every((field) => {
+      const before = frame[field];
+      const after = root[field];
+      return typeof before !== "number" || typeof after === "number" && Math.abs(before - after) < 0.01;
+    })
+  ) return undefined;
+  const discoveryId = discoveryEntry?.operationId ?? saved?.discoveryOperationId;
+  if (!discoveryId) return undefined;
+  return {
+    query: saved?.query ?? String(discoveryData?.discovery && typeof discoveryData.discovery === "object"
+      ? (discoveryData.discovery as Record<string, unknown>).query ?? editTargetQuery(task) ?? task.targetName ?? ""
+      : editTargetQuery(task) ?? task.targetName ?? "").slice(0, 100),
+    ref,
+    pageId: actionPageId ?? saved?.pageId ?? "",
+    ...(typeof frame.pageName === "string" ? { pageName: frame.pageName.slice(0, 100) } : saved?.pageName ? { pageName: saved.pageName } : {}),
+    nodeId: typeof frame.nodeId === "string" ? frame.nodeId : saved!.nodeId,
+    ...(typeof frame.parentNodeId === "string" ? { parentId: frame.parentNodeId } : saved?.parentId ? { parentId: saved.parentId } : {}),
+    type: String(root.type ?? frame.type ?? "FRAME"),
+    name: String(root.name ?? frame.name ?? "Target frame").slice(0, 100),
+    x: Number(root.x),
+    y: Number(root.y),
+    width: Number(root.width),
+    height: Number(root.height),
+    verifiedRefs: inspected.verifiedRefs,
+    ...(saved?.plannedRefs ? { plannedRefs: saved.plannedRefs } : {}),
+    nativeEvidence: inspected.nativeEvidence,
+    discoveryOperationId: discoveryId,
+    inspectionOperationId: entry.operationId,
+  };
+}
+
+type EditTargetOperation =
+  | { action: FigmaToolAction; progress: string }
+  | { ready: true }
+  | { blocked: true; code: "target_not_found" | "target_ambiguous" | "target_not_inspected" | "reference_not_mutation_eligible"; reason: string };
+
+function nextEditTargetOperation(
+  task: ChatTask,
+  options: { forceFresh: boolean; initialLedgerLength: number },
+): EditTargetOperation {
+  const query = task.editTarget?.query ?? editTargetQuery(task);
+  if (!query)
+    return { blocked: true, code: "target_not_found", reason: "Name the existing frame or screen to edit; no selection was used as a fallback." };
+  if (!task.targetName) task.targetName = query;
+  if (task.editTarget) {
+    const inspection = task.ledger.find((entry) => entry.operationId === task.editTarget!.inspectionOperationId);
+    const verified = inspection?.status === "completed" && ledgerPayload(inspection)?.success === true;
+    const freshInspection = task.ledger.some((entry, index) => index >= options.initialLedgerLength &&
+      entry.call.callId.startsWith(EDIT_TARGET_CALL_PREFIX) && entry.call.action.tool === "inspect_nodes" &&
+      entry.status === "completed" && ledgerPayload(entry)?.success === true);
+    if (options.forceFresh && !freshInspection)
+      return {
+        action: {
+          tool: "inspect_nodes", pageId: task.editTarget.pageId, refs: [task.editTarget.ref],
+          selection: false, depth: INSPECT_NODES_LIMITS.depth.max, maxNodes: INSPECT_NODES_LIMITS.maxNodes.max,
+          readOnlyInspection: false,
+        },
+        progress: "Revalidating the saved edit target and its native hierarchy…",
+      };
+    if (!verified && !freshInspection)
+      return { blocked: true, code: "target_not_inspected", reason: "The discovered target has no successful native inspection checkpoint." };
+    return { ready: true };
+  }
+
+  const contexts = task.ledger.filter((entry) => {
+    const action = entry.call.action;
+    return action.tool === "get_document_context" && action.readOnlyInspection !== true &&
+      (action.offset ?? 0) === 0 && normalizeInspectionQuery(action.query) === normalizeInspectionQuery(query);
+  });
+  const freshContext = contexts.some((entry) => task.ledger.indexOf(entry) >= options.initialLedgerLength &&
+    entry.status === "completed" && ledgerPayload(entry)?.success === true);
+  if (options.forceFresh && !freshContext)
+    return {
+      action: { tool: "get_document_context", query, readOnlyInspection: false },
+      progress: "Resuming the progressive scan and revalidating the named edit target…",
+    };
+  const context = [...contexts].reverse().find((entry) => entry.status === "completed" && ledgerPayload(entry)?.success === true);
+  if (!context) {
+    if (contexts.some((entry) => entry.status === "failed"))
+      return { blocked: true, code: "target_not_found", reason: "Figma could not complete discovery for the requested existing target." };
+    return {
+      action: { tool: "get_document_context", query, readOnlyInspection: false },
+      progress: "Progressively discovering the named existing frame across accessible pages…",
+    };
+  }
+  const payload = ledgerPayload(context)!;
+  const data = payload.data && typeof payload.data === "object" ? payload.data as Record<string, unknown> : undefined;
+  const discovery = data?.discovery && typeof data.discovery === "object" ? data.discovery as Record<string, unknown> : {};
+  if (discovery.paused === true || discovery.truncated === true || discovery.complete !== true ||
+      (typeof discovery.pagesRemaining === "number" && discovery.pagesRemaining > 0))
+    return { blocked: true, code: "target_not_inspected", reason: "Target discovery paused or reached a scan limit before full accessible-page coverage; the edit was not planned." };
+  const matchStatus = discovery.matchStatus;
+  if (matchStatus === "ambiguous" || (typeof discovery.matchCount === "number" && discovery.matchCount > 1 && discovery.exactNameMatchCount !== 1))
+    return { blocked: true, code: "target_ambiguous", reason: `“${query}” matches multiple existing frames. Specify which frame to edit; nothing was changed.` };
+  if (matchStatus === "no_match" || discovery.matchCount === 0)
+    return { blocked: true, code: "target_not_found", reason: `No existing frame matched “${query}” across the completed accessible-page scan. No replacement was created.` };
+  if (matchStatus === "uneditable")
+    return { blocked: true, code: "reference_not_mutation_eligible", reason: "The matching frame was discovered but could not be promoted to a safe mutation-eligible reference." };
+  const frames = Array.isArray(data?.frames) ? data.frames.filter((frame) => frame && typeof frame === "object") as Array<Record<string, unknown>> : [];
+  const exactNameUnique = discovery.exactNameMatchCount === 1;
+  const matchingFrames = frames.filter((item) => typeof item.ref === "string" && typeof item.nodeId === "string" && typeof item.pageId === "string");
+  const frame = (exactNameUnique
+    ? matchingFrames.find((item) => normalizeInspectionQuery(String(item.name ?? "")) === normalizeInspectionQuery(query))
+    : matchingFrames[0]);
+  if (matchStatus !== "unique" ||
+      (discovery.matchCount !== 1 && discovery.exactNameMatchCount !== 1) ||
+      !frame)
+    return { blocked: true, code: "target_not_found", reason: "A unique, safely referenced existing frame was not established by discovery." };
+  if (frame.editable !== true || !["FRAME", "COMPONENT", "COMPONENT_SET"].includes(String(frame.type)))
+    return { blocked: true, code: "reference_not_mutation_eligible", reason: "The discovered target is not a verified editable frame/component." };
+  const ref = String(frame.ref);
+  const pageId = String(frame.pageId);
+  const inspections = task.ledger.filter((entry) => entry.call.action.tool === "inspect_nodes" &&
+    entry.call.action.readOnlyInspection !== true && entry.call.action.pageId === pageId &&
+    entry.call.action.refs.includes(ref));
+  const inspection = [...inspections].reverse().find((entry) => entry.status === "completed" && ledgerPayload(entry)?.success === true);
+  if (!inspection) {
+    if (inspections.some((entry) => entry.status === "failed"))
+      return { blocked: true, code: "target_not_inspected", reason: "Native inspection could not verify the discovered target. No edit plan or mutation was created." };
+    return {
+      action: {
+        tool: "inspect_nodes", pageId, refs: [ref], selection: false,
+        depth: INSPECT_NODES_LIMITS.depth.max, maxNodes: INSPECT_NODES_LIMITS.maxNodes.max,
+        readOnlyInspection: false,
+      },
+      progress: `Inspecting “${String(frame.name ?? query).slice(0, 80)}” and its native hierarchy before planning…`,
+    };
+  }
+  return { blocked: true, code: "target_not_inspected", reason: "Native inspection completed but did not produce durable verified target evidence." };
+}
+
+function editMutationBlocker(
+  task: ChatTask,
+  calls: Array<{ action: FigmaToolAction }>,
+): string | undefined {
+  const target = task.editTarget;
+  if (!target) return "target_not_inspected: the edit target is not checkpointed.";
+  const allowed = new Set(target.plannedRefs ?? []);
+  const created = new Set<string>();
+  for (const entry of task.ledger) {
+    const action = entry.call.action;
+    if (
+      entry.status === "completed" && !entry.reused &&
+      ["create_frame", "create_text", "create_rectangle"].includes(action.tool) &&
+      "parent" in action && action.parent.kind === "node" &&
+      (allowed.has(action.parent.ref) || created.has(action.parent.ref)) &&
+      (!action.pageId || action.pageId === target.pageId) && "ref" in action
+    ) created.add(action.ref);
+  }
+  const stage = task.stages.find((item) => !item.completed);
+  if (!stage) return "native_execution_blocked: no saved edit stage is active.";
+  const stageRefs = new Set(stage.logicalRefs);
+  const inScope = (ref: string) => allowed.has(ref) || created.has(ref);
+  for (const { action } of calls) {
+    if (!isCanvasMutationTool(action.tool)) continue;
+    if ("pageId" in action && action.pageId && action.pageId !== target.pageId)
+      return "native_execution_blocked: edit operations must remain on the verified target page.";
+    if (["create_frame", "create_text", "create_rectangle"].includes(action.tool)) {
+      if (!("parent" in action) || action.parent.kind !== "node" || !inScope(action.parent.ref))
+        return "native_execution_blocked: new layers must be created inside the verified target subtree.";
+      if (!("ref" in action) || allowed.has(action.ref) || !stageRefs.has(action.ref))
+        return "edit_plan_invalid: each new layer must use a fresh stage logicalRef.";
+      created.add(action.ref);
+      continue;
+    }
+    if (action.tool === "set_properties" || action.tool === "set_auto_layout") {
+      if (!inScope(action.ref) || !stageRefs.has(action.ref))
+        return "native_execution_blocked: the modified layer is outside the verified target scope or missing from the saved stage.";
+      if (action.tool === "set_auto_layout" && action.children.some((child) => !inScope(child.ref) || !stageRefs.has(child.ref)))
+        return "native_execution_blocked: Auto Layout child sizing must use verified or task-created refs listed in the saved stage.";
+      continue;
+    }
+    if (action.tool === "append_child") {
+      if (!inScope(action.childRef) || !stageRefs.has(action.childRef) || !inScope(action.parentRef))
+        return "native_execution_blocked: append_child may only connect planned refs inside the verified target subtree.";
+      continue;
+    }
+    if (action.tool === "reparent_node") {
+      if (action.ref === target.ref || !inScope(action.ref) || !stageRefs.has(action.ref) || !inScope(action.parentRef))
+        return "native_execution_blocked: reparenting must stay within the verified target subtree and cannot move its root.";
+    }
+  }
+  return undefined;
+}
+
+function editCompletionReport(task: ChatTask): string | undefined {
+  const target = task.editTarget;
+  if (!target) return undefined;
+  const confirmed = task.ledger.filter((entry) =>
+    entry.status === "completed" && !entry.reused &&
+    isCanvasMutationTool(entry.call.action.tool) &&
+    entry.acknowledgementStatus === "confirmed_mutation",
+  );
+  if (!confirmed.length) return undefined;
+  const changes = confirmed.slice(0, 24).map(({ call }) => {
+    const action = call.action;
+    if (action.tool === "set_properties")
+      return `Updated ${action.ref}: ${Object.keys(action.properties).join(", ")}.`;
+    if (action.tool === "set_auto_layout")
+      return `Set ${action.layout.direction} Auto Layout on ${action.ref}.`;
+    if (action.tool === "create_frame" || action.tool === "create_text" || action.tool === "create_rectangle")
+      return `Added ${action.tool.replace("create_", "")} “${action.name}” inside ${action.parent.kind === "node" ? action.parent.ref : "the page"}.`;
+    if (action.tool === "append_child") return `Appended ${action.childRef} to ${action.parentRef}.`;
+    if (action.tool === "reparent_node") return `Moved ${action.ref} inside ${action.parentRef}.`;
+    return `Applied ${action.tool}.`;
+  });
+  const lines = [
+    `Completed the edit of “${target.name}” on ${target.pageName ?? target.pageId}.`,
+    `Existing root reference ${target.ref} was preserved and included in native verification.`,
+    "Verified native changes:",
+    ...changes.map((change) => `- ${change}`),
+    `Confirmed canvas mutations: ${confirmed.length}. No page-root replacement was created.`,
+  ];
+  return lines.join("\n").slice(0, 8_000);
+}
+
+function compactReadOnlyEvidence(checkpoint: ReadOnlyCheckpoint) {
+  const discoveryFields = [
+    "pagesVisited",
+    "pagesAvailable",
+    "scope",
+    "pagesRemaining",
+    "pagesLoaded",
+    "nodesVisited",
+    "nodesVisitedTotal",
+    "inspectionNodesVisited",
+    "framesDiscovered",
+    "framesInspected",
+    "framesReturned",
+    "nativeInspection",
+    "truncated",
+    "complete",
+    "continuationAvailable",
+    "truncationReason",
+    "inaccessiblePages",
+    "inaccessiblePageSamples",
+    "sliceCount",
+    "nodesPerSliceBudget",
+    "pagesPerCheckpoint",
+    "pagesPerYield",
+    "maxNodesPerSliceObserved",
+    "targetSliceMs",
+    "hardSliceMs",
+    "averageSliceMs",
+    "maxSliceMs",
+    "pageLoadMs",
+    "scanElapsedMs",
+    "loadedPageCacheEntries",
+    "trackedPageListeners",
+    "globalInvalidationFallback",
+    "discoveryCacheEntries",
+    "discoveryCacheBytes",
+    "matchStatus",
+    "matchCount",
+    "offset",
+    "returnedFrameCount",
+    "nextOffset",
+    "cacheHit",
+    "cacheLookups",
+    "cacheHits",
+    "cacheHitRate",
+    "resumedCursors",
+    "revalidatedAfterRestart",
+  ];
+  const frameFields = [
+    "ref",
+    "pageId",
+    "pageName",
+    "name",
+    "type",
+    "x",
+    "y",
+    "width",
+    "height",
+    "editable",
+    "verified",
+    "inspectionAttempted",
+    "nativeInspected",
+    "nativeInspection",
+  ];
+  return {
+    discoveries: checkpoint.discoveries.map(({ query, offset, pageId, discovery }) => ({
+      ...(query ? { query } : {}),
+      offset,
+      ...(pageId ? { pageId } : {}),
+      discovery: Object.fromEntries(
+        discoveryFields
+          .filter((field) => discovery[field] !== undefined)
+          .map((field) => [field, discovery[field]]),
+      ),
+    })),
+    pages: checkpoint.pages.map(({ id, name, current }) => ({ id, name, current })),
+    frames: checkpoint.frames.map((frame) =>
+      Object.fromEntries(
+        frameFields
+          .filter((field) => frame[field] !== undefined)
+          .map((field) => [field, frame[field]]),
+      ),
+    ),
+    pendingOffsets: checkpoint.pendingOffsets,
+    uninspectedRefs: checkpoint.uninspectedRefs.slice(0, 60),
+    repeatedOperations: checkpoint.repeatedOperations,
+  };
+}
+
 // Only complete call/output pairs survive compaction; the durable ledger is the source of truth.
 export function chatTaskInput(task: ChatTask): ChatInputItem[] {
   syncCapacityAccounting(task);
@@ -198,8 +1533,41 @@ export function chatTaskInput(task: ChatTask): ChatInputItem[] {
         ...(status === "failed" ? { error: JSON.parse(output ?? "{}").error } : {}),
       };
     });
+  let editNativeEvidence: unknown = [];
+  if (task.editTarget) {
+    try {
+      editNativeEvidence = JSON.parse(task.editTarget.nativeEvidence);
+    } catch {
+      editNativeEvidence = [];
+    }
+  }
   const state = JSON.stringify({
     taskId: task.id,
+    ...(task.chatId ? { chatId: task.chatId } : {}),
+    ...(task.intent ? { intent: task.intent } : {}),
+    ...(task.targetName ? { targetName: task.targetName } : {}),
+    ...(task.editTarget
+      ? {
+          editTarget: {
+            query: task.editTarget.query,
+            ref: task.editTarget.ref,
+            pageId: task.editTarget.pageId,
+            type: task.editTarget.type,
+            name: task.editTarget.name,
+            x: task.editTarget.x,
+            y: task.editTarget.y,
+            width: task.editTarget.width,
+            height: task.editTarget.height,
+            verifiedRefs: task.editTarget.verifiedRefs,
+            inspectionVerified: true,
+            nativeEvidence: editNativeEvidence,
+            ...(task.editTarget.plannedRefs ? { plannedRefs: task.editTarget.plannedRefs } : {}),
+          },
+        }
+      : {}),
+    ...(task.designName ? { designName: task.designName } : {}),
+    ...(["inspect", "explain"].includes(task.intent ?? "")
+      ? { readOnlyInspection: compactReadOnlyEvidence(readOnlyCheckpoint(task)) } : {}),
     brief: task.brief,
     planVersion: CHAT_PLAN_VERSION,
     stages: modelPlanStages(task.stages),
@@ -218,9 +1586,9 @@ export function chatTaskInput(task: ChatTask): ChatInputItem[] {
           ?.segments.find(({ status }) => status === "active")?.index ?? null,
       mutationCapacityPerSegment: CHAT_EXECUTION_SEGMENT_MAX_MUTATIONS,
     },
-    confirmed,
+    confirmed: ["inspect", "explain"].includes(task.intent ?? "") ? [] : confirmed,
     referencePolicy:
-      "Creation refs are task-local aliases. Repeated creation of a confirmed alias reuses its node without applying new styling. Use set_properties for edits. For follow-up edits use the exact logicalRef returned by inspect_nodes or earlier results; never guess an alias from another task. Inspect selection when ownership is uncertain.",
+      "Intent is checkpointed: inspect/explain are read-only; create/edit/continue require a saved plan and native verification. New designs use fresh task-local refs. Edit/continue require document discovery plus successful native inspection and must not create a new page-root layer. For edits use the exact logicalRef and pageId returned by successful inspection; never guess refs, page IDs, or native node IDs. Repeated confirmed creation reuses its node without re-styling it.",
   });
   const summaries: ChatInputItem[] = [];
   for (let index = 0; index < state.length; index += 7_500)
@@ -281,16 +1649,38 @@ type SafeQualityFinding = {
 function safeQualityFindings(
   findings: ReturnType<typeof auditNativeSection>,
 ): SafeQualityFinding[] {
-  return findings.slice(0, 24).map((finding) => ({
+  const safe = findings.map((finding) => ({
     code: finding.code,
-    refs: finding.refs ?? (finding.ref ? [finding.ref] : []),
+    refs: [...(finding.refs ?? (finding.ref ? [finding.ref] : []))].sort(),
     expected: finding.expected.slice(0, 300),
     actual: finding.actual.slice(0, 1_000),
   }));
+  return [...new Map(safe.map((finding) => [JSON.stringify(finding), finding])).values()].slice(
+    0,
+    24,
+  );
 }
 
 function qualityFindingKey(finding: SafeQualityFinding): string {
-  return `${finding.code}:${[...finding.refs].sort().join(",")}:${finding.expected}`;
+  return `${finding.code}:${[...finding.refs].sort().join(",")}`;
+}
+
+function qualityFailureSignature(findings: SafeQualityFinding[]): string {
+  return findings
+    .map((finding) => {
+      let measurement = finding.actual;
+      try {
+        const actual = JSON.parse(finding.actual);
+        if (finding.code === "clipped-child")
+          measurement = `${actual.parentRef ?? ""}:${Math.round(actual.overflow * 1_000) / 1_000}`;
+        if (finding.code === "overlapping-auto-layout") measurement = String(actual.overlapArea);
+      } catch {
+        /* Non-geometric findings use their measured text. */
+      }
+      return `${qualityFindingKey(finding)}:${measurement}`;
+    })
+    .sort()
+    .join("|");
 }
 
 function qualityMeasurementImproved(
@@ -328,6 +1718,23 @@ function qualityMeasurementImproved(
 }
 
 function hasQualityProgress(before: SafeQualityFinding[], after: SafeQualityFinding[]): boolean {
+  const overflow = (findings: SafeQualityFinding[]) =>
+    findings.reduce((total, finding) => {
+      if (finding.code !== "clipped-child") return total;
+      try {
+        return total + (Number(JSON.parse(finding.actual).overflow) || 0);
+      } catch {
+        return total;
+      }
+    }, 0);
+  if (overflow(after) > overflow(before) + 0.001) return false;
+  const beforeKeys = new Set(before.map(qualityFindingKey));
+  if (
+    after.some(
+      (finding) => finding.code === "clipped-child" && !beforeKeys.has(qualityFindingKey(finding)),
+    )
+  )
+    return false;
   const afterByKey = new Map(after.map((finding) => [qualityFindingKey(finding), finding]));
   return before.some((finding) => {
     const next = afterByKey.get(qualityFindingKey(finding));
@@ -381,17 +1788,181 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       );
     await deps.save(parsed.data);
   };
+  const stopEdit = async (
+    code: string,
+    reason: string,
+    phase: ChatTaskFailurePhase = "planning",
+  ) => {
+    task.pending = [];
+    task.recent = [];
+    task.status = "failed";
+    task.error = reason.slice(0, 500);
+    task.text = reason.slice(0, 8_000);
+    task.failure = {
+      category: "planning",
+      phase,
+      code,
+      committedOperations: chatTaskCommittedOperationCount(task),
+    };
+    await save();
+  };
+  const palette = () =>
+    Object.values(task.brief?.palette ?? {}).filter(
+      (value): value is string => typeof value === "string" && /^#[0-9a-f]{6}$/iu.test(value),
+    );
+  const recordRepairPlan = (stageIndex: number, proposals: NativeRepairDecision[]) => {
+    const allowed = chatFunctionToolsForState("VERIFYING_STAGE").map(({ name }) => name);
+    task.stages[stageIndex]!.nativeRepairPlan = proposals.map((decision) => {
+      const action = decision.action;
+      if (!action)
+        return {
+          ...decision,
+          toolAllowedInVerifyingStage:
+            decision.code === "clipped-child"
+              ? allowed.includes("set_auto_layout")
+              : decision.code === "low-contrast"
+                ? allowed.includes("set_properties")
+                : false,
+          dispatchGate: "eligibility",
+        };
+      const toolAllowedInVerifyingStage = allowed.some((name) => name === action.tool);
+      let prior = task.ledger.find(
+        (entry) =>
+          entry.stage === stageIndex &&
+          entry.qualityRepairAttempted &&
+          entry.status === "completed" &&
+          JSON.stringify(entry.call.action) === JSON.stringify(action),
+      );
+      if (prior) {
+        const verified = task.stages[stageIndex]!.verificationHistory.find((verification) =>
+          verification.repairOperationIds?.includes(prior!.operationId),
+        );
+        if (
+          verified &&
+          !verified.findings.some((finding) => qualityFindingKey(finding) === decision.findingKey)
+        )
+          prior = undefined;
+      }
+      let reason = decision.reason;
+      if (prior) {
+        reason = "native_strategy_no_progress";
+        try {
+          const reports = JSON.parse(prior.output ?? "{}").data?.overflowRepair;
+          const blocked =
+            Array.isArray(reports) &&
+            reports.find((report) => report.strategy === "unsupported-preserve-layout");
+          if (
+            blocked &&
+            typeof blocked.stopReason === "string" &&
+            /^[a-z-]+$/u.test(blocked.stopReason)
+          )
+            reason = blocked.stopReason.replaceAll("-", "_");
+        } catch {
+          /* Invalid native reports are not dispatch instructions. */
+        }
+      }
+      return {
+        ...decision,
+        toolAllowedInVerifyingStage,
+        ...(prior
+          ? {
+              eligible: false,
+              reason,
+              operationId: prior.operationId,
+              dispatchGate: "strategy_already_verified",
+            }
+          : !toolAllowedInVerifyingStage
+            ? {
+                eligible: false,
+                reason: "verification_tool_not_allowed",
+                dispatchGate: "tool_permission",
+              }
+            : {}),
+      };
+    });
+  };
+  const readVerification = (
+    stageIndex: number,
+    data: Record<string, unknown> | undefined,
+    nodes: Parameters<typeof auditNativeSection>[0],
+    refs: string[],
+  ) => {
+    const native = NativeVerificationResultSchema.safeParse(data);
+    if (data && "qualityFindings" in data && !native.success)
+      throw new Error(
+        "native_verification_invalid: Native structural verification returned invalid or incomplete coverage; no repair was scheduled.",
+      );
+    task.stages[stageIndex]!.nativeQualityCoverage = native.success
+      ? native.data.qualityCoverage
+      : undefined;
+    task.stages[stageIndex]!.nativeRepairPipelineVersion = native.success
+      ? native.data.repairPipelineVersion
+      : undefined;
+    const findings: NativeVisualFinding[] = native.success
+      ? native.data.qualityFindings.map((finding) => ({
+          ...finding,
+          message: "Measured native structural finding.",
+        }))
+      : auditNativeSection(nodes, refs);
+    const proposals = native.success
+      ? native.data.nativeRepairPlan
+      : planNativeQualityRepairs(nodes, findings, palette(), Boolean(task.referenceScope));
+    for (const proposal of proposals) {
+      const finding = findings.find(
+        (item) =>
+          item.code === proposal.code &&
+          JSON.stringify([...(item.refs ?? (item.ref ? [item.ref] : []))].sort()) ===
+            JSON.stringify([...proposal.refs].sort()),
+      );
+      let valid = Boolean(finding);
+      if (proposal.action?.tool === "set_properties")
+        valid =
+          valid && proposal.code === "low-contrast" && proposal.action.ref === proposal.refs[0];
+      if (proposal.action?.tool === "set_auto_layout") {
+        try {
+          valid =
+            valid &&
+            proposal.code === "clipped-child" &&
+            proposal.action.ref === JSON.parse(finding!.actual).parentRef;
+        } catch {
+          valid = false;
+        }
+      }
+      if (!valid) {
+        proposal.eligible = false;
+        proposal.reason = "repair_target_not_verified";
+        proposal.dispatchGate = "finding_identity";
+      }
+    }
+    recordRepairPlan(stageIndex, proposals);
+    return findings;
+  };
+  const failUnavailableRepair = (stageIndex: number): never => {
+    const stage = task.stages[stageIndex]!;
+    stage.qualityRepairBlocked = true;
+    task.failure = {
+      category: "verification",
+      phase: "verification",
+      code: "native_quality_unrepairable",
+      committedOperations: chatTaskCommittedOperationCount(task),
+    };
+    throw new Error(
+      `native_quality_unrepairable: ${(stage.nativeRepairPlan ?? []).map((decision) => `${decision.code}/${decision.refs.join(",")}: ${decision.reason} (${decision.dispatchGate ?? "eligibility"})`).join("; ")}. Existing nodes are retained; inspect the repair plan and native before/after measurements.`,
+    );
+  };
   const inspectAfterQualityRepair = async (
     stageIndex: number,
     resumeBlockedRepair = false,
   ): Promise<void> => {
     const stage = task.stages[stageIndex];
     if (!stage || (!stage.repairVerificationPending && !resumeBlockedRepair)) return;
+    transition("VERIFYING_STAGE");
+    activePhase = "verification";
     const repairOperationId = stage.pendingRepairOperationId;
     if (stage.repairVerificationPending && !repairOperationId)
       throw new Error("A confirmed repair is missing its checkpointed operation identity.");
     const operationId = repairOperationId
-      ? `${task.id}-qa-repair-${stageIndex + 1}-${stage.repairOperationsExecuted}`
+      ? `${task.id}-qa-repair-${stageIndex + 1}-${repairOperationId.split("-op-").at(-1)}`
       : (stage.pendingQualityProbeOperationId ??= `${task.id}-qa-probe-${stageIndex + 1}-${stage.verificationHistory.length + 1}`);
     const callId = operationId.replaceAll("-", "_");
     let entry = task.ledger.find((item) => item.operationId === operationId);
@@ -420,7 +1991,15 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           type: "function_call",
           call_id: callId,
           name: "inspect_nodes",
-          arguments: JSON.stringify({ refs, selection: false, depth: 4, maxNodes: 25 }),
+          arguments: JSON.stringify({
+            ...(stage.pageId ? { pageId: stage.pageId } : {}),
+            refs,
+            selection: false,
+            depth: 4,
+            maxNodes: 25,
+            purpose: "structural_verification",
+            palette: palette(),
+          }),
         },
       ])[0]!;
       entry = {
@@ -436,6 +2015,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       operationId,
       idempotencyKey: `chat:${operationId}`,
       ...(task.referenceScope ? { taskId: task.id } : {}),
+      ...(task.chatId ? { chatId: task.chatId } : {}),
+      ...(task.designName ? { designName: task.designName } : {}),
       action: entry.call.action,
     });
     let verificationResult: Result | undefined;
@@ -456,6 +2037,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       task.batches++;
       await save();
       deps.progress(`Re-reading ${stage.title} after the confirmed repair…`);
+      activePhase = "verification";
       verificationResult = await deps.execute([operation]);
       result =
         verificationResult.results.length === 1 &&
@@ -504,14 +2086,20 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         "The post-repair inspection returned invalid geometry; committed changes remain.",
       );
     }
-    const before = stage.qualityFindings;
+    const before = [
+      ...new Map(
+        stage.qualityFindings.map((finding) => [JSON.stringify(finding), finding]),
+      ).values(),
+    ];
     const expectedRefs =
       entry.call.action.tool === "inspect_nodes"
         ? entry.call.action.refs.map(knownRef)
         : stage.logicalRefs.map(knownRef);
-    const findings = auditNativeSection(parsedNodes.data, expectedRefs);
+    const findings = readVerification(stageIndex, result.data, parsedNodes.data, expectedRefs);
     const after = safeQualityFindings(findings);
-    const improved = hasQualityProgress(before, after);
+    const improved = after.length === 0 || hasQualityProgress(before, after);
+    const eligibleNativeRepair =
+      stage.nativeRepairPlan?.some((decision) => decision.eligible) ?? false;
     const afterKeys = new Set(after.map(qualityFindingKey));
     stage.repairFindingsResolved = Math.min(
       CHAT_TASK_MAX_MUTATIONS,
@@ -547,7 +2135,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       findings: after,
       ...(repairOperationId ? { repairOperationIds: [repairOperationId] } : {}),
     });
-    if (improved) {
+    if (improved || eligibleNativeRepair) {
+      delete task.lastFailureSignature;
+      delete task.lastFailureProgress;
       task.recent.push({
         role: "user",
         content: repairOperationId
@@ -557,12 +2147,21 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       task.recent = task.recent.slice(-20);
     }
     delete stage.pendingQualityProbeOperationId;
-    stage.qualityRepairBlocked = !improved;
+    stage.qualityRepairBlocked = !improved && !eligibleNativeRepair;
     await save();
-    if (!improved)
+    if (
+      !improved &&
+      !eligibleNativeRepair &&
+      stage.nativeRepairPlan?.some(
+        (decision) => decision.code === "clipped-child" || decision.code === "low-contrast",
+      )
+    )
+      failUnavailableRepair(stageIndex);
+    if (!improved && !eligibleNativeRepair)
       throw new Error(
         `no_progress_repeated_error: structural_repair_no_progress after ${operationId}; before and after measurements are unchanged or worse. Further model repairs were stopped until a fresh native measurement changes.`,
       );
+    transition("EXECUTING_STAGE");
   };
   const output = (callId: string, payload: unknown): ChatInputItem => ({
     type: "function_call_output",
@@ -571,8 +2170,21 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
   });
   const wasRetry =
     task.status === "failed" || task.status === "stopped" || task.status === "running";
+  const initialLedgerLength = task.ledger.length;
+  const readOnly = () => task.intent === "inspect" || task.intent === "explain";
+  let activePhase: ChatTaskFailurePhase = readOnly() ? "inspection" : task.stages.length ? "native_execution" : "planning";
   syncCapacityAccounting(task);
-  if (!task.stages.length) transition("UNPLANNED");
+  if (readOnly()) transition("INSPECTING");
+  else if (!task.stages.length)
+    transition(
+      task.intent === "edit"
+        ? wasRetry
+          ? "EDIT_TARGETING"
+          : task.editTarget
+            ? "EDIT_PLANNING"
+            : "UNPLANNED"
+        : "UNPLANNED",
+    );
   else if (task.stages.every((stage) => stage.completed))
     transition(task.status === "completed" ? "TASK_COMPLETED" : "STAGE_COMPLETED");
   else if (task.lifecycle === "UNPLANNED")
@@ -590,21 +2202,260 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       stage.verified = false;
     }
   }
+  const retryQualityStage = task.stages.findIndex(
+    (stage) =>
+      !stage.completed &&
+      !stage.repairVerificationPending &&
+      !stage.qualityRepairBlocked &&
+      (stage.awaitingQualityRepair || stage.completionReason === "native_verification_failed") &&
+      (task.lifecycle === "VERIFYING_STAGE" ||
+        task.failure?.phase === "verification" ||
+        task.failure?.code === "no_progress_repeated_error"),
+  );
   task.status = "running";
   delete task.error;
   delete task.failure;
-  await save();
   try {
+    await save();
+    if (
+      retryQualityStage >= 0 &&
+      !task.pending.some((call) => isCanvasMutationTool(call.action.tool))
+    ) {
+      task.stages[retryQualityStage]!.awaitingQualityRepair = true;
+      await inspectAfterQualityRepair(retryQualityStage, true);
+    }
     while (true) {
       check();
+      if (task.intent === "edit" && task.stages.length === 0) {
+        const controllerPending = task.pending.some((call) => call.callId.startsWith(EDIT_TARGET_CALL_PREFIX));
+        if (!controllerPending) {
+          const editStep = nextEditTargetOperation(task, {
+            forceFresh: wasRetry,
+            initialLedgerLength,
+          });
+          if ("blocked" in editStep) {
+            await stopEdit(editStep.code, editStep.reason, "planning");
+            return;
+          }
+          if ("action" in editStep) {
+            transition("EDIT_TARGETING");
+            activePhase = "inspection";
+            for (const pending of task.pending) {
+              const entry = task.ledger.find((candidate) => candidate.call.callId === pending.callId);
+              if (!entry || !["pending", "running"].includes(entry.status)) continue;
+              entry.status = "failed";
+              entry.acknowledgementStatus = "not_attempted";
+              entry.output = JSON.stringify({
+                success: false,
+                acknowledgementStatus: "not_attempted",
+                error: "The deterministic edit controller must verify the target before accepting model planning or native work.",
+              });
+            }
+            const scheduled = autonomousEditTargetCall(task, editStep.action);
+            task.pending = [scheduled];
+            task.recent = [scheduled.functionCall];
+            await save();
+            deps.progress(editStep.progress);
+            continue;
+          }
+          transition("EDIT_PLANNING");
+        }
+      }
+      if (readOnly()) {
+        const conflictingIntent = task.pending.find(
+          (call) =>
+            call.action.tool === "classify_canvas_intent" &&
+            (call.action.intent !== task.intent ||
+              Boolean(call.action.targetName && call.action.targetName !== task.targetName)),
+        );
+        if (conflictingIntent)
+          throw new Error("Canvas intent is already checkpointed and cannot be changed.");
+        const inspection = readOnlyCheckpoint(task);
+        const plan = nextReadOnlyOperation(task, inspection, {
+          forceFreshDiscovery: wasRetry,
+          initialLedgerLength,
+        });
+        if ("paused" in plan) {
+          task.pending = [];
+          task.inspectionOutcome = "PARTIAL";
+          task.inspectionSummary = readOnlyInspectionSummary(task, inspection);
+          task.text = readOnlyInspectionReport(task, inspection, "PARTIAL", plan.reason);
+          task.status = "stopped";
+          task.error = plan.reason;
+          delete task.failure;
+          task.recent = [];
+          await save();
+          return;
+        } else if ("action" in plan) {
+          const planKey = inspectionActionKey(plan.action);
+          const trackedPending = task.pending.find((pending) => {
+            const ledgerEntry = task.ledger.find((entry) => entry.call.callId === pending.callId);
+            return (
+              ledgerEntry &&
+              ["pending", "running"].includes(ledgerEntry.status) &&
+              (pending.action.tool === "get_document_context" ||
+                pending.action.tool === "inspect_nodes") &&
+              inspectionActionKey(pending.action) === planKey
+            );
+          });
+          const matchingPending =
+            trackedPending ??
+            task.pending.find(
+              (pending) =>
+                (pending.action.tool === "get_document_context" ||
+                  pending.action.tool === "inspect_nodes") &&
+                inspectionActionKey(pending.action) === planKey,
+            );
+          for (const pending of task.pending) {
+            if (pending.callId === matchingPending?.callId) continue;
+            const ledgerEntry = task.ledger.find((entry) => entry.call.callId === pending.callId);
+            if (!ledgerEntry) continue;
+            if (ledgerEntry.status === "pending" || ledgerEntry.status === "running") {
+              ledgerEntry.status = "failed";
+              ledgerEntry.acknowledgementStatus = "not_attempted";
+              ledgerEntry.output = JSON.stringify({
+                success: false,
+                acknowledgementStatus: "not_attempted",
+                error: "Not scheduled; the deterministic inspection controller selected the next required operation.",
+              });
+            }
+          }
+          const scheduled = matchingPending ?? autonomousInspectionCall(task, plan.action);
+          const changed =
+            task.pending.length !== 1 || task.pending[0]?.callId !== scheduled.callId;
+          task.pending = [scheduled];
+          if (!matchingPending) task.recent = [scheduled.functionCall];
+          if (changed || !matchingPending) await save();
+          deps.progress(plan.progress);
+          if (changed || !matchingPending) continue;
+        } else {
+          task.pending = [];
+          task.inspectionOutcome = plan.outcome;
+          task.inspectionSummary = readOnlyInspectionSummary(task, inspection);
+          if (chatTaskCommittedOperationCount(task) !== 0)
+            throw new Error("Read-only inspection recorded a canvas mutation; completion was refused.");
+          task.text = readOnlyInspectionReport(task, inspection, plan.outcome, plan.reason);
+          if (["COMPLETED", "PARTIAL", "NO_MATCH"].includes(plan.outcome)) {
+            transition("TASK_COMPLETED");
+            task.status = "completed";
+            delete task.error;
+            if (plan.outcome !== "PARTIAL") delete task.failure;
+          } else {
+            task.status = "failed";
+            task.failure ??= {
+              category: "inspection",
+              phase: "inspection",
+              code: plan.outcome === "BLOCKED" ? "inspection_blocked" : "inspection_failed",
+              committedOperations: 0,
+            };
+            task.error = task.text.slice(0, 500);
+          }
+          task.recent = [];
+          await save();
+          return;
+        }
+      }
       const repairVerificationStage = task.stages.findIndex(
         (stage) => stage.repairVerificationPending,
       );
       if (repairVerificationStage >= 0) await inspectAfterQualityRepair(repairVerificationStage);
       const blockedRepairStage = task.stages.findIndex((stage) => stage.qualityRepairBlocked);
       if (blockedRepairStage >= 0) await inspectAfterQualityRepair(blockedRepairStage, true);
+      const correctionStageIndex = task.stages.findIndex(
+        (stage) => !stage.completed && stage.awaitingQualityRepair,
+      );
+      const correctionStage = task.stages[correctionStageIndex];
+      if (
+        correctionStage &&
+        (!task.pending.length ||
+          task.pending.every((call) => call.action.tool === "complete_canvas_stage"))
+      ) {
+        const decision = correctionStage.nativeRepairPlan?.find(
+          (candidate) => candidate.eligible && candidate.action,
+        );
+        if (decision?.action) {
+          const capacity = chatTaskCapacityUsage(task);
+          if (
+            capacity.mutations >= CHAT_TASK_MAX_MUTATIONS ||
+            task.ledger.length >= CHAT_TASK_MAX_LEDGER_ENTRIES
+          ) {
+            decision.eligible = false;
+            decision.reason = "repair_capacity_exhausted";
+            decision.dispatchGate = "existing_capacity";
+            failUnavailableRepair(correctionStageIndex);
+          }
+          for (const pending of task.pending)
+            task.recent.push(
+              output(pending.callId, {
+                success: false,
+                instruction: "Native correction is scheduled before stage completion.",
+              }),
+            );
+          const callId = `native_repair_${task.id}_${task.ledger.length + 1}`;
+          const { tool, ...args } = decision.action;
+          const call = parseResponsesFunctionCalls([
+            { type: "function_call", call_id: callId, name: tool, arguments: JSON.stringify(args) },
+          ])[0]!;
+          decision.dispatchGate = "scheduled";
+          decision.operationId = `${task.id}-op-${task.ledger.length + 1}`;
+          task.pending = [call];
+          task.recent.push(call.functionCall);
+          transition("EXECUTING_STAGE");
+          await save();
+        } else if (
+          correctionStage.nativeRepairPlan?.some(
+            (candidate) =>
+              (candidate.code === "clipped-child" || candidate.code === "low-contrast") &&
+              candidate.reason !== "intentional_or_unsupported_clip",
+          )
+        )
+          failUnavailableRepair(correctionStageIndex);
+      }
       if (task.pending.length) {
         const calls = task.pending;
+        const intentCalls = calls.filter(
+          (call) => call.action.tool === "classify_canvas_intent",
+        );
+        if (intentCalls.length) {
+          if (calls.length !== 1 || intentCalls.length !== 1)
+            throw new Error("Canvas intent must be classified alone before other canvas tools.");
+          const call = intentCalls[0]!;
+          if (call.action.tool !== "classify_canvas_intent")
+            throw new Error("The intent classifier returned an invalid tool action.");
+          const replayed = task.intent === call.action.intent &&
+            (!call.action.targetName || call.action.targetName === task.targetName);
+          if ((task.intent || task.stages.length) && !replayed)
+            throw new Error("Canvas intent is already checkpointed and cannot be changed.");
+          task.intent = call.action.intent;
+          if (call.action.targetName) task.targetName = call.action.targetName;
+          if (readOnly()) {
+            transition("INSPECTING");
+            activePhase = "inspection";
+          } else if (task.intent === "edit") {
+            transition("EDIT_TARGETING");
+            activePhase = "inspection";
+          }
+          task.recent.push(
+            output(call.callId, {
+              success: true,
+              replayed,
+                intent: task.intent,
+                ...(task.targetName ? { targetName: task.targetName } : {}),
+              instruction:
+                task.intent === "inspect" || task.intent === "explain"
+                  ? "Use bounded document discovery and read-only node inspection only; do not plan or mutate."
+                  : task.intent === "create"
+                    ? "Optionally read document context, then save one create plan before any native changes."
+                    : "Discover and inspect the existing target first; plan only targeted edits and never create a replacement root.",
+            }),
+          );
+          task.pending = [];
+          await save();
+          continue;
+        }
+        if (readOnly() && calls.some(({ action }) =>
+          action.tool !== "get_document_context" && action.tool !== "inspect_nodes"))
+          throw new Error("Read-only intent permits discovery and inspection only; no plan or mutation was executed.");
         if (
           calls.some((call) => call.action.tool === "get_document_context") &&
           calls.length !== 1
@@ -644,22 +2495,175 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           const call = planning[0]!;
           const action = call.action;
           const reusingSavedPlan = action.tool === "plan_canvas_task" && task.stages.length > 0;
+          activePhase = action.tool === "complete_canvas_stage" ? "verification" : "planning";
           try {
             if (action.tool === "plan_canvas_task") {
               if (
+                (task.intent && !["create", "edit", "continue"].includes(task.intent)) ||
+                (!task.intent && !task.stages.length)
+              )
+                throw new Error(
+                  "A canvas plan requires a checkpointed create, edit, or continue intent. Inspect/explain requests remain read-only.",
+                );
+              if (
+                (task.intent === "edit" || task.intent === "continue") &&
                 !task.ledger.some(
                   (entry) =>
-                    entry.call.action.tool === "get_document_context" &&
-                    entry.status === "completed",
+                    entry.status === "completed" &&
+                    entry.call.action.tool === "get_document_context",
                 )
               )
                 throw new Error(
-                  "Read the current document context and local styles before proposing a canvas plan. No canvas changes were made.",
+                  "Edit/continue is blocked until bounded document discovery confirms the existing target. No new frame was created.",
                 );
+              if (task.intent === "edit" && !reusingSavedPlan) {
+                const target = task.editTarget;
+                if (!target)
+                  throw new Error("target_not_inspected: the controller did not save verified native target evidence.");
+                const targetRefs = action.targetRefs ?? [];
+                const uniqueTargetRefs = new Set(targetRefs);
+                if (
+                  !targetRefs.includes(target.ref) ||
+                  uniqueTargetRefs.size !== targetRefs.length ||
+                  targetRefs.some((ref) => !target.verifiedRefs.includes(ref)) ||
+                  action.stages.some((stage) => stage.pageId && stage.pageId !== target.pageId) ||
+                  action.stages.some((stage) => stage.logicalRefs.length > 19) ||
+                  action.stages.some((stage) =>
+                    stage.logicalRefs.some((ref) => target.verifiedRefs.includes(ref) && !targetRefs.includes(ref)),
+                  )
+                )
+                  throw new Error(
+                    "edit_plan_invalid: include the existing root in targetRefs, use only natively inspected target refs, keep each stage at 19 or fewer refs for root verification, and keep every edit stage on the verified target page.",
+                  );
+                target.plannedRefs = targetRefs;
+              }
+              if (task.intent === "continue") {
+                const discovery = [...task.ledger].reverse().find(
+                  (entry) =>
+                    entry.status === "completed" &&
+                    entry.call.action.tool === "get_document_context",
+                );
+                if (!discovery)
+                  throw new Error(
+                    "Edit/continue requires completed bounded document discovery before planning.",
+                  );
+                let discoveryDecision: string | undefined;
+                let discoveryData: Record<string, unknown> | undefined;
+                try {
+                  discoveryData = JSON.parse(discovery?.output ?? "{}").data;
+                  discoveryDecision = (discoveryData?.discovery as { matchStatus?: string } | undefined)
+                    ?.matchStatus;
+                } catch {
+                  // Malformed or missing discovery is blocked below.
+                }
+                const discoveryQuery =
+                  discovery.call.action.tool === "get_document_context"
+                    ? discovery.call.action.query
+                    : undefined;
+                const namedTarget = discoveryQuery ?? task.targetName;
+                if (
+                  (namedTarget &&
+                    !["unique"].includes(discoveryDecision ?? ""))
+                )
+                  throw new Error(
+                    discoveryDecision === "ambiguous"
+                      ? `“${namedTarget}” matches multiple existing frames. Ask the user which one to edit, or repeat discovery with a more specific target name; no plan or canvas changes were made.`
+                      : discoveryDecision === "no_match"
+                        ? `No existing frame matched “${namedTarget}”. Report that no target was found; do not create a replacement frame.`
+                        : discoveryDecision === "no_match_truncated"
+                          ? `No match for “${namedTarget}” was found in the bounded scan, which was truncated. Ask for a more specific page/frame or report the discovery limit; do not create a replacement.`
+                          : discoveryDecision === "uneditable"
+                            ? "The unique matching node has no safe logical reference. Ask the user to select another editable frame or resolve its stale/ambiguous reference; do not guess or recreate it."
+                          : "Edit/continue requires a unique discovery match for the named target before planning. Refine the query or ask the user which frame to edit.",
+                  );
+                if (namedTarget) {
+                  const target = (discoveryData?.frames as Array<Record<string, unknown>> | undefined)
+                    ?.find((frame) => typeof frame.ref === "string");
+                  const currentPageId = (discoveryData?.page as { id?: string } | undefined)?.id;
+                  const inspectedTarget = target
+                    ? task.ledger.some((entry) => {
+                        if (
+                          entry.status !== "completed" ||
+                          entry.call.action.tool !== "inspect_nodes" ||
+                          !entry.call.action.refs.includes(target.ref as string) ||
+                          (entry.call.action.pageId ?? currentPageId) !== target.pageId
+                        )
+                          return false;
+                        try {
+                          const nodes = JSON.parse(entry.output ?? "{}").data?.nodes;
+                          return (
+                            Array.isArray(nodes) &&
+                            nodes.some((node) => node?.ref === target.ref)
+                          );
+                        } catch {
+                          return false;
+                        }
+                      })
+                    : false;
+                  if (!inspectedTarget)
+                    throw new Error(
+                      "Inspect the uniquely matched frame using its returned logical ref and exact pageId before planning the edit. No canvas changes were made.",
+                    );
+                } else {
+                  const selected = Array.isArray(discoveryData?.selection)
+                    ? discoveryData.selection.length > 0
+                    : false;
+                  if (!selected)
+                    throw new Error(
+                      "No selected target was present. Repeat discovery with the exact project/screen name or ask the user which existing frame to edit; do not guess.",
+                    );
+                  if (!task.ledger.some((entry) => {
+                    if (
+                      entry.status !== "completed" ||
+                      entry.call.action.tool !== "inspect_nodes"
+                    )
+                      return false;
+                    try {
+                      const output = JSON.parse(entry.output ?? "{}");
+                      return Array.isArray(output.data?.nodes) && output.data.nodes.length > 0;
+                    } catch {
+                      return false;
+                    }
+                  }))
+                    throw new Error(
+                      "Edit/continue is blocked until a non-empty native inspection confirms the selected existing target. No new frame was created.",
+                    );
+                }
+              }
+              if (action.designName) task.designName = action.designName;
               if (!task.stages.length) {
+                const contextEntry = [...task.ledger].reverse().find(
+                  (entry) =>
+                    entry.status === "completed" &&
+                    entry.call.action.tool === "get_document_context",
+                );
+                let contextPageId: string | undefined;
+                try {
+                  contextPageId = JSON.parse(contextEntry?.output ?? "{}").data?.page?.id;
+                } catch {
+                  // A missing page ID leaves the plan explicitly unscoped.
+                }
+                const inspectedPageIds = new Set(
+                  task.ledger.flatMap((entry) =>
+                    entry.status === "completed" &&
+                    entry.call.action.tool === "inspect_nodes" &&
+                    (entry.call.action.pageId ?? contextPageId)
+                      ? [entry.call.action.pageId ?? contextPageId!]
+                      : [],
+                  ),
+                );
+                const inspectedPageId =
+                  inspectedPageIds.size === 1 ? [...inspectedPageIds][0] : undefined;
                 task.brief = action.brief;
                 task.stages = action.stages.map((planned) => ({
                   ...planned,
+                  ...(!planned.pageId && task.intent === "edit" && task.editTarget
+                    ? { pageId: task.editTarget.pageId }
+                    : {}),
+                  ...(!planned.pageId && task.intent !== "create" && inspectedPageId
+                    && task.intent !== "edit"
+                    ? { pageId: inspectedPageId }
+                    : {}),
                   estimatedMutations:
                     planned.estimatedMutations ?? estimatedStageMutations(planned.logicalRefs),
                   completed: false,
@@ -749,10 +2753,12 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   !entry.reused &&
                   isCanvasMutationTool(entry.call.action.tool),
               );
-              if (!confirmedStageMutations.length)
+              if (!confirmedStageMutations.length) {
+                stage.completionReason = "pending_or_failed_mutations";
                 throw new Error(
                   "No native operations were confirmed for this stage; it cannot be marked complete.",
                 );
+              }
               const missingRefs = stage.logicalRefs.filter(
                 (ref) =>
                   !task.ledger.some(
@@ -780,7 +2786,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 const attempt = stage.qaAttempts + 1;
                 const verificationNumber = stage.verificationOperations + 1;
                 const refs = stage.logicalRefs.length
-                  ? stage.logicalRefs
+                  ? task.intent === "edit" && task.editTarget
+                    ? [...new Set([task.editTarget.ref, ...stage.logicalRefs])]
+                    : stage.logicalRefs
                   : task.ledger
                       .filter((entry) => entry.stage === stageIndex && "ref" in entry.call.action)
                       .map((entry) => ("ref" in entry.call.action ? entry.call.action.ref : ""))
@@ -791,7 +2799,15 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                     type: "function_call",
                     call_id: `${task.id}_qa_${stageIndex + 1}_${verificationNumber}`,
                     name: "inspect_nodes",
-                    arguments: JSON.stringify({ refs, selection: false, depth: 4, maxNodes: 25 }),
+                    arguments: JSON.stringify({
+                      ...(stage.pageId ? { pageId: stage.pageId } : {}),
+                      refs,
+                      selection: false,
+                      depth: 4,
+                      maxNodes: 25,
+                      purpose: "structural_verification",
+                      palette: palette(),
+                    }),
                   },
                 ])[0]!;
                 let inspectionEntry = task.ledger.find(
@@ -824,6 +2840,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   operationId: inspectionEntry.operationId,
                   idempotencyKey: `chat:${inspectionEntry.operationId}`,
                   ...(task.referenceScope ? { taskId: task.id } : {}),
+                  ...(task.chatId ? { chatId: task.chatId } : {}),
+                  ...(task.designName ? { designName: task.designName } : {}),
                   action: inspection.action,
                 });
                 let inspectionResult: Result;
@@ -848,6 +2866,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   task.batches++;
                   await save();
                   deps.progress(`Reviewing ${stage.title} geometry and editable layers…`);
+                  activePhase = "verification";
                   inspectionResult = await deps.execute([inspectionOperation]);
                   result =
                     inspectionResult.results.length === 1 &&
@@ -901,7 +2920,12 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   );
                 }
                 const verifiedRefs = refs.map(knownRef);
-                const findings = auditNativeSection(parsedNodes.data, verifiedRefs);
+                const findings = readVerification(
+                  stageIndex,
+                  result.data,
+                  parsedNodes.data,
+                  verifiedRefs,
+                );
                 const safeFindings = safeQualityFindings(findings);
                 inspectionEntry.status = "completed";
                 inspectionEntry.output = JSON.stringify({
@@ -910,27 +2934,42 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   findingCount: findings.length,
                   findings: findings.slice(0, 12),
                 });
+                if (hasQualityProgress(stage.qualityFindings, safeFindings)) {
+                  delete task.lastFailureSignature;
+                  delete task.lastFailureProgress;
+                }
                 stage.qualityFindings = safeFindings;
                 stage.verificationHistory.push({
                   attempt: verificationNumber,
                   findings: safeFindings,
                 });
                 if (findings.length) {
-                  guardRepeatedFailure(`structural_quality:${JSON.stringify(safeFindings)}`);
                   stage.verified = false;
                   stage.completionReason = "native_verification_failed";
                   stage.awaitingQualityRepair = true;
+                  if (!stage.nativeRepairPlan?.some((decision) => decision.eligible)) {
+                    if (
+                      stage.nativeRepairPlan?.some(
+                        (decision) =>
+                          (decision.code === "clipped-child" || decision.code === "low-contrast") &&
+                          (decision.reason !== "intentional_or_unsupported_clip" ||
+                            stage.verificationHistory.length > 1),
+                      )
+                    )
+                      failUnavailableRepair(stageIndex);
+                    guardRepeatedFailure(
+                      `structural_quality:${qualityFailureSignature(safeFindings)}`,
+                    );
+                  }
                   transition("EXECUTING_STAGE");
                   task.recent.push(
                     output(call.callId, {
                       success: false,
                       stage: stage.title,
                       inspectedNodes: parsedNodes.data.length,
-                      qualityFindings: findings
-                        .slice(0, 12)
-                        .map(({ code, ref, message }) => ({ code, ref, message })),
+                      qualityFindings: findings.slice(0, 12),
                       instruction:
-                        "Repair only the listed existing logical refs. Do not recreate the stage. After corrections request complete_canvas_stage again.",
+                        "The local runner dispatches eligible native hierarchy and contrast corrections, then re-inspects. Do not recreate nodes or duplicate repairs. Unsupported conditions remain visible with their eligibility gates.",
                     }),
                   );
                   task.pending = [];
@@ -962,7 +3001,22 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               }),
             );
           } catch (error) {
-            if (error instanceof Error && error.message.startsWith("no_progress_repeated_error"))
+            if (action.tool === "plan_canvas_task" && task.intent === "edit" && !reusingSavedPlan) {
+              const message = error instanceof Error ? error.message : "The edit plan was rejected by the safety validator.";
+              const code = message.startsWith("target_not_inspected")
+                ? "target_not_inspected"
+                : message.startsWith("reference_not_mutation_eligible")
+                  ? "reference_not_mutation_eligible"
+                  : "edit_plan_invalid";
+              await stopEdit(code, message.replace(/^edit_plan_invalid:\s*/u, ""), "planning");
+              return;
+            }
+            if (
+              error instanceof Error &&
+              (error.message.startsWith("no_progress_repeated_error") ||
+                error.message.startsWith("native_quality_unrepairable") ||
+                error.message.startsWith("native_verification_invalid"))
+            )
               throw error;
             if (task.stages.length && task.lifecycle === "VERIFYING_STAGE")
               transition("EXECUTING_STAGE");
@@ -1003,6 +3057,21 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           continue;
         }
         const stage = stageIndex >= 0 ? task.stages[stageIndex] : undefined;
+        if (stage) {
+          const actionPageIds = new Set(
+            calls.flatMap((call) =>
+              "pageId" in call.action && call.action.pageId ? [call.action.pageId] : [],
+            ),
+          );
+          if (actionPageIds.size > 1)
+            throw new Error(
+              "Each saved stage must target one Figma page; split cross-page edits into separate ordered stages.",
+            );
+          const actionPageId = [...actionPageIds][0];
+          if (stage.pageId && actionPageId && stage.pageId !== actionPageId)
+            throw new Error("A stage operation targets a different page from its saved target.");
+          if (!stage.pageId && actionPageId) stage.pageId = actionPageId;
+        }
         const newCalls = calls.filter(
           (call) => !task.ledger.some((entry) => entry.call.callId === call.callId),
         );
@@ -1080,6 +3149,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         await save();
         let rateRetries = 0;
         let referenceCorrection = false;
+        let continueAfterPrePlanReadOnly = false;
         while (true) {
           check();
           const remaining = calls
@@ -1108,12 +3178,18 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                         ),
                     )
                   : undefined;
+              const action =
+                stage?.pageId && "pageId" in call.action
+                  ? { ...call.action, pageId: call.action.pageId ?? stage.pageId }
+                  : call.action;
               return {
                 operationId,
                 idempotencyKey: `chat:${operationId}`,
                 ...(task.referenceScope ? { taskId: task.id } : {}),
+                ...(task.chatId ? { chatId: task.chatId } : {}),
+                ...(task.designName ? { designName: task.designName } : {}),
                 ...(original ? { expectedCreationOperationId: original.operationId } : {}),
-                action: call.action,
+                action,
               };
             });
           while (
@@ -1147,6 +3223,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             entry.status = "running";
             task.starts.push(now());
             const stage = task.stages[entry.stage];
+            if (entry.category === "mutation" && stage) stage.verified = false;
             if (
               entry.category === "mutation" &&
               stage?.awaitingQualityRepair &&
@@ -1158,9 +3235,36 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           });
           task.batches++;
           await save();
+          const activeReadOnlyAction = entries[0]?.call.action;
           deps.progress(
-            `${stage ? `Applying ${stage.title}` : "Reading document styles and page context"} · ${chatTaskCommittedOperationCount(task)} canvas operations confirmed…`,
+            stage
+              ? "Applying " +
+                  stage.title +
+                  " · " +
+                  chatTaskCommittedOperationCount(task) +
+                  " canvas operations confirmed…"
+              : activeReadOnlyAction?.tool === "get_document_context"
+                ? "Scanning accessible pages and frame window " +
+                  (activeReadOnlyAction.offset ?? 0) +
+                  "…"
+                : activeReadOnlyAction?.tool === "inspect_nodes"
+                  ? "Inspecting " +
+                    activeReadOnlyAction.refs.length +
+                    " frame(s) on " +
+                    (activeReadOnlyAction.pageId ?? "the current page") +
+                    "…"
+                  : "Reading the bounded document context…",
           );
+          activePhase = entries.some((entry) => entry.category === "verification")
+            ? "verification"
+            : calls.every(
+                  (call) =>
+                    call.action.tool === "get_document_context" ||
+                    call.action.tool === "inspect_nodes" ||
+                    call.action.tool === "get_operation_status",
+                )
+              ? "inspection"
+              : "native_execution";
           const result = await deps.execute(batch.operations);
           if (
             result.results.some(
@@ -1210,9 +3314,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 ? item.acknowledgementStatus === "confirmed_mutation" ||
                     item.acknowledgementStatus === "verified_idempotent_replay"
                 : ["rejected", "ambiguous", "not_attempted"].includes(item.acknowledgementStatus);
-            return item.success
-              ? item.acknowledgementStatus === "read_only"
-              : ["rejected", "not_attempted"].includes(item.acknowledgementStatus);
+            return ["read_only", "rejected", "not_attempted"].includes(
+              item.acknowledgementStatus,
+            );
           });
           if (
             !acknowledgementsValid ||
@@ -1239,6 +3343,13 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               continue;
             }
             entry.acknowledgementStatus = item.acknowledgementStatus;
+            for (const decision of task.stages[entry.stage]?.nativeRepairPlan ?? [])
+              if (decision.operationId === entry.operationId)
+                decision.dispatchGate = item.success
+                  ? item.acknowledgementStatus === "confirmed_mutation"
+                    ? "native_confirmed"
+                    : "native_noop"
+                  : "native_rejected";
             entry.status =
               item.acknowledgementStatus === "not_attempted"
                 ? "pending"
@@ -1254,7 +3365,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 item.acknowledgementStatus === "verified_idempotent_replay")
             ) {
               const stage = task.stages[entry.stage]!;
-              stage.repairOperationsExecuted++;
+              if (item.acknowledgementStatus === "confirmed_mutation" && !entry.reused)
+                stage.repairOperationsExecuted++;
               stage.repairVerificationPending = true;
               stage.pendingRepairOperationId = entry.operationId;
             }
@@ -1266,7 +3378,142 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               error: item.error,
               data: item.data,
             };
+            if (
+              task.intent === "edit" &&
+              entry.call.callId.startsWith(EDIT_TARGET_CALL_PREFIX) &&
+              entry.call.action.tool === "inspect_nodes" &&
+              item.success && item.data
+            ) {
+              const verifiedTarget = editTargetFromInspection(task, entry, item.data);
+              if (verifiedTarget) task.editTarget = verifiedTarget;
+            }
             entry.output = JSON.stringify(payload);
+            if (entry.output.length > 7_500) {
+              const nodes = item.data?.nodes;
+              if (entry.call.action.tool === "inspect_nodes" && Array.isArray(nodes)) {
+                const compactEvidence = inspectEvidenceTree(nodes).nativeEvidence;
+                entry.output = JSON.stringify({
+                  ...payload,
+                  data: {
+                    pageId: item.data?.pageId,
+                    nodes: JSON.parse(compactEvidence),
+                  },
+                });
+              } else if (entry.call.action.tool === "get_document_context") {
+                const source = item.data ?? {};
+                const discovery = source.discovery as Record<string, unknown> | undefined;
+                const frameFields = [
+                  "pageId",
+                  "pageName",
+                  "ref",
+                  "nodeId",
+                  "parentNodeId",
+                  "type",
+                  "name",
+                  "x",
+                  "y",
+                  "width",
+                  "height",
+                  "parentName",
+                  "depth",
+                  "editable",
+                  "visible",
+                  "locked",
+                  "nativeInspected",
+                  "nativeInspection",
+                  "projectName",
+                ];
+                const compactData = () => ({
+                  ...(source.document ? { document: source.document } : {}),
+                  ...(source.page ? { page: source.page } : {}),
+                  pages: Array.isArray(source.pages)
+                    ? source.pages.slice(0, 12).map((page) => {
+                        if (!page || typeof page !== "object") return {};
+                        const item = page as Record<string, unknown>;
+                        return Object.fromEntries(
+                          ["id", "name", "current"]
+                            .filter((key) => item[key] !== undefined)
+                            .map((key) => [key, item[key]]),
+                        );
+                      })
+                    : [],
+                  frames: Array.isArray(source.frames)
+                    ? source.frames.slice(0, 8).map((frame) =>
+                        frame && typeof frame === "object"
+                          ? Object.fromEntries(
+                              frameFields
+                                .filter((field) => (frame as Record<string, unknown>)[field] !== undefined)
+                                .map((field) => [field, (frame as Record<string, unknown>)[field]]),
+                            )
+                          : {},
+                      )
+                    : [],
+                  discovery: discovery
+                    ? Object.fromEntries(
+                        [
+                          "pagesVisited",
+                          "pagesAvailable",
+                          "scope",
+                          "pagesRemaining",
+                          "pagesLoaded",
+                          "nodesVisited",
+                          "nodesVisitedTotal",
+                          "inspectionNodesVisited",
+                          "framesDiscovered",
+                          "framesInspected",
+                          "framesReturned",
+                          "nativeInspection",
+                          "truncated",
+                          "complete",
+                          "continuationAvailable",
+                          "truncationReason",
+                          "inaccessiblePages",
+                          "sliceCount",
+                          "nodesPerSliceBudget",
+                          "maxNodesPerSliceObserved",
+                          "targetSliceMs",
+                          "hardSliceMs",
+                          "averageSliceMs",
+                          "maxSliceMs",
+                          "scanElapsedMs",
+                          "pageLoadMs",
+                          "cacheHit",
+                          "cacheAgeMs",
+                          "query",
+                          "matchStatus",
+                          "matchCount",
+                          "exactNameMatchCount",
+                          "returnedFrameCount",
+                          "offset",
+                          "sampleFramesTruncated",
+                          "revalidatedAfterRestart",
+                          "issues",
+                        ]
+                          .filter((field) => discovery[field] !== undefined)
+                          .map((field) => [field, discovery[field]]),
+                      )
+                    : {},
+                  ...(source.tokens ? { tokens: source.tokens } : {}),
+                  ...(source.profiling ? { profiling: source.profiling } : {}),
+                });
+                const compactPayload = { ...payload, data: compactData() };
+                while (
+                  utf8Bytes(JSON.stringify(compactPayload)) > 7_500 &&
+                  Array.isArray(compactPayload.data.frames) &&
+                  compactPayload.data.frames.length > 1
+                ) {
+                  compactPayload.data.frames.pop();
+                  const nextDiscovery = compactPayload.data.discovery;
+                  if (nextDiscovery && typeof nextDiscovery === "object")
+                    compactPayload.data.discovery = {
+                      ...(nextDiscovery as Record<string, unknown>),
+                      sampleFramesTruncated: true,
+                      returnedFrameCount: compactPayload.data.frames.length,
+                    };
+                }
+                entry.output = JSON.stringify(compactPayload);
+              }
+            }
             if (entry.output.length > 7_500)
               entry.output = JSON.stringify({ ...payload, data: undefined });
             failed ||= !item.success && item.acknowledgementStatus !== "not_attempted";
@@ -1296,41 +3543,114 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             await wait(60_100, deps.signal);
             continue;
           }
+          const stateFailureResult = result.results.find((item) => item.data?.toolStateDiagnostic);
+          const stateDiagnostic = FigmaToolStateDiagnosticSchema.safeParse(
+            stateFailureResult?.data?.toolStateDiagnostic,
+          );
+          if (stateDiagnostic.success) {
+            const diagnostic = stateDiagnostic.data;
+            task.failure = {
+              category: "tool_state",
+              code: toolStateFailureCode(diagnostic.category),
+              phase:
+                diagnostic.location === "migration"
+                  ? "state_migration"
+                  : diagnostic.location === "save"
+                    ? "state_persistence"
+                    : "state_loading",
+              committedOperations: chatTaskCommittedOperationCount(task),
+              ...(stateFailureResult ? { operationId: stateFailureResult.operationId } : {}),
+              toolStateDiagnostic: diagnostic,
+            };
+          }
+          const canContinueAfterPrePlanReadOnly =
+            prePlanReadOnly &&
+            calls.length > 0 &&
+            !stateDiagnostic.success &&
+            result.results.some((item) => !item.success);
+          if (canContinueAfterPrePlanReadOnly) {
+            for (const call of calls) {
+              const entry = task.ledger.find((item) => item.call.callId === call.callId);
+              if (!entry) continue;
+              task.recent.push(
+                output(call.callId, {
+                  ...JSON.parse(entry.output ?? "{}"),
+                  operationId: entry.operationId,
+                  note: readOnly()
+                    ? "Read-only discovery/inspection failed. No canvas mutation was attempted. Retry only the exact accessible target or report the inspection failure; never plan, reclassify intent, or invent verified results."
+                    : "Optional pre-planning context/inspection failed; no canvas mutation was attempted. For a new design, plan with fresh task-local refs and ignore unrelated history. For an edit, use only refs from a successful inspection; retry the named target or explain why it cannot be resolved.",
+                }),
+              );
+            }
+            task.pending = [];
+            await save();
+            continueAfterPrePlanReadOnly = true;
+            break;
+          }
           if (failed) {
             const failedResult = result.results.find((item) => !item.success);
-            task.failure = {
-              category: failedResult?.data?.referenceResolution
-                ? "ambiguous_recovery"
-                : /rate limit/iu.test(failedResult?.error ?? "")
-                  ? "rate_limit"
-                  : /timed out/iu.test(failedResult?.error ?? "")
-                    ? "timeout"
-                    : /interrupted|reconcil|unconfirmed/iu.test(failedResult?.error ?? "")
-                      ? "ambiguous_recovery"
-                      : result.committedOperationIds.length || chatTaskCommittedOperationCount(task)
-                        ? "partial_commit"
-                        : /invalid|safety limit|must be unique|does not support|can only|requires|must use/iu.test(
-                              failedResult?.error ?? "",
-                            )
-                          ? "executor_validation"
-                          : "figma_runtime",
-              code: failedResult?.data?.referenceResolution
-                ? "reference_resolution"
-                : "native_operation_failed",
-              committedOperations: chatTaskCommittedOperationCount(task),
-              ...(failedResult ? { operationId: failedResult.operationId } : {}),
-            };
-            task.failure.code = {
-              ambiguous_recovery: "inspection_required",
-              rate_limit: "local_tool_rate_limit",
-              timeout: "native_operation_timeout",
-              cancelled: "request_cancelled",
-              partial_commit: "native_batch_partial_commit",
-              executor_validation: "executor_contract_rejected",
-              figma_runtime: "native_api_failed",
-              planning: "planning_failed",
-              model_schema: "tool_arguments_invalid",
-            }[task.failure.category];
+            const referenceResolution = failedResult?.data?.referenceResolution;
+            const referenceResolutionCode =
+              referenceResolution &&
+              typeof referenceResolution === "object" &&
+              "code" in referenceResolution
+                ? referenceResolution.code
+                : undefined;
+            const hasReferenceResolutionFailure = Boolean(referenceResolution);
+            const safeReferenceResolutionCode =
+              typeof referenceResolutionCode === "string" &&
+              SAFE_REFERENCE_CODES.has(referenceResolutionCode)
+                ? referenceResolutionCode
+                : undefined;
+            if (!stateDiagnostic.success)
+              task.failure = {
+                category: hasReferenceResolutionFailure
+                  ? "inspection"
+                  : /rate limit/iu.test(failedResult?.error ?? "")
+                    ? "rate_limit"
+                    : /timed out/iu.test(failedResult?.error ?? "")
+                      ? "timeout"
+                      : /interrupted|reconcil|unconfirmed/iu.test(failedResult?.error ?? "")
+                        ? "ambiguous_recovery"
+                        : result.committedOperationIds.length ||
+                            chatTaskCommittedOperationCount(task)
+                          ? "partial_commit"
+                          : activePhase === "inspection"
+                            ? "inspection"
+                            : /invalid|safety limit|must be unique|does not support|can only|requires|must use/iu.test(
+                                  failedResult?.error ?? "",
+                                )
+                              ? "executor_validation"
+                              : "figma_runtime",
+                phase: hasReferenceResolutionFailure ? "inspection" : activePhase,
+                code: hasReferenceResolutionFailure
+                  ? "reference_resolution"
+                  : activePhase === "inspection"
+                    ? "inspection_failed"
+                    : "native_operation_failed",
+                committedOperations: chatTaskCommittedOperationCount(task),
+                ...(failedResult ? { operationId: failedResult.operationId } : {}),
+              };
+            const failure = task.failure;
+            if (!stateDiagnostic.success && failure)
+              failure.code =
+                safeReferenceResolutionCode ??
+                {
+                  ambiguous_recovery: "inspection_required",
+                  rate_limit: "local_tool_rate_limit",
+                  timeout: "native_operation_timeout",
+                  cancelled: "request_cancelled",
+                  partial_commit: "native_batch_partial_commit",
+                  executor_validation: "executor_contract_rejected",
+                  figma_runtime: "native_api_failed",
+                  planning: "planning_failed",
+                  verification: "verification_failed",
+                  model_schema: "tool_arguments_invalid",
+                  tool_state: "tool_state_invalid_schema",
+                  checkpoint_storage: "checkpoint_save_failed",
+                  inspection: "inspection_failed",
+                  transport: "responses_transport_error",
+                }[failure.category];
             for (const call of calls) {
               const entry = task.ledger.find((entry) => entry.call.callId === call.callId)!;
               if (entry.status === "pending") {
@@ -1367,6 +3687,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             );
           if (result.cancelled) throw new Error("Stopped between native operations.");
         }
+        if (continueAfterPrePlanReadOnly) continue;
         const failed = calls.some(
           (call) =>
             task.ledger.find((entry) => entry.call.callId === call.callId)?.status === "failed",
@@ -1383,6 +3704,14 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             output: JSON.stringify({
               ...JSON.parse(entry.output ?? "{}"),
               operationId: entry.operationId,
+              ...(prePlanReadOnly
+                ? {
+                  planningGuidance:
+                      readOnly()
+                        ? "Continue read-only discovery/inspection using exact refs and pageIds. Follow nextOffset for remaining matches. Once the returned frames are verified, report their names, locations and limits and finish with prose. No mutation plan is needed or allowed; do not classify intent again."
+                        : "This was pre-planning read-only context. Continue to plan_canvas_task now. New designs need only fresh task-local aliases; edits must use exact refs returned by successful inspection.",
+                  }
+                : {}),
               ...(call.normalizedInspectionParameters && call.action.tool === "inspect_nodes"
                 ? {
                     normalization: {
@@ -1401,22 +3730,26 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       }
       check();
       const current = task.stages.find((stage) => !stage.completed);
-      if (task.rounds >= 100 || (!task.stages.length && task.roundBreakdown.prePlan >= 4))
+      if (task.rounds >= 100)
         throw new Error(
-          "Initial planning budget reached before a valid plan was saved. Confirmed canvas work is retained; inspect the safe lifecycle diagnostic before continuing.",
+          "The model-round budget was reached before the task could progress. Confirmed canvas work is retained; inspect the original planning or inspection failure before retrying.",
         );
       deps.progress(
         current
           ? `Continuing saved stage ${current.title}…`
           : task.stages.length
             ? "Checking completion against Figma confirmations…"
-            : "Planning bounded canvas stages…",
-      );
+             : readOnly() ? "Inspecting existing canvas frames…" : "Planning bounded canvas stages…",
+       );
+      activePhase = readOnly() ? "inspection" : task.stages.length ? "native_execution" : "planning";
       const input = chatTaskInput(task);
       let turn: AuthorizedChatTurn | undefined;
+      let turnDurationMs = 0;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
+          const modelStarted = now();
           turn = await deps.model(input, task.lifecycle);
+          turnDurationMs = Math.max(0, now() - modelStarted);
           break;
         } catch (error) {
           if (
@@ -1447,6 +3780,15 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       if (!hadPlan) task.roundBreakdown.prePlan++;
       const kind = roundKind(turn);
       task.roundBreakdown[kind]++;
+      task.modelRoundTrace.push({
+        round: task.rounds,
+        lifecycle: task.lifecycle,
+        outcome: turn.kind,
+        tools: turn.kind === "tool_calls" ? turn.calls.map(({ name }) => name) : [],
+        validationCodes: turn.kind === "tool_validation" ? turn.issues.slice(0, 8).map(({ errorCode }) => errorCode) : [],
+        durationMs: turnDurationMs,
+        inputBytes: utf8Bytes(JSON.stringify(input)),
+      });
       if (current) {
         current.rounds++;
         current.roundBreakdown ??= roundBreakdown();
@@ -1554,6 +3896,48 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       if (turn.kind === "done") {
         delete task.validationFeedback;
         task.lastResponseCalls = 0;
+        if (readOnly()) {
+          const evidence = readOnlyCheckpoint(task);
+          const lastDiscovery = evidence.discoveries.at(-1)?.discovery;
+          const nativeInspection =
+            lastDiscovery?.nativeInspection && typeof lastDiscovery.nativeInspection === "object"
+              ? (lastDiscovery.nativeInspection as Record<string, unknown>)
+              : undefined;
+          if (
+            !evidence.discoveries.length ||
+            evidence.pendingOffsets.length ||
+            evidence.uninspectedRefs.length ||
+            (lastDiscovery?.complete === true && nativeInspection?.complete !== true)
+          )
+            throw new Error("Read-only inspection needs complete progressive coverage and verified native evidence before reporting success.");
+        }
+        if (task.intent === "edit" && !task.stages.length) {
+          if (task.editTarget && (task.planningContinuations ?? 0) < 1) {
+            task.planningContinuations = (task.planningContinuations ?? 0) + 1;
+            transition("EDIT_PLANNING");
+            task.recent = [{
+              role: "user",
+              content: "Your target is already discovered and natively inspected. Save the edit plan now by calling plan_canvas_task alone. Include targetRefs with the existing root ref and only the inspected refs you intend to modify. Keep every stage on the verified target page, preserve the root, and include actionable native mutations. Do not respond with final prose yet.",
+            }];
+            await save();
+            continue;
+          }
+          await stopEdit(
+            "edit_plan_missing",
+            task.editTarget
+              ? "The edit plan was not saved after one bounded planning continuation. The existing frame was inspected and no canvas changes were made."
+              : "The edit request stopped before a verified target and plan were available. No canvas changes were made.",
+            "planning",
+          );
+          return;
+        }
+        if (
+          ["create", "edit", "continue"].includes(task.intent ?? "") &&
+          !task.stages.length
+        )
+          throw new Error(
+            `${task.intent} request has no saved canvas plan; it cannot be reported as completed. Retry the request so its native work can be planned.`,
+          );
         if (task.stages.some((stage) => !stage.completed)) {
           guardRepeatedFailure("continuation:done_before_stages_complete");
           task.recent = [
@@ -1566,7 +3950,18 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           await save();
           continue;
         }
-        task.text = turn.text.slice(0, 8_000);
+        if (task.intent === "edit") {
+          const report = editCompletionReport(task);
+          if (!report) {
+            await stopEdit(
+              "native_execution_blocked",
+              "No confirmed native edits were recorded, so the existing design cannot be reported as improved.",
+              "verification",
+            );
+            return;
+          }
+          task.text = report;
+        } else task.text = turn.text.slice(0, 8_000);
         transition("TASK_COMPLETED");
         task.status = "completed";
         delete task.failure;
@@ -1576,9 +3971,46 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       }
       delete task.validationFeedback;
       delete task.failure;
-      const calls = turn.calls.map((call) => ChatFunctionCallSchema.parse(call));
+      const calls = turn.calls.map((rawCall) => {
+        const call = ChatFunctionCallSchema.parse(rawCall);
+        if (
+          task.targetName &&
+          call.action.tool === "get_document_context" &&
+          !call.action.query
+        )
+          return {
+            ...call,
+            action: { ...call.action, query: task.targetName },
+          };
+        return call;
+      });
       if (!calls.length || calls.length > 10)
         throw new Error("The model returned an invalid bounded stage.");
+      if (task.intent === "edit" && task.stages.length && calls.some(({ action }) => isCanvasMutationTool(action.tool))) {
+        const mutationCalls = calls.filter(({ action }) => isCanvasMutationTool(action.tool));
+        const blocker = editMutationBlocker(
+          task,
+          mutationCalls as unknown as Array<{ action: FigmaToolAction }>,
+        );
+        if (blocker) {
+          const message = blocker.replace(/^[a-z_]+:\s*/u, "");
+          const code = blocker.startsWith("edit_plan_invalid") ? "edit_plan_invalid" : "native_execution_blocked";
+          await stopEdit(code, message, "native_execution");
+          return;
+        }
+      }
+      if (task.intent === "edit" || task.intent === "continue") {
+        const rootCreation = calls.find(
+          ({ action }) =>
+            ["create_frame", "create_text", "create_rectangle"].includes(action.tool) &&
+            "parent" in action &&
+            action.parent.kind === "page",
+        );
+        if (rootCreation)
+          throw new Error(
+            "Edit/continue intent cannot create a new page-root layer. Inspect and modify the verified existing frame; if no target exists, report the discovery blocker instead.",
+          );
+      }
       const awaitingRepair = task.stages.find((stage) => !stage.completed)?.awaitingQualityRepair;
       if (
         awaitingRepair &&
@@ -1601,41 +4033,134 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       await save();
     }
   } catch (error) {
-    task.status = deps.signal.aborted ? "stopped" : "failed";
-    task.error = deps.signal.aborted
-      ? "Stopped. Confirmed canvas changes are retained. Resume reconciles in-flight IDs before continuing."
-      : (error instanceof Error ? error.message : "Stage failed safely.").slice(0, 500);
     const transportCategory =
       error && typeof error === "object" && "category" in error ? String(error.category) : "";
+    const isCancelled =
+      deps.signal.aborted ||
+      transportCategory === "request_cancelled" ||
+      (error instanceof Error &&
+        /^(?:Stopped|Stopped between native operations)/u.test(error.message));
+    task.status = isCancelled ? "stopped" : "failed";
+    task.error = isCancelled
+      ? task.intent === "edit"
+        ? "Edit cancelled. Verified target evidence and any confirmed native changes are retained."
+        : "Inspection cancelled. Saved read-only evidence is retained."
+      : (error instanceof Error ? error.message : "Stage failed safely.").slice(0, 500);
+    if (readOnly() && isCancelled) {
+      const checkpoint = readOnlyCheckpoint(task);
+      task.inspectionOutcome = "CANCELLED";
+      task.inspectionSummary = readOnlyInspectionSummary(task, checkpoint);
+      task.text = readOnlyInspectionReport(
+        task,
+        checkpoint,
+        "CANCELLED",
+        "The request stopped before the remaining native inspection work completed.",
+      );
+    }
+    if (task.intent === "edit" && isCancelled)
+      task.text = `${task.error} Confirmed canvas mutations: ${chatTaskCommittedOperationCount(task)}. Resume to reconcile the saved edit checkpoint.`;
+    const isTransportFailure =
+      transportCategory === "responses_transport_error" ||
+      transportCategory === "connection_failed" ||
+      transportCategory === "service_unavailable";
     const requestDiagnostic = safeRequestDiagnostic(error);
     if (requestDiagnostic) task.lastRequestDiagnostic = requestDiagnostic;
-    task.failure ??= {
-      category:
-        transportCategory === "quota_or_rate_limit" || transportCategory === "inference_busy"
-          ? "rate_limit"
-          : transportCategory === "request_cancelled" || deps.signal.aborted
+    const checkpointCode =
+      error && typeof error === "object" && "code" in error && typeof error.code === "string"
+        ? error.code
+        : undefined;
+    const thrownStateDiagnostic =
+      error && typeof error === "object" && "diagnostic" in error
+        ? FigmaToolStateDiagnosticSchema.safeParse(error.diagnostic)
+        : undefined;
+    if (thrownStateDiagnostic?.success) {
+      const diagnostic = thrownStateDiagnostic.data;
+      task.failure ??= {
+        category: "tool_state",
+        code: toolStateFailureCode(diagnostic.category),
+        phase:
+          diagnostic.location === "migration"
+            ? "state_migration"
+            : diagnostic.location === "save"
+              ? "state_persistence"
+              : "state_loading",
+        committedOperations: chatTaskCommittedOperationCount(task),
+        toolStateDiagnostic: diagnostic,
+      };
+    }
+    const checkpointFailure = transportCategory === "checkpoint_storage";
+    const phase = checkpointFailure
+      ? "checkpoint"
+      : isCancelled
+        ? activePhase
+        : transportCategory
+          ? "transport"
+          : activePhase;
+    if (!task.failure || transportCategory || isCancelled)
+      task.failure = {
+        category: checkpointFailure
+          ? "checkpoint_storage"
+          : isCancelled
             ? "cancelled"
-            : transportCategory === "request_timed_out" || /timed out|timeout/iu.test(task.error)
-              ? "timeout"
-              : transportCategory === "response_invalid"
-                ? "model_schema"
-                : /validation|Zod|bounded stage|invalid request/iu.test(task.error)
-                  ? "executor_validation"
-                  : /interrupted|reconcil|Lost.*result|Lost.*acknowledgement/iu.test(task.error)
-                    ? "ambiguous_recovery"
-                    : "planning",
-      code: /^[a-z_]{1,80}$/u.test(transportCategory)
-        ? transportCategory
-        : task.error.startsWith("no_progress_repeated_error")
-          ? "no_progress_repeated_error"
-          : task.error.startsWith("Initial planning budget reached")
-            ? "planning_budget_exhausted"
-            : "task_paused",
-      committedOperations: chatTaskCommittedOperationCount(task),
-    };
+          : isTransportFailure
+            ? "transport"
+            : transportCategory === "quota_or_rate_limit" || transportCategory === "inference_busy"
+              ? "rate_limit"
+              : transportCategory === "request_timed_out" ||
+                    /timed out|timeout/iu.test(task.error)
+                  ? "timeout"
+                  : transportCategory === "response_invalid"
+                    ? "model_schema"
+                    : /validation|Zod|bounded stage|invalid request/iu.test(task.error)
+                      ? "executor_validation"
+                      : /interrupted|reconcil|Lost.*result|Lost.*acknowledgement/iu.test(task.error)
+                        ? "ambiguous_recovery"
+                        : activePhase === "verification"
+                          ? "verification"
+                          : activePhase === "inspection"
+                            ? "inspection"
+                            : "planning",
+        phase,
+        code:
+          isCancelled
+            ? "request_cancelled"
+            : checkpointFailure && checkpointCode && /^[a-z_]{1,80}$/u.test(checkpointCode)
+            ? checkpointCode
+            : /^[a-z_]{1,80}$/u.test(transportCategory)
+              ? transportCategory
+              : task.error.startsWith("native_verification_invalid")
+                ? "native_verification_invalid"
+                : task.error.startsWith("no_progress_repeated_error")
+                  ? "no_progress_repeated_error"
+                  : task.error.startsWith("Initial planning budget reached")
+                    ? "planning_budget_exhausted"
+                    : activePhase === "inspection"
+                      ? "inspection_failed"
+                      : activePhase === "verification"
+                        ? "verification_failed"
+                        : activePhase === "planning"
+                          ? "planning_failed"
+                          : "task_paused",
+        committedOperations: chatTaskCommittedOperationCount(task),
+        ...(isCancelled
+          ? {
+              cancellationSource: deps.signal.aborted
+                ? "ui_abort"
+                : transportCategory === "request_cancelled"
+                  ? "unspecified"
+                  : "native_batch_cancelled",
+            }
+          : {}),
+      };
     if (task.error.startsWith("no_progress_repeated_error"))
       task.failure.code = "no_progress_repeated_error";
-    await save();
+    if (!checkpointFailure) {
+      try {
+        await save();
+      } catch {
+        // Keep the original failure in memory when its checkpoint cannot be written.
+      }
+    }
     throw error;
   }
 }

@@ -1,6 +1,17 @@
 import { PluginToUISchema, type UIToPluginMessage } from "../shared/messages";
 import type { PluginToUIMessage } from "../shared/messages";
 
+export class ChatTaskBridgeError extends Error {
+  readonly category = "checkpoint_storage";
+
+  constructor(
+    message: string,
+    readonly code: string,
+  ) {
+    super(message);
+  }
+}
+
 export function chatTaskBridge(
   message: Extract<UIToPluginMessage, { type: "chat-task-load" | "chat-task-save" }>,
 ) {
@@ -21,11 +32,22 @@ export function chatTaskBridge(
         return;
       finish();
       if (parsed.data.success) resolve(parsed.data);
-      else reject(new Error(parsed.data.error ?? "Task checkpoint could not be saved."));
+        else
+          reject(
+            new ChatTaskBridgeError(
+              parsed.data.error ?? "Task checkpoint could not be saved.",
+              parsed.data.errorCode ?? "checkpoint_load_failed",
+            ),
+          );
     };
     const timer = setTimeout(() => {
       finish();
-      reject(new Error("Task checkpoint timed out; no further canvas batch was started."));
+      reject(
+        new ChatTaskBridgeError(
+          "Task checkpoint timed out; no further canvas batch was started.",
+          "checkpoint_timeout",
+        ),
+      );
     }, 10_000);
     window.addEventListener("message", receive);
     parent.postMessage({ pluginMessage: message }, "*");

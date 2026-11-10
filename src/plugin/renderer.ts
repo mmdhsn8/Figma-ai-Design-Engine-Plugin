@@ -2096,6 +2096,7 @@ export async function renderMultiScreenDesign(
         root.setPluginData(
           MULTI_SCREEN_META_KEY,
           JSON.stringify({
+            batchName: batch.name,
             group: screen.group,
             devicePreset: screen.devicePreset,
             order: screen.order,

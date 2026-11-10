@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import {
   chatTaskLedgerCategory,
   chatTaskProgress,
+  chatTaskRetryLabel,
   mutationAccounting,
   type ChatTask,
 } from "../shared/chat-task";
@@ -150,7 +151,7 @@ function ActivityTaskDetails({
               disabled={!canResume}
               onClick={onResume}
             >
-              {task.status === "failed" ? "Retry Failed Stage" : "Resume saved task"}
+              {chatTaskRetryLabel(task)}
             </button>
           ) : null}
           <button className="text-button" type="button" onClick={() => onNavigate("chat")}>

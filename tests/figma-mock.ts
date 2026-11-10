@@ -15,6 +15,17 @@ export function createMockApi() {
   const storage = new Map<string, unknown>();
   const rootData = new Map<string, string>();
   const viewportFocusCalls: string[][] = [];
+  const pageChangeListeners = new Map<string, Set<(event: NodeChangeEvent) => void>>();
+  const documentChangeListeners = new Set<(event: DocumentChangeEvent) => void>();
+  const emitDocumentChange = () => {
+    const event = { documentChanges: [] } as unknown as DocumentChangeEvent;
+    for (const listener of documentChangeListeners) listener(event);
+  };
+  const emitPageChange = (pageId: string) => {
+    for (const listener of pageChangeListeners.get(pageId) ?? [])
+      listener({ nodeChanges: [] } as unknown as NodeChangeEvent);
+    emitDocumentChange();
+  };
   const paintStyles = [
     { id: "paint-token-brand", name: "Color/Brand", paints: [] },
   ] as unknown as PaintStyle[];
@@ -41,6 +52,20 @@ export function createMockApi() {
     type: "PAGE",
     children: roots,
     selection: [] as MockNode[],
+    loaded: true,
+    loadCalls: 0,
+    async loadAsync() {
+      page.loadCalls++;
+      page.loaded = true;
+    },
+    on(_type: "nodechange", listener: (event: NodeChangeEvent) => void) {
+      const listeners = pageChangeListeners.get(page.id) ?? new Set();
+      listeners.add(listener);
+      pageChangeListeners.set(page.id, listeners);
+    },
+    off(_type: "nodechange", listener: (event: NodeChangeEvent) => void) {
+      pageChangeListeners.get(page.id)?.delete(listener);
+    },
     findAll(predicate: (node: SceneNode) => boolean = () => true) {
       const result: MockNode[] = [];
       const visit = (node: MockNode) => {
@@ -207,19 +232,110 @@ export function createMockApi() {
     }
     if (type === "TEXT") delete (node as unknown as Record<string, unknown>).cornerRadius;
     nodes.push(node);
-    roots.push(node);
-    node.parent = page as unknown as PageNode;
+    const activePage = api.currentPage as unknown as PageNode & { children: MockNode[] };
+    activePage.children.push(node);
+    node.parent = activePage;
     return node;
   };
+  const otherRoots: MockNode[] = [];
+  const otherPage = {
+    id: "page:other",
+    name: "Other Page",
+    type: "PAGE",
+    children: otherRoots,
+    selection: [] as MockNode[],
+    loaded: false,
+    loadCalls: 0,
+    async loadAsync() {
+      otherPage.loadCalls++;
+      otherPage.loaded = true;
+    },
+    on(_type: "nodechange", listener: (event: NodeChangeEvent) => void) {
+      const listeners = pageChangeListeners.get(otherPage.id) ?? new Set();
+      listeners.add(listener);
+      pageChangeListeners.set(otherPage.id, listeners);
+    },
+    off(_type: "nodechange", listener: (event: NodeChangeEvent) => void) {
+      pageChangeListeners.get(otherPage.id)?.delete(listener);
+    },
+    findAll(predicate: (node: SceneNode) => boolean = () => true) {
+      const result: MockNode[] = [];
+      const visit = (node: MockNode) => {
+        if (predicate(node)) result.push(node);
+        node.children.forEach(visit);
+      };
+      otherRoots.forEach(visit);
+      return result;
+    },
+    appendChild(node: MockNode) {
+      detach(node);
+      otherRoots.push(node);
+      node.parent = otherPage as unknown as PageNode;
+    },
+  };
+  const additionalPages: Array<ReturnType<typeof makeAdditionalPage>> = [];
+  function makeAdditionalPage(id: string, name: string) {
+    const pageRoots: MockNode[] = [];
+    const mockPage = {
+      id,
+      name,
+      type: "PAGE",
+      children: pageRoots,
+      selection: [] as MockNode[],
+      loaded: false,
+      loadCalls: 0,
+      async loadAsync() {
+        mockPage.loadCalls++;
+        mockPage.loaded = true;
+      },
+      on(_type: "nodechange", listener: (event: NodeChangeEvent) => void) {
+        const listeners = pageChangeListeners.get(mockPage.id) ?? new Set();
+        listeners.add(listener);
+        pageChangeListeners.set(mockPage.id, listeners);
+      },
+      off(_type: "nodechange", listener: (event: NodeChangeEvent) => void) {
+        pageChangeListeners.get(mockPage.id)?.delete(listener);
+      },
+      findAll(predicate: (node: SceneNode) => boolean = () => true) {
+        const result: MockNode[] = [];
+        const visit = (node: MockNode) => {
+          if (predicate(node)) result.push(node);
+          node.children.forEach(visit);
+        };
+        pageRoots.forEach(visit);
+        return result;
+      },
+      appendChild(node: MockNode) {
+        detach(node);
+        pageRoots.push(node);
+        node.parent = mockPage as unknown as PageNode;
+      },
+    };
+    return mockPage;
+  }
   const root = {
+    get children() {
+      return [page, otherPage, ...additionalPages] as unknown as PageNode[];
+    },
     getPluginData: (key: string) => rootData.get(key) ?? "",
     setPluginData: (key: string, value: string) => rootData.set(key, value),
   };
+  let setCurrentPageCalls = 0;
   const api = {
     fileKey: "file-test-56",
     mixed: Symbol("mixed"),
     root,
     currentPage: page,
+    setCurrentPageAsync: async (target: PageNode) => {
+      setCurrentPageCalls++;
+      (api as unknown as { currentPage: PageNode }).currentPage = target;
+    },
+    on: (event: "documentchange", listener: (event: DocumentChangeEvent) => void) => {
+      if (event === "documentchange") documentChangeListeners.add(listener);
+    },
+    off: (event: "documentchange", listener: (event: DocumentChangeEvent) => void) => {
+      if (event === "documentchange") documentChangeListeners.delete(listener);
+    },
     viewport: {
       center: { x: 500, y: 400 },
       scrollAndZoomIntoView(focused: SceneNode[]) {
@@ -230,6 +346,7 @@ export function createMockApi() {
       getAsync: async (key: string) => storage.get(key),
       setAsync: async (key: string, value: unknown) => void storage.set(key, value),
       deleteAsync: async (key: string) => void storage.delete(key),
+      keysAsync: async () => [...storage.keys()],
     },
     getNodeByIdAsync: async (id: string) =>
       nodes.find((node) => node.id === id && !node.removed) ?? null,
@@ -250,13 +367,6 @@ export function createMockApi() {
     },
     commitUndo: () => undefined,
   } as unknown as PluginAPI;
-  const otherPage = {
-    ...page,
-    id: "page:other",
-    name: "Other Page",
-    children: [] as MockNode[],
-    selection: [] as MockNode[],
-  };
   return {
     api,
     page,
@@ -264,9 +374,18 @@ export function createMockApi() {
     roots,
     storage,
     viewportFocusCalls,
+    emitPageChange,
+    emitDocumentChange,
+    addPage: (name: string, id = `page:${additionalPages.length + 2}`) => {
+      const added = makeAdditionalPage(id, name);
+      additionalPages.push(added);
+      return added;
+    },
+    getSetCurrentPageCalls: () => setCurrentPageCalls,
     switchCurrentPage: () => {
       (api as unknown as { currentPage: PageNode }).currentPage = otherPage as unknown as PageNode;
     },
     find: (name: string) => page.findAll((node) => node.name === name)[0] as MockNode | undefined,
+    otherPage,
   };
 }

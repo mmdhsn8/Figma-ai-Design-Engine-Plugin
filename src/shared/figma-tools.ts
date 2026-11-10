@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 const RefSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u);
+const PageIdSchema = z.string().min(1).max(200);
 const OperationIdSchema = z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u);
 const ColorSchema = z.string().regex(/^#[0-9A-Fa-f]{6}$/u);
 const ShadowSchema = z
@@ -38,10 +39,33 @@ const LayoutSchema = z
     padding: PaddingSchema.default({ top: 0, right: 0, bottom: 0, left: 0 }),
     primaryAlign: z.enum(["MIN", "CENTER", "MAX", "SPACE_BETWEEN"]).default("MIN"),
     counterAlign: z.enum(["MIN", "CENTER", "MAX", "BASELINE"]).default("MIN"),
-    primarySizing: z.enum(["FIXED", "AUTO"]).default("FIXED"),
+    primarySizing: z.enum(["FIXED", "AUTO"]).optional(),
     counterSizing: z.enum(["FIXED", "AUTO"]).default("FIXED"),
   })
   .strict();
+export const AutoLayoutRepairReportSchema = z.object({
+  ref: RefSchema,
+  parentRef: RefSchema.optional(),
+  strategy: z.enum(["hug-vertical-content", "unsupported-preserve-layout"]),
+  required: DimensionsSchema,
+  before: z.object({
+    width: z.number().finite(),
+    height: z.number().finite(),
+    primarySizing: z.enum(["AUTO", "FIXED"]),
+  }),
+  after: z.object({
+    width: z.number().finite(),
+    height: z.number().finite(),
+    primarySizing: z.enum(["AUTO", "FIXED"]),
+  }),
+  stopReason: z.enum([
+    "fixed-viewport-or-fill-boundary",
+    "primary-fill-cycle",
+    "cross-axis-overflow",
+    "unowned-content",
+    "native-remeasurement-required",
+  ]),
+});
 const SizeRuleSchema = z
   .object({
     ref: RefSchema,
@@ -62,11 +86,38 @@ export const INSPECT_NODES_LIMITS = {
   depth: { min: 0, max: 4, default: 2 },
   maxNodes: { min: 1, max: 25, default: 25 },
 } as const;
+export const DOCUMENT_DISCOVERY_LIMITS = {
+  nodesPerSlice: 128,
+  targetSliceMs: 35,
+  hardSliceMs: 100,
+  resultFrames: 8,
+  checkpointBytes: 256 * 1024,
+  cacheBytes: 1536 * 1024,
+  cacheEntries: 12,
+  pagesPerCheckpoint: 32,
+  pagesPerYield: 4,
+  pageCacheEntries: 64,
+  pageChangeListeners: 64,
+  pageLoadTimeoutMs: 10_000,
+  cancellationPollMs: 25,
+} as const;
 export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
-  z.object({ tool: z.literal("get_document_context") }).strict(),
+  z
+    .object({
+      tool: z.literal("get_document_context"),
+      query: z.string().trim().min(1).max(100).optional(),
+      pageId: PageIdSchema.optional(),
+      offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+      readOnlyInspection: z.boolean().optional(),
+    })
+    .strict(),
   z
     .object({
       tool: z.literal("inspect_nodes"),
+      pageId: PageIdSchema.optional(),
+      readOnlyInspection: z.boolean().optional(),
+      purpose: z.literal("structural_verification").optional(),
+      palette: z.array(ColorSchema).optional(),
       refs: z.array(RefSchema).max(INSPECT_NODES_LIMITS.refs).default([]),
       selection: z.boolean().default(false),
       depth: z
@@ -90,6 +141,7 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
   z
     .object({
       tool: z.literal("create_frame"),
+      pageId: PageIdSchema.optional(),
       ref: RefSchema,
       name: z.string().min(1).max(100),
       parent: ParentSchema,
@@ -114,6 +166,7 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
   z
     .object({
       tool: z.literal("create_text"),
+      pageId: PageIdSchema.optional(),
       ref: RefSchema,
       name: z.string().min(1).max(100),
       parent: ParentSchema,
@@ -134,6 +187,7 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
   z
     .object({
       tool: z.literal("create_rectangle"),
+      pageId: PageIdSchema.optional(),
       ref: RefSchema,
       name: z.string().min(1).max(100),
       parent: ParentSchema,
@@ -156,14 +210,17 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
   z
     .object({
       tool: z.literal("set_auto_layout"),
+      pageId: PageIdSchema.optional(),
       ref: RefSchema,
       layout: LayoutSchema,
+      repairOverflow: z.boolean().optional(),
       children: z.array(SizeRuleSchema).max(100).default([]),
     })
     .strict(),
   z
     .object({
       tool: z.literal("set_properties"),
+      pageId: PageIdSchema.optional(),
       ref: RefSchema,
       properties: z
         .object({
@@ -212,12 +269,33 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
         ),
     })
     .strict(),
-  z.object({ tool: z.literal("append_child"), childRef: RefSchema, parentRef: RefSchema }).strict(),
-  z.object({ tool: z.literal("reparent_node"), ref: RefSchema, parentRef: RefSchema }).strict(),
-  z.object({ tool: z.literal("get_operation_status"), operationId: OperationIdSchema }).strict(),
+  z
+    .object({
+      tool: z.literal("append_child"),
+      pageId: PageIdSchema.optional(),
+      childRef: RefSchema,
+      parentRef: RefSchema,
+    })
+    .strict(),
+  z
+    .object({
+      tool: z.literal("reparent_node"),
+      pageId: PageIdSchema.optional(),
+      ref: RefSchema,
+      parentRef: RefSchema,
+    })
+    .strict(),
+  z
+    .object({
+      tool: z.literal("get_operation_status"),
+      pageId: PageIdSchema.optional(),
+      operationId: OperationIdSchema,
+    })
+    .strict(),
   z
     .object({
       tool: z.literal("delete_node"),
+      pageId: PageIdSchema.optional(),
       ref: RefSchema,
       consentToken: z.string().min(32).max(128),
     })
@@ -232,6 +310,8 @@ export const FigmaToolOperationSchema = z
       .string()
       .regex(/^[A-Za-z0-9_-]{8,60}$/u)
       .optional(),
+    chatId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u).optional(),
+    designName: z.string().trim().min(1).max(100).optional(),
     expectedCreationOperationId: OperationIdSchema.optional(),
     action: FigmaToolActionSchema,
   })
@@ -262,6 +342,26 @@ export const FigmaToolAcknowledgementSchema = z.enum([
   "read_only",
   "not_attempted",
 ]);
+
+export const FigmaToolStateDiagnosticSchema = z
+  .object({
+    category: z.enum([
+      "state_too_large",
+      "record_limit",
+      "invalid_schema",
+      "corrupted_state",
+      "storage_unavailable",
+    ]),
+    location: z.enum(["load", "migration", "save"]),
+    schemaVersion: z.number().int().min(1).max(3).nullable(),
+    serializedBytes: z.number().int().nonnegative().nullable().optional(),
+    configuredLimitBytes: z.number().int().positive().optional(),
+    sourceBytes: z.number().int().nonnegative().optional(),
+    reservedBytes: z.number().int().nonnegative().optional(),
+    recordLimit: z.enum(["references_500", "operations_400"]).optional(),
+  })
+  .strict();
+export type FigmaToolStateDiagnostic = z.infer<typeof FigmaToolStateDiagnosticSchema>;
 
 const CompatibilityParentTypeSchema = z.enum(["PAGE", "FRAME", "COMPONENT"]);
 const CompatibilityLayoutModeSchema = z.enum(["NONE", "HORIZONTAL", "VERTICAL"]);
@@ -437,10 +537,18 @@ export const FigmaToolDeleteConsentSchema = z
     confirmation: z.string().max(120),
   })
   .strict();
+export const FigmaToolPauseSchema = z
+  .object({
+    type: z.literal("tool-pause"),
+    protocolVersion: z.literal(1),
+    batchId: OperationIdSchema,
+  })
+  .strict();
 
 export const FigmaToolRequestSchema = z.union([
   FigmaToolBatchSchema,
   FigmaToolCancelSchema,
+  FigmaToolPauseSchema,
   FigmaToolDeleteConsentSchema,
 ]);
 
@@ -494,6 +602,7 @@ export const FigmaToolDeleteConsentResultSchema = z
     success: z.boolean(),
     consentToken: z.string().min(32).max(128).optional(),
     message: z.string().max(300),
+    toolStateDiagnostic: FigmaToolStateDiagnosticSchema.optional(),
   })
   .strict();
 

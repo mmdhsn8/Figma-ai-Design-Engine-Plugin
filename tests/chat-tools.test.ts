@@ -10,10 +10,24 @@ import {
 } from "../src/shared/chat-tools";
 
 describe("allowlisted chat functions", () => {
+  it("offers only read-only tools while inspecting, never classification or mutation planning", () => {
+    expect(chatFunctionToolsForState("INSPECTING").map(({ name }) => name))
+      .toEqual(["get_document_context", "inspect_nodes"]);
+    for (const name of ["get_document_context", "inspect_nodes"])
+      expect(CHAT_FUNCTION_TOOLS.find((tool) => tool.name === name)?.parameters.properties)
+        .not.toHaveProperty("readOnlyInspection");
+  });
   it("exposes planning only while the lifecycle is unplanned", () => {
-    expect(chatFunctionToolsForState("UNPLANNED").map(({ name }) => name)).toContain(
-      "plan_canvas_task",
+    const unplanned = chatFunctionToolsForState("UNPLANNED").map(({ name }) => name);
+    expect(unplanned).toEqual(
+      expect.arrayContaining([
+        "classify_canvas_intent",
+        "get_document_context",
+        "inspect_nodes",
+        "plan_canvas_task",
+      ]),
     );
+    expect(unplanned).not.toContain("create_frame");
     for (const state of [
       "PLAN_SAVED",
       "EXECUTING_STAGE",
@@ -29,6 +43,9 @@ describe("allowlisted chat functions", () => {
     );
     expect(chatFunctionToolsForState("PLAN_SAVED").map(({ name }) => name)).not.toContain(
       "complete_canvas_stage",
+    );
+    expect(chatFunctionToolsForState("PLAN_SAVED").map(({ name }) => name)).not.toContain(
+      "classify_canvas_intent",
     );
     expect(chatFunctionToolsForState("EXECUTING_STAGE").map(({ name }) => name)).toContain(
       "complete_canvas_stage",
@@ -116,6 +133,30 @@ describe("allowlisted chat functions", () => {
         },
       ]);
     }
+  });
+
+  it("accepts explicit canvas intent and page-scoped native targeting", () => {
+    const [classification] = parseResponsesFunctionCalls([
+      {
+        type: "function_call",
+        call_id: "intent_call_0001",
+        name: "classify_canvas_intent",
+        arguments: JSON.stringify({ intent: "edit", targetName: "Charm" }),
+      },
+    ]);
+    expect(classification?.action).toEqual({
+      tool: "classify_canvas_intent",
+      intent: "edit",
+      targetName: "Charm",
+    });
+    const inspect = CHAT_FUNCTION_TOOLS.find(({ name }) => name === "inspect_nodes");
+    expect(inspect?.parameters).toMatchObject({
+      properties: { pageId: { type: "string", maxLength: 200 } },
+    });
+    const context = CHAT_FUNCTION_TOOLS.find(({ name }) => name === "get_document_context");
+    expect(context?.parameters).toMatchObject({
+      properties: { query: { type: "string", maxLength: 100 } },
+    });
   });
 
   it("rejects unsupported call_set wrappers without reading or executing embedded calls", () => {

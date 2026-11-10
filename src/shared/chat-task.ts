@@ -1,11 +1,19 @@
 import { z } from "zod";
 import {
+  NATIVE_REPAIR_PIPELINE_VERSION,
+  NativeRepairPlanSchema,
+  NativeQualityCoverageSchema,
+} from "./native-quality-repair.js";
+import {
   ChatDesignBriefSchema,
   ChatFunctionCallSchema,
   ChatLifecycleStateSchema,
   ChatInputItemSchema,
+  CHAT_TOOL_NAMES,
 } from "./chat-tools.js";
 import {
+  AutoLayoutRepairReportSchema,
+  FigmaToolStateDiagnosticSchema,
   FigmaToolAcknowledgementSchema,
   FigmaToolParentingDiagnosticSchema,
 } from "./figma-tools.js";
@@ -45,11 +53,12 @@ const emptyRoundBreakdown = () => ({
   modelRetries: 0,
 });
 
-const SAFE_REFERENCE_CODES = new Set([
+export const SAFE_REFERENCE_CODES = new Set([
   "ambiguous",
   "ambiguous_alias",
   "checkpoint_registry_conflict",
   "inspection_required",
+  "inspection_only_reference",
   "missing_or_other_page",
   "missing_or_uninspected",
   "namespace_conflict",
@@ -61,14 +70,38 @@ const SAFE_REFERENCE_CODES = new Set([
   "unregistered_existing_node",
 ]);
 const SAFE_FAILURE_CODES = new Set([
+  ...SAFE_REFERENCE_CODES,
+  "target_not_found",
+  "target_ambiguous",
+  "target_not_inspected",
+  "reference_not_mutation_eligible",
+  "edit_plan_missing",
+  "edit_plan_invalid",
+  "native_execution_blocked",
+  "native_quality_unrepairable",
+  "native_verification_invalid",
   "local_tool_rate_limit",
   "reference_resolution",
   "native_operation_failed",
+  "tool_state_too_large",
+  "tool_state_record_limit",
+  "tool_state_invalid_schema",
+  "tool_state_corrupted_state",
+  "tool_state_storage_unavailable",
+  "checkpoint_load_failed",
+  "checkpoint_save_failed",
+  "checkpoint_timeout",
+  "inspection_failed",
+  "inspection_blocked",
+  "missing_or_uninspected",
+  "verification_failed",
   "inspection_required",
   "executor_contract_rejected",
   "native_api_failed",
   "native_batch_partial_commit",
   "native_operation_timeout",
+  "response_invalid",
+  "responses_transport_error",
   "planning_failed",
   "tool_arguments_invalid",
   "no_progress_repeated_error",
@@ -227,14 +260,174 @@ export const ChatRequestDiagnosticSchema = z
   })
   .strict();
 
+export const ChatTaskFailurePhaseSchema = z.enum([
+  "state_loading",
+  "state_migration",
+  "state_persistence",
+  "checkpoint",
+  "inspection",
+  "planning",
+  "native_execution",
+  "verification",
+  "transport",
+]);
+export type ChatTaskFailurePhase = z.infer<typeof ChatTaskFailurePhaseSchema>;
+export const ReadOnlyInspectionOutcomeSchema = z.enum([
+  "COMPLETED",
+  "PARTIAL",
+  "NO_MATCH",
+  "BLOCKED",
+  "CANCELLED",
+  "FAILED",
+]);
+const ChatEditTargetSchema = z
+  .object({
+    query: z.string().min(1).max(100),
+    ref: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u),
+    pageId: z.string().min(1).max(200),
+    pageName: z.string().min(1).max(100).optional(),
+    nodeId: z.string().min(1).max(200),
+    parentId: z.string().min(1).max(200).optional(),
+    type: z.string().min(1).max(40),
+    name: z.string().min(1).max(100),
+    x: z.number().finite(),
+    y: z.number().finite(),
+    width: z.number().finite().positive(),
+    height: z.number().finite().positive(),
+    verifiedRefs: z
+      .array(z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u))
+      .min(1)
+      .max(25),
+    plannedRefs: z
+      .array(z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u))
+      .min(1)
+      .max(20)
+      .optional(),
+    nativeEvidence: z.string().max(16_000),
+    discoveryOperationId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+    inspectionOperationId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+  })
+  .strict();
+const ReadOnlyInspectionSummarySchema = z
+  .object({
+    pagesScanned: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    pagesAvailable: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    scope: z.enum(["all_accessible_pages", "requested_page", "exact_node"]).default("all_accessible_pages"),
+    pagesRemaining: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
+    framesDiscovered: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    matchingFrames: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    framesInspected: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    uninspectedFrames: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    inaccessiblePages: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
+    inaccessiblePageSamples: z.array(z.object({
+      id: z.string().max(200),
+      name: z.string().max(100),
+      reason: z.string().max(100).optional(),
+    }).strict()).max(24).default([]),
+    complete: z.boolean().default(false),
+    continuationAvailable: z.boolean().default(false),
+    truncationReason: z.string().max(160).optional(),
+    truncated: z.boolean(),
+    nativeOperations: z.number().int().min(0).max(CHAT_TASK_MAX_READ_ONLY_OPERATIONS),
+    repeatedOperations: z.number().int().min(0).max(CHAT_TASK_MAX_READ_ONLY_OPERATIONS),
+    nativePerformance: z
+      .object({
+        pagesLoaded: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+        loadedPageCacheEntries: z.number().int().min(0).max(64).default(0),
+        trackedPageListeners: z.number().int().min(0).max(64).default(0),
+        globalInvalidationFallback: z.boolean().default(false),
+        discoveryCacheEntries: z.number().int().min(0).max(12).default(0),
+        discoveryCacheBytes: z.number().int().min(0).max(10_000_000).default(0),
+        nodesVisited: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+        framesReturned: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+        slices: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
+        nodesPerSliceBudget: z.number().int().min(1).max(10_000).default(128),
+        pagesPerCheckpoint: z.number().int().min(1).max(10_000).default(32),
+        pagesPerYield: z.number().int().min(1).max(10_000).default(4),
+        maxNodesPerSliceObserved: z.number().int().min(0).max(10_000).default(0),
+        targetSliceMs: z.number().int().min(1).max(10_000).default(35),
+        hardSliceMs: z.number().int().min(1).max(60_000).default(100),
+        averageSliceMs: z.number().int().min(0).max(86_400_000).default(0),
+        maxSliceMs: z.number().int().min(0).max(86_400_000).default(0),
+        pageLoadMs: z.number().int().min(0).max(86_400_000).default(0),
+        scanElapsedMs: z.number().int().min(0).max(86_400_000).default(0),
+        cacheHit: z.boolean().default(false),
+        revalidatedAfterRestart: z.boolean().default(false),
+        discoveryCacheHits: z.number().int().min(0).max(CHAT_TASK_MAX_READ_ONLY_OPERATIONS),
+        discoveryCacheLookups: z.number().int().min(0).max(CHAT_TASK_MAX_READ_ONLY_OPERATIONS).default(0),
+        discoveryCacheHitRate: z.number().min(0).max(1).default(0),
+        nativeExecutionMs: z.number().int().min(0).max(86_400_000),
+        resultSerializationMs: z.number().int().min(0).max(86_400_000),
+        resultPayloadBytes: z.number().int().min(0).max(10_000_000),
+        transferPayloadBytes: z.number().int().min(0).max(10_000_000),
+        resultPayloadBytesPeak: z.number().int().min(0).max(10_000_000).default(0),
+        transferPayloadBytesPeak: z.number().int().min(0).max(10_000_000).default(0),
+        payloadSamples: z.number().int().min(0).max(CHAT_TASK_MAX_READ_ONLY_OPERATIONS).default(0),
+        modelRequests: z.number().int().min(0).max(100),
+        modelLatencyMs: z.number().int().min(0).max(86_400_000),
+        modelInputBytes: z.number().int().min(0).max(10_000_000),
+        uiRenderCommits: z.number().int().min(0).max(10_000),
+        uiRenderDurationMs: z.number().int().min(0).max(86_400_000),
+      })
+      .strict()
+      .default({
+        pagesLoaded: 0,
+        loadedPageCacheEntries: 0,
+        trackedPageListeners: 0,
+        globalInvalidationFallback: false,
+        discoveryCacheEntries: 0,
+        discoveryCacheBytes: 0,
+        nodesVisited: 0,
+        framesReturned: 0,
+        slices: 0,
+        nodesPerSliceBudget: 128,
+        pagesPerCheckpoint: 32,
+        pagesPerYield: 4,
+        maxNodesPerSliceObserved: 0,
+        targetSliceMs: 35,
+        hardSliceMs: 100,
+        averageSliceMs: 0,
+        maxSliceMs: 0,
+        pageLoadMs: 0,
+        scanElapsedMs: 0,
+        cacheHit: false,
+        revalidatedAfterRestart: false,
+        discoveryCacheHits: 0,
+        discoveryCacheLookups: 0,
+        discoveryCacheHitRate: 0,
+        nativeExecutionMs: 0,
+        resultSerializationMs: 0,
+        resultPayloadBytes: 0,
+        transferPayloadBytes: 0,
+        resultPayloadBytesPeak: 0,
+        transferPayloadBytesPeak: 0,
+        payloadSamples: 0,
+        modelRequests: 0,
+        modelLatencyMs: 0,
+        modelInputBytes: 0,
+        uiRenderCommits: 0,
+        uiRenderDurationMs: 0,
+      }),
+    canvasMutations: z.literal(0),
+  })
+  .strict();
+
 export const ChatTaskSchema = z
   .object({
     version: z.literal(1),
     id: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+    chatId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u).optional(),
+    intent: z.enum(["create", "edit", "inspect", "explain", "continue"]).optional(),
+    targetName: z.string().trim().min(1).max(100).optional(),
+    editTarget: ChatEditTargetSchema.optional(),
+    planningContinuations: z.number().int().min(0).max(1).optional(),
+    designName: z.string().trim().min(1).max(100).optional(),
     referenceScope: z.literal("task-v1").optional(),
     documentId: z.string().min(1).max(300),
     prompt: z.string().min(1).max(8_000),
     lifecycle: ChatLifecycleStateSchema.default("UNPLANNED"),
+    inspectionOutcome: ReadOnlyInspectionOutcomeSchema.optional(),
+    inspectionSummary: ReadOnlyInspectionSummarySchema.optional(),
     validationFeedback: z.string().max(7_500).optional(),
     brief: ChatDesignBriefSchema.optional(),
     context: z.array(ChatInputItemSchema).max(28),
@@ -244,6 +437,7 @@ export const ChatTaskSchema = z
           .object({
             title: z.string().min(1).max(160),
             goal: z.string().min(1).max(240).default("Complete the requested section."),
+            pageId: z.string().min(1).max(200).optional(),
             logicalRefs: z
               .array(z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u))
               .max(20)
@@ -353,6 +547,9 @@ export const ChatTaskSchema = z
               .regex(/^[A-Za-z0-9_-]{8,100}$/u)
               .optional(),
             awaitingQualityRepair: z.boolean().default(false),
+            nativeRepairPlan: NativeRepairPlanSchema.optional(),
+            nativeQualityCoverage: NativeQualityCoverageSchema.optional(),
+            nativeRepairPipelineVersion: z.literal(NATIVE_REPAIR_PIPELINE_VERSION).optional(),
             completionReason: z
               .enum([
                 "required_refs_and_native_verification_confirmed",
@@ -389,6 +586,15 @@ export const ChatTaskSchema = z
     recent: z.array(ChatInputItemSchema).max(20),
     starts: z.array(z.number().int().nonnegative()).max(40),
     rounds: z.number().int().min(0).max(100),
+    modelRoundTrace: z.array(z.object({
+      round: z.number().int().min(1).max(100),
+      lifecycle: ChatLifecycleStateSchema,
+      outcome: z.enum(["done", "tool_calls", "tool_validation"]),
+      tools: z.array(z.enum(CHAT_TOOL_NAMES)).max(10),
+      validationCodes: z.array(z.string().regex(/^[A-Za-z0-9_]{1,80}$/u)).max(8),
+      durationMs: z.number().int().min(0).max(600_000).optional(),
+      inputBytes: z.number().int().min(0).max(64 * 1024).optional(),
+    }).strict()).max(100).default([]),
     roundBreakdown: ChatRoundBreakdownSchema.default(emptyRoundBreakdown),
     batches: z.number().int().min(0).max(1_000).default(0),
     lifecycleTransitions: z.number().int().min(0).max(100).default(0),
@@ -407,6 +613,7 @@ export const ChatTaskSchema = z
         category: z.enum([
           "model_schema",
           "planning",
+          "verification",
           "executor_validation",
           "figma_runtime",
           "rate_limit",
@@ -414,10 +621,17 @@ export const ChatTaskSchema = z
           "cancelled",
           "partial_commit",
           "ambiguous_recovery",
+          "tool_state",
+          "checkpoint_storage",
+          "inspection",
+          "transport",
         ]),
         code: z.string().max(80),
+        phase: ChatTaskFailurePhaseSchema.optional(),
+        cancellationSource: z.enum(["ui_abort", "native_batch_cancelled", "unspecified"]).optional(),
         committedOperations: z.number().int().nonnegative(),
         operationId: z.string().max(100).optional(),
+        toolStateDiagnostic: FigmaToolStateDiagnosticSchema.optional(),
         inspectionIssues: z.array(SafeInspectionValidationIssueSchema).max(8).optional(),
       })
       .strict()
@@ -432,6 +646,28 @@ export const ChatTaskSchema = z
 export type ChatTask = z.infer<typeof ChatTaskSchema>;
 
 export type ChatRoundKind = Exclude<keyof ChatTask["roundBreakdown"], "modelRetries">;
+
+export function chatTaskRetryLabel(task: ChatTask): string {
+  switch (task.failure?.phase) {
+    case "state_loading":
+    case "state_migration":
+    case "state_persistence":
+    case "checkpoint":
+      return "Retry storage recovery";
+    case "inspection":
+      return "Retry inspection";
+    case "planning":
+      return "Retry planning";
+    case "verification":
+      return "Retry verification";
+    case "native_execution":
+      return "Retry failed stage";
+    case "transport":
+      return "Retry request";
+    default:
+      return task.status === "failed" ? "Retry failed stage" : "Resume saved task";
+  }
+}
 
 export function chatTaskCommittedOperationCount(task: ChatTask): number {
   return mutationAccounting(task.ledger).confirmedMutations;
@@ -580,20 +816,34 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
   const completionReason = stage
     ? stage.completed
       ? (stage.completionReason ?? "required_refs_and_native_verification_confirmed")
-      : remainingRequiredRefs
-        ? "missing_required_refs"
-        : stageEntries.some(
-              (entry) =>
-                chatTaskLedgerCategory(entry) === "mutation" &&
-                ["pending", "running", "failed"].includes(entry.status),
-            )
+      : (stage.completionReason ??
+        (remainingRequiredRefs ||
+        stageEntries.some(
+          (entry) =>
+            chatTaskLedgerCategory(entry) === "mutation" &&
+            ["pending", "running", "failed"].includes(entry.status),
+        )
           ? "pending_or_failed_mutations"
           : !stage.verified
-            ? (stage.completionReason ?? "native_verification_pending")
-            : "awaiting_completion_call"
+            ? "native_verification_pending"
+            : "awaiting_completion_call"))
     : task.lifecycle === "TASK_COMPLETED"
-      ? "required_refs_and_native_verification_confirmed"
-      : "missing_required_refs";
+      ? ["inspect", "explain"].includes(task.intent ?? "")
+        ? task.inspectionOutcome === "NO_MATCH"
+          ? "read_only_inspection_no_match"
+          : task.inspectionOutcome === "PARTIAL"
+            ? "read_only_inspection_partial"
+            : "read_only_inspection_confirmed"
+        : "required_refs_and_native_verification_confirmed"
+      : ["inspect", "explain"].includes(task.intent ?? "")
+        ? task.inspectionOutcome
+          ? "read_only_inspection_" + task.inspectionOutcome.toLocaleLowerCase()
+          : "read_only_inspection_pending"
+        : task.intent === "edit"
+          ? task.failure?.code && SAFE_FAILURE_CODES.has(task.failure.code)
+            ? task.failure.code
+            : "edit_plan_missing"
+          : "plan_not_saved";
   const stageCapacity = task.stages.map((item, index) => {
     const entries = task.ledger.filter((entry) => entry.stage === index);
     const confirmedRefs = confirmedNodeRefs(entries);
@@ -616,13 +866,12 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
       remainingRequirements,
       completionReason: item.completed
         ? (item.completionReason ?? "required_refs_and_native_verification_confirmed")
-        : remainingRequirements
-          ? "missing_required_refs"
-          : pendingOrFailed
+        : (item.completionReason ??
+          (remainingRequirements || pendingOrFailed
             ? "pending_or_failed_mutations"
             : !item.verified
-              ? (item.completionReason ?? "native_verification_pending")
-              : "awaiting_completion_call",
+              ? "native_verification_pending"
+              : "awaiting_completion_call")),
       segments: item.segments.map(
         ({
           index: segment,
@@ -648,11 +897,13 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
   });
   const committedOperations =
     task.failure?.committedOperations ?? chatTaskCommittedOperationCount(task);
-  const failureCategory = task.failure?.category ?? "planning";
+  const failureCategory = task.failure?.category ?? "none";
   const errorCode =
     task.failure?.code && SAFE_FAILURE_CODES.has(task.failure.code)
       ? task.failure.code
-      : "task_paused";
+      : task.failure || task.status === "failed"
+        ? "task_paused"
+        : "none";
   const inspectionIssues = task.failure?.inspectionIssues?.flatMap((issue) => {
     const safeIssue = SafeInspectionValidationIssueSchema.safeParse(issue);
     return safeIssue.success ? [safeIssue.data] : [];
@@ -677,7 +928,14 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
     : undefined;
   return {
     version: 1,
+    repairPipelineVersion: NATIVE_REPAIR_PIPELINE_VERSION,
+    ...(stage?.nativeRepairPipelineVersion
+      ? { lastNativeRepairPipelineVersion: stage.nativeRepairPipelineVersion }
+      : {}),
     taskId: task.id,
+    ...(task.intent ? { intent: task.intent } : {}),
+    ...(task.inspectionOutcome ? { inspectionOutcome: task.inspectionOutcome } : {}),
+    ...(task.inspectionSummary ? { inspectionSummary: task.inspectionSummary } : {}),
     lifecycle: task.lifecycle,
     lifecycleTransitions: task.lifecycleTransitions,
     ...(stageIndex >= 0 ? { stageId: `stage-${stageIndex + 1}` } : {}),
@@ -687,6 +945,17 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
     ...(partialCommitReconciliation ? { partialCommitReconciliation } : {}),
     failureCategory,
     errorCode,
+    ...(task.failure?.phase ? { failurePhase: task.failure.phase } : {}),
+    ...(task.failure?.cancellationSource
+      ? { cancellationSource: task.failure.cancellationSource }
+      : {}),
+    ...(task.failure?.toolStateDiagnostic
+      ? {
+          toolStateDiagnostic: FigmaToolStateDiagnosticSchema.parse(
+            task.failure.toolStateDiagnostic,
+          ),
+        }
+      : {}),
     ...(referenceResolution ? { referenceResolution } : {}),
     ...(inspectionIssues?.length ? { inspectionIssues } : {}),
     ...(task.lastRequestDiagnostic
@@ -703,6 +972,7 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
     completionReason,
     stageCapacity,
     modelRounds: task.rounds,
+    modelRoundTrace: task.modelRoundTrace,
     modelRequests: task.rounds + task.roundBreakdown.modelRetries,
     roundBreakdown: task.roundBreakdown,
     nativeBatches: task.batches,
@@ -753,14 +1023,62 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
             completionReason,
             structuralQuality: {
               verificationAttempts: stage.verificationOperations,
-              failedRules: stage.qualityFindings,
-              verificationHistory: stage.verificationHistory,
+              failedRules: [
+                ...new Map(
+                  stage.qualityFindings.map((finding) => [JSON.stringify(finding), finding]),
+                ).values(),
+              ],
+              verificationHistory: stage.verificationHistory.map((verification) => ({
+                ...verification,
+                findings: [
+                  ...new Map(
+                    verification.findings.map((finding) => [JSON.stringify(finding), finding]),
+                  ).values(),
+                ],
+              })),
+              hierarchyRepairs: task.ledger
+                .filter((entry) => entry.stage === stageIndex && entry.output)
+                .flatMap((entry) => {
+                  try {
+                    const reports = AutoLayoutRepairReportSchema.array().safeParse(
+                      JSON.parse(entry.output!).data?.overflowRepair,
+                    );
+                    return reports.success
+                      ? [{ operationId: entry.operationId, containers: reports.data }]
+                      : [];
+                  } catch {
+                    return [];
+                  }
+                }),
               repairOperationsAttempted: stage.repairOperationsAttempted,
               repairOperationsExecuted: stage.repairOperationsExecuted,
               repairFindingsResolved: stage.repairFindingsResolved ?? 0,
               repairVerificationPending: stage.repairVerificationPending ?? false,
               qualityRepairBlocked: stage.qualityRepairBlocked ?? false,
               repairsExecuted: stage.repairOperationsExecuted > 0,
+              nativeRepairPlan: stage.nativeRepairPlan,
+              nativeQualityCoverage: stage.nativeQualityCoverage,
+              nativeRepairDispatches: task.ledger
+                .filter(
+                  (entry) =>
+                    entry.stage === stageIndex &&
+                    entry.qualityRepairAttempted &&
+                    entry.call.callId.startsWith("native_repair_"),
+                )
+                .map((entry) => ({
+                  operationId: entry.operationId,
+                  tool: entry.call.action.tool,
+                  ref: "ref" in entry.call.action ? entry.call.action.ref : undefined,
+                  ...(entry.call.action.tool === "set_properties"
+                    ? { color: entry.call.action.properties.color }
+                    : {}),
+                  status: entry.status,
+                  acknowledgementStatus: entry.acknowledgementStatus,
+                  executed:
+                    entry.status === "completed" &&
+                    entry.acknowledgementStatus === "confirmed_mutation" &&
+                    !entry.reused,
+                })),
             },
           },
         }
