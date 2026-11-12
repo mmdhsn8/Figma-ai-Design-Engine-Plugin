@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ChatTask } from "../src/shared/chat-task";
 import {
+  CHAT_HISTORY_MAX_CHATS,
   chatHistoryMatchesQuery,
   chatHistoryExportJson,
   chatHistoryTitle,
@@ -47,6 +48,59 @@ describe("chat history schema and export", () => {
       }),
     );
     expect(html).toContain("Current · Needs recovery");
+  });
+
+  it("groups a bounded history list, searches mixed-direction text, and survives extreme timestamps", () => {
+    const conversations = Array.from({ length: CHAT_HISTORY_MAX_CHATS }, (_, index) =>
+      ChatHistoryConversationSchema.parse({
+        ...conversation(`history-chat-${String(index).padStart(4, "0")}`, `گفتگو ${index}`),
+        updatedAt: index === 0 ? Number.MAX_SAFE_INTEGER : 1_700_000_000_000 - index,
+        model: "provider/model-v1",
+        messages: [{ id: `message-${index}`, role: "user", content: "ساخت صفحه محصول" }],
+      }),
+    );
+    const html = renderToStaticMarkup(
+      createElement(ChatHistoryView, {
+        conversations,
+        activeChatId: null,
+        canSwitch: true,
+        onNew: () => undefined,
+        onOpen: () => undefined,
+        onRename: () => undefined,
+        onDuplicate: () => undefined,
+        onExport: () => undefined,
+        onDelete: () => undefined,
+      }),
+    );
+
+    expect((html.match(/class="history-card /gu) ?? []).length).toBe(CHAT_HISTORY_MAX_CHATS);
+    expect(html).toContain("Showing 40 of 40 saved chats");
+    expect(html).toContain("Earlier");
+    expect(html).toContain('dir="auto">گفتگو');
+    expect(html).toContain('dir="auto">ساخت صفحه محصول');
+    expect(html).toContain('dir="ltr">provider/model-v1');
+  });
+
+  it("surfaces loading errors and preserved corrupt-record notices without exposing stored payloads", () => {
+    const html = renderToStaticMarkup(
+      createElement(ChatHistoryView, {
+        conversations: [],
+        activeChatId: null,
+        canSwitch: false,
+        loadError: "Storage is temporarily unavailable.",
+        corruptRecordCount: 2,
+        onNew: () => undefined,
+        onOpen: () => undefined,
+        onRename: () => undefined,
+        onDuplicate: () => undefined,
+        onExport: () => undefined,
+        onDelete: () => undefined,
+      }),
+    );
+    expect(html).toContain("2 saved history records need recovery");
+    expect(html).toContain("Storage is temporarily unavailable");
+    expect(html).toContain("Reload the plugin to retry");
+    expect(html).not.toContain("payload");
   });
 
   it("creates, searches, renames, and duplicates conversations without copying task ownership", () => {
@@ -215,6 +269,103 @@ describe("document-scoped chat history", () => {
     });
     expect(secondPage.documentId).not.toBe(firstDocumentId);
     expect(secondPage.history?.conversations).toEqual([]);
+  });
+
+  it("recovers valid conversations around a corrupt record and archives it before the next write", async () => {
+    const mock = createMockApi();
+    const documentId = `${mock.api.fileKey}-${mock.api.currentPage.id.replaceAll(":", "_")}`;
+    const historyKey = `fad.chat-history.v1:${documentId}`;
+    const archiveKey = `fad.chat-history-preserved.v1:${documentId}`;
+    const older = { ...conversation("conversation-0001", "Older valid chat"), updatedAt: 10 };
+    const newer = { ...conversation("conversation-0002", "Newer valid chat"), updatedAt: 20 };
+    const corrupt = { id: "broken", title: "Unreadable entry", messages: [{ prompt: "retained" }] };
+    const original = {
+      version: 1,
+      activeChatId: newer.id,
+      conversations: [older, corrupt, newer],
+    };
+    mock.storage.set(historyKey, original);
+
+    const loaded = await handleChatHistoryStorage(mock.api, {
+      type: "chat-history-load",
+      requestId: "recover-corrupt-index",
+    });
+    expect(loaded.success).toBe(true);
+    expect(loaded.corruptRecordCount).toBeGreaterThan(0);
+    expect(loaded.history?.conversations.map(({ id }) => id)).toEqual([newer.id, older.id]);
+    expect(loaded.history?.activeChatId).toBe(newer.id);
+    expect(mock.storage.get(historyKey)).toEqual(original);
+    expect(mock.storage.has(archiveKey)).toBe(false);
+
+    const saved = await handleChatHistoryStorage(mock.api, {
+      type: "chat-history-upsert",
+      requestId: "save-after-recovery",
+      documentId,
+      conversation: conversation("conversation-0003", "New chat"),
+    });
+    expect(saved.success).toBe(true);
+    expect(saved.history?.conversations.map(({ id }) => id)).toEqual([
+      "conversation-0003",
+      newer.id,
+      older.id,
+    ]);
+    expect(mock.storage.get(archiveKey)).toMatchObject({ version: 1, records: [corrupt] });
+
+    const reopened = await handleChatHistoryStorage(mock.api, {
+      type: "chat-history-load",
+      requestId: "reopen-recovered-history",
+    });
+    expect(reopened.history?.conversations).toEqual(saved.history?.conversations);
+    expect(reopened.corruptRecordCount).toBeGreaterThan(0);
+  });
+
+  it("blocks writes when the recovery archive is itself corrupt", async () => {
+    const mock = createMockApi();
+    const documentId = `${mock.api.fileKey}-${mock.api.currentPage.id.replaceAll(":", "_")}`;
+    const historyKey = `fad.chat-history.v1:${documentId}`;
+    const archiveKey = `fad.chat-history-preserved.v1:${documentId}`;
+    const current = { version: 1, activeChatId: null, conversations: [conversation("conversation-0001")] };
+    mock.storage.set(historyKey, current);
+    mock.storage.set(archiveKey, { version: 9, payload: "preserve me" });
+
+    const result = await handleChatHistoryStorage(mock.api, {
+      type: "chat-history-upsert",
+      requestId: "refuse-write-with-bad-archive",
+      documentId,
+      conversation: conversation("conversation-0002"),
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("recovery archive is damaged");
+    expect(mock.storage.get(historyKey)).toEqual(current);
+    expect(mock.storage.get(archiveKey)).toEqual({ version: 9, payload: "preserve me" });
+  });
+
+  it("removes an explicitly deleted chat from recovered and preserved records only", async () => {
+    const mock = createMockApi();
+    const documentId = `${mock.api.fileKey}-${mock.api.currentPage.id.replaceAll(":", "_")}`;
+    const archiveKey = `fad.chat-history-preserved.v1:${documentId}`;
+    const deleted = conversation("conversation-0001", "Target chat");
+    const retained = conversation("conversation-0002", "Keep this chat");
+    const duplicateCorrupt = { ...deleted, messages: [{ id: 1 }] };
+    mock.storage.set(`fad.chat-history.v1:${documentId}`, {
+      version: 1,
+      activeChatId: deleted.id,
+      conversations: [deleted, duplicateCorrupt, retained],
+    });
+    const canvasNode = mock.api.createFrame();
+    const rootsBeforeDelete = mock.roots.slice();
+
+    const result = await handleChatHistoryStorage(mock.api, {
+      type: "chat-history-delete",
+      requestId: "delete-recovered-chat",
+      documentId,
+      chatId: deleted.id,
+    });
+    expect(result.success).toBe(true);
+    expect(result.history?.conversations.map(({ id }) => id)).toEqual([retained.id]);
+    expect(mock.storage.get(archiveKey)).toMatchObject({ version: 1, records: [] });
+    expect(mock.roots).toEqual(rootsBeforeDelete);
+    expect(mock.roots[0]).toBe(canvasNode);
   });
 
   it("isolates per-chat checkpoints and deleting history never deletes canvas nodes", async () => {

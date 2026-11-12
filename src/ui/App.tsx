@@ -389,6 +389,14 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     };
   }, [drawerOpen]);
   const { activeView, settingsOpen } = navigation;
+  useEffect(() => {
+    if (activeView === "chat" && !settingsOpen) return;
+    const headingId = settingsOpen ? "settings-title" : "route-heading";
+    const focusFrame = window.requestAnimationFrame(() => {
+      document.getElementById(headingId)?.focus();
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [activeView, settingsOpen]);
   const [prompt, setPrompt] = useState("");
   const [generationTarget, setGenerationTarget] = useState<GenerationTarget>("mobile");
   const [generationScreenCount, setGenerationScreenCount] = useState(2);
@@ -479,6 +487,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const [chatHistory, setChatHistory] = useState<ChatHistoryConversation[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [chatHistoryLoaded, setChatHistoryLoaded] = useState(false);
+  const [historyLoadError, setHistoryLoadError] = useState("");
+  const [historyCorruptRecordCount, setHistoryCorruptRecordCount] = useState(0);
   const [historyDocumentId, setHistoryDocumentId] = useState<string | null>(null);
   const [pendingDeleteChat, setPendingDeleteChat] = useState<ChatHistoryConversation | null>(null);
   const [chatSwitchBusy, setChatSwitchBusy] = useState(false);
@@ -566,6 +576,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         if (!active) return;
         let conversations = loaded.history?.conversations ?? [];
         let activeId = loaded.history?.activeChatId ?? null;
+        setHistoryCorruptRecordCount(loaded.corruptRecordCount ?? 0);
+        setHistoryLoadError("");
         setHistoryDocumentId(loaded.documentId);
         setDocumentId((current) => current ?? loaded.documentId);
         let legacyTask: ChatTask | null = null;
@@ -648,6 +660,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         setChatHistoryLoaded(true);
       } catch (error) {
         if (!active) return;
+        setHistoryLoadError(
+          error instanceof Error ? error.message : "Saved chat history could not be loaded.",
+        );
         setChatActivity(
           error instanceof Error ? error.message : "Chat history could not be loaded.",
         );
@@ -1181,6 +1196,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       conversation,
       activeChatId: selectedId,
     });
+    setHistoryCorruptRecordCount(result.corruptRecordCount ?? 0);
     const conversations = result.history?.conversations ?? chatHistoryRef.current;
     chatHistoryRef.current = conversations;
     setChatHistory(conversations);
@@ -1372,6 +1388,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         chatId: target.id,
       });
       if (epoch !== chatSelectionEpoch.current) return;
+      setHistoryCorruptRecordCount(result.corruptRecordCount ?? 0);
       const history = result.history;
       const removedActive = activeChatIdRef.current === target.id;
       setPendingDeleteChat(null);
@@ -2866,7 +2883,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         : chatTaskSnapshot?.status === "stopped"
           ? "paused"
           : "ready";
-  const navigateFromDrawer = (view: "home" | "chat" | "history") => {
+  const navigateFromDrawer = (view: "home" | "chat" | "history" | "more") => {
     if (moreMenuRef.current) moreMenuRef.current.open = false;
     setDrawerOpen(false);
     dispatchNavigation({ type: "navigate", view });
@@ -2968,7 +2985,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           <div className="page-heading compact-heading">
             <div>
               <span className="page-eyebrow">PREFERENCES & CONNECTION</span>
-              <h1 id="settings-title">Settings</h1>
+              <h1 id="settings-title" tabIndex={-1}>
+                Settings
+              </h1>
             </div>
             <span className="system-status">Optional companion</span>
           </div>
@@ -3005,6 +3024,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           canSwitch={canSwitchChats}
           disabledReason={chatSwitchBlockReason}
           loading={!chatHistoryLoaded}
+          loadError={historyLoadError}
+          corruptRecordCount={historyCorruptRecordCount}
           onNew={() => void createNewChat()}
           onOpen={(conversation) => void openConversation(conversation)}
           onRename={(conversation, title) => void renameConversation(conversation, title)}
@@ -3013,7 +3034,12 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           onDelete={setPendingDeleteChat}
         />
       ) : activeView === "more" ? (
-        <MoreMenu onNavigate={(view) => dispatchNavigation({ type: "navigate", view })} />
+        <MoreMenu
+          connection={connectionSummary}
+          model={selectedCompanionModel || "No model selected"}
+          onNavigate={(view) => dispatchNavigation({ type: "navigate", view })}
+          onOpenSettings={() => dispatchNavigation({ type: "open-settings" })}
+        />
       ) : activeView === "progress" ||
         activeView === "activity" ||
         activeView === "results" ||

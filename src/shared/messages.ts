@@ -309,6 +309,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       success: z.boolean(),
       documentId: z.string().max(300),
       history: ChatHistoryIndexSchema.optional(),
+      corruptRecordCount: z.number().int().nonnegative().max(10_000).optional(),
       error: z.string().max(500).optional(),
     })
     .strict(),

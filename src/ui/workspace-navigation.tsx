@@ -15,7 +15,7 @@ export function NavigationDrawer({
   drawerRef: RefObject<HTMLElement>;
   closeButtonRef: RefObject<HTMLButtonElement>;
   onClose: () => void;
-  onNavigate: (view: "home" | "chat" | "history") => void;
+  onNavigate: (view: "home" | "chat" | "history" | "more") => void;
   onOpenSettings: () => void;
 }) {
   return (
@@ -85,6 +85,15 @@ export function NavigationDrawer({
           >
             <span className="navigation-drawer-icon" aria-hidden="true">◷</span>
             <span>History</span>
+          </button>
+          <button
+            className={`navigation-drawer-link ${!settingsOpen && activeView === "more" ? "is-active" : ""}`}
+            type="button"
+            aria-current={!settingsOpen && activeView === "more" ? "page" : undefined}
+            onClick={() => onNavigate("more")}
+          >
+            <span className="navigation-drawer-icon" aria-hidden="true">•••</span>
+            <span>More</span>
           </button>
         </nav>
       </aside>
@@ -180,7 +189,60 @@ export function MoreOptionsAccordion({
   );
 }
 
-export function MoreMenu({ onNavigate }: { onNavigate: (view: PluginView) => void }) {
+export function MoreMenu({
+  connection,
+  model,
+  onNavigate,
+  onOpenSettings,
+}: {
+  connection: string;
+  model: string;
+  onNavigate: (view: PluginView) => void;
+  onOpenSettings: () => void;
+}) {
+  const groups: Array<{
+    title: string;
+    items: Array<{ view: PluginView; title: string; description: string; future?: boolean }>;
+  }> = [
+    {
+      title: "Task & generation",
+      items: [
+        { view: "design", title: "Generation Options", description: "Screens, target, and style" },
+        { view: "progress", title: "Generation Progress", description: "Live stages and recovery" },
+        { view: "results", title: "Result & Preview", description: "Verified native screens" },
+        { view: "layers", title: "Layers & Structure", description: "Task-owned Figma hierarchy" },
+        { view: "activity", title: "Activity & Diagnostics", description: "Safe task recovery details" },
+      ],
+    },
+    {
+      title: "Workspace tools",
+      items: [
+        { view: "system", title: "Design System", description: "Document-scoped native tokens" },
+        { view: "assets", title: "Asset Library", description: "Local assets and provenance" },
+        { view: "quality", title: "Quality Report", description: "Measured findings and preflight" },
+        { view: "json", title: "JSON Advanced", description: "Offline validate, edit, and apply" },
+        {
+          view: "brand-kit",
+          title: "Brand Kit",
+          description: "Planned for a later phase",
+          future: true,
+        },
+        {
+          view: "skills",
+          title: "Design Skills",
+          description: "Planned for a later phase",
+          future: true,
+        },
+      ],
+    },
+    {
+      title: "Guides",
+      items: [
+        { view: "help", title: "Help & Guide", description: "How native changes are handled" },
+        { view: "about", title: "About", description: "Version and project information" },
+      ],
+    },
+  ];
   return (
     <section className="route-page more-page" aria-labelledby="route-heading">
       <div className="page-heading">
@@ -189,25 +251,46 @@ export function MoreMenu({ onNavigate }: { onNavigate: (view: PluginView) => voi
           <h1 id="route-heading" tabIndex={-1}>
             More
           </h1>
-          <p className="page-description">Advanced tools and workspace areas.</p>
+          <p className="page-description">Task activity, workspace tools, and product settings.</p>
         </div>
       </div>
-      <div className="more-grid">
-        {moreItems.map((item) => (
-          <button
-            className="more-link-card"
-            key={item.view}
-            type="button"
-            onClick={() => onNavigate(item.view)}
-          >
-            <span>{item.title}</span>
-            <small>{item.description}</small>
-            <span className="more-chevron" aria-hidden="true">
-              ›
-            </span>
-          </button>
-        ))}
-      </div>
+      <section className="more-connection-card" aria-label="Connection and model status">
+        <div>
+          <span className="section-kicker">CONNECTION &amp; MODEL</span>
+          <strong>{connection}</strong>
+          <small title={model} dir="ltr">
+            {model}
+          </small>
+        </div>
+        <button className="secondary-action" type="button" onClick={onOpenSettings}>
+          Open Settings
+        </button>
+      </section>
+      {groups.map((group) => {
+        const headingId = `more-${group.title.toLowerCase().replaceAll(/[^a-z0-9]+/gu, "-")}`;
+        return (
+          <section className="more-group" key={group.title} aria-labelledby={headingId}>
+            <h2 id={headingId}>{group.title}</h2>
+            <div className="more-grid">
+              {group.items.map((item) => (
+                <button
+                  className="more-link-card"
+                  key={item.view}
+                  type="button"
+                  onClick={() => onNavigate(item.view)}
+                >
+                  <span>{item.title}</span>
+                  {item.future && <small className="more-status-badge">Coming later</small>}
+                  <small>{item.description}</small>
+                  <span className="more-chevron" aria-hidden="true">
+                    ›
+                  </span>
+                </button>
+              ))}
+            </div>
+          </section>
+        );
+      })}
     </section>
   );
 }

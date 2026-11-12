@@ -4268,3 +4268,136 @@ body:has(.app-shell.is-chat-view) #root {
     animation: none;
   }
 }
+
+/* Phase 7 non-Chat refinements. Keep these selectors isolated from the frozen Chat surface. */
+.more-page,
+.more-group {
+  min-width: 0;
+}
+
+.more-connection-card {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid #273553;
+  border-radius: 13px;
+  background: linear-gradient(145deg, rgba(21, 30, 55, 0.97), rgba(15, 22, 41, 0.97));
+}
+
+.more-connection-card > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.more-connection-card strong {
+  color: #edf0ff;
+  font-size: 11px;
+}
+
+.more-connection-card small {
+  max-width: 230px;
+  overflow: hidden;
+  color: #a4afcb;
+  font: 9px/13px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.more-connection-card .secondary-action {
+  flex: 0 0 auto;
+}
+
+.more-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.more-group > h2 {
+  margin: 0;
+  color: #e1e7ff;
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.more-link-card .more-status-badge {
+  width: fit-content;
+  margin-top: 6px;
+  padding: 2px 6px;
+  border: 1px solid #67502e;
+  border-radius: 999px;
+  color: #f2d588;
+  background: #302718;
+  font-size: 8px;
+  line-height: 11px;
+}
+
+.more-link-card .more-status-badge + small {
+  margin-top: 3px;
+}
+
+.history-count {
+  margin: 0;
+  color: #9ba8c5;
+  font-size: 9px;
+  line-height: 13px;
+}
+
+.history-integrity-note,
+.history-load-error {
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px solid #67502e;
+  border-radius: 10px;
+  color: #efd39b;
+  background: #2c241a;
+  font-size: 10px;
+  line-height: 15px;
+  overflow-wrap: anywhere;
+}
+
+.history-load-error {
+  border-color: #793e54;
+  color: #ffc4cd;
+  background: #351d2a;
+}
+
+.history-group-heading {
+  padding: 2px 1px 0;
+}
+
+.history-group-heading h2 {
+  margin: 0;
+  color: #aebbe0;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.035em;
+}
+
+.history-card-top h2,
+.history-preview,
+.home-recent-list strong,
+.home-task-card p {
+  text-align: start;
+  unicode-bidi: plaintext;
+}
+
+.history-meta time {
+  direction: ltr;
+  unicode-bidi: plaintext;
+}
+
+@media (max-width: 420px) {
+  .more-connection-card {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .more-connection-card .secondary-action {
+    width: 100%;
+  }
+}

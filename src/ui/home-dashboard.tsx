@@ -18,7 +18,9 @@ export function HomeDashboard({
   taskState?: string;
   canOpenChats: boolean;
   onStartChat: () => void;
-  onNavigate: (view: "history" | "brand-kit" | "skills" | "system" | "design") => void;
+  onNavigate: (
+    view: "history" | "progress" | "brand-kit" | "skills" | "system" | "design",
+  ) => void;
   onOpenChat: (conversation: ChatHistoryConversation) => void;
 }) {
   return (
@@ -40,7 +42,7 @@ export function HomeDashboard({
           <span className="connection-dot" aria-hidden="true" />
           <span>{connection}</span>
           <span aria-hidden="true">·</span>
-          <span className="home-model" title={model}>
+            <span className="home-model" title={model} dir="ltr">
             {model}
           </span>
         </div>
@@ -50,10 +52,10 @@ export function HomeDashboard({
         <section className="home-task-card" aria-label="Recent task status">
           <div>
             <span className="section-kicker">CURRENT TASK · {taskState ?? "SAVED"}</span>
-            <p>{taskSummary}</p>
+            <p dir="auto">{taskSummary}</p>
           </div>
-          <button className="text-button" type="button" onClick={() => onNavigate("history")}>
-            View history
+          <button className="text-button" type="button" onClick={() => onNavigate("progress")}>
+            View task progress
           </button>
         </section>
       )}
@@ -69,10 +71,20 @@ export function HomeDashboard({
               key: "history" as const,
               icon: "◷",
               title: "Chat History",
-              detail: "Reopen a saved task",
+              detail: "Reopen a saved chat",
             },
-            { key: "brand-kit" as const, icon: "◈", title: "Brand Kit", detail: "Brand workspace" },
-            { key: "skills" as const, icon: "✧", title: "Skills", detail: "Local guidance" },
+            {
+              key: "brand-kit" as const,
+              icon: "◈",
+              title: "Brand Kit",
+              detail: "Planned for a later phase",
+            },
+            {
+              key: "skills" as const,
+              icon: "✧",
+              title: "Design Skills",
+              detail: "Planned for a later phase",
+            },
             {
               key: "system" as const,
               icon: "▧",
@@ -116,7 +128,7 @@ export function HomeDashboard({
                     ✦
                   </span>
                   <span>
-                    <strong>{conversation.title}</strong>
+                    <strong dir="auto">{conversation.title}</strong>
                     <small>
                       {conversation.taskState} · {conversation.messages.length} messages
                     </small>
