@@ -1,5 +1,9 @@
 import { z } from "zod";
 
+export const MAX_NATIVE_QUALITY_SCAN_NODES = 5_000;
+export const MAX_NATIVE_QUALITY_SCAN_DEPTH = 48;
+export const MAX_NATIVE_QUALITY_OVERLAP_PAIRS = 50_000;
+
 export interface NativeVisualColor {
   r: number;
   g: number;
@@ -9,6 +13,9 @@ export interface NativeVisualColor {
 export interface NativeVisualNode {
   ownedByTask?: boolean;
   ref?: string;
+  logicalRef?: string;
+  pattern?: string;
+  qualityRole?: "button" | "input" | "image" | "heading" | "body" | "decorative";
   type: string;
   name: string;
   x: number;
@@ -20,6 +27,7 @@ export interface NativeVisualNode {
   fill?: string;
   fillRGB?: NativeVisualColor;
   fillOpacity?: number;
+  fillStyleId?: string;
   textColor?: string;
   textColorRGB?: NativeVisualColor;
   textColorOpacity?: number;
@@ -28,6 +36,20 @@ export interface NativeVisualNode {
   cornerRadius?: number;
   opacity?: number;
   fontSize?: number;
+  fontFamily?: string;
+  fontStyle?: string;
+  textStyleId?: string;
+  lineHeight?: number;
+  letterSpacing?: number;
+  textAutoResize?: "NONE" | "HEIGHT" | "WIDTH_AND_HEIGHT" | "TRUNCATE";
+  shadow?: {
+    color: string;
+    opacity: number;
+    offsetX: number;
+    offsetY: number;
+    radius: number;
+    spread: number;
+  };
   layoutMode?: "NONE" | "HORIZONTAL" | "VERTICAL";
   itemSpacing?: number;
   padding?: { top: number; right: number; bottom: number; left: number };
@@ -65,6 +87,9 @@ export const NativeVisualNodeSchema: z.ZodType<NativeVisualNode> = z.lazy(() =>
   z
     .object({
       ref: z.string().max(80).optional(),
+      logicalRef: z.string().max(120).optional(),
+      pattern: z.string().max(40).optional(),
+      qualityRole: z.enum(["button", "input", "image", "heading", "body", "decorative"]).optional(),
       type: z.string().max(40),
       name: z.string().max(100),
       x: z.number().finite(),
@@ -79,6 +104,7 @@ export const NativeVisualNodeSchema: z.ZodType<NativeVisualNode> = z.lazy(() =>
         .optional(),
       fillRGB: NativeVisualColorSchema.optional(),
       fillOpacity: z.number().finite().min(0).max(1).optional(),
+      fillStyleId: z.string().max(100).optional(),
       textColor: z
         .string()
         .regex(/^#[\da-f]{6}$/iu)
@@ -93,6 +119,23 @@ export const NativeVisualNodeSchema: z.ZodType<NativeVisualNode> = z.lazy(() =>
       cornerRadius: z.number().finite().min(0).max(500).optional(),
       opacity: z.number().finite().min(0).max(1).optional(),
       fontSize: z.number().finite().min(0).max(1_000).optional(),
+      fontFamily: z.string().max(80).optional(),
+      fontStyle: z.string().max(80).optional(),
+      textStyleId: z.string().max(100).optional(),
+      lineHeight: z.number().finite().positive().optional(),
+      letterSpacing: z.number().finite().optional(),
+      textAutoResize: z.enum(["NONE", "HEIGHT", "WIDTH_AND_HEIGHT", "TRUNCATE"]).optional(),
+      shadow: z
+        .object({
+          color: z.string().regex(/^#[\da-f]{6}$/iu),
+          opacity: z.number().finite().min(0).max(1),
+          offsetX: z.number().finite(),
+          offsetY: z.number().finite(),
+          radius: z.number().finite().min(0),
+          spread: z.number().finite(),
+        })
+        .strict()
+        .optional(),
       layoutMode: z.enum(["NONE", "HORIZONTAL", "VERTICAL"]).optional(),
       itemSpacing: z.number().finite().optional(),
       padding: z
@@ -133,6 +176,7 @@ export interface NativeVisualFinding {
     | "empty-text"
     | "clipped-child"
     | "overlapping-auto-layout"
+    | "overlap-analysis-limit"
     | "low-contrast"
     | "viewport-mismatch"
     | "missing-section"
@@ -140,7 +184,10 @@ export interface NativeVisualFinding {
     | "undersized-target"
     | "inconsistent-cards"
     | "missing-native-fallback"
-    | "excessive-whitespace";
+    | "excessive-whitespace"
+    | "type-mismatch"
+    | "parent-mismatch"
+    | "value-mismatch";
   ref?: string;
   refs?: string[];
   message: string;
@@ -382,6 +429,8 @@ export function auditNativeSection(
   expectedRefs: string[],
 ): NativeVisualFinding[] {
   const findings: NativeVisualFinding[] = [];
+  let overlapPairs = 0;
+  let overlapAnalysisLimited = false;
   const all = flatten(roots);
   const byRef = new Map(all.flatMap((node) => (node.ref ? [[node.ref, node] as const] : [])));
   for (const ref of expectedRefs)
@@ -504,40 +553,54 @@ export function auditNativeSection(
     }
     const children = node.children ?? [];
     if (node.layoutMode === "VERTICAL" || node.layoutMode === "HORIZONTAL") {
-      for (let first = 0; first < children.length; first++)
-        for (let second = first + 1; second < children.length; second++)
-          if (
-            children[first]!.layoutPositioning !== "ABSOLUTE" &&
-            children[second]!.layoutPositioning !== "ABSOLUTE" &&
-            overlaps(children[first]!, children[second]!)
-          ) {
-            const firstBounds = rect(children[first]!);
-            const secondBounds = rect(children[second]!);
-            const overlapWidth = Math.max(
-              0,
-              Math.min(firstBounds.x + firstBounds.width, secondBounds.x + secondBounds.width) -
-                Math.max(firstBounds.x, secondBounds.x),
-            );
-            const overlapHeight = Math.max(
-              0,
-              Math.min(firstBounds.y + firstBounds.height, secondBounds.y + secondBounds.height) -
-                Math.max(firstBounds.y, secondBounds.y),
-            );
-            findings.push({
-              code: "overlapping-auto-layout",
-              ref: children[second]!.ref,
-              refs: [children[first]!.ref, children[second]!.ref].filter((ref): ref is string =>
-                Boolean(ref),
-              ),
-              message: `“${children[first]!.name}” overlaps “${children[second]!.name}” inside Auto Layout “${node.name}”.`,
-              expected: "non-overlapping children",
-              actual: JSON.stringify({
-                overlapWidth,
-                overlapHeight,
-                overlapArea: overlapWidth * overlapHeight,
-              }),
-            });
-          }
+      const pairCount = (children.length * (children.length - 1)) / 2;
+      if (overlapPairs + pairCount > MAX_NATIVE_QUALITY_OVERLAP_PAIRS) {
+        if (!overlapAnalysisLimited)
+          findings.push({
+            code: "overlap-analysis-limit",
+            ref: node.ref,
+            message: `Auto Layout overlap analysis reached its ${MAX_NATIVE_QUALITY_OVERLAP_PAIRS}-pair safety budget.`,
+            expected: `at most ${MAX_NATIVE_QUALITY_OVERLAP_PAIRS} sibling comparisons`,
+            actual: `${overlapPairs + pairCount} required comparisons`,
+          });
+        overlapAnalysisLimited = true;
+      } else {
+        overlapPairs += pairCount;
+        for (let first = 0; first < children.length; first++)
+          for (let second = first + 1; second < children.length; second++)
+            if (
+              children[first]!.layoutPositioning !== "ABSOLUTE" &&
+              children[second]!.layoutPositioning !== "ABSOLUTE" &&
+              overlaps(children[first]!, children[second]!)
+            ) {
+              const firstBounds = rect(children[first]!);
+              const secondBounds = rect(children[second]!);
+              const overlapWidth = Math.max(
+                0,
+                Math.min(firstBounds.x + firstBounds.width, secondBounds.x + secondBounds.width) -
+                  Math.max(firstBounds.x, secondBounds.x),
+              );
+              const overlapHeight = Math.max(
+                0,
+                Math.min(firstBounds.y + firstBounds.height, secondBounds.y + secondBounds.height) -
+                  Math.max(firstBounds.y, secondBounds.y),
+              );
+              findings.push({
+                code: "overlapping-auto-layout",
+                ref: children[second]!.ref,
+                refs: [children[first]!.ref, children[second]!.ref].filter((ref): ref is string =>
+                  Boolean(ref),
+                ),
+                message: `“${children[first]!.name}” overlaps “${children[second]!.name}” inside Auto Layout “${node.name}”.`,
+                expected: "non-overlapping children",
+                actual: JSON.stringify({
+                  overlapWidth,
+                  overlapHeight,
+                  overlapArea: overlapWidth * overlapHeight,
+                }),
+              });
+            }
+      }
     }
     const fill = colorChannels(node.fill, node.fillRGB);
     const fillAlpha = (node.fillOpacity ?? 1) * (node.opacity ?? 1);

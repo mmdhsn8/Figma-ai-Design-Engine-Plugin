@@ -16,6 +16,7 @@ export function generationBridge(
         | "generation-context"
         | "generation-remember"
         | "generation-render"
+        | "generation-verify"
         | "generation-select"
         | "generation-prepare"
         | "generation-apply-section";

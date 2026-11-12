@@ -21,13 +21,14 @@ import { describe, expect, it } from "vitest";
 
 function request(overrides: Partial<DesignGenerationRequest> = {}): DesignGenerationRequest {
   return {
-    prompt: "Create a polished storefront with realistic product and checkout screens.",
+    prompt: "Create a storefront interface for a design-system fixture.",
     target: "mobile",
     screenCount: 2,
     language: "auto",
     style: "",
     projectType: "auto",
     theme: "auto",
+    fidelity: "standard",
     ...overrides,
   };
 }
@@ -98,6 +99,163 @@ function generatedResponse(ids: string[]): GeneratedDesign {
 }
 
 describe("brief planner and constrained design generation", () => {
+  it("defaults to high fidelity, preserves explicit wireframe mode, and covers non-commerce domains", () => {
+    const defaultPlan = createDesignPlan(
+      request({
+        prompt: "Design a professional education onboarding flow with clear learning progress.",
+        fidelity: undefined,
+        target: "mobile",
+        screenCount: 1,
+        screenNames: ["Welcome"],
+      }),
+    );
+    expect(defaultPlan).toMatchObject({
+      success: true,
+      data: { fidelity: "high_fidelity", domain: "education", screens: [{ familyName: "Welcome" }] },
+    });
+    expect(
+      createDesignPlan(request({
+        prompt: "Create a wireframe for a health app welcome screen.",
+        fidelity: undefined,
+        screenCount: 1,
+        screenNames: ["Welcome"],
+      })),
+    ).toMatchObject({ success: true, data: { fidelity: "wireframe", domain: "health" } });
+    expect(
+      createDesignPlan(request({
+        prompt: "Create a SaaS workspace for a team.",
+        fidelity: undefined,
+        screenCount: 1,
+        screenNames: ["Tasks"],
+      })),
+    ).toMatchObject({ success: true, data: { fidelity: "high_fidelity", domain: "saas" } });
+    expect(
+      createDesignPlan(request({
+        prompt: "Create a productivity task manager for a team.",
+        fidelity: undefined,
+        screenCount: 1,
+        screenNames: ["Tasks"],
+      })),
+    ).toMatchObject({ success: true, data: { fidelity: "high_fidelity", domain: "productivity" } });
+  });
+
+  it("preflights high-fidelity native hierarchy and stable, parent-first refs", () => {
+    const plan = planFor(request({
+      prompt: "Create a professional health app home screen.",
+      target: "mobile",
+      screenCount: 1,
+      screenNames: ["Home"],
+      fidelity: "high_fidelity",
+      projectType: "product",
+    }));
+    const design: GeneratedDesign = {
+      ...generatedResponse([plan.screens[0]!.id]),
+      screens: [{
+        id: plan.screens[0]!.id,
+        children: [{
+          type: "frame",
+          name: "Home content region",
+          pattern: "service-card",
+          text: null,
+          palette: "surface",
+          width: 350,
+          height: 600,
+          fontSize: 16,
+          fontStyle: "Regular",
+          textAlign: "left",
+          cornerRadius: 12,
+          elevation: "none",
+          layout: "vertical",
+          gap: 16,
+          padding: 16,
+          qualityRole: "decorative",
+          children: [
+            textNode("Your daily wellness"),
+            {
+              type: "icon",
+              name: "Heart icon",
+              text: null,
+              palette: "brand",
+              width: 24,
+              height: 24,
+              fontSize: 16,
+              fontStyle: "Regular",
+              textAlign: "center",
+              cornerRadius: 0,
+              elevation: "none",
+              layout: "none",
+              gap: 0,
+              padding: 0,
+              qualityRole: "decorative",
+              iconName: "heart",
+              children: [],
+            },
+          ],
+        }],
+      }],
+    };
+    const prepared = prepareGeneratedDesign(JSON.stringify(design), plan);
+    expect(prepared.success).toBe(true);
+    if (!prepared.success) throw new Error(prepared.errors.join(" "));
+    const nodes = prepared.data.visualSpecs[0]!.nodes;
+    expect(nodes.map(({ logicalRef }) => logicalRef)).toEqual([
+      "home.root",
+      "home.main.n0",
+      "home.main.n0.n0",
+      "home.main.n0.n1",
+    ]);
+    expect(nodes[2]).toMatchObject({ nodeType: "text", qualityRole: "heading", nativeType: "TEXT" });
+    expect(nodes[3]).toMatchObject({ nodeType: "icon", iconName: "heart", nativeType: "VECTOR" });
+
+    const flat = structuredClone(design);
+    flat.screens[0]!.children = [textNode("A flat title")];
+    const rejected = prepareGeneratedDesign(JSON.stringify(flat), plan);
+    expect(rejected.success).toBe(false);
+    if (!rejected.success)
+      expect(rejected.errors.join(" ")).toContain("Required pattern “service-card”");
+  });
+
+  it("turns image slots into disclosed editable native placeholders with matching spec refs", () => {
+    const plan = planFor(request({
+      prompt: "Create a health app home screen with a visual image placeholder.",
+      screenCount: 1,
+      screenNames: ["Home"],
+      fidelity: "high_fidelity",
+      projectType: "product",
+    }));
+    const design = generatedResponse([plan.screens[0]!.id]);
+    const content = design.screens[0]!.children[0]!;
+    content.pattern = "service-card";
+    content.children.push({
+      type: "image",
+      name: "Wellness illustration slot",
+      text: null,
+      palette: "surface",
+      width: 180,
+      height: 120,
+      fontSize: 16,
+      fontStyle: "Regular",
+      textAlign: "center",
+      cornerRadius: 12,
+      elevation: "none",
+      layout: "none",
+      gap: 0,
+      padding: 0,
+      qualityRole: "image",
+      placeholder: true,
+      children: [],
+    });
+    const prepared = prepareGeneratedDesign(JSON.stringify(design), plan);
+    expect(prepared.success).toBe(true);
+    if (!prepared.success) throw new Error(prepared.errors.join(" "));
+    const refs = prepared.data.visualSpecs[0]!.nodes.map(({ logicalRef }) => logicalRef);
+    expect(refs).toContain("home.main.n0.n1.illustration");
+    expect(refs).toContain("home.main.n0.n1.disclosure");
+    const root = prepared.data.batch.screens[0]!.children[0];
+    expect(root?.type).toBe("frame");
+    if (root?.type === "frame") expect(root.children[1]).toMatchObject({ type: "frame", name: "Wellness illustration slot" });
+  });
+
   it("normalizes Persian, Finglish, and English briefs without losing the user's copy language", () => {
     const persian = createDesignPlan(
       request({ prompt: "یک فروشگاه لباس فارسی با صفحهٔ خانه و سبد خرید طراحی کن." }),
@@ -232,6 +390,48 @@ describe("brief planner and constrained design generation", () => {
     if (extendedBatch.success) expect(extendedBatch.data.screens).toHaveLength(12);
   });
 
+  it("plans bounded 400-screen mobile batches and 400 responsive counterparts", () => {
+    const names = Array.from({ length: 400 }, (_, index) => `Screen ${index + 1}`);
+    const mobile = createDesignPlan(request({ target: "mobile", screenCount: 400, screenNames: names }));
+    expect(mobile.success).toBe(true);
+    if (mobile.success) expect(mobile.data.screens).toHaveLength(400);
+
+    const responsive = createDesignPlan(request({
+      target: "both",
+      screenCount: 200,
+      screenNames: names.slice(0, 200),
+    }));
+    expect(responsive.success).toBe(true);
+    if (responsive.success) expect(responsive.data.screens).toHaveLength(400);
+    expect(createDesignPlan(request({ target: "both", screenCount: 201, screenNames: names.slice(0, 201) })))
+      .toMatchObject({ success: false, errors: [expect.stringContaining("200 screen families")] });
+  });
+
+  it("requires domain-specific high-fidelity composition patterns", () => {
+    const commerce = planFor(request({
+      prompt: "Create a professional mobile storefront home screen.",
+      target: "mobile",
+      screenCount: 1,
+      screenNames: ["Home"],
+      fidelity: "high_fidelity",
+      projectType: "storefront",
+    }));
+    const commerceInstructions = createDesignInstructions(commerce);
+    expect(commerceInstructions).toContain("hero-banner");
+    expect(commerceInstructions).toContain("category-chips");
+    expect(commerceInstructions).toContain("product-card");
+
+    const dashboard = planFor(request({
+      prompt: "Create a high fidelity SaaS overview dashboard.",
+      target: "desktop",
+      screenCount: 1,
+      screenNames: ["Overview"],
+      fidelity: "high_fidelity",
+    }));
+    expect(createDesignInstructions(dashboard)).toContain("stat-card");
+    expect(createDesignInstructions(dashboard)).toContain("data-table");
+  });
+
   it("resumes only missing planned screens and never duplicates a completed screen", () => {
     const plan = planFor(
       request({
@@ -318,7 +518,7 @@ describe("brief planner and constrained design generation", () => {
     );
     expect(JSON.stringify(generated)).toBe(raw);
     const prepared = prepareGeneratedDesign(raw, plan);
-    expect(prepared.success).toBe(true);
+    if (!prepared.success) throw new Error(prepared.errors.join("\n"));
     if (prepared.success) {
       const frame = prepared.data.batch.screens[1]!.children[0]!;
       expect(frame.type).toBe("frame");
@@ -399,6 +599,7 @@ describe("brief planner and constrained design generation", () => {
     const card: GeneratedDesignNode = {
       ...generated.screens[1]!.children[0]!,
       name: "کارت محصول",
+      pattern: "product-card",
       width: 318,
       height: 280,
       padding: 12,
@@ -407,13 +608,15 @@ describe("brief planner and constrained design generation", () => {
       children: [
         {
           ...button,
-          type: "rectangle",
+          type: "image",
           text: null,
           name: "تصویر محصول",
           palette: "surface",
           qualityRole: "image",
           width: 100,
           height: 220,
+          placeholder: true,
+          children: [],
         },
         details,
       ],
@@ -596,7 +799,7 @@ describe("brief planner and constrained design generation", () => {
     expect(completed[0]).toBe(saved[0]);
   });
 
-  it("does not normalize invalid schemas or desktop controls", () => {
+  it("does not normalize invalid schemas and repairs small desktop controls", () => {
     const plan = planFor(request({ screenNames: ["Home", "Detail"] }));
     const generated = generatedResponse(plan.screens.map(({ id }) => id));
     generated.screens[0]!.children = [
@@ -608,9 +811,13 @@ describe("brief planner and constrained design generation", () => {
         .success,
     ).toBe(false);
     const desktop = planFor(request({ target: "desktop", screenNames: ["Home", "Detail"] }));
-    expect(normalizeGeneratedDesignResponse(JSON.stringify(generated), desktop).success).toBe(
-      false,
-    );
+    const desktopRepair = normalizeGeneratedDesignResponse(JSON.stringify(generated), desktop);
+    expect(desktopRepair.success).toBe(true);
+    if (desktopRepair.success)
+      expect(desktopRepair.data.design.screens[0]!.children[0]).toMatchObject({
+        width: 44,
+        height: 44,
+      });
   });
 
   it.each([1, 2, 3, 4, 5, 6])(
@@ -805,9 +1012,9 @@ describe("brief planner and constrained design generation", () => {
   it("keeps Persian copy and RTL alignment editable in the prepared native text layers", () => {
     const plan = planFor(
       request({
-        prompt: "یک فروشگاه فارسی با صفحهٔ خانه و سبد خرید",
+        prompt: "یک فروشگاه فارسی با صفحهٔ خانه و جزئیات",
         language: "fa",
-        screenNames: ["خانه", "سبد خرید"],
+        screenNames: ["خانه", "جزئیات"],
       }),
     );
     const generated = generatedResponse(plan.screens.map(({ id }) => id));

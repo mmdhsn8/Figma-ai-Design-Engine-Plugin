@@ -927,7 +927,7 @@ describe("Figma UI companion client", () => {
     const frames = [
       `event: progress\ndata: ${JSON.stringify({ requestId, elapsedMs: 150, eventCount: 2 })}\n\n`,
       `event: delta\ndata: ${JSON.stringify({ requestId, delta: "Hello from the model." })}\n\n`,
-      `event: done\ndata: ${JSON.stringify({ requestId, text: "Hello from the model." })}\n\n`,
+      `event: done\ndata: ${JSON.stringify({ requestId, text: "Hello from the model.", timing: { upstreamHeadersMs: 124000, upstreamFirstDeltaMs: 124500, upstreamTotalMs: 124813 } })}\n\n`,
     ];
     const fetcher = vi.fn<typeof fetch>(
       async () =>
@@ -954,7 +954,7 @@ describe("Figma UI companion client", () => {
         (delta) => deltas.push(delta),
         (elapsedMs) => progress.push(elapsedMs),
       ),
-    ).resolves.toEqual({ kind: "done", text: "Hello from the model." });
+    ).resolves.toEqual({ kind: "done", text: "Hello from the model.", timing: { companionHeadersMs: expect.any(Number), upstreamHeadersMs: 124000, upstreamFirstDeltaMs: 124500, upstreamTotalMs: 124813 } });
     expect(deltas.join("")).toBe("Hello from the model.");
     expect(progress).toEqual([150]);
   });

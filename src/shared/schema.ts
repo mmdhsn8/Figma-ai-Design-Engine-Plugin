@@ -16,12 +16,17 @@ import {
   visualAssetSize,
 } from "./visual-schema";
 import { isFigmaPathData } from "./visual-assets";
+import { DESIGN_PATTERN_IDS, type DesignPatternId } from "./design-patterns.js";
 
 export const DESIGN_SCHEMA_VERSION = "1.0.0";
 export const MAX_NESTING_DEPTH = 8;
 
 export type SizingMode = "fixed" | "hug" | "fill";
 export type AxisSizing = { width: SizingMode; height: SizingMode };
+export interface DesignNodeMetadata {
+  logicalRef?: string;
+  pattern?: DesignPatternId;
+}
 export interface LayoutConstraints {
   horizontal: "left" | "right" | "center" | "left-right" | "scale";
   vertical: "top" | "bottom" | "center" | "top-bottom" | "scale";
@@ -40,7 +45,7 @@ export interface LayoutSpec {
   counterAxisAlign?: "start" | "center" | "end" | "baseline" | "stretch";
 }
 
-export interface TextNodeSpec {
+export interface TextNodeSpec extends DesignNodeMetadata {
   type: "text";
   name: string;
   text: string;
@@ -65,7 +70,7 @@ export interface TextNodeSpec {
   qualityExceptions?: QualityRule[];
 }
 
-export interface RectangleNodeSpec {
+export interface RectangleNodeSpec extends DesignNodeMetadata {
   type: "rectangle";
   name: string;
   x?: number;
@@ -83,7 +88,7 @@ export interface RectangleNodeSpec {
   qualityExceptions?: QualityRule[];
 }
 
-export interface FrameNodeSpec {
+export interface FrameNodeSpec extends DesignNodeMetadata {
   type: "frame";
   name: string;
   x?: number;
@@ -103,7 +108,7 @@ export interface FrameNodeSpec {
   qualityExceptions?: QualityRule[];
 }
 
-export interface EllipseNodeSpec {
+export interface EllipseNodeSpec extends DesignNodeMetadata {
   type: "ellipse";
   name: string;
   x?: number;
@@ -118,7 +123,7 @@ export interface EllipseNodeSpec {
   qualityExceptions?: QualityRule[];
 }
 
-export interface VectorNodeSpec {
+export interface VectorNodeSpec extends DesignNodeMetadata {
   type: "vector";
   name: string;
   x?: number;
@@ -134,7 +139,7 @@ export interface VectorNodeSpec {
   qualityExceptions?: QualityRule[];
 }
 
-export interface ImageNodeSpec {
+export interface ImageNodeSpec extends DesignNodeMetadata {
   type: "image";
   name: string;
   x?: number;
@@ -153,7 +158,7 @@ export interface ImageNodeSpec {
   qualityExceptions?: QualityRule[];
 }
 
-export interface InstanceNodeSpec {
+export interface InstanceNodeSpec extends DesignNodeMetadata {
   type: "instance";
   componentId: string;
   name?: string;
@@ -213,6 +218,8 @@ const dimensionSchema = z.number().finite().min(1).max(10_000);
 const radiusSchema = z.number().finite().min(0).max(5_000);
 const nodeColorSchema = TokenColorValueSchema;
 const nodeQualityMeta = {
+  logicalRef: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u).optional(),
+  pattern: z.enum(DESIGN_PATTERN_IDS).optional(),
   visual: VisualStyleSchema.optional(),
   qualityRole: z.enum(["button", "input", "image", "heading", "body", "decorative"]).optional(),
   qualityExceptions: z
@@ -392,6 +399,8 @@ const ImageNodeSchema = z
 
 const InstanceNodeSchema = z
   .object({
+    logicalRef: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u).optional(),
+    pattern: z.enum(DESIGN_PATTERN_IDS).optional(),
     type: z.literal("instance"),
     componentId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,99}$/),
     name: nameSchema.optional(),

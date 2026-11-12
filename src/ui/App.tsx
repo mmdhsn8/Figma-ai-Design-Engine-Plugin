@@ -395,6 +395,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const [generationScreenNames, setGenerationScreenNames] = useState("");
   const [generationLanguage, setGenerationLanguage] = useState<GenerationLanguage>("auto");
   const [generationStyle, setGenerationStyle] = useState("");
+  const [generationFidelity, setGenerationFidelity] = useState<"auto" | NonNullable<DesignGenerationRequest["fidelity"]>>("auto");
   const [generationProjectType, setGenerationProjectType] =
     useState<DesignGenerationRequest["projectType"]>("auto");
   const [generationTheme, setGenerationTheme] = useState<DesignGenerationRequest["theme"]>("auto");
@@ -516,6 +517,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       style: generationStyle,
       projectType: generationProjectType,
       theme: generationTheme,
+      ...(generationFidelity !== "auto" ? { fidelity: generationFidelity } : {}),
     }),
     [
       generationLanguage,
@@ -524,6 +526,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       generationScreenNames,
       generationStyle,
       generationTheme,
+      generationFidelity,
       generationTarget,
       prompt,
     ],
@@ -2440,6 +2443,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                   "The section must contain one bounded Auto Layout frame with all content inside it.",
                 );
               } else {
+                sectionRoot.sectionId = section.id;
                 try {
                   const transaction = createGenerationTransaction({
                     generationId: draft.manifest.generationId,
@@ -2458,9 +2462,11 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                     }));
                     firstSectionRecorded = true;
                   }
-                } catch {
+                } catch (error) {
                   issues.push(
-                    "The section failed its bounded transaction, size, nesting, or node-count contract.",
+                    error instanceof Error
+                      ? error.message.slice(0, 300)
+                      : "The section failed its bounded transaction, size, nesting, or node-count contract.",
                   );
                 }
               }
@@ -2550,6 +2556,27 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         throw new Error(
           `Saved sections did not compose into a valid complete design. ${prepared.errors.join(" ")}`,
         );
+      setGenerationState("validating");
+      for (const screen of completeScreens) {
+        const verificationStarted = performance.now();
+        const verified = await generationBridge({
+          type: "generation-verify",
+          requestId: nextRequestId(),
+          manifest: draft.manifest,
+          design: {
+            projectName: draft.projectName,
+            palette: draft.palette,
+            screens: [screen],
+          } satisfies GeneratedDesign,
+        });
+        if (!verified.nodeId)
+          throw new Error(`Figma did not return a native identity for ${screen.id} verification.`);
+        nativeWarnings.push(...(verified.warnings ?? []));
+        setStageMetrics((metrics) => ({
+          ...metrics,
+          [`${screen.id}.nativeVerificationMs`]: Math.round(performance.now() - verificationStarted),
+        }));
+      }
       const audit = auditVisualQuality(prepared.data.batch);
       const warnings = [
         ...nativeWarnings,
@@ -3599,12 +3626,14 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                 <span>Screens</span>
                 <input
                   type="number"
-                  min={2}
-                  max={200}
+                  min={1}
+                  max={generationTarget === "both" ? 200 : 400}
                   step={1}
                   value={generationScreenCount}
                   onChange={(event) => {
-                    setGenerationScreenCount(Number(event.target.value));
+                    setGenerationScreenCount(
+                      Math.max(1, Math.min(generationTarget === "both" ? 200 : 400, Number(event.target.value) || 1)),
+                    );
                     setGenerationPreview(null);
                     if (generationState === "ready") setGenerationState("idle");
                   }}
@@ -3660,6 +3689,23 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                   <option value="auto">Match brief</option>
                   <option value="light">Light</option>
                   <option value="dark">Dark</option>
+                </select>
+              </label>
+              <label>
+                <span>Fidelity</span>
+                <select
+                  value={generationFidelity}
+                  onChange={(event) => {
+                    setGenerationFidelity(event.target.value as "auto" | NonNullable<DesignGenerationRequest["fidelity"]>);
+                    setGenerationPreview(null);
+                    if (generationState === "ready") setGenerationState("idle");
+                  }}
+                  disabled={generationInFlight}
+                >
+                  <option value="auto">Automatic (high fidelity; honors wireframe request)</option>
+                  <option value="high_fidelity">High fidelity (default)</option>
+                  <option value="standard">Standard</option>
+                  <option value="wireframe">Wireframe</option>
                 </select>
               </label>
             </div>
@@ -3772,6 +3818,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                   setGenerationStyle(request.style);
                   setGenerationProjectType(request.projectType);
                   setGenerationTheme(request.theme);
+                  setGenerationFidelity(request.fidelity ?? "auto");
                   activeChatModel.current = savedDraft.manifest.model;
                   setSelectedCompanionModel(savedDraft.manifest.model);
                   setDraftNotice(

@@ -10,7 +10,7 @@ export function draftFixture(): { manifest: DraftManifest; design: GeneratedDesi
       createdAt: 1,
       model: "account-model",
       request: {
-        prompt: "یک فروشگاه فارسی با صفحه خانه و جزئیات محصول طراحی کن.",
+        prompt: "یک فروشگاه فارسی با صفحه خانه و جزئیات طراحی کن.",
         target: "mobile",
         screenCount: 2,
         screenNames: ["Home", "Detail"],
@@ -18,6 +18,7 @@ export function draftFixture(): { manifest: DraftManifest; design: GeneratedDesi
         style: "",
         projectType: "storefront",
         theme: "auto",
+        fidelity: "standard",
       },
     },
     design: {

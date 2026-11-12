@@ -5,6 +5,7 @@ import {
   DraftIdentitySchema,
 } from "../shared/generation-draft";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
+import { verifyNativeDesign, type NativeDesignVerification } from "./native-design-verification";
 import { prepareGeneratedDesign } from "../ui/design-generation";
 import { createGenerationSkeletons, renderMultiScreenDesign } from "./renderer";
 
@@ -15,11 +16,25 @@ type GenerationRequest = Extract<
       | "generation-context"
       | "generation-remember"
       | "generation-render"
+      | "generation-verify"
       | "generation-select"
       | "generation-prepare"
       | "generation-apply-section";
   }
 >;
+
+function visualVerificationError(result: NativeDesignVerification): string | undefined {
+  if (result.verified) return undefined;
+  const issueRefs = result.findings
+    .filter((finding) => [
+      "missing-ref", "invalid-geometry", "hidden-node", "empty-text", "clipped-child",
+      "overlapping-auto-layout", "low-contrast", "type-mismatch", "parent-mismatch", "viewport-mismatch", "value-mismatch",
+    ].includes(finding.code))
+    .slice(0, 6)
+    .map((finding) => `${finding.code}${finding.ref ? `:${finding.ref}` : ""}`);
+  const missingPatterns = result.missingPatterns.slice(0, 4).map((pattern) => `pattern:${pattern}`);
+  return `Native visual verification is incomplete; saved nodes were retained. ${result.truncated ? "The native QA safety budget was exceeded. " : ""}${[...issueRefs, ...missingPatterns].join(", ") || "required evidence unavailable"}.`;
+}
 
 export function createGenerationController(
   api: PluginAPI,
@@ -111,7 +126,7 @@ export function createGenerationController(
           const prepared = prepareGeneratedDesign(JSON.stringify(checked.design), {
             ...plan.data,
             screens: plan.data.screens.filter(({ id }) => id === checked.transaction.screen_id),
-          });
+          }, { scope: "section", sectionId: checked.transaction.section_id });
           if (!prepared.success) throw new Error(prepared.errors.join(" "));
           if (prepared.data.nodeCount > 250)
             throw new Error(
@@ -150,13 +165,55 @@ export function createGenerationController(
             );
           const nodeId = result.screens[0]?.nodeId;
           if (!nodeId) throw new Error("Figma did not acknowledge the section root.");
+          const visualSpec = prepared.data.visualSpecs[0];
+          if (!visualSpec) throw new Error("The saved visual specification is unavailable for native verification.");
+          const verification = await verifyNativeDesign(api, nodeId, api.currentPage.id, visualSpec);
+          const verificationError = visualVerificationError(verification);
+          if (verificationError) throw new Error(verificationError);
           return {
             type: "generation-result",
             requestId: message.requestId,
             success: true,
             nodeId,
             generationId: message.manifest.generationId,
-            warnings: result.warnings.slice(0, 8).map((warning) => warning.slice(0, 500)),
+            warnings: [
+              ...result.warnings.slice(0, 6).map((warning) => warning.slice(0, 500)),
+              `Fresh native visual verification passed for ${verification.nodeCount} nodes.`,
+            ],
+            elapsedMs: Date.now() - started,
+          };
+        }
+        if (message.type === "generation-verify") {
+          if (message.manifest.documentId !== documentId)
+            throw new Error("Document/page changed; reopen the draft in its original page.");
+          const design = validateDraftScreen(message.manifest, message.design);
+          const plan = createDesignPlan(message.manifest.request);
+          if (!plan.success) throw new Error("Saved plan is invalid.");
+          const screenId = design.screens[0]!.id;
+          const prepared = prepareGeneratedDesign(JSON.stringify(design), {
+            ...plan.data,
+            screens: plan.data.screens.filter(({ id }) => id === screenId),
+          });
+          if (!prepared.success) throw new Error(prepared.errors.join(" "));
+          const roots = api.currentPage.findAll(
+            (node) =>
+              node.getPluginData("fad.multi-screen.batch-id") === message.manifest.generationId &&
+              node.getPluginData("fad.multi-screen.screen-id") === screenId,
+          );
+          if (roots.length !== 1 || roots[0]?.type !== "FRAME")
+            throw new Error("Native screen identity is missing or ambiguous; no canvas changes were made.");
+          if (roots[0].getPluginData("fad.generation.commit") !== "complete")
+            throw new Error("Native screen has unfinished section transactions; verification is partial.");
+          const verification = await verifyNativeDesign(api, roots[0].id, api.currentPage.id, prepared.data.visualSpecs[0]!);
+          const verificationError = visualVerificationError(verification);
+          if (verificationError) throw new Error(verificationError);
+          return {
+            type: "generation-result",
+            requestId: message.requestId,
+            success: true,
+            nodeId: roots[0].id,
+            generationId: message.manifest.generationId,
+            warnings: [`Fresh full-screen native verification passed for ${verification.nodeCount} nodes.`],
             elapsedMs: Date.now() - started,
           };
         }
@@ -196,12 +253,22 @@ export function createGenerationController(
           throw new Error(
             result.screens[0]?.error ?? "Figma rendering failed; validated screen remains saved.",
           );
+        const rootNodeId = result.screens[0]?.nodeId;
+        if (!rootNodeId) throw new Error("Figma did not acknowledge the rendered screen root.");
+        const visualSpec = prepared.data.visualSpecs[0];
+        if (!visualSpec) throw new Error("The saved visual specification is unavailable for native verification.");
+        const verification = await verifyNativeDesign(api, rootNodeId, api.currentPage.id, visualSpec);
+        const verificationError = visualVerificationError(verification);
+        if (verificationError) throw new Error(verificationError);
         return {
           type: "generation-result",
           requestId: message.requestId,
           success: true,
-          nodeId: result.screens[0]?.nodeId,
-          warnings: result.warnings.slice(0, 8).map((warning) => warning.slice(0, 500)),
+          nodeId: rootNodeId,
+          warnings: [
+            ...result.warnings.slice(0, 6).map((warning) => warning.slice(0, 500)),
+            `Fresh native visual verification passed for ${verification.nodeCount} nodes.`,
+          ],
           elapsedMs: Date.now() - started,
         };
       } catch (error) {

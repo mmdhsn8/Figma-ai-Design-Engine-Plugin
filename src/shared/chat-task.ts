@@ -6,6 +6,8 @@ import {
 } from "./native-quality-repair.js";
 import {
   ChatDesignBriefSchema,
+  ChatTurnTimingSchema,
+  PlannedPropertyEditSchema,
   ChatFunctionCallSchema,
   ChatLifecycleStateSchema,
   ChatInputItemSchema,
@@ -80,6 +82,11 @@ const SAFE_FAILURE_CODES = new Set([
   "native_execution_blocked",
   "native_quality_unrepairable",
   "native_verification_invalid",
+  "native_verification_capacity_exceeded",
+  "native_property_verification_failed",
+  "missing_creation_operation",
+  "missing_reference_inspection",
+  "invalid_required_reference",
   "local_tool_rate_limit",
   "reference_resolution",
   "native_operation_failed",
@@ -188,6 +195,7 @@ const ChatStructuralFindingSchema = z
       "empty-text",
       "clipped-child",
       "overlapping-auto-layout",
+      "overlap-analysis-limit",
       "low-contrast",
       "viewport-mismatch",
       "missing-section",
@@ -196,6 +204,9 @@ const ChatStructuralFindingSchema = z
       "inconsistent-cards",
       "missing-native-fallback",
       "excessive-whitespace",
+      "type-mismatch",
+      "parent-mismatch",
+      "value-mismatch",
     ]),
     refs: z.array(z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u)).max(20),
     expected: z.string().max(300),
@@ -429,6 +440,7 @@ export const ChatTaskSchema = z
     inspectionOutcome: ReadOnlyInspectionOutcomeSchema.optional(),
     inspectionSummary: ReadOnlyInspectionSummarySchema.optional(),
     validationFeedback: z.string().max(7_500).optional(),
+    editReferenceDiagnostic: z.string().max(500).optional(),
     brief: ChatDesignBriefSchema.optional(),
     context: z.array(ChatInputItemSchema).max(28),
     stages: z
@@ -443,6 +455,7 @@ export const ChatTaskSchema = z
               .max(20)
               .default([]),
             completionCriteria: z.array(z.string().min(1).max(180)).max(5).default([]),
+            propertyEdit: PlannedPropertyEditSchema.optional(),
             estimatedMutations: z.number().int().min(1).max(CHAT_TASK_MAX_MUTATIONS).default(1),
             completed: z.boolean(),
             operations: z.number().int().min(0).max(CHAT_TASK_MAX_MUTATIONS),
@@ -557,7 +570,12 @@ export const ChatTaskSchema = z
                 "pending_or_failed_mutations",
                 "native_verification_pending",
                 "native_verification_failed",
+                "native_property_verification_failed",
+                "missing_creation_operation",
+                "missing_reference_inspection",
+                "invalid_required_reference",
                 "awaiting_completion_call",
+                "verified_no_op",
               ])
               .optional(),
           })
@@ -594,6 +612,7 @@ export const ChatTaskSchema = z
       validationCodes: z.array(z.string().regex(/^[A-Za-z0-9_]{1,80}$/u)).max(8),
       durationMs: z.number().int().min(0).max(600_000).optional(),
       inputBytes: z.number().int().min(0).max(64 * 1024).optional(),
+      timing: ChatTurnTimingSchema.optional(),
     }).strict()).max(100).default([]),
     roundBreakdown: ChatRoundBreakdownSchema.default(emptyRoundBreakdown),
     batches: z.number().int().min(0).max(1_000).default(0),
@@ -731,6 +750,82 @@ function confirmedNodeRefs(entries: ChatTask["ledger"]): Set<string> {
   return refs;
 }
 
+export function chatTaskInspectedContinuationRefs(task: ChatTask, stageIndex: number): Set<string> {
+  const pageId = task.stages[stageIndex]?.pageId;
+  if (task.intent !== "continue" || !pageId || !task.targetName) return new Set();
+  const roots = new Set<string>();
+  const inspected = new Set<string>();
+  for (const entry of task.ledger) {
+    if (isCanvasMutationTool(entry.call.action.tool)) break;
+    if (entry.status !== "completed" || entry.acknowledgementStatus !== "read_only") continue;
+    try {
+      const data = JSON.parse(entry.output ?? "{}").data;
+      if (entry.call.action.tool === "get_document_context" && data?.discovery?.matchStatus === "unique") {
+        for (const frame of data.frames ?? [])
+          if (frame.pageId === pageId && frame.type === "FRAME" && typeof frame.ref === "string")
+            roots.add(frame.ref);
+      }
+      if (entry.call.action.tool !== "inspect_nodes" || data?.pageId !== pageId) continue;
+      const visit = (node: { ref?: string; children?: unknown[] }) => {
+        if (typeof node.ref === "string") inspected.add(node.ref);
+        for (const child of node.children ?? []) if (child && typeof child === "object") visit(child);
+      };
+      for (const node of data.nodes ?? [])
+        if (roots.size === 1 && roots.has(node.ref)) visit(node);
+    } catch {
+      // An unreadable result cannot establish identity.
+    }
+  }
+  return roots.size === 1 ? inspected : new Set();
+}
+
+export function chatTaskStageSatisfiedRefs(task: ChatTask, stageIndex: number): Set<string> {
+  const stage = task.stages[stageIndex];
+  if (!stage) return new Set();
+  const nativeMutationRefs = new Set<string>();
+  const deletedRefs = new Set<string>();
+  for (const entry of task.ledger) {
+    const action = entry.call.action;
+    if (
+      entry.status !== "completed" ||
+      entry.reused ||
+      entry.acknowledgementStatus !== "confirmed_mutation" ||
+      !isCanvasMutationTool(action.tool) ||
+      !("ref" in action)
+    )
+      continue;
+    let logicalRef = action.ref;
+    try {
+      const output = JSON.parse(entry.output ?? "{}");
+      if (typeof output.logicalRef === "string") logicalRef = output.logicalRef;
+    } catch {
+      // The stable action ref remains sufficient for legacy checkpoints.
+    }
+    if (action.tool === "delete_node") {
+      nativeMutationRefs.delete(action.ref);
+      nativeMutationRefs.delete(logicalRef);
+      deletedRefs.add(action.ref);
+      deletedRefs.add(logicalRef);
+    } else if (task.intent !== "continue" || ["create_frame", "create_rectangle", "create_text"].includes(action.tool)) {
+      nativeMutationRefs.add(action.ref);
+      nativeMutationRefs.add(logicalRef);
+      deletedRefs.delete(action.ref);
+      deletedRefs.delete(logicalRef);
+    }
+  }
+  const existingRefs = chatTaskInspectedContinuationRefs(task, stageIndex);
+  for (const ref of deletedRefs) existingRefs.delete(ref);
+  const target = task.intent === "edit" ? task.editTarget : undefined;
+  if (target) {
+    const planned = target.plannedRefs ? new Set(target.plannedRefs) : undefined;
+    for (const ref of target.verifiedRefs)
+      if ((!planned || planned.has(ref)) && !deletedRefs.has(ref)) existingRefs.add(ref);
+  }
+  return new Set(
+    stage.logicalRefs.filter((ref) => nativeMutationRefs.has(ref) || existingRefs.has(ref)),
+  );
+}
+
 export function chatTaskCapacityUsage(task: ChatTask) {
   const categories = task.ledger.map(chatTaskLedgerCategory);
   const confirmedRefs = confirmedNodeRefs(task.ledger);
@@ -809,9 +904,11 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
     (sum, entries) => sum + mutationAccounting(entries).confirmedMutations,
     0,
   );
-  const confirmedStageRefs = confirmedNodeRefs(stageEntries);
+  const satisfiedStageRefs = stage
+    ? chatTaskStageSatisfiedRefs(task, task.stages.indexOf(stage))
+    : new Set<string>();
   const remainingRequiredRefs = stage
-    ? stage.logicalRefs.filter((ref) => !confirmedStageRefs.has(ref)).length
+    ? stage.logicalRefs.filter((ref) => !satisfiedStageRefs.has(ref)).length
     : 0;
   const completionReason = stage
     ? stage.completed
@@ -846,8 +943,9 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
           : "plan_not_saved";
   const stageCapacity = task.stages.map((item, index) => {
     const entries = task.ledger.filter((entry) => entry.stage === index);
+    const satisfiedRefs = chatTaskStageSatisfiedRefs(task, index);
     const confirmedRefs = confirmedNodeRefs(entries);
-    const remainingRequirements = item.logicalRefs.filter((ref) => !confirmedRefs.has(ref)).length;
+    const remainingRequirements = item.logicalRefs.filter((ref) => !satisfiedRefs.has(ref)).length;
     const pendingOrFailed = entries.some(
       (entry) =>
         chatTaskLedgerCategory(entry) === "mutation" &&
@@ -970,6 +1068,7 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
       consistent: chatTaskCommittedOperationCount(task) === confirmedSegmentTotal,
     },
     completionReason,
+    ...(task.editReferenceDiagnostic ? { editReferenceDiagnostic: task.editReferenceDiagnostic } : {}),
     stageCapacity,
     modelRounds: task.rounds,
     modelRoundTrace: task.modelRoundTrace,

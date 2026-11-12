@@ -14,6 +14,14 @@ const readJson = async (path) => JSON.parse(await readFile(new URL(path, root), 
 const pluginBundle = await readFile(new URL("dist/plugin.js", root), "utf8");
 const uiHtml = await readFile(new URL("dist/ui.html", root), "utf8");
 const companionServer = await readFile(new URL("dist-companion/companion/server.js", root), "utf8");
+const nativeQualitySource = await readFile(
+  new URL("src/shared/native-visual-quality.ts", root),
+  "utf8",
+);
+const companionDesignGeneration = await readFile(
+  new URL("dist-companion/shared/design-generation.js", root),
+  "utf8",
+);
 const uiMarker = "figma.showUI(";
 const uiStart = pluginBundle.indexOf(uiMarker);
 const quote = pluginBundle[uiStart + uiMarker.length];
@@ -81,6 +89,15 @@ assert.ok(
     controllerBundle.includes("measured_foreground_contrast"),
   "Registered plugin controller is missing complete native QA and deterministic repair planning.",
 );
+assert.match(nativeQualitySource, /MAX_NATIVE_QUALITY_SCAN_NODES = 5_000/u);
+assert.match(nativeQualitySource, /MAX_NATIVE_QUALITY_SCAN_DEPTH = 48/u);
+assert.match(nativeQualitySource, /MAX_NATIVE_QUALITY_OVERLAP_PAIRS = 50_000/u);
+assert.ok(
+  controllerBundle.includes("overlap-analysis-limit") &&
+    controllerBundle.includes("qualityCoverage") &&
+    uiHtml.includes("native_verification_capacity_exceeded"),
+  "Registered plugin/UI artifacts are missing bounded-QA markers or fail-closed incomplete-coverage handling.",
+);
 assert.ok(
   uiHtml.includes("native-quality-repair-v1") && uiHtml.includes("native_quality_unrepairable"),
   "Registered UI is missing repair dispatch and versioned diagnostics.",
@@ -105,8 +122,8 @@ assert.ok(
   "Registered artifacts are missing deterministic edit target verification and planning gates.",
 );
 assert.ok(
-  uiHtml.includes("Native operation harness"),
-  "UI bundle is missing the local developer harness.",
+  !uiHtml.includes("Native operation harness"),
+  "UI bundle unexpectedly exposes the removed local developer harness.",
 );
 assert.ok(uiHtml.includes("Enter to send"), "UI bundle is missing the conversational composer.");
 assert.ok(
@@ -116,6 +133,14 @@ assert.ok(
 assert.ok(
   pluginBundle.includes("task-native-inspect") && pluginBundle.includes("task-native-focus"),
   "Plugin bundle is missing the read-only native inspection and validated focus protocol.",
+);
+assert.ok(
+  pluginBundle.includes("Fresh native text differs from the validated design copy") &&
+    pluginBundle.includes("Fresh native color differs from the validated palette token") &&
+    pluginBundle.includes("Fresh native Auto Layout direction differs") &&
+    companionDesignGeneration.includes("Required composition patterns for this screen") &&
+    uiHtml.includes("high_fidelity"),
+  "Registered plugin/UI artifacts are missing high-fidelity design generation and fresh native value verification.",
 );
 assert.ok(
   uiHtml.includes("Retry Failed Stage") && uiHtml.includes("Resume"),
@@ -160,12 +185,22 @@ for (const [source, output] of [
   ["src/shared/chat-task.ts", "dist/plugin.js"],
   ["src/plugin/chat-task-storage.ts", "dist/plugin.js"],
   ["src/plugin/generation-controller.ts", "dist/plugin.js"],
+  ["src/plugin/native-design-verification.ts", "dist/plugin.js"],
   ["src/plugin/figma-tool-executor.ts", "dist/plugin.js"],
   ["src/plugin/auto-layout-repair.ts", "dist/plugin.js"],
   ["src/shared/native-quality-repair.ts", "dist/plugin.js"],
   ["src/shared/native-quality-repair.ts", "dist/ui.html"],
   ["src/shared/native-visual-quality.ts", "dist/plugin.js"],
   ["src/shared/native-visual-quality.ts", "dist/ui.html"],
+  ["src/shared/visual-design-spec.ts", "dist/ui.html"],
+  ["src/shared/visual-design-spec.ts", "dist/plugin.js"],
+  ["src/shared/visual-design-spec.ts", "dist-companion/shared/visual-design-spec.js"],
+  ["src/shared/design-patterns.ts", "dist/ui.html"],
+  ["src/shared/design-patterns.ts", "dist/plugin.js"],
+  ["src/shared/design-patterns.ts", "dist-companion/shared/design-patterns.js"],
+  ["src/shared/design-icons.ts", "dist/ui.html"],
+  ["src/shared/design-icons.ts", "dist/plugin.js"],
+  ["src/shared/design-icons.ts", "dist-companion/shared/design-icons.js"],
   ["src/shared/figma-tools.ts", "dist/plugin.js"],
   ["src/shared/messages.ts", "dist/plugin.js"],
   ["src/shared/messages.ts", "dist/ui.html"],

@@ -116,7 +116,7 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
       tool: z.literal("inspect_nodes"),
       pageId: PageIdSchema.optional(),
       readOnlyInspection: z.boolean().optional(),
-      purpose: z.literal("structural_verification").optional(),
+      purpose: z.enum(["structural_verification", "background_verification"]).optional(),
       palette: z.array(ColorSchema).optional(),
       refs: z.array(RefSchema).max(INSPECT_NODES_LIMITS.refs).default([]),
       selection: z.boolean().default(false),
@@ -220,6 +220,7 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
   z
     .object({
       tool: z.literal("set_properties"),
+      backgroundRootRef: RefSchema.optional(),
       pageId: PageIdSchema.optional(),
       ref: RefSchema,
       properties: z

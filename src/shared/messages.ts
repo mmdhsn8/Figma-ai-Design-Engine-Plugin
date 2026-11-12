@@ -261,6 +261,14 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
+      type: z.literal("generation-verify"),
+      requestId: z.string().max(100),
+      manifest: DraftManifestSchema,
+      design: z.unknown(),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("generation-apply-section"),
       requestId: z.string().max(100),
       manifest: DraftManifestSchema,

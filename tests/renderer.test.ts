@@ -24,6 +24,7 @@ import {
 } from "../src/shared/design-generation";
 import { prepareGeneratedDesign } from "../src/ui/design-generation";
 import { createGenerationController } from "../src/plugin/generation-controller";
+import { verifyNativeDesign } from "../src/plugin/native-design-verification";
 import { UIToPluginSchema, PluginToUISchema } from "../src/shared/messages";
 import { createGenerationTransaction } from "../src/shared/generation-transaction";
 import { draftFixture, sectionDesignFixture } from "./generation-fixture";
@@ -37,6 +38,11 @@ interface MockNode {
   y: number;
   width: number;
   height: number;
+  visible: boolean;
+  layoutMode?: string;
+  itemSpacing?: number;
+  paddingLeft?: number;
+  paddingTop?: number;
   fills: readonly Paint[];
   strokes: readonly Paint[];
   readonly absoluteRenderBounds: Rect | null;
@@ -62,13 +68,38 @@ interface MockNode {
 function createMockFigma(options: { failLoadFamily?: string } = {}) {
   const roots: MockNode[] = [];
   const allCreated: MockNode[] = [];
+  let pageParent: MockNode | null = null;
   const paintStyles: PaintStyle[] = [];
   const textStyles: TextStyle[] = [];
   let nextStyleId = 1;
   const loadedFonts: FontName[] = [];
+  const absolutePosition = (target: MockNode): { x: number; y: number } => {
+    const parent = target.parent;
+    if (!parent || parent.type === "PAGE") return { x: target.x, y: target.y };
+    let localX = target.x;
+    let localY = target.y;
+    const siblings = parent.children;
+    const targetIndex = siblings.indexOf(target);
+    if (parent.layoutMode === "VERTICAL") {
+      localX = parent.paddingLeft ?? 0;
+      localY = (parent.paddingTop ?? 0) + siblings.slice(0, targetIndex).reduce(
+        (sum, child) => sum + child.height + (parent.itemSpacing ?? 0),
+        0,
+      );
+    } else if (parent.layoutMode === "HORIZONTAL") {
+      localX = (parent.paddingLeft ?? 0) + siblings.slice(0, targetIndex).reduce(
+        (sum, child) => sum + child.width + (parent.itemSpacing ?? 0),
+        0,
+      );
+      localY = parent.paddingTop ?? 0;
+    }
+    const ancestor = absolutePosition(parent);
+    return { x: ancestor.x + localX, y: ancestor.y + localY };
+  };
   const detach = (node: MockNode) => {
     if (node.parent) {
-      node.parent.children = node.parent.children.filter((child) => child !== node);
+      const index = node.parent.children.indexOf(node);
+      if (index >= 0) node.parent.children.splice(index, 1);
       node.parent = null;
     } else {
       const index = roots.indexOf(node);
@@ -84,22 +115,26 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
       y: 0,
       width: 100,
       height: 100,
+      visible: true,
       fills: [],
       strokes: [],
       get absoluteRenderBounds() {
-        return { x: node.x, y: node.y, width: node.width, height: node.height };
+        const position = absolutePosition(node);
+        return { ...position, width: node.width, height: node.height };
       },
       get absoluteBoundingBox() {
-        return { x: node.x, y: node.y, width: node.width, height: node.height };
+        const position = absolutePosition(node);
+        return { ...position, width: node.width, height: node.height };
       },
       get absoluteTransform() {
+        const position = absolutePosition(node);
         return [
-          [1, 0, node.x],
-          [0, 1, node.y],
+          [1, 0, position.x],
+          [0, 1, position.y],
         ] as Transform;
       },
       children: [],
-      parent: null,
+      parent: pageParent,
       removed: false,
       pluginData: new Map(),
       getPluginData(key) {
@@ -233,7 +268,13 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
       if (font.family === options.failLoadFamily) throw new Error("Font unavailable");
       loadedFonts.push(font);
     }),
+    getNodeByIdAsync: vi.fn(async (id: string) => {
+      const node = walk(roots, (candidate) => candidate.id === id)[0];
+      return node ? (node as unknown as BaseNode) : null;
+    }),
     currentPage: {
+      id: "0:1",
+      type: "PAGE",
       children: roots as unknown as SceneNode[],
       selection: [] as SceneNode[],
       findAll: vi.fn((predicate: (node: MockNode) => boolean) => walk(roots, predicate)),
@@ -244,6 +285,8 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
     },
     variables: { createVariableCollection: vi.fn() },
   };
+  pageParent = raw.currentPage as unknown as MockNode;
+  for (const node of roots) node.parent = pageParent;
   return {
     api: raw as unknown as RendererFigmaApi,
     raw,
@@ -295,6 +338,79 @@ describe("renderDesign", () => {
 
   beforeEach(() => {
     mock = createMockFigma();
+  });
+
+  it("freshly verifies native generation refs, types, parents, geometry, and visibility", async () => {
+    const planned = createDesignPlan({
+      prompt: "Create a health interface for native verification.",
+      target: "mobile",
+      screenCount: 1,
+      screenNames: ["Home"],
+      language: "en",
+      style: "",
+      projectType: "product",
+      theme: "auto",
+      fidelity: "standard",
+    });
+    if (!planned.success) throw new Error(planned.errors.join(" "));
+    const design = {
+      projectName: "Native QA fixture",
+      palette: {
+        brand: "#223344", accent: "#CC7744", page: "#F7F5F0", surface: "#FFFFFF",
+        text: "#17212B", muted: "#647080", border: "#D8DEE6",
+      },
+      screens: [{
+        id: planned.data.screens[0]!.id,
+        children: [{
+          type: "frame", name: "Home content", text: null, palette: "surface",
+          width: 350, height: 300, fontSize: 16, fontStyle: "Regular", textAlign: "left",
+          cornerRadius: 12, elevation: "none", layout: "vertical", gap: 12, padding: 12,
+          qualityRole: "decorative", pattern: "service-card", children: [{
+            type: "text", name: "Home title", text: "Wellbeing overview", palette: "text",
+            width: 300, height: 32, fontSize: 24, fontStyle: "Bold", textAlign: "left",
+            cornerRadius: 0, elevation: "none", layout: "none", gap: 0, padding: 0,
+            qualityRole: "heading", children: [],
+          }],
+        }],
+      }],
+    };
+    const prepared = prepareGeneratedDesign(JSON.stringify(design), planned.data);
+    if (!prepared.success) throw new Error(prepared.errors.join(" "));
+    const render = await renderMultiScreenDesign(mock.api, prepared.data.batch, { resume: true });
+    expect(render.failedScreens).toBe(0);
+    const rootNodeId = render.screens[0]?.nodeId;
+    if (!rootNodeId) throw new Error("Native screen root missing.");
+    const result = await verifyNativeDesign(
+      mock.raw as unknown as PluginAPI,
+      rootNodeId,
+      "0:1",
+      prepared.data.visualSpecs[0]!,
+    );
+    expect(result).toMatchObject({ verified: true, nodeCount: 3, truncated: false });
+
+    const nativeText = mock.find("Home title");
+    if (!nativeText) throw new Error("Native title node missing.");
+    const editableText = nativeText as typeof nativeText & { characters: string };
+    const originalText = editableText.characters;
+    editableText.characters = "Wrong title";
+    const wrongValues = await verifyNativeDesign(
+      mock.raw as unknown as PluginAPI,
+      rootNodeId,
+      "0:1",
+      prepared.data.visualSpecs[0]!,
+    );
+    expect(wrongValues.verified).toBe(false);
+    expect(wrongValues.findings.some((finding) => finding.code === "value-mismatch")).toBe(true);
+    editableText.characters = originalText;
+    nativeText.setPluginData("fad.design.logical-ref", "lost-title-ref");
+    const stale = await verifyNativeDesign(
+      mock.raw as unknown as PluginAPI,
+      rootNodeId,
+      "0:1",
+      prepared.data.visualSpecs[0]!,
+    );
+    expect(stale.verified).toBe(false);
+    expect(stale.findings.some((finding) => finding.code === "missing-ref")).toBe(true);
   });
 
   it("keeps the Phase 1 sample editable and positioned", async () => {
@@ -744,7 +860,7 @@ describe("renderDesign", () => {
 
   it("hands generated designs with large screen child lists to the native renderer", async () => {
     const plan = createDesignPlan({
-      prompt: "Create a storefront with a home and cart screen.",
+      prompt: "Create a storefront with a home and detail screen.",
       target: "mobile",
       screenCount: 2,
       screenNames: ["Home", "Cart"],
@@ -752,6 +868,7 @@ describe("renderDesign", () => {
       style: "",
       projectType: "storefront",
       theme: "auto",
+      fidelity: "standard",
     });
     expect(plan.success).toBe(true);
     if (!plan.success) return;
@@ -806,6 +923,7 @@ describe("renderDesign", () => {
       screenNames: ["Home", "Detail"],
       language: "fa",
       style: "",
+      fidelity: "standard",
     });
     if (!plan.success) throw new Error(plan.errors.join(" "));
     const label = {
@@ -951,7 +1069,22 @@ describe("renderDesign", () => {
     manifest.documentId = context.documentId;
     const request = { type: "generation-render" as const, requestId: "render", manifest, design };
     expect(UIToPluginSchema.safeParse(request).success).toBe(true);
-    expect(await controller(request)).toMatchObject({ success: true });
+    const firstRender = await controller(request);
+    if (firstRender.type !== "generation-result") throw new Error("Unexpected native render response.");
+    if (!firstRender.success) throw new Error(firstRender.error);
+    expect(firstRender).toMatchObject({ success: true });
+    const beforeNativeVerify = mock.allCreated.length;
+    const selectionBeforeNativeVerify = [...mock.api.currentPage.selection];
+    const nativeVerification = await controller({
+      type: "generation-verify",
+      requestId: "verify-rendered-screen",
+      manifest,
+      design,
+    });
+    if (nativeVerification.type !== "generation-result") throw new Error("Unexpected verification response.");
+    expect(nativeVerification).toMatchObject({ success: true, nodeId: expect.any(String) });
+    expect(mock.allCreated).toHaveLength(beforeNativeVerify);
+    expect(mock.api.currentPage.selection).toEqual(selectionBeforeNativeVerify);
     const created = mock.allCreated.length;
     await controller({
       type: "generation-remember",
@@ -1211,6 +1344,8 @@ describe("renderDesign", () => {
           transaction,
           design,
         });
+        if (result.type !== "generation-result") throw new Error("Unexpected section response.");
+        if (!result.success) throw new Error(result.error);
         expect(result).toMatchObject({ success: true, nodeId: expect.any(String) });
         if (result.type !== "generation-result" || !result.nodeId)
           throw new Error("The offline native section transaction was not acknowledged.");

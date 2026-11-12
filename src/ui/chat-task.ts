@@ -38,6 +38,8 @@ import {
   chatTaskCapacityUsage,
   chatTaskCommittedOperationCount,
   chatTaskLedgerCategory,
+  chatTaskStageSatisfiedRefs,
+  chatTaskInspectedContinuationRefs,
   mutationAccounting,
   isCanvasMutationTool,
   type ChatRoundKind,
@@ -160,7 +162,11 @@ function syncCapacityAccounting(task: ChatTask): void {
     stage.verificationOperations = entries.filter(
       (entry) => entry.category === "verification",
     ).length;
-    if (stage.estimatedMutations === 1 && stage.logicalRefs.length > 1)
+    if (
+      task.intent !== "edit" &&
+      stage.estimatedMutations === 1 &&
+      stage.logicalRefs.length > 1
+    )
       stage.estimatedMutations = estimatedStageMutations(stage.logicalRefs);
     const segmentCount = Math.max(
       1,
@@ -1342,40 +1348,94 @@ function nextEditTargetOperation(
 function editMutationBlocker(
   task: ChatTask,
   calls: Array<{ action: FigmaToolAction }>,
+  reservations?: string[],
 ): string | undefined {
   const target = task.editTarget;
   if (!target) return "target_not_inspected: the edit target is not checkpointed.";
-  const allowed = new Set(target.plannedRefs ?? []);
+  const allowed = new Set((target.plannedRefs ?? []).filter((ref) => target.verifiedRefs.includes(ref)));
+  const occupied = new Set(target.verifiedRefs);
   const created = new Set<string>();
+  const nonContainerRefs = new Set<string>();
   for (const entry of task.ledger) {
     const action = entry.call.action;
     if (
-      entry.status === "completed" && !entry.reused &&
+      entry.status === "completed" && !entry.reused && entry.acknowledgementStatus === "confirmed_mutation" &&
       ["create_frame", "create_text", "create_rectangle"].includes(action.tool) &&
       "parent" in action && action.parent.kind === "node" &&
       (allowed.has(action.parent.ref) || created.has(action.parent.ref)) &&
       (!action.pageId || action.pageId === target.pageId) && "ref" in action
-    ) created.add(action.ref);
+    ) {
+      created.add(action.ref);
+      if (action.tool !== "create_frame") nonContainerRefs.add(action.ref);
+      try {
+        const ref: unknown = JSON.parse(entry.output ?? "{}").logicalRef;
+        if (typeof ref === "string") {
+          created.add(ref);
+          if (action.tool !== "create_frame") nonContainerRefs.add(ref);
+        }
+      } catch {
+        // The action alias remains available from the confirmed checkpoint.
+      }
+    }
   }
+  for (const ref of created) occupied.add(ref);
   const stage = task.stages.find((item) => !item.completed);
   if (!stage) return "native_execution_blocked: no saved edit stage is active.";
   const stageRefs = new Set(stage.logicalRefs);
+  const additions: string[] = [];
+  const otherStageRefs = new Set(task.stages.filter((item) => item !== stage).flatMap((item) => item.logicalRefs));
   const inScope = (ref: string) => allowed.has(ref) || created.has(ref);
   for (const { action } of calls) {
     if (!isCanvasMutationTool(action.tool)) continue;
+    if (action.tool === "set_properties") {
+      const propertiesKey = JSON.stringify(
+        Object.entries(action.properties).sort(([first], [second]) => first.localeCompare(second)),
+      );
+      const alreadyConfirmed = task.ledger.some((entry) => {
+        const prior = entry.call.action;
+        if (
+          entry.status !== "completed" ||
+          entry.reused ||
+          entry.acknowledgementStatus !== "confirmed_mutation" ||
+          prior.tool !== "set_properties" ||
+          prior.ref !== action.ref ||
+          (prior.pageId ?? target.pageId) !== (action.pageId ?? target.pageId)
+        )
+          return false;
+        return JSON.stringify(
+          Object.entries(prior.properties).sort(([first], [second]) => first.localeCompare(second)),
+        ) === propertiesKey;
+      });
+      if (alreadyConfirmed)
+        return `duplicate_confirmed_operation: The exact property update for ${action.ref} is already confirmed in the saved ledger. Do not replay it; request fresh stage verification or continue only with a different outstanding requirement.`;
+    }
     if ("pageId" in action && action.pageId && action.pageId !== target.pageId)
       return "native_execution_blocked: edit operations must remain on the verified target page.";
-    if (["create_frame", "create_text", "create_rectangle"].includes(action.tool)) {
-      if (!("parent" in action) || action.parent.kind !== "node" || !inScope(action.parent.ref))
-        return "native_execution_blocked: new layers must be created inside the verified target subtree.";
-      if (!("ref" in action) || allowed.has(action.ref) || !stageRefs.has(action.ref))
-        return "edit_plan_invalid: each new layer must use a fresh stage logicalRef.";
+    if (action.tool === "create_frame" || action.tool === "create_text" || action.tool === "create_rectangle") {
+      if (occupied.has(action.ref) || created.has(action.ref) || /^task-/iu.test(action.ref))
+        return `edit_plan_invalid: Creation ref ${action.ref} already identifies a layer or is reserved for native identity. Reuse an existing layer through an edit or supply a fresh alias.`;
+      if (action.parent.kind !== "node")
+        return `native_execution_blocked: Creation ref ${action.ref} has a page parent. Use the approved existing frame ${target.ref} or an authorized nested parent.`;
+      if (action.tool === "create_frame" && action.name.trim().toLowerCase() === target.name.trim().toLowerCase())
+        return `native_execution_blocked: Creation ref ${action.ref} duplicates the existing screen name. Edit the approved screen ${target.ref} in place.`;
+      if (nonContainerRefs.has(action.parent.ref))
+        return `edit_plan_invalid: Creation ref ${action.ref} has a non-container parent ${action.parent.ref}. Use a frame or reusable container as its parent.`;
+      if (!inScope(action.parent.ref))
+        return `edit_plan_invalid: Creation ref ${action.ref} uses unresolved parent ${action.parent.ref}. Put its parent creation earlier in the batch or use an approved existing container.`;
+      if (!stageRefs.has(action.ref)) {
+        if (!reservations || stage.propertyEdit || otherStageRefs.has(action.ref) ||
+            new Set([target.ref, ...stageRefs, action.ref]).size > INSPECT_NODES_LIMITS.refs)
+          return `edit_plan_invalid: Creation ref ${action.ref} cannot be reserved in this stage. Use a declared unused alias or reduce the stage's new layers.`;
+        stageRefs.add(action.ref);
+        additions.push(action.ref);
+      }
       created.add(action.ref);
+      if (action.tool !== "create_frame") nonContainerRefs.add(action.ref);
       continue;
     }
     if (action.tool === "set_properties" || action.tool === "set_auto_layout") {
       if (!inScope(action.ref) || !stageRefs.has(action.ref))
-        return "native_execution_blocked: the modified layer is outside the verified target scope or missing from the saved stage.";
+        return `native_execution_blocked: Ref ${action.ref} is outside the approved scope or absent from this stage. Use a verified planned ref or a reserved creation alias.`;
       if (action.tool === "set_auto_layout" && action.children.some((child) => !inScope(child.ref) || !stageRefs.has(child.ref)))
         return "native_execution_blocked: Auto Layout child sizing must use verified or task-created refs listed in the saved stage.";
       continue;
@@ -1390,6 +1450,7 @@ function editMutationBlocker(
         return "native_execution_blocked: reparenting must stay within the verified target subtree and cannot move its root.";
     }
   }
+  reservations?.push(...additions);
   return undefined;
 }
 
@@ -1404,8 +1465,13 @@ function editCompletionReport(task: ChatTask): string | undefined {
   if (!confirmed.length) return undefined;
   const changes = confirmed.slice(0, 24).map(({ call }) => {
     const action = call.action;
-    if (action.tool === "set_properties")
-      return `Updated ${action.ref}: ${Object.keys(action.properties).join(", ")}.`;
+    if (action.tool === "set_properties") {
+      const values = Object.entries(action.properties)
+        .filter(([key]) => key !== "shadow")
+        .map(([key, value]) => `${key} ${typeof value === "string" ? value : JSON.stringify(value)}`)
+        .join(", ");
+      return `Verified ${action.ref}: ${values || Object.keys(action.properties).join(", ")}.`;
+    }
     if (action.tool === "set_auto_layout")
       return `Set ${action.layout.direction} Auto Layout on ${action.ref}.`;
     if (action.tool === "create_frame" || action.tool === "create_text" || action.tool === "create_rectangle")
@@ -1422,6 +1488,103 @@ function editCompletionReport(task: ChatTask): string | undefined {
     `Confirmed canvas mutations: ${confirmed.length}. No page-root replacement was created.`,
   ];
   return lines.join("\n").slice(0, 8_000);
+}
+
+type NativePropertyCheck = {
+  ref: string;
+  property: string;
+  expected: unknown;
+  actual: unknown;
+};
+
+function nativePropertyChecks(
+  task: ChatTask,
+  stageIndex: number,
+  nodes: Parameters<typeof auditNativeSection>[0],
+  knownRef: (ref: string) => string,
+  planned?: Extract<FigmaToolAction, { tool: "set_properties" }>,
+): NativePropertyCheck[] {
+  const byRef = new Map<string, (typeof nodes)[number]>();
+  const visit = (node: (typeof nodes)[number]) => {
+    if (node.ref) byRef.set(node.ref, node);
+    node.children?.forEach(visit);
+  };
+  nodes.forEach(visit);
+  const checks: NativePropertyCheck[] = [];
+  const actions = planned ? [planned] : task.ledger.flatMap((entry) => {
+    const action = entry.call.action;
+    return entry.stage === stageIndex && entry.status === "completed" && !entry.reused &&
+      entry.acknowledgementStatus === "confirmed_mutation" && action.tool === "set_properties"
+      ? [action] : [];
+  });
+  for (const action of actions) {
+    const ref = knownRef(action.ref);
+    const node = byRef.get(ref);
+    const expectedProperties = action.properties;
+    const evidenceFields: Partial<Record<keyof typeof expectedProperties, keyof (typeof nodes)[number]>> = {
+      name: "name",
+      fill: "fill",
+      paintStyleId: "fillStyleId",
+      visible: "visible",
+      width: "width",
+      height: "height",
+      text: "text",
+      fontSize: "fontSize",
+      color: "textColor",
+      textStyleId: "textStyleId",
+      fontFamily: "fontFamily",
+      fontStyle: "fontStyle",
+      align: "textAlignHorizontal",
+      lineHeight: "lineHeight",
+      letterSpacing: "letterSpacing",
+      textAutoResize: "textAutoResize",
+      stroke: "stroke",
+      strokeWeight: "strokeWeight",
+      cornerRadius: "cornerRadius",
+      opacity: "opacity",
+      shadow: "shadow",
+    };
+    for (const [property, expected] of Object.entries(expectedProperties)) {
+      if (expected === undefined) continue;
+      const evidenceField = evidenceFields[property as keyof typeof expectedProperties];
+      const actual = node && evidenceField ? node[evidenceField] : undefined;
+      const normalizedExpected =
+        typeof expected === "string" && ["fill", "color", "stroke"].includes(property)
+          ? expected.toLocaleUpperCase("en-US")
+          : expected;
+      const normalizedActual =
+        typeof actual === "string" && ["fill", "textColor", "stroke"].includes(evidenceField ?? "")
+          ? actual.toLocaleUpperCase("en-US")
+          : actual;
+      checks.push({
+        ref,
+        property,
+        expected: normalizedExpected,
+        actual: normalizedActual,
+      });
+    }
+  }
+  return checks;
+}
+
+function nativePropertyMismatches(checks: NativePropertyCheck[]): NativePropertyCheck[] {
+  const equalValue = (expected: unknown, actual: unknown): boolean => {
+    if (typeof expected === "number" && typeof actual === "number")
+      return Math.abs(expected - actual) <= 0.01;
+    if (
+      expected && actual &&
+      typeof expected === "object" && typeof actual === "object" &&
+      !Array.isArray(expected) && !Array.isArray(actual)
+    ) {
+      const expectedEntries = Object.entries(expected);
+      return expectedEntries.length === Object.keys(actual).length &&
+        expectedEntries.every(([key, value]) => equalValue(value, (actual as Record<string, unknown>)[key]));
+    }
+    return actual !== undefined && actual === expected;
+  };
+  return checks.filter(({ expected, actual }) => {
+    return !equalValue(expected, actual);
+  });
 }
 
 function compactReadOnlyEvidence(checkpoint: ReadOnlyCheckpoint) {
@@ -1892,6 +2055,13 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       throw new Error(
         "native_verification_invalid: Native structural verification returned invalid or incomplete coverage; no repair was scheduled.",
       );
+    if (native.success && !native.data.qualityCoverage.complete) {
+      task.stages[stageIndex]!.nativeQualityCoverage = native.data.qualityCoverage;
+      task.stages[stageIndex]!.nativeRepairPipelineVersion = native.data.repairPipelineVersion;
+      throw new Error(
+        `native_verification_capacity_exceeded: Native QA inspected ${native.data.qualityCoverage.nodeCount} nodes but reached its bounded scan limit; no completion or repair was allowed. Reduce the target scope and resume after fresh inspection.`,
+      );
+    }
     task.stages[stageIndex]!.nativeQualityCoverage = native.success
       ? native.data.qualityCoverage
       : undefined;
@@ -1936,6 +2106,371 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     }
     recordRepairPlan(stageIndex, proposals);
     return findings;
+  };
+  const executePlannedPropertyStage = async (): Promise<"advance" | "complete" | undefined> => {
+    if (task.intent !== "edit" || task.pending.length) return;
+    const stageIndex = task.stages.findIndex((item) => !item.completed);
+    const stage = task.stages[stageIndex];
+    const target = task.editTarget;
+    if (!stage) return;
+
+    // Older checkpoints have no executable action. Recognize the exact legacy
+    // verification-only contract without treating prose as write authorization.
+    const legacyFill = /^Confirm native root fill exactly equals (#[0-9a-f]{6}) without mutations\.$/iu
+      .exec(stage.goal)?.[1];
+    const verificationOnly = !stage.propertyEdit && Boolean(
+      legacyFill && stage.completionCriteria.length === 1 &&
+      stage.completionCriteria[0] === `Native fill of existing root frame is ${legacyFill}; no mutation performed.`,
+    );
+    const planned = stage.propertyEdit ?? (verificationOnly && target && legacyFill
+      ? { tool: "set_properties" as const, ref: target.ref, properties: { fill: legacyFill } }
+      : undefined);
+    if (!planned) return;
+    activePhase = "verification";
+    if (!target || (stage.pageId ?? target.pageId) !== target.pageId ||
+      (planned.pageId ?? target.pageId) !== target.pageId ||
+      !target.plannedRefs?.includes(planned.ref) ||
+      !stage.logicalRefs.includes(planned.ref) ||
+      stage.logicalRefs.some((ref) => !target.plannedRefs?.includes(ref) || !target.verifiedRefs.includes(ref)))
+      throw new Error("invalid_required_reference: Property stage is outside the inspected edit plan.");
+
+    const visual = planned.properties.fill !== undefined && target.type === "FRAME" && planned.ref === target.ref;
+    let action = { ...planned, pageId: target.pageId };
+    const mutations = task.ledger.filter((entry) =>
+      entry.stage === stageIndex && isCanvasMutationTool(entry.call.action.tool) && !entry.reused);
+    const matches = (entry: ChatTask["ledger"][number]) => {
+      const prior = entry.call.action;
+      return prior.tool === "set_properties" && knownRef(prior.ref) === knownRef(action.ref) &&
+        JSON.stringify(Object.entries(prior.properties).sort()) ===
+          JSON.stringify(Object.entries(action.properties).sort());
+    };
+    const capacity = chatTaskCapacityUsage(task);
+    if (capacity.verificationOperations >= CHAT_TASK_MAX_VERIFICATION_OPERATIONS ||
+        task.ledger.length >= CHAT_TASK_MAX_LEDGER_ENTRIES || task.batches >= 1_000)
+      throw new Error("native_verification_invalid: Property verification capacity exhausted.");
+
+    const refs = [...new Set([target.ref, ...stage.logicalRefs])];
+    const id = `${task.id}-property-check-${task.ledger.length + 1}`;
+    const call = parseResponsesFunctionCalls([{
+      type: "function_call", call_id: id, name: "inspect_nodes",
+      arguments: JSON.stringify({ pageId: target.pageId, refs, selection: false,
+        depth: 1, maxNodes: 25, purpose: visual ? "background_verification" : "structural_verification" }),
+    }])[0]!;
+    const entry: ChatTask["ledger"][number] = {
+      call, operationId: id, stage: stageIndex, status: "running", category: "verification",
+    };
+    check();
+    transition("VERIFYING_STAGE");
+    task.ledger.push(entry);
+    task.batches++;
+    await save();
+    deps.progress(`Checking native property values for ${stage.title}…`);
+    const result = await deps.execute([FigmaToolOperationSchema.parse({
+      operationId: id, idempotencyKey: `chat:${id}`,
+      ...(task.referenceScope ? { taskId: task.id } : {}),
+      ...(task.chatId ? { chatId: task.chatId } : {}),
+      action: call.action,
+    })]);
+    check();
+    const item = result.results.length === 1 ? result.results[0] : undefined;
+    const nodes = NativeVisualNodeSchema.array().max(25).safeParse(item?.data?.nodes);
+    if (!result.success || !item?.success || item.operationId !== id ||
+        item.data?.pageId !== target.pageId || !nodes.success ||
+        refs.some((ref) => !nodes.data.some((node) => node.ref && knownRef(node.ref) === knownRef(ref)))) {
+      entry.status = "failed";
+      entry.output = JSON.stringify({ success: false, error: item?.error });
+      await save();
+      throw new Error(`missing_reference_inspection: ${item?.error ?? "Native evidence did not resolve all property stage refs on the approved page."}`);
+    }
+    let backgroundNodeId: string | undefined;
+    if (visual) {
+      const proof = item.data?.visualBackground as Record<string, unknown> | undefined;
+      const node = nodes.data.find((candidate) => candidate.ref === proof?.ref);
+      if (!proof || proof.rootNodeId !== target.nodeId || proof.rootRef !== knownRef(target.ref) ||
+          typeof proof.nodeId !== "string" || !node?.ref || !node.fill || proof.fill !== node.fill ||
+          (node.ref !== knownRef(target.ref) && node.type !== "RECTANGLE") ||
+          (node.ref !== knownRef(target.ref) && Object.keys(planned.properties).length !== 1)) {
+        entry.status = "failed";
+        entry.output = JSON.stringify({ success: false, visualOutcomeVerified: false });
+        await save();
+        throw new Error("native_property_verification_failed: The visible background could not be verified on the approved frame.");
+      }
+      backgroundNodeId = proof.nodeId;
+      action = { ...action, ref: node.ref, backgroundRootRef: target.ref };
+    }
+    if (mutations.some((entry) => !matches(entry) || entry.status !== "completed" ||
+        entry.acknowledgementStatus !== "confirmed_mutation"))
+      throw new Error("native_verification_invalid: Saved mutations require reconciliation before this property stage can continue.");
+    const checks = nativePropertyChecks(task, stageIndex, nodes.data, knownRef, action);
+    const differences = nativePropertyMismatches(checks);
+    entry.status = "completed";
+    entry.acknowledgementStatus = "read_only";
+    entry.output = JSON.stringify({
+      success: true, propertyVerificationConfirmed: !differences.length,
+      verifiedNoOp: !mutations.length && !differences.length,
+      ...(visual ? { visualOutcomeVerified: !differences.length, backgroundNodeId } : {}),
+      checks: checks.map(({ ref, property, actual }) => ({
+        ref, property, available: actual !== undefined,
+        ...(property === "fill" ? { actual } : {}),
+      })),
+    });
+    if (differences.length) {
+      await save();
+      if (verificationOnly || mutations.length || differences.some((item) => item.actual === undefined))
+        throw new Error(`native_property_verification_failed: ${differences.map(({ property, actual }) =>
+          `${property} ${actual === undefined ? "unavailable" : "differs"}`).join(", ")} on ${action.ref}.`);
+      if (visual && action.ref !== target.ref) {
+        if (target.verifiedRefs.length >= 25 && !target.verifiedRefs.includes(action.ref) ||
+            (target.plannedRefs?.length ?? 0) >= 20 && !target.plannedRefs?.includes(action.ref) ||
+            stage.logicalRefs.length >= 20 && !stage.logicalRefs.includes(action.ref))
+          throw new Error("invalid_required_reference: No room to checkpoint the verified background ref.");
+        target.verifiedRefs = [...new Set([...target.verifiedRefs, action.ref])];
+        target.plannedRefs = [...new Set([...(target.plannedRefs ?? []), action.ref])];
+        stage.logicalRefs = [...new Set([...stage.logicalRefs, action.ref])];
+      }
+      const { tool, ...args } = action;
+      const blocker = editMutationBlocker(task, [{ action }]);
+      if (blocker) throw new Error(blocker);
+      const setter = parseResponsesFunctionCalls([{
+        type: "function_call", call_id: `${id}-write`, name: tool, arguments: JSON.stringify(args),
+      }])[0]!;
+      task.pending = [setter];
+      transition("EXECUTING_STAGE");
+      await save();
+      return "advance";
+    }
+
+    stage.verified = true;
+    stage.completed = true;
+    stage.completionReason = mutations.length ? "required_refs_and_native_verification_confirmed" : "verified_no_op";
+    transition("STAGE_COMPLETED");
+    if (task.stages.every((item) => item.completed)) {
+      task.status = "completed";
+      task.text = task.stages.map((item) =>
+        `${item.title}: ${item.completionReason === "verified_no_op" ? "Verified no-op" : visual ? "Verified visible background edit" : "Verified native edit"}.`).join("\n") +
+        `\nConfirmed canvas mutations: ${chatTaskCommittedOperationCount(task)}.`;
+      task.recent = [];
+      delete task.failure;
+      transition("TASK_COMPLETED");
+      await save();
+      return "complete";
+    }
+    await save();
+    return "advance";
+  };
+
+  const reconcileSavedEditOnResume = async (): Promise<void> => {
+    if (task.intent !== "edit") return;
+    activePhase = "verification";
+    const stageIndex = task.stages.findIndex((stage) => !stage.completed);
+    const stage = task.stages[stageIndex];
+    const target = task.editTarget;
+    if (!stage || !target || stage.propertyEdit) return;
+    const confirmedMutations = task.ledger.filter(
+      (entry) =>
+        entry.stage === stageIndex &&
+        entry.status === "completed" &&
+        !entry.reused &&
+        entry.acknowledgementStatus === "confirmed_mutation" &&
+        isCanvasMutationTool(entry.call.action.tool),
+    );
+    if (!confirmedMutations.length) return;
+
+    const verifiedTargetRefs = new Set(target.verifiedRefs.map(knownRef));
+    const plannedTargetRefs = new Set((target.plannedRefs ?? []).map(knownRef));
+    const invalidExistingRefs = stage.logicalRefs.filter(
+      (ref) => verifiedTargetRefs.has(knownRef(ref)) && !plannedTargetRefs.has(knownRef(ref)),
+    );
+    if (invalidExistingRefs.length) {
+      stage.completionReason = "invalid_required_reference";
+      throw new Error(
+        `invalid_required_reference: Saved edit stage references verified native nodes outside its approved target set: ${invalidExistingRefs.join(", ")}. The confirmed mutation is retained.`,
+      );
+    }
+    const satisfied = chatTaskStageSatisfiedRefs(task, stageIndex);
+    const missingCreations = stage.logicalRefs.filter(
+      (ref) =>
+        !satisfied.has(ref) &&
+        !(plannedTargetRefs.has(knownRef(ref)) && !verifiedTargetRefs.has(knownRef(ref))),
+    );
+    if (missingCreations.length) return;
+
+    const refs = [
+      ...new Set([
+        target.ref,
+        ...stage.logicalRefs,
+        ...confirmedMutations.flatMap((entry) =>
+          entry.call.action.tool === "set_properties" ? [entry.call.action.ref] : [],
+        ),
+      ]),
+    ];
+    if (!refs.length || refs.length > INSPECT_NODES_LIMITS.refs)
+      throw new Error(
+        "invalid_required_reference: Saved edit refs exceed the bounded native resume-verification limit. No mutation was replayed.",
+      );
+    const capacity = chatTaskCapacityUsage(task);
+    if (
+      capacity.verificationOperations >= CHAT_TASK_MAX_VERIFICATION_OPERATIONS ||
+      task.ledger.length >= CHAT_TASK_MAX_LEDGER_ENTRIES
+    )
+      throw new Error(
+        "native_verification_invalid: No bounded verification capacity is available to reconcile the saved edit. The confirmed mutation is retained.",
+      );
+    const verificationNumber = stage.verificationOperations + 1;
+    const call = parseResponsesFunctionCalls([
+      {
+        type: "function_call",
+        call_id: `${task.id}_resume_verify_${stageIndex + 1}_${verificationNumber}`,
+        name: "inspect_nodes",
+        arguments: JSON.stringify({
+          pageId: target.pageId,
+          refs,
+          selection: false,
+          depth: 4,
+          maxNodes: 25,
+          purpose: "structural_verification",
+          palette: palette(),
+        }),
+      },
+    ])[0]!;
+    const entry: ChatTask["ledger"][number] = {
+      call,
+      operationId: `${task.id}-resume-qa-${stageIndex + 1}-${verificationNumber}`,
+      stage: stageIndex,
+      status: "pending",
+      category: "verification",
+    };
+    task.ledger.push(entry);
+    stage.qaAttempts = Math.min(3, stage.qaAttempts + 1);
+    const operation = FigmaToolOperationSchema.parse({
+      operationId: entry.operationId,
+      idempotencyKey: `chat:${entry.operationId}`,
+      taskId: task.id,
+      ...(task.chatId ? { chatId: task.chatId } : {}),
+      ...(task.designName ? { designName: task.designName } : {}),
+      action: call.action,
+    });
+    check();
+    entry.status = "running";
+    task.starts = task.starts.filter((started) => started > now() - 60_100);
+    task.starts.push(now());
+    task.batches++;
+    activePhase = "verification";
+    await save();
+    deps.progress(`Reconciling the saved ${stage.title} against current native Figma values…`);
+    const result = await deps.execute([operation]);
+    const native =
+      result.results.length === 1 && result.results[0]!.operationId === entry.operationId
+        ? result.results[0]
+        : undefined;
+    if (!result.success || !native?.success) {
+      entry.status = "failed";
+      entry.acknowledgementStatus = native?.acknowledgementStatus ?? "read_only";
+      entry.output = JSON.stringify({
+        success: false,
+        error: native?.error ?? "Figma did not confirm resume inspection.",
+      });
+      await save();
+      throw new Error(
+        native?.error ?? "Figma did not confirm native resume inspection; saved changes were not replayed.",
+      );
+    }
+    const parsedNodes = NativeVisualNodeSchema.array().max(25).safeParse(native.data?.nodes);
+    if (!parsedNodes.success) {
+      entry.status = "failed";
+      entry.acknowledgementStatus = "read_only";
+      entry.output = JSON.stringify({ success: false, error: "Invalid native resume evidence." });
+      await save();
+      throw new Error(
+        "native_verification_invalid: Figma returned invalid native resume evidence; the saved mutation was not replayed.",
+      );
+    }
+    const observedRefs = new Set(
+      parsedNodes.data.flatMap((node) => (node.ref ? [knownRef(node.ref)] : [])),
+    );
+    const missingRefs = refs.map(knownRef).filter((ref) => !observedRefs.has(ref));
+    if (missingRefs.length) {
+      entry.status = "completed";
+      entry.acknowledgementStatus = "read_only";
+      entry.output = JSON.stringify({ success: false, missingInspectionRefs: missingRefs });
+      stage.completionReason = "missing_reference_inspection";
+      await save();
+      throw new Error(
+        `missing_reference_inspection: Resume verification could not find ${missingRefs.join(", ")}; the confirmed mutation was not replayed.`,
+      );
+    }
+    const propertyChecks = nativePropertyChecks(task, stageIndex, parsedNodes.data, knownRef);
+    const backgrounds = native.data?.frameBackgrounds as Record<string, unknown> | undefined;
+    if (backgrounds && backgrounds[knownRef(target.ref)] !== "root" &&
+        propertyChecks.some((item) => item.ref === knownRef(target.ref) && item.property === "fill"))
+      throw new Error("native_property_verification_failed: The confirmed frame fill is not established as the visible background.");
+    const propertyMismatches = nativePropertyMismatches(propertyChecks);
+    const findings = readVerification(
+      stageIndex,
+      native.data,
+      parsedNodes.data,
+      refs.map(knownRef),
+    );
+    entry.status = "completed";
+    entry.acknowledgementStatus = "read_only";
+    entry.output = JSON.stringify({
+      success: propertyMismatches.length === 0 && findings.length === 0,
+      inspectedNodes: parsedNodes.data.length,
+      findingCount: findings.length,
+      verifiedPropertyCount: propertyChecks.length,
+      propertyVerificationConfirmed: propertyMismatches.length === 0 && propertyChecks.length > 0,
+      ...(propertyMismatches.length
+        ? {
+            propertyMismatches: propertyMismatches.slice(0, 12).map(({ ref, property, actual }) => ({
+              ref,
+              property,
+              observation: actual === undefined ? "unavailable" : "different",
+            })),
+          }
+        : {}),
+    });
+    if (propertyMismatches.length) {
+      stage.verified = false;
+      stage.completionReason = "native_property_verification_failed";
+      await save();
+      throw new Error(
+        `native_property_verification_failed: The saved edit's native value does not match its confirmed operation (${propertyMismatches
+          .slice(0, 5)
+          .map(({ ref, property }) => `${ref}.${property}`)
+          .join(", ")}). The confirmed mutation was not replayed.`,
+      );
+    }
+    const inspectedPlannedRefs = refs
+      .map(knownRef)
+      .filter((ref) => plannedTargetRefs.has(ref));
+    target.verifiedRefs = [...new Set([...target.verifiedRefs, ...inspectedPlannedRefs])].slice(0, 25);
+    stage.qualityFindings = safeQualityFindings(findings);
+    stage.verificationHistory.push({
+      attempt: verificationNumber,
+      findings: stage.qualityFindings,
+    });
+    stage.verified = findings.length === 0;
+    stage.awaitingQualityRepair = findings.length > 0;
+    stage.completionReason = findings.length
+      ? "native_verification_failed"
+      : "awaiting_completion_call";
+    if (findings.length) {
+      task.recent.push({
+        role: "user",
+        content: `Resume inspection completed. Native structure findings remain: ${findings
+          .slice(0, 6)
+          .map((finding) => `${finding.code} on ${(finding.refs ?? (finding.ref ? [finding.ref] : [])).join(",")}`)
+          .join("; ")}. Do not repeat confirmed mutations.`,
+      });
+    } else {
+      task.recent.push({
+        role: "user",
+        content: `Resume inspection verified ${propertyChecks.length} native property value(s) for the already-confirmed edit. Do not replay those operations; continue only genuine outstanding work or complete the stage.`,
+      });
+    }
+    task.recent = task.recent.slice(-20);
+    syncCapacityAccounting(task);
+    await save();
   };
   const failUnavailableRepair = (stageIndex: number): never => {
     const stage = task.stages[stageIndex]!;
@@ -2168,6 +2703,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     call_id: callId,
     output: JSON.stringify(payload),
   });
+  let editBatchCorrections = 0;
   const wasRetry =
     task.status === "failed" || task.status === "stopped" || task.status === "running";
   const initialLedgerLength = task.ledger.length;
@@ -2217,6 +2753,16 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
   delete task.failure;
   try {
     await save();
+    if (wasRetry && task.intent === "edit") await reconcileSavedEditOnResume();
+    const unfinished = task.stages.findIndex((stage) => !stage.completed);
+    if (!task.pending.length && task.stages[unfinished]?.completionReason === "missing_creation_operation" &&
+        chatTaskInspectedContinuationRefs(task, unfinished).size > 0) {
+      task.pending = parseResponsesFunctionCalls([{
+        type: "function_call", call_id: `${task.id}_resume_stage`,
+        name: "complete_canvas_stage", arguments: JSON.stringify({ summary: "Reconcile the saved stage against native evidence." }),
+      }]);
+      await save();
+    }
     if (
       retryQualityStage >= 0 &&
       !task.pending.some((call) => isCanvasMutationTool(call.action.tool))
@@ -2355,6 +2901,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           return;
         }
       }
+      const propertyStage = await executePlannedPropertyStage();
+      if (propertyStage === "complete") return;
+      if (propertyStage === "advance") continue;
       const repairVerificationStage = task.stages.findIndex(
         (stage) => stage.repairVerificationPending,
       );
@@ -2527,7 +3076,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   uniqueTargetRefs.size !== targetRefs.length ||
                   targetRefs.some((ref) => !target.verifiedRefs.includes(ref)) ||
                   action.stages.some((stage) => stage.pageId && stage.pageId !== target.pageId) ||
-                  action.stages.some((stage) => stage.logicalRefs.length > 19) ||
+                  action.stages.some((stage) => stage.logicalRefs.length > 19 ||
+                    new Set(stage.logicalRefs).size !== stage.logicalRefs.length ||
+                    stage.logicalRefs.some((ref) => /^task-/iu.test(ref) && !target.verifiedRefs.includes(ref))) ||
                   action.stages.some((stage) =>
                     stage.logicalRefs.some((ref) => target.verifiedRefs.includes(ref) && !targetRefs.includes(ref)),
                   )
@@ -2665,7 +3216,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                     ? { pageId: inspectedPageId }
                     : {}),
                   estimatedMutations:
-                    planned.estimatedMutations ?? estimatedStageMutations(planned.logicalRefs),
+                    planned.estimatedMutations ??
+                    (task.intent === "edit" ? 1 : estimatedStageMutations(planned.logicalRefs)),
                   completed: false,
                   operations: 0,
                   readOnlyOperations: 0,
@@ -2759,24 +3311,64 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   "No native operations were confirmed for this stage; it cannot be marked complete.",
                 );
               }
-              const missingRefs = stage.logicalRefs.filter(
-                (ref) =>
-                  !task.ledger.some(
-                    (entry) =>
-                      entry.stage === stageIndex &&
-                      entry.status === "completed" &&
-                      isCanvasMutationTool(entry.call.action.tool) &&
-                      "ref" in entry.call.action &&
-                      knownRef(entry.call.action.ref) === knownRef(ref),
-                  ),
+              const target = task.intent === "edit" ? task.editTarget : undefined;
+              const verifiedTargetRefs = new Set(target?.verifiedRefs.map(knownRef) ?? []);
+              const plannedTargetRefs = target?.plannedRefs
+                ? new Set(target.plannedRefs.map(knownRef))
+                : undefined;
+              const invalidExistingRefs = stage.logicalRefs.filter((ref) =>
+                verifiedTargetRefs.has(knownRef(ref)) &&
+                plannedTargetRefs &&
+                !plannedTargetRefs.has(knownRef(ref)),
               );
-              if (missingRefs.length) {
-                stage.completionReason = "missing_required_refs";
+              if (invalidExistingRefs.length) {
+                stage.completionReason = "invalid_required_reference";
                 throw new Error(
-                  `Stage is missing confirmed required refs: ${missingRefs.join(", ")}. Create or repair only these requirements, then complete the saved stage again.`,
+                  `invalid_required_reference: Saved edit stage references existing native targets outside the verified plan: ${invalidExistingRefs.join(", ")}. The confirmed mutation is retained; inspect and replan this stage before continuing.`,
                 );
               }
-              if (!stage.verified) {
+              const satisfiedRefs = chatTaskStageSatisfiedRefs(task, stageIndex);
+              const satisfiedRefKeys = new Set([...satisfiedRefs].map(knownRef));
+              const requiresInspection = stage.logicalRefs.filter(
+                (ref) =>
+                  target !== undefined &&
+                  plannedTargetRefs?.has(knownRef(ref)) &&
+                  !verifiedTargetRefs.has(knownRef(ref)),
+              );
+              const missingCreationRefs = stage.logicalRefs.filter(
+                (ref) =>
+                  !satisfiedRefKeys.has(knownRef(ref)) &&
+                  !requiresInspection.some((pendingRef) => knownRef(pendingRef) === knownRef(ref)),
+              );
+              if (missingCreationRefs.length) {
+                stage.completionReason = "missing_creation_operation";
+                throw new Error(
+                  `missing_creation_operation: The saved stage still requires native creation of ${missingCreationRefs.join(", ")}. Existing verified edit targets may be reused without mutation; create only genuinely new required refs, then complete the stage again.`,
+                );
+              }
+              const reusedContinuation = chatTaskInspectedContinuationRefs(task, stageIndex);
+              const offPlanCreations = reusedContinuation.size ? confirmedStageMutations.flatMap((entry) => {
+                const action = entry.call.action;
+                return (action.tool === "create_frame" || action.tool === "create_text" || action.tool === "create_rectangle") &&
+                  !stage.logicalRefs.some((ref) => knownRef(ref) === knownRef(action.ref)) ? [knownRef(action.ref)] : [];
+              }) : [];
+              const hasConfirmedPropertyEdit =
+                task.intent === "edit" &&
+                confirmedStageMutations.some((entry) => entry.call.action.tool === "set_properties");
+              const propertyVerificationPersisted = task.ledger.some((entry) => {
+                if (
+                  entry.stage !== stageIndex ||
+                  entry.category !== "verification" ||
+                  entry.status !== "completed"
+                )
+                  return false;
+                try {
+                  return JSON.parse(entry.output ?? "{}").propertyVerificationConfirmed === true;
+                } catch {
+                  return false;
+                }
+              });
+              if (!stage.verified || offPlanCreations.length || (hasConfirmedPropertyEdit && !propertyVerificationPersisted)) {
                 if (stage.qaAttempts >= 3) {
                   stage.completionReason = "native_verification_failed";
                   throw new Error(
@@ -2785,15 +3377,27 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 }
                 const attempt = stage.qaAttempts + 1;
                 const verificationNumber = stage.verificationOperations + 1;
-                const refs = stage.logicalRefs.length
+                const refs = offPlanCreations.length
+                  ? [...new Set([...stage.logicalRefs, ...offPlanCreations])]
+                  : stage.logicalRefs.length
                   ? task.intent === "edit" && task.editTarget
-                    ? [...new Set([task.editTarget.ref, ...stage.logicalRefs])]
+                    ? [
+                        ...new Set([
+                          task.editTarget.ref,
+                          ...stage.logicalRefs,
+                          ...confirmedStageMutations.flatMap((entry) =>
+                            entry.call.action.tool === "set_properties" ? [entry.call.action.ref] : [],
+                          ),
+                        ]),
+                      ]
                     : stage.logicalRefs
                   : task.ledger
                       .filter((entry) => entry.stage === stageIndex && "ref" in entry.call.action)
                       .map((entry) => ("ref" in entry.call.action ? entry.call.action.ref : ""))
                       .filter(Boolean)
                       .slice(0, 20);
+                if (refs.length > INSPECT_NODES_LIMITS.refs)
+                  throw new Error("invalid_required_reference: The saved stage exceeds the bounded native verification scope.");
                 const inspection = parseResponsesFunctionCalls([
                   {
                     type: "function_call",
@@ -2919,6 +3523,46 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                     "The bounded section inspection returned invalid geometry; committed changes remain.",
                   );
                 }
+                const inspectedRootRefs = new Set(
+                  parsedNodes.data.flatMap((node) => node.ref ? [knownRef(node.ref)] : []),
+                );
+                const missingInspectionRefs = refs
+                  .map(knownRef)
+                  .filter((ref) => !inspectedRootRefs.has(ref));
+                if (missingInspectionRefs.length) {
+                  inspectionEntry.status = "completed";
+                  inspectionEntry.acknowledgementStatus = "read_only";
+                  inspectionEntry.output = JSON.stringify({
+                    success: false,
+                    inspectedNodes: parsedNodes.data.length,
+                    missingInspectionRefs,
+                  });
+                  stage.completionReason = "missing_reference_inspection";
+                  await save();
+                  throw new Error(
+                    `missing_reference_inspection: Native verification did not return evidence for ${missingInspectionRefs.join(", ")}. The confirmed mutation remains; the stage was not marked complete.`,
+                  );
+                }
+                if (target) {
+                  const inspectedPlannedRefs = refs
+                    .map(knownRef)
+                    .filter((ref) => plannedTargetRefs?.has(ref));
+                  target.verifiedRefs = [
+                    ...new Set([...target.verifiedRefs, ...inspectedPlannedRefs]),
+                  ].slice(0, 25);
+                }
+                if (offPlanCreations.length) {
+                  inspectionEntry.status = "completed";
+                  inspectionEntry.acknowledgementStatus = "read_only";
+                  inspectionEntry.output = JSON.stringify({
+                    success: true, planMismatch: true, refs: refs.map(knownRef),
+                    identities: result.data?.nativeIdentities,
+                  });
+                  stage.verified = false;
+                  stage.completionReason = "invalid_required_reference";
+                  await save();
+                  throw new Error("invalid_required_reference: Fresh native inspection confirmed the existing refs and saved additions, but the additions are outside the saved enhancement specification. Review the remaining design work before authorizing a revised plan.");
+                }
                 const verifiedRefs = refs.map(knownRef);
                 const findings = readVerification(
                   stageIndex,
@@ -2928,12 +3572,51 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 );
                 const safeFindings = safeQualityFindings(findings);
                 inspectionEntry.status = "completed";
+                inspectionEntry.acknowledgementStatus = "read_only";
+                const propertyChecks =
+                  task.intent === "edit"
+                    ? nativePropertyChecks(task, stageIndex, parsedNodes.data, knownRef)
+                    : [];
+                const backgrounds = result.data?.frameBackgrounds as Record<string, unknown> | undefined;
+                if (target && backgrounds && backgrounds[knownRef(target.ref)] !== "root" &&
+                    propertyChecks.some((item) => item.ref === knownRef(target.ref) && item.property === "fill")) {
+                  stage.verified = false;
+                  stage.completionReason = "native_property_verification_failed";
+                  inspectionEntry.output = JSON.stringify({ success: false, visualOutcomeVerified: false });
+                  throw new Error("native_property_verification_failed: The confirmed frame fill is not established as the visible background.");
+                }
+                const propertyMismatches = nativePropertyMismatches(propertyChecks);
                 inspectionEntry.output = JSON.stringify({
-                  success: true,
+                  success: propertyMismatches.length === 0,
                   inspectedNodes: parsedNodes.data.length,
                   findingCount: findings.length,
                   findings: findings.slice(0, 12),
+                  verifiedPropertyCount: propertyChecks.length,
+                  propertyVerificationConfirmed:
+                    propertyMismatches.length === 0 && propertyChecks.length > 0,
+                  ...(propertyMismatches.length
+                    ? {
+                        propertyMismatches: propertyMismatches.slice(0, 12).map(({ ref, property, actual }) => ({
+                          ref,
+                          property,
+                          observation: actual === undefined ? "unavailable" : "different",
+                        })),
+                      }
+                    : {}),
                 });
+                if (propertyMismatches.length) {
+                  stage.verified = false;
+                  stage.completionReason = "native_property_verification_failed";
+                  await save();
+                  throw new Error(
+                    `native_property_verification_failed: Native values did not match the confirmed edit for ${propertyMismatches
+                      .slice(0, 5)
+                      .map(({ ref, property, actual }) =>
+                        `${ref}.${property} (${actual === undefined ? "native value unavailable" : "native value differs from the requested value"})`,
+                      )
+                      .join("; ")}. The confirmed mutation is retained; it was not replayed.`,
+                  );
+                }
                 if (hasQualityProgress(stage.qualityFindings, safeFindings)) {
                   delete task.lastFailureSignature;
                   delete task.lastFailureProgress;
@@ -2981,7 +3664,24 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               }
               stage.completed = true;
               stage.completionReason = "required_refs_and_native_verification_confirmed";
+              delete task.lastFailureSignature;
+              delete task.lastFailureProgress;
               transition("STAGE_COMPLETED");
+              if (task.intent === "edit" && task.stages.every((item) => item.completed)) {
+                const report = editCompletionReport(task);
+                if (!report)
+                  throw new Error(
+                    "native_verification_invalid: The verified edit did not produce a safe completion report.",
+                  );
+                task.text = report;
+                task.pending = [];
+                task.status = "completed";
+                delete task.failure;
+                task.recent = [];
+                transition("TASK_COMPLETED");
+                await save();
+                return;
+              }
             }
             task.recent.push(
               output(call.callId, {
@@ -3015,12 +3715,21 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               error instanceof Error &&
               (error.message.startsWith("no_progress_repeated_error") ||
                 error.message.startsWith("native_quality_unrepairable") ||
-                error.message.startsWith("native_verification_invalid"))
+                error.message.startsWith("native_verification_invalid") ||
+                error.message.startsWith("native_property_verification_failed") ||
+                error.message.startsWith("missing_reference_inspection") ||
+                error.message.startsWith("invalid_required_reference"))
             )
               throw error;
             if (task.stages.length && task.lifecycle === "VERIFYING_STAGE")
               transition("EXECUTING_STAGE");
-            guardRepeatedFailure(
+            if (error instanceof Error && error.message.startsWith("missing_creation_operation:")) {
+              const progress = chatTaskCommittedOperationCount(task);
+              if (task.lastFailureSignature === error.message && task.lastFailureProgress === progress)
+                throw error;
+              task.lastFailureSignature = error.message;
+              task.lastFailureProgress = progress;
+            } else guardRepeatedFailure(
               `planning:${error instanceof Error ? error.message : "stage_not_confirmed"}`,
             );
             task.recent.push(
@@ -3787,6 +4496,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         tools: turn.kind === "tool_calls" ? turn.calls.map(({ name }) => name) : [],
         validationCodes: turn.kind === "tool_validation" ? turn.issues.slice(0, 8).map(({ errorCode }) => errorCode) : [],
         durationMs: turnDurationMs,
+        ...(turn.timing ? { timing: turn.timing } : {}),
         inputBytes: utf8Bytes(JSON.stringify(input)),
       });
       if (current) {
@@ -3986,15 +4696,49 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       });
       if (!calls.length || calls.length > 10)
         throw new Error("The model returned an invalid bounded stage.");
+      const continuationStage = task.stages.findIndex((stage) => !stage.completed);
+      const continuationRefs = chatTaskInspectedContinuationRefs(task, continuationStage);
+      if (continuationRefs.size && calls.some(({ action }) =>
+        (action.tool === "create_frame" || action.tool === "create_text" || action.tool === "create_rectangle") &&
+        (!task.stages[continuationStage]?.logicalRefs.includes(action.ref) ||
+          continuationRefs.has(action.ref) || action.parent.kind === "page"))) {
+        await stopEdit("invalid_required_reference",
+          "New layers in an existing design must use declared new refs and stay inside the existing screen.", "planning");
+        return;
+      }
+      const reservations: string[] = [];
       if (task.intent === "edit" && task.stages.length && calls.some(({ action }) => isCanvasMutationTool(action.tool))) {
         const mutationCalls = calls.filter(({ action }) => isCanvasMutationTool(action.tool));
         const blocker = editMutationBlocker(
           task,
           mutationCalls as unknown as Array<{ action: FigmaToolAction }>,
+          reservations,
         );
         if (blocker) {
+          if (blocker.startsWith("duplicate_confirmed_operation")) {
+            guardRepeatedFailure(`edit_duplicate_mutation:${blocker}`);
+            for (const call of calls)
+              task.recent.push(
+                output(call.callId, {
+                  success: false,
+                  error: blocker.replace(/^duplicate_confirmed_operation:\s*/u, ""),
+                  instruction:
+                    "The already-confirmed native update was not replayed. Use the saved operation and fresh native verification to finish or identify a different unresolved change.",
+                }),
+              );
+            task.pending = [];
+            await save();
+            continue;
+          }
           const message = blocker.replace(/^[a-z_]+:\s*/u, "");
           const code = blocker.startsWith("edit_plan_invalid") ? "edit_plan_invalid" : "native_execution_blocked";
+          task.editReferenceDiagnostic = message.slice(0, 500);
+          if (code === "edit_plan_invalid" && editBatchCorrections++ < 2) {
+            task.validationFeedback = `The entire batch was rejected before dispatch. ${message} Return a corrected batch in dependency order. Keep the existing frame and use the saved aliases for previously confirmed nodes.`;
+            task.recent = [];
+            await save();
+            continue;
+          }
           await stopEdit(code, message, "native_execution");
           return;
         }
@@ -4027,6 +4771,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         await save();
         continue;
       }
+      const stage = task.stages.find((item) => !item.completed);
+      if (stage && reservations.length) stage.logicalRefs.push(...reservations);
       task.pending = calls;
       task.lastResponseCalls = calls.length;
       task.recent = calls.map((call) => call.functionCall);
@@ -4130,6 +4876,16 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               ? transportCategory
               : task.error.startsWith("native_verification_invalid")
                 ? "native_verification_invalid"
+                : task.error.startsWith("native_verification_capacity_exceeded")
+                  ? "native_verification_capacity_exceeded"
+                : task.error.startsWith("missing_creation_operation")
+                  ? "missing_creation_operation"
+                : task.error.startsWith("native_property_verification_failed")
+                  ? "native_property_verification_failed"
+                  : task.error.startsWith("missing_reference_inspection")
+                    ? "missing_reference_inspection"
+                    : task.error.startsWith("invalid_required_reference")
+                      ? "invalid_required_reference"
                 : task.error.startsWith("no_progress_repeated_error")
                   ? "no_progress_repeated_error"
                   : task.error.startsWith("Initial planning budget reached")

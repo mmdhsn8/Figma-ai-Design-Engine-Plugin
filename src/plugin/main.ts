@@ -154,6 +154,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     message.data.type === "generation-context" ||
     message.data.type === "generation-remember" ||
     message.data.type === "generation-render" ||
+    message.data.type === "generation-verify" ||
     message.data.type === "generation-select" ||
     message.data.type === "generation-prepare" ||
     message.data.type === "generation-apply-section"

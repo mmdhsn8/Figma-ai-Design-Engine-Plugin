@@ -110,6 +110,10 @@ export const ChatDesignBriefSchema = z
   })
   .strict();
 
+export const PlannedPropertyEditSchema = FigmaToolActionSchema.options.find(
+  (option) => option.shape.tool.value === "set_properties",
+)! as Extract<(typeof FigmaToolActionSchema.options)[number], { shape: { tool: z.ZodLiteral<"set_properties"> } }>;
+
 export const ChatDesignStageSchema = z
   .object({
     title: z.string().min(1).max(160),
@@ -121,8 +125,17 @@ export const ChatDesignStageSchema = z
       .max(20),
     completionCriteria: z.array(z.string().min(1).max(180)).min(1).max(5),
     estimatedMutations: z.number().int().min(1).max(240).optional(),
+    propertyEdit: PlannedPropertyEditSchema.optional(),
   })
   .strict();
+
+const phaseMs = z.number().int().nonnegative().max(600_000);
+export const ChatTurnTimingSchema = z.object({
+  companionHeadersMs: phaseMs.optional(),
+  upstreamHeadersMs: phaseMs.optional(),
+  upstreamFirstDeltaMs: phaseMs.optional(),
+  upstreamTotalMs: phaseMs.optional(),
+}).strict();
 
 export const CHAT_PLAN_VERSION = 1;
 export const ChatPlanActionSchema = z
@@ -141,12 +154,13 @@ export const ChatPlanActionSchema = z
   .strict();
 
 export function modelPlanStages(stages: z.infer<typeof ChatDesignStageSchema>[]) {
-  return stages.map(({ title, goal, pageId, logicalRefs, completionCriteria, estimatedMutations }) => ({
+  return stages.map(({ title, goal, pageId, logicalRefs, completionCriteria, estimatedMutations, propertyEdit }) => ({
     title,
     goal,
     ...(pageId ? { pageId } : {}),
     logicalRefs,
     completionCriteria,
+    ...(propertyEdit ? { propertyEdit } : {}),
     ...(estimatedMutations ? { estimatedMutations } : {}),
   }));
 }
@@ -269,9 +283,9 @@ const descriptions: Record<ChatToolName, string> = {
   classify_canvas_intent:
     "Classify a canvas-related user request before any other canvas tool unless intent is already checkpointed: create new work, edit existing nodes, inspect/report existing work, explain the observed state, or continue prior work. When the user or recent conversation identifies a project/screen, include its exact targetName. Call alone once. Never reclassify saved intent or classify an edit as create.",
   plan_canvas_task:
-    "For create/edit/continue only, call alone once after intent classification. For edit, the native controller performs discovery and inspection first; include targetRefs copied exactly from the verified target evidence, including the existing root frame, and use only those refs for existing nodes. Return an internal concise design brief (viewport/platform, direction, audience, content, hierarchy, typography, spacing/radii, palette source/roles, image policy, interactions) and 1–12 ordered stages. Include designName when the user named a project. Each stage needs a goal, stable logicalRefs for every required acceptance layer, completionCriteria that name measurable native-layer, RTL, content, size, and Auto Layout outcomes, and an estimatedMutations count when known. For a new design, logicalRefs are fresh task-local aliases to create in this task, never unrelated page-history refs. For edits, include only specifically requested existing nodes, use exact refs returned by inspection, and preserve their pageId. Put the target pageId on each edit stage; keep one page per stage. Do not replace or delete existing root frames. Work over 32 mutations continues in deterministic local segments; do not replan for that internal boundary. This plan is persisted and must not be recreated after execution starts. Preserve existing document styles/tokens and requested colors. No canvas edits in this call.",
+    "For create/edit/continue only, call alone once after intent classification. For edit, the native controller performs discovery and inspection first; include targetRefs copied exactly from the verified target evidence, including the existing root frame, and use only those refs for existing nodes. Return an internal concise design brief and 1–12 ordered stages. Include designName when the user named a project. Each stage needs a goal, stable logicalRefs for only required acceptance nodes, measurable completionCriteria, and estimatedMutations when known. For a new design, logicalRefs are fresh task-local aliases to create in this task, never unrelated page-history refs. For a stage that only updates properties of one existing node, include propertyEdit with tool set_properties, the exact ref, and the requested properties even if native evidence already matches. For edits, use the smallest plan that satisfies the request: a one-property change is one mutation on its existing target. Existing verified logicalRefs may be reused as acceptance evidence and do not each require a mutation. Do not add collateral refs or operations. Estimates are advisory and are not outstanding-operation requirements. Use exact inspected refs and their pageId. Do not replace or delete existing root frames. Work over 32 mutations continues in deterministic local segments; do not replan for that internal boundary. Preserve existing document styles/tokens and requested colors. No canvas edits in this call.",
   complete_canvas_stage:
-    "Finish only the current saved stage after every required logicalRef and native operation is confirmed. Call alone. Local deterministic verification checks required refs and editable geometry; missing requirements are returned explicitly. For failed operations, first obtain a confirmed repair using the same tool and logical ref, then include their original operation IDs in resolvedOperationIds. Never omit failed elements or replan. The result persists completion and identifies the next stage; continue automatically until all stages finish.",
+    "Finish only the current saved stage after every required logicalRef and native operation is confirmed. Call alone. Previously verified existing edit targets may satisfy a required ref without a mutation; never mutate a layer only to satisfy a ref. The local controller reconciles missing creation, missing inspection, and invalid refs, then verifies actual native property values and editable geometry before completion. For failed operations, first obtain a confirmed repair using the same tool and logical ref, then include their original operation IDs in resolvedOperationIds. Never omit failed elements or replan. The result persists completion and identifies the next stage; continue automatically until all stages finish.",
   get_document_context:
     "Read current document/page identity, selection, tokens, and progressively scan accessible page trees in bounded yielding slices. Optionally pass a project/screen query or pageId to scope discovery. The native controller owns continuation, checkpoints, cancellation, and exact coverage reporting; never request repeated context calls or offset pagination for inspection. Multiple matches are valid for inspecting all frames, but ambiguous for editing one. Only a verified unique native target may be edited. No canvas edits are performed by this tool.",
   inspect_nodes: `Read-only inspection. Use at most ${INSPECT_NODES_LIMITS.refs} refs. pageId must be copied from document context when inspecting another page. depth is an integer from ${INSPECT_NODES_LIMITS.depth.min}–${INSPECT_NODES_LIMITS.depth.max} (default ${INSPECT_NODES_LIMITS.depth.default}); maxNodes is an integer from ${INSPECT_NODES_LIMITS.maxNodes.min}–${INSPECT_NODES_LIMITS.maxNodes.max} (default ${INSPECT_NODES_LIMITS.maxNodes.default}). Finite numbers outside either range are clamped locally. Invalid types and in-range fractions are rejected. Never inspect more than ${INSPECT_NODES_LIMITS.maxNodes.max} nodes. Set selection:true when refs is empty. Returns stable logical refs for follow-up edits. For INSPECTING requests, the plugin controller chooses targets and sequences operations; do not repeat inspection. A failed pre-plan inspection does not block a new design; existing-node edits still require successful inspection.`,
@@ -311,6 +325,7 @@ function toolParameters(name: ChatToolName): Record<string, unknown> {
   delete properties.tool;
   // Internal controller flag: native inspection calls set this after intent classification.
   delete properties.readOnlyInspection;
+  delete properties.backgroundRootRef;
   if (Array.isArray(parameters.required))
     parameters.required = parameters.required.filter((field) => field !== "tool");
   if (name === "create_frame" || name === "create_rectangle")

@@ -16,6 +16,11 @@ import { ChatTaskSchema, chatTaskCommittedOperationCount } from "../src/shared/c
 import { handleChatTaskStorage } from "../src/plugin/chat-task-storage";
 import { chatTaskInput, runChatTask } from "../src/ui/chat-task";
 import { CompanionClientError, type AuthorizedChatTurn } from "../src/ui/companion-client";
+import {
+  MAX_NATIVE_QUALITY_SCAN_DEPTH,
+  MAX_NATIVE_QUALITY_SCAN_NODES,
+  MAX_NATIVE_QUALITY_OVERLAP_PAIRS,
+} from "../src/shared/native-visual-quality";
 
 import { createMockApi, type MockNode } from "./figma-mock";
 
@@ -715,6 +720,213 @@ describe("safe Figma tool executor", () => {
     expect(frame.getPluginData("fad.tool.logical-ref.v1")).toBe("");
     expect(mock.api.root.getPluginData("fad.document-id")).toBe(originalDocumentId);
   });
+
+  it("verifies and edits the covering rectangle on the exact frame among duplicate names", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const taskId = "chat-background-native";
+    const size = { width: 390, height: 844 };
+    await run(executor, ["charm-target", "charm-other"].map((ref) =>
+      operation(`create-${ref}`, { tool: "create_frame", ref, name: "Charm Home",
+        size, parent: { kind: "page" }, fill: "#FFF0F5" }, taskId)));
+    await run(executor, [operation("create-charm-cover", { tool: "create_rectangle", ref: "charm-cover",
+      name: "خانه - زمینه", parent: { kind: "node", ref: "charm-target" }, size,
+      x: 0, y: 0, fill: "#FFF9F4" }, taskId)]);
+    const [root, other] = mock.api.currentPage.children;
+    const cover = root?.type === "FRAME" ? root.children[0] : undefined;
+    expect(cover?.type).toBe("RECTANGLE");
+    const inspect = async (suffix: string) => resultFor(messages, await run(executor, [
+      operation(`verify-charm-${suffix}`, { tool: "inspect_nodes", refs: ["charm-target"],
+        purpose: "background_verification" }, taskId),
+    ]));
+    expect(await inspect("before")).toMatchObject({ success: true, results: [{ data: {
+      visualBackground: { rootNodeId: root?.id, nodeId: cover?.id, fill: "#FFF9F4" },
+    } }] });
+    const blocked = await run(executor, [operation("write-hidden-root", { tool: "set_properties",
+      ref: "charm-target", backgroundRootRef: "charm-target", properties: { fill: "#00FF00" } }, taskId)]);
+    expect(resultFor(messages, blocked)).toMatchObject({ success: false, committedOperationIds: [] });
+    for (const [label, fill] of [["green", "#00FF00"], ["blue", "#0000FF"]]) {
+      const batch = await run(executor, [operation(`write-charm-${label}`, { tool: "set_properties",
+        ref: "charm-cover", backgroundRootRef: "charm-target", properties: { fill } }, taskId)]);
+      expect(resultFor(messages, batch)).toMatchObject({ success: true });
+      expect(await inspect(label!)).toMatchObject({ success: true, results: [{ data: {
+        visualBackground: { rootNodeId: root?.id, nodeId: cover?.id, fill },
+      } }] });
+    }
+    expect(mock.api.currentPage.children.map((node) => node.id)).toEqual([root?.id, other?.id]);
+    expect(root?.type === "FRAME" && root.children.map((node) => node.id)).toEqual([cover?.id]);
+    expect(other?.type === "FRAME" && other.fills).toEqual(root?.type === "FRAME" && root.fills);
+  });
+
+  it("returns bounded native property evidence from structural verification without selecting nodes", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const taskId = "chat-task-0001";
+    const rootRef = "verified-fill-root";
+    const createBatch = await run(executor, [
+      operation(
+        "verified-fill-create",
+        {
+          tool: "create_frame",
+          ref: rootRef,
+          name: "Existing Root",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+          fill: "#FFF9F4",
+        },
+        taskId,
+      ),
+    ]);
+    const createResult = resultFor(messages, createBatch);
+    expect(createResult?.type === "tool-result" && createResult.success).toBe(true);
+    if (createResult?.type !== "tool-result" || !createResult.results[0]?.logicalRef)
+      throw new Error("The created root did not return its canonical native reference.");
+    const canonicalRootRef = createResult.results[0].logicalRef;
+    const frame = mock.api.currentPage.children[0] as unknown as MockNode;
+    const originalId = frame.id;
+    const originalSelection = [...mock.api.currentPage.selection];
+    const mutationBatch = await run(executor, [
+      operation(
+        "verified-fill-mutation",
+        { tool: "set_properties", ref: rootRef, properties: { fill: "#FFF0F5" } },
+        taskId,
+      ),
+    ]);
+    const mutationResult = resultFor(messages, mutationBatch);
+    expect(mutationResult?.type === "tool-result" && mutationResult.success).toBe(true);
+
+    const verificationBatch = await run(executor, [
+      operation(
+        "verified-fill-inspection",
+        {
+          tool: "inspect_nodes",
+          pageId: "page:current",
+          refs: [rootRef],
+          selection: false,
+          depth: 4,
+          maxNodes: 25,
+          purpose: "structural_verification",
+        },
+        taskId,
+      ),
+    ]);
+
+    expect(resultFor(messages, verificationBatch)).toMatchObject({
+      success: true,
+      committedOperationIds: [],
+      results: [
+        {
+          data: {
+            nodes: [{ ref: canonicalRootRef, fill: "#FFF0F5", width: 390, height: 844 }],
+            qualityCoverage: { complete: true, nodeCount: 1, findingCount: 0 },
+          },
+        },
+      ],
+    });
+    expect(frame.id).toBe(originalId);
+    expect(mock.api.currentPage.selection).toEqual(originalSelection);
+    expect(mock.api.currentPage.children).toContain(frame);
+  });
+
+  it.each(["node-limit", "depth-limit", "overlap-limit"] as const)(
+    "yields and marks native structural QA incomplete at its %s",
+    async (limit) => {
+      const mock = createMockApi();
+      const messages: PluginToUIMessage[] = [];
+      const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+      const taskId = `chat-qa-${limit}`;
+      const createBatch = await run(executor, [
+        operation(
+          `create-${limit}-root`,
+          {
+            tool: "create_frame",
+            ref: "qa-root",
+            name: "Bounded QA root",
+            parent: { kind: "page" },
+            size: { width: 390, height: 844 },
+            ...(limit === "overlap-limit"
+              ? {
+                  autoLayout: {
+                    direction: "horizontal",
+                    gap: 0,
+                    padding: { top: 0, right: 0, bottom: 0, left: 0 },
+                  },
+                }
+              : {}),
+          },
+          taskId,
+        ),
+      ]);
+      expect(resultFor(messages, createBatch)).toMatchObject({ success: true });
+      const root = mock.find("Bounded QA root");
+      if (!root) throw new Error("QA root was not created.");
+      const attachOwned = (node: MockNode, parent: MockNode) => {
+        (node as MockNode & { setPluginData: (key: string, value: string) => void }).setPluginData(
+          "fad.tool.task-id.v1",
+          taskId,
+        );
+        parent.appendChild(node);
+      };
+      if (limit === "node-limit" || limit === "overlap-limit") {
+        const childCount =
+          limit === "node-limit"
+            ? MAX_NATIVE_QUALITY_SCAN_NODES
+            : Math.ceil((1 + Math.sqrt(1 + 8 * MAX_NATIVE_QUALITY_OVERLAP_PAIRS)) / 2);
+        for (let index = 0; index < childCount; index++) {
+          const child = mock.api.createRectangle() as unknown as MockNode;
+          child.name = `QA child ${index}`;
+          attachOwned(child, root);
+        }
+      } else {
+        let parent = root;
+        for (let index = 0; index <= MAX_NATIVE_QUALITY_SCAN_DEPTH; index++) {
+          const child = mock.api.createFrame() as unknown as MockNode;
+          child.name = `QA depth ${index}`;
+          attachOwned(child, parent);
+          parent = child;
+        }
+      }
+
+      const verificationBatch = await run(executor, [
+        operation(
+          `verify-${limit}`,
+          {
+            tool: "inspect_nodes",
+            refs: ["qa-root"],
+            selection: false,
+            depth: 1,
+            maxNodes: 1,
+            purpose: "structural_verification",
+          },
+          taskId,
+        ),
+      ]);
+
+      expect(resultFor(messages, verificationBatch)).toMatchObject({
+        success: true,
+        committedOperationIds: [],
+        results: [
+          {
+            data: {
+              qualityCoverage: {
+                complete: false,
+                truncated: true,
+                nodeCount:
+                  limit === "node-limit"
+                    ? MAX_NATIVE_QUALITY_SCAN_NODES
+                    : limit === "depth-limit"
+                      ? MAX_NATIVE_QUALITY_SCAN_DEPTH + 1
+                      : 1,
+              },
+            },
+          },
+        ],
+      });
+    },
+    20_000,
+  );
 
   it("refuses to use persisted inspection-only refs for mutations", async () => {
     const mock = createMockApi();
@@ -1811,6 +2023,30 @@ describe("safe Figma tool executor", () => {
     expect(resultFor(messages, scoped)).toMatchObject({ success: true });
     expect(mock.nodes).toHaveLength(2);
     expect(mock.nodes[0]!.getPluginData("fad.tool.logical-ref.v1")).toBe("store");
+  });
+
+  it("restores a lost alias during fresh inspection without replaying the confirmed creation", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const taskId = "chat-alias-recovery";
+    const created = await run(executor, [operation("alias-card-create", {
+      tool: "create_frame", ref: "polishHero", name: "Existing card",
+      parent: { kind: "page" }, size: { width: 100, height: 40 },
+    }, taskId)]);
+    expect(resultFor(messages, created)).toMatchObject({ success: true });
+    const node = mock.nodes[0]!;
+    const ref = node.getPluginData("fad.tool.logical-ref.v1");
+    const { key, state } = legacyToolState(mock);
+    delete state.refs[ref];
+    mock.storage.set(key, state);
+    const reopened = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const batch = await run(reopened, [operation("alias-card-inspect", {
+      tool: "inspect_nodes", refs: ["polishHero"], purpose: "structural_verification",
+    }, taskId)]);
+    expect(resultFor(messages, batch)).toMatchObject({ success: true, committedOperationIds: [],
+      results: [{ data: { nativeIdentities: [{ ref, nodeId: node.id, type: "FRAME" }] } }] });
+    expect(mock.nodes.map((item) => item.id)).toEqual([node.id]);
   });
 
   it("does not recreate a checkpointed creation when the executor registry is missing", async () => {

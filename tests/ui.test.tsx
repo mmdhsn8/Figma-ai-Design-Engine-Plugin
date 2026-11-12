@@ -179,14 +179,14 @@ describe("plugin UI navigation and capability states", () => {
     expect(render("quality")).not.toContain("Asset source / license");
   });
 
-  it("defines responsive four-item navigation and removes the plugin minimum width", () => {
+  it("defines responsive drawer navigation and removes the plugin minimum width", () => {
     const css = readFileSync("src/ui/styles.css", "utf8");
 
-    expect(css).toContain("grid-template-columns: repeat(4, minmax(0, 1fr))");
+    expect(css).toContain(".navigation-drawer-links");
+    expect(css).toContain(".drawer-button");
     expect(css).toContain("@media (max-width: 420px)");
     expect(css).toContain("@media (max-width: 340px)");
     expect(css).toContain("min-width: 0;");
-    expect(css).toContain("--bg: #090e1d");
-    expect(css).toContain("linear-gradient(115deg, #7655e9");
+    expect(css).toContain("--bg: #17181d");
   });
 });

@@ -19,6 +19,7 @@ import { ChatTaskBridgeError } from "../src/ui/chat-task-bridge";
 import { CompanionClientError, type AuthorizedChatTurn } from "../src/ui/companion-client";
 import type { FigmaToolOperation } from "../src/shared/figma-tools";
 import type { PluginToUIMessage } from "../src/shared/messages";
+import { MAX_NATIVE_QUALITY_SCAN_NODES } from "../src/shared/native-visual-quality";
 
 type Result = Extract<PluginToUIMessage, { type: "tool-result" }>;
 let callNumber = 0;
@@ -140,6 +141,14 @@ function success(ops: FigmaToolOperation[]): Result {
     })),
   };
 }
+function markVerifiedStructure(data: Record<string, unknown>, nodeCount: number): void {
+  Object.assign(data, {
+    repairPipelineVersion: "native-quality-repair-v1",
+    qualityFindings: [],
+    nativeRepairPlan: [],
+    qualityCoverage: { complete: true, nodeCount, findingCount: 0 },
+  });
+}
 function harness(turns: Array<AuthorizedChatTurn | Error>, autoReadContext = true) {
   let clock = 100_000;
   const checkpoints: ChatTask[] = [];
@@ -147,6 +156,7 @@ function harness(turns: Array<AuthorizedChatTurn | Error>, autoReadContext = tru
   const inputs: ChatInputItem[][] = [];
   const lifecycles: string[] = [];
   const controller = new AbortController();
+  const nativeProperties = new Map<string, Record<string, unknown>>();
   let readContext = false;
   const deps = {
     signal: controller.signal,
@@ -178,7 +188,28 @@ function harness(turns: Array<AuthorizedChatTurn | Error>, autoReadContext = tru
     }),
     execute: vi.fn(async (operations: FigmaToolOperation[]) => {
       batches.push(operations);
-      return success(operations);
+      for (const operation of operations) {
+        if (operation.action.tool !== "set_properties") continue;
+        const values = nativeProperties.get(operation.action.ref) ?? {};
+        for (const [key, value] of Object.entries(operation.action.properties)) {
+          const evidenceKey = key === "color" ? "textColor" : key === "align" ? "textAlignHorizontal" : key;
+          values[evidenceKey] = value;
+        }
+        nativeProperties.set(operation.action.ref, values);
+      }
+      const result = success(operations);
+      for (const operation of operations) {
+        if (operation.action.tool !== "inspect_nodes") continue;
+        const item = result.results.find(({ operationId }) => operationId === operation.operationId);
+        const nodes = item?.data?.nodes;
+        if (!Array.isArray(nodes)) continue;
+        for (const value of nodes) {
+          if (!value || typeof value !== "object" || !("ref" in value)) continue;
+          const native = nativeProperties.get(String(value.ref));
+          if (native) Object.assign(value, native);
+        }
+      }
+      return result;
     }),
     save: vi.fn(async (checkpoint: ChatTask) => {
       checkpoints.push(structuredClone(ChatTaskSchema.parse(checkpoint)));
@@ -239,6 +270,200 @@ const done: AuthorizedChatTurn = {
   kind: "done",
   text: "همه بخش‌ها با لایه‌های قابل ویرایش ساخته شدند.",
 };
+
+function reportedPartialEditTask() {
+  const current = task();
+  const rootRef = "task-caba0d5eb320fddc43748146a97ca144";
+  const backgroundRef = "task-71c74e09c3a188e7a94c9eb1b1e6550f";
+  const textRef = "task-3aafa4981a685bdaefd93890f2053992";
+  const nativeNodes = [
+    {
+      ref: rootRef,
+      type: "FRAME",
+      name: "خانه | Charm",
+      x: 2040,
+      y: 5925,
+      width: 390,
+      height: 844,
+      visible: true,
+      fill: "#FFF9F4",
+      children: [
+        {
+          ref: backgroundRef,
+          type: "RECTANGLE",
+          name: "خانه - زمینه",
+          x: 0,
+          y: 0,
+          width: 390,
+          height: 844,
+          visible: true,
+          fill: "#FFF9F4",
+        },
+        {
+          ref: textRef,
+          type: "TEXT",
+          name: "خانه - معرفی",
+          x: 20,
+          y: 40,
+          width: 350,
+          height: 96,
+          visible: true,
+          fill: "#29231F",
+          text: "معرفی Charm",
+        },
+      ],
+    },
+  ];
+  const discoveryCall = turn("get_document_context", { query: "خانه | Charm", pageId: "0:1" });
+  const targetInspectionCall = turn("inspect_nodes", {
+    pageId: "0:1",
+    refs: [rootRef],
+    selection: false,
+    depth: 4,
+    maxNodes: 25,
+  });
+  const mutationCall = turn("set_properties", {
+    pageId: "0:1",
+    ref: rootRef,
+    properties: { fill: "#FFF0F5" },
+  });
+  const priorQualityCall = turn("inspect_nodes", {
+    pageId: "0:1",
+    refs: [rootRef, backgroundRef],
+    selection: false,
+    depth: 1,
+    maxNodes: 5,
+    purpose: "structural_verification",
+  });
+  const priorInspectionCall = turn("inspect_nodes", {
+    pageId: "0:1",
+    refs: [rootRef, backgroundRef],
+    selection: false,
+    depth: 1,
+    maxNodes: 5,
+  });
+  if (
+    discoveryCall.kind !== "tool_calls" ||
+    targetInspectionCall.kind !== "tool_calls" ||
+    mutationCall.kind !== "tool_calls" ||
+    priorQualityCall.kind !== "tool_calls" ||
+    priorInspectionCall.kind !== "tool_calls"
+  )
+    throw new Error("Expected saved live-task tool calls.");
+  const callAt = (turnValue: AuthorizedChatTurn) => {
+    if (turnValue.kind !== "tool_calls") throw new Error("Expected a tool call.");
+    return turnValue.calls[0]!;
+  };
+  current.id = "chat-1794304545560-ythoff";
+  current.chatId = "chat-1794304485267-qarld7";
+  current.documentId = "doc-mw1xggge-dwqwh8bw2b-0_1";
+  current.prompt = "فقط پس‌زمینه فریم موجود خانه | Charm را به #FFF0F5 تغییر بده و سایر لایه‌ها را حفظ کن.";
+  current.intent = "edit";
+  current.targetName = "خانه | Charm";
+  current.lifecycle = "EXECUTING_STAGE";
+  current.status = "failed";
+  current.failure = {
+    category: "verification",
+    phase: "verification",
+    code: "no_progress_repeated_error",
+    committedOperations: 1,
+  };
+  current.rounds = 7;
+  current.editTarget = {
+    query: "خانه | Charm",
+    ref: rootRef,
+    pageId: "0:1",
+    pageName: "Phase 1 — Storefront",
+    nodeId: "68:133",
+    type: "FRAME",
+    name: "خانه | Charm",
+    x: 2040,
+    y: 5925,
+    width: 390,
+    height: 844,
+    verifiedRefs: [rootRef, backgroundRef, textRef],
+    plannedRefs: [rootRef, backgroundRef],
+    nativeEvidence: JSON.stringify(nativeNodes),
+    discoveryOperationId: "chat-discovery-0001",
+    inspectionOperationId: "chat-inspection-0001",
+  };
+  current.stages = [
+    {
+      title: "تغییر پس‌زمینه فریم موجود",
+      goal: "فقط fill فریم خانه | Charm را به #FFF0F5 تغییر بده و شناسه، ابعاد، موقعیت و سایر لایه‌ها را دست‌نخورده نگه دار.",
+      pageId: "0:1",
+      logicalRefs: [rootRef, backgroundRef],
+      completionCriteria: [
+        "root fill is #FFF0F5",
+        "root size and location are unchanged",
+        "all other layers and positions are unchanged",
+      ],
+      estimatedMutations: 6,
+      completed: false,
+      operations: 1,
+      readOnlyOperations: 0,
+      segments: [],
+      rounds: 4,
+      qaAttempts: 0,
+      verificationOperations: 0,
+      verified: false,
+      verificationHistory: [],
+      qualityFindings: [],
+      repairOperationsExecuted: 0,
+      repairOperationsAttempted: 0,
+      awaitingQualityRepair: false,
+      completionReason: "missing_required_refs",
+    },
+  ];
+  current.ledger = [
+    {
+      call: callAt(discoveryCall),
+      operationId: `${current.id}-op-1`,
+      stage: 0,
+      status: "completed",
+      category: "read_only",
+      acknowledgementStatus: "read_only",
+      output: JSON.stringify({ success: true, data: { page: { id: "0:1", name: "Phase 1 — Storefront" } } }),
+    },
+    {
+      call: callAt(targetInspectionCall),
+      operationId: `${current.id}-op-2`,
+      stage: 0,
+      status: "completed",
+      category: "read_only",
+      acknowledgementStatus: "read_only",
+      output: JSON.stringify({ success: true, data: { pageId: "0:1", nodes: nativeNodes } }),
+    },
+    {
+      call: callAt(mutationCall),
+      operationId: `${current.id}-op-3`,
+      stage: 0,
+      status: "completed",
+      category: "mutation",
+      acknowledgementStatus: "confirmed_mutation",
+      output: JSON.stringify({ success: true, logicalRef: rootRef, summary: "Updated only the requested properties on the existing frame." }),
+    },
+    {
+      call: callAt(priorQualityCall),
+      operationId: `${current.id}-op-4`,
+      stage: 0,
+      status: "completed",
+      category: "read_only",
+      acknowledgementStatus: "read_only",
+      output: JSON.stringify({ success: true, summary: "Verified 3 native layers; 0 structural finding(s).", data: { pageId: "0:1", nodes: [] } }),
+    },
+    {
+      call: callAt(priorInspectionCall),
+      operationId: `${current.id}-op-5`,
+      stage: 0,
+      status: "completed",
+      category: "read_only",
+      acknowledgementStatus: "read_only",
+      output: JSON.stringify({ success: true, data: { pageId: "0:1", nodes: nativeNodes } }),
+    },
+  ];
+  return ChatTaskSchema.parse(current);
+}
 
 describe("progressive conversational canvas tasks", () => {
   it("closes the reported 11-round repeated-context failure with one model request and bounded inspection", async () => {
@@ -728,6 +953,485 @@ describe("progressive conversational canvas tasks", () => {
     expect(current.text).toContain("root reference charm-home was preserved");
   });
 
+  it.each([
+    ["legacy", "#FFF0F5", false],
+    ["structured", "#FFF0F5", false],
+    ["structured", "#FFF9F4", true],
+    ["covered", "#FFF9F4", true],
+    ["covered", "#FFF0F5", false],
+    ["blocked", "#FFF9F4", false],
+    ["resumed", "#FFF0F5", false],
+  ] as const)("reconciles the 11-round saved edit (%s, %s)", async (kind, initialFill, writes) => {
+    const current = reportedPartialEditTask();
+    current.id = "chat-1794466383934-p2wwgq";
+    current.lifecycle = "PLAN_SAVED";
+    current.failure!.phase = "native_execution";
+    current.rounds = 11;
+    const target = current.editTarget!;
+    const stage = current.stages[0]!;
+    target.plannedRefs = [target.ref];
+    stage.logicalRefs = [target.ref];
+    stage.goal = "Confirm native root fill exactly equals #FFF0F5 without mutations.";
+    stage.completionCriteria = ["Native fill of existing root frame is #FFF0F5; no mutation performed."];
+    stage.completionReason = "native_verification_pending";
+    stage.estimatedMutations = 1;
+    if (kind !== "legacy") {
+      stage.goal = "Set the existing root fill";
+      stage.propertyEdit = { tool: "set_properties", ref: target.ref, properties: { fill: "#FFF0F5" } };
+    }
+    const priorMutation = current.ledger.find((entry) => entry.category === "mutation")!;
+    current.ledger = current.ledger.filter((entry) => entry.category !== "mutation");
+    if (kind === "resumed") current.ledger.push(priorMutation);
+    const historical = ["classify_canvas_intent", "plan_canvas_task", "inspect_nodes", "done",
+      "inspect_nodes", "done", "inspect_nodes", "done", "inspect_nodes", "get_operation_status", "done"] as const;
+    current.modelRoundTrace = historical.map((tool, index) => ({
+      round: index + 1, lifecycle: index === 0 ? "UNPLANNED" : index === 1 ? "EDIT_PLANNING" : "PLAN_SAVED",
+      outcome: tool === "done" ? "done" : "tool_calls", tools: tool === "done" ? [] : [tool],
+      validationCodes: [], durationMs: 0, inputBytes: 0,
+    }));
+    const h = harness([done, done], false);
+    let fill: string = initialFill;
+    h.deps.execute.mockImplementation(async (operations) => {
+      h.batches.push(operations);
+      const result = success(operations);
+      for (const op of operations) {
+        if (op.action.tool === "set_properties") fill = op.action.properties.fill!;
+        if (op.action.tool !== "inspect_nodes") continue;
+        const data = result.results.find((item) => item.operationId === op.operationId)!.data!;
+        data.nodes = [{ ref: target.ref, type: "FRAME", name: target.name, visible: true,
+          x: target.x, y: target.y, width: target.width, height: target.height, fill: kind === "covered" ? "#FFF0F5" : fill }];
+        const ref = kind === "covered" ? "visible-background" : target.ref;
+        if (kind === "covered") (data.nodes as object[]).push({ ...(data.nodes as object[])[0], ref, type: "RECTANGLE", fill });
+        if (kind !== "blocked") data.visualBackground = { rootRef: target.ref, rootNodeId: target.nodeId, ref,
+          nodeId: kind === "covered" ? "68:134" : target.nodeId, fill };
+      }
+      return result;
+    });
+    if (kind === "blocked") {
+      await expect(runChatTask(current, h.deps)).rejects.toThrow("visible background");
+      expect(current.status).toBe("failed");
+      return;
+    }
+    await runChatTask(current, h.deps);
+    expect(h.deps.model).not.toHaveBeenCalled();
+    expect(h.batches.flat().map(({ action }) => action.tool)).toEqual(
+      writes ? ["inspect_nodes", "set_properties", "inspect_nodes"] : ["inspect_nodes"],
+    );
+    expect(current.status).toBe("completed");
+    if (kind === "covered" && writes) expect(h.batches[1]?.[0]?.action).toMatchObject({ ref: "visible-background" });
+    expect(stage.completionReason).toBe(writes || kind === "resumed" ? "required_refs_and_native_verification_confirmed" : "verified_no_op");
+    expect(chatTaskCommittedOperationCount(current)).toBe(writes || kind === "resumed" ? 1 : 0);
+    expect(target.nodeId).toBe("68:133");
+  });
+
+  it("reconciles three reused refs and preserves four off-plan creations on legacy continue resume", async () => {
+    const current = reportedPartialEditTask();
+    current.id = "chat-1794468051454-jjhs2d";
+    current.intent = "continue";
+    delete current.editTarget;
+    const stage = current.stages[0]!;
+    const [root, background] = stage.logicalRefs;
+    const intro = "task-3aafa4981a685bdaefd93890f2053992";
+    stage.logicalRefs.push(intro);
+    stage.completionReason = "missing_creation_operation";
+    current.ledger = [];
+    const add = (tool: string, args: unknown, data: unknown, mutation = false) => {
+      const response = turn(tool, args);
+      if (response.kind !== "tool_calls") throw new Error("Expected call");
+      current.ledger.push({ call: response.calls[0]!, operationId: `${current.id}-op-${current.ledger.length + 1}`,
+        status: "completed", stage: 0, category: mutation ? "mutation" : "read_only",
+        acknowledgementStatus: mutation ? "confirmed_mutation" : "read_only",
+        output: JSON.stringify({ success: true, data }) });
+    };
+    add("get_document_context", {}, { discovery: { matchStatus: "unique" },
+      frames: [{ ref: root, pageId: "0:1", type: "FRAME" }] });
+    add("inspect_nodes", { pageId: "0:1", refs: [root] }, { pageId: "0:1",
+      nodes: [{ ref: root, children: [{ ref: background }, { ref: intro }] }] });
+    for (const [tool, ref] of [["create_frame", "polishHero"], ["create_text", "heroCopy"],
+      ["create_rectangle", "heroBand"], ["create_text", "heroSubcopy"]]) {
+      add(tool!, { ref, pageId: "0:1", name: ref, parent: { kind: "node", ref: ref === "polishHero" ? root : "polishHero" },
+        size: { width: 100, height: 40 }, ...(tool === "create_text" ? { text: "Charm" } : {}) }, {}, true);
+    }
+    const h = harness([], false);
+    await expect(runChatTask(current, h.deps)).rejects.toThrow("outside the saved enhancement specification");
+    expect(h.deps.model).not.toHaveBeenCalled();
+    expect(h.batches.flat().map(({ action }) => action.tool)).toEqual(["inspect_nodes"]);
+    expect(chatTaskCommittedOperationCount(current)).toBe(4);
+    expect(stage.completed).toBe(false);
+    expect(stage.verificationOperations).toBe(1);
+  });
+
+  it("reserves nested aliases in the 10 and 6 call Charm batches after atomically rejecting a ref collision", async () => {
+    const current = reportedPartialEditTask();
+    current.id = "chat-1794469538757-ejm4jz";
+    current.lifecycle = "PLAN_SAVED";
+    const target = current.editTarget!;
+    const stage = current.stages[0]!;
+    const existing = [...target.verifiedRefs, "task-d12ddc8f99ff0679add2b5179a612d21",
+      "task-d0baefe3ceaf3bc57cfa598b4e5dd7ed", "task-074450a5446e70e7cbc3817d6211027f",
+      "task-63d52d619508b0474b9dce59716c115f"];
+    target.plannedRefs = [...existing];
+    target.verifiedRefs = [...existing];
+    stage.logicalRefs = [...existing];
+    current.ledger = current.ledger.filter((entry) => entry.category !== "mutation");
+    const calls = (...turns: AuthorizedChatTurn[]): AuthorizedChatTurn => {
+      const items = turns.flatMap((item) => item.kind === "tool_calls" ? item.calls : []);
+      return { kind: "tool_calls", calls: items, functionCallItems: items.map((item) => item.functionCall), text: "" };
+    };
+    const create = (tool: string, ref: string, parentRef = target.ref) => turn(tool, {
+      ref, name: ref, pageId: target.pageId, size: { width: 160, height: 40 },
+      parent: { kind: "node", ref: parentRef }, ...(tool === "create_text" ? { text: "Charm" } : {}),
+    });
+    const set = (ref: string) => turn("set_properties", { ref, pageId: target.pageId, properties: { visible: true } });
+    const first = (header: string) => calls(set(existing[1]!), set(existing[2]!),
+      create("create_frame", header), create("create_frame", "banner"),
+      create("create_frame", "categories"), create("create_frame", "products"),
+      create("create_rectangle", "bannerSurface", "banner"),
+      create("create_text", "logo", header), create("create_text", "bannerTitle", "banner"),
+      create("create_text", "categoryLabel", "categories"));
+    const second = calls(set(existing[3]!), set(existing[4]!), set(existing[5]!),
+      create("create_frame", "productCard", "products"),
+      create("create_text", "productName", "productCard"), create("create_text", "price", "productCard"));
+    const h = harness([first(existing[3]!), first("header"), second, finish()], false);
+    await runChatTask(current, h.deps);
+    expect(h.inputs[1]?.some((item) => "content" in item && JSON.stringify(item).includes(existing[3]!))).toBe(true);
+    expect(current.editReferenceDiagnostic).toContain(existing[3]);
+    expect(h.batches.flat().filter(({ action }) => isCanvasMutationTool(action.tool))).toHaveLength(16);
+    const creations = h.batches.flat().filter(({ action }) => action.tool.startsWith("create_"));
+    expect(creations).toHaveLength(11);
+    expect(new Set(stage.logicalRefs).size).toBe(18);
+    expect(h.checkpoints.some((checkpoint) => checkpoint.pending.length === 10 &&
+      checkpoint.stages[0]?.logicalRefs.includes("header"))).toBe(true);
+    expect(h.batches.at(-1)?.[0]?.action).toMatchObject({ tool: "inspect_nodes", refs: stage.logicalRefs });
+    expect(target.nodeId).toBe("68:133");
+    expect(current.status).toBe("completed");
+  });
+
+  it("resumes the reported live edit, reuses the verified background ref, and verifies the confirmed fill once", async () => {
+    const current = reportedPartialEditTask();
+    const h = harness(
+      [
+        finish(),
+        turn("inspect_nodes", {
+          pageId: "0:1",
+          refs: ["task-caba0d5eb320fddc43748146a97ca144"],
+          selection: false,
+          depth: 1,
+          maxNodes: 5,
+        }),
+        finish(),
+      ],
+      false,
+    );
+    h.deps.execute.mockImplementation(async (operations) => {
+      h.batches.push(operations);
+      const result = success(operations);
+      for (const operation of operations) {
+        if (operation.action.tool !== "inspect_nodes" || operation.action.purpose !== "structural_verification")
+          continue;
+        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        item.data!.nodes = operation.action.refs.map((ref) => ({
+          ref,
+          type: ref.endsWith("144") ? "FRAME" : "RECTANGLE",
+          name: ref.endsWith("144") ? "خانه | Charm" : "خانه - زمینه",
+          x: 0,
+          y: 0,
+          width: 390,
+          height: 844,
+          visible: true,
+          fill: "#FFF0F5",
+        }));
+        markVerifiedStructure(item.data!, operation.action.refs.length);
+      }
+      return result;
+    });
+
+    await runChatTask(current, h.deps);
+
+    expect(current).toMatchObject({ status: "completed", lifecycle: "TASK_COMPLETED" });
+    expect(current.stages[0]).toMatchObject({
+      completed: true,
+      verified: true,
+      operations: 1,
+      estimatedMutations: 6,
+      verificationOperations: 1,
+      completionReason: "required_refs_and_native_verification_confirmed",
+    });
+    expect(current.stages[0]?.logicalRefs).toEqual([
+      "task-caba0d5eb320fddc43748146a97ca144",
+      "task-71c74e09c3a188e7a94c9eb1b1e6550f",
+    ]);
+    expect(current.ledger.filter((entry) => entry.category === "mutation")).toHaveLength(1);
+    expect(current.ledger.filter((entry) => entry.category === "verification")).toHaveLength(1);
+    expect(
+      h.batches.flat().filter((operation) => isCanvasMutationTool(operation.action.tool)),
+    ).toHaveLength(0);
+    expect(h.batches.flat().map(({ action }) => action.tool)).toEqual(["inspect_nodes"]);
+    expect(h.deps.model).toHaveBeenCalledTimes(1);
+    expect(current.text).toContain("fill #FFF0F5");
+    expect(current.text).toContain("Confirmed canvas mutations: 1");
+    expect(chatTaskSafeDiagnostic(current)).toMatchObject({
+      committedOperations: 1,
+      stageCapacity: [
+        expect.objectContaining({
+          remainingRequirements: 0,
+          confirmedMutations: 1,
+          verificationOperations: 1,
+        }),
+      ],
+    });
+    expect(
+      JSON.parse(current.ledger.find((entry) => entry.category === "verification")!.output!),
+    ).toMatchObject({ propertyVerificationConfirmed: true, verifiedPropertyCount: 1 });
+  });
+
+  it("blocks saved-task completion when native QA reaches its scan limit", async () => {
+    const current = reportedPartialEditTask();
+    const h = harness([finish()], false);
+    h.deps.execute.mockImplementation(async (operations) => {
+      h.batches.push(operations);
+      const result = success(operations);
+      for (const operation of operations) {
+        if (operation.action.tool !== "inspect_nodes") continue;
+        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        item.data!.nodes = operation.action.refs.map((ref) => ({
+          ref,
+          type: ref === current.editTarget!.ref ? "FRAME" : "RECTANGLE",
+          name: ref,
+          x: 0,
+          y: 0,
+          width: 390,
+          height: 844,
+          visible: true,
+          ...(ref === current.editTarget!.ref ? { fill: "#FFF0F5" } : {}),
+        }));
+        Object.assign(item.data!, {
+          repairPipelineVersion: "native-quality-repair-v1",
+          qualityFindings: [],
+          nativeRepairPlan: [],
+          qualityCoverage: {
+            complete: false,
+            truncated: true,
+            nodeCount: MAX_NATIVE_QUALITY_SCAN_NODES,
+            findingCount: 0,
+          },
+        });
+      }
+      return result;
+    });
+
+    await expect(runChatTask(current, h.deps)).rejects.toThrow(
+      "native_verification_capacity_exceeded",
+    );
+
+    expect(current.status).toBe("failed");
+    expect(current.failure).toMatchObject({
+      category: "verification",
+      code: "native_verification_capacity_exceeded",
+      committedOperations: 1,
+    });
+    expect(current.stages[0]?.completed).toBe(false);
+    expect(current.stages[0]?.nativeQualityCoverage).toMatchObject({
+      complete: false,
+      truncated: true,
+      nodeCount: MAX_NATIVE_QUALITY_SCAN_NODES,
+    });
+    expect(h.deps.model).not.toHaveBeenCalled();
+    expect(h.batches.flat().filter(({ action }) => isCanvasMutationTool(action.tool))).toHaveLength(0);
+  });
+
+  it("reconciles a resumed edit before rejecting a model replay of the confirmed property update", async () => {
+    const current = reportedPartialEditTask();
+    const h = harness(
+      [
+        turn("set_properties", {
+          pageId: "0:1",
+          ref: "task-caba0d5eb320fddc43748146a97ca144",
+          properties: { fill: "#FFF0F5" },
+        }),
+        finish(),
+      ],
+      false,
+    );
+    h.deps.execute.mockImplementation(async (operations) => {
+      h.batches.push(operations);
+      const result = success(operations);
+      for (const operation of operations) {
+        if (operation.action.tool !== "inspect_nodes" || operation.action.purpose !== "structural_verification")
+          continue;
+        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        item.data!.nodes = operation.action.refs.map((ref) => ({
+          ref,
+          type: "FRAME",
+          name: "verified existing target",
+          x: 0,
+          y: 0,
+          width: 390,
+          height: 844,
+          visible: true,
+          fill: "#FFF0F5",
+        }));
+        markVerifiedStructure(item.data!, operation.action.refs.length);
+      }
+      return result;
+    });
+
+    await runChatTask(current, h.deps);
+
+    expect(current.status).toBe("completed");
+    expect(h.deps.model).toHaveBeenCalledTimes(2);
+    expect(h.batches.flat().map(({ action }) => action.tool)).toEqual(["inspect_nodes"]);
+    expect(current.ledger.filter((entry) => entry.category === "mutation")).toHaveLength(1);
+    expect(current.stages[0]).toMatchObject({ completed: true, verificationOperations: 1 });
+  });
+
+  it("rejects an impossible saved edit ref without replaying its confirmed mutation", async () => {
+    const current = reportedPartialEditTask();
+    current.editTarget!.plannedRefs = ["task-caba0d5eb320fddc43748146a97ca144"];
+    const h = harness([finish()], false);
+
+    await expect(runChatTask(current, h.deps)).rejects.toThrow("invalid_required_reference");
+
+    expect(current.status).toBe("failed");
+    expect(current.failure).toMatchObject({
+      category: "verification",
+      code: "invalid_required_reference",
+      committedOperations: 1,
+    });
+    expect(current.stages[0]?.completed).toBe(false);
+    expect(current.ledger.filter((entry) => entry.category === "mutation")).toHaveLength(1);
+    expect(h.deps.execute).not.toHaveBeenCalled();
+  });
+
+  it("routes a genuinely new missing ref to creation instead of repeating completion", async () => {
+    const current = reportedPartialEditTask();
+    const newRef = "new-charm-label";
+    current.stages[0]!.logicalRefs.push(newRef);
+    const h = harness(
+      [
+        finish(),
+        turn("create_text", {
+          pageId: "0:1",
+          ref: newRef,
+          name: "Charm label",
+          parent: { kind: "node", ref: "task-caba0d5eb320fddc43748146a97ca144" },
+          text: "Charm",
+          size: { width: 120, height: 32 },
+        }),
+        finish(),
+      ],
+      false,
+    );
+    h.deps.execute.mockImplementation(async (operations) => {
+      h.batches.push(operations);
+      const result = success(operations);
+      for (const operation of operations) {
+        if (operation.action.tool !== "inspect_nodes" || operation.action.purpose !== "structural_verification")
+          continue;
+        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        item.data!.nodes = operation.action.refs.map((ref) => ({
+          ref,
+          type: ref === "new-charm-label" ? "TEXT" : "FRAME",
+          name: ref,
+          x: 0,
+          y: 0,
+          width: 390,
+          height: 844,
+          visible: true,
+          ...(ref === "task-caba0d5eb320fddc43748146a97ca144" ? { fill: "#FFF0F5" } : {}),
+          ...(ref === "new-charm-label" ? { text: "Charm" } : {}),
+        }));
+        markVerifiedStructure(item.data!, operation.action.refs.length);
+      }
+      return result;
+    });
+
+    await runChatTask(current, h.deps);
+
+    expect(current.status).toBe("completed");
+    expect(h.deps.model).toHaveBeenCalledTimes(3);
+    expect(
+      h.batches.flat().filter((operation) => operation.action.tool === "create_text"),
+    ).toHaveLength(1);
+    expect(
+      h.batches.flat().filter((operation) => operation.action.tool === "set_properties"),
+    ).toHaveLength(0);
+    expect(current.stages[0]).toMatchObject({ completed: true, operations: 2, verificationOperations: 1 });
+  });
+
+  it("uses bounded native verification to fill a missing inspection checkpoint for a planned target ref", async () => {
+    const current = reportedPartialEditTask();
+    current.editTarget!.verifiedRefs = ["task-caba0d5eb320fddc43748146a97ca144"];
+    const h = harness([finish()], false);
+    h.deps.execute.mockImplementation(async (operations) => {
+      h.batches.push(operations);
+      const result = success(operations);
+      for (const operation of operations) {
+        if (operation.action.tool !== "inspect_nodes" || operation.action.purpose !== "structural_verification")
+          continue;
+        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        item.data!.nodes = operation.action.refs.map((ref) => ({
+          ref,
+          type: ref.endsWith("144") ? "FRAME" : "RECTANGLE",
+          name: ref,
+          x: 0,
+          y: 0,
+          width: 390,
+          height: 844,
+          visible: true,
+          fill: "#FFF0F5",
+        }));
+        markVerifiedStructure(item.data!, operation.action.refs.length);
+      }
+      return result;
+    });
+
+    await runChatTask(current, h.deps);
+
+    expect(current.status).toBe("completed");
+    expect(current.editTarget?.verifiedRefs).toContain("task-71c74e09c3a188e7a94c9eb1b1e6550f");
+    expect(h.batches.flat().filter((operation) => isCanvasMutationTool(operation.action.tool))).toHaveLength(0);
+    expect(current.stages[0]?.verificationOperations).toBe(1);
+  });
+
+  it("does not complete an edit when native fill evidence disagrees with the confirmed operation", async () => {
+    const current = reportedPartialEditTask();
+    const h = harness([finish()], false);
+    h.deps.execute.mockImplementation(async (operations) => {
+      h.batches.push(operations);
+      const result = success(operations);
+      for (const operation of operations) {
+        if (operation.action.tool !== "inspect_nodes" || operation.action.purpose !== "structural_verification")
+          continue;
+        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        item.data!.nodes = operation.action.refs.map((ref) => ({
+          ref,
+          type: "FRAME",
+          name: "native target",
+          x: 0,
+          y: 0,
+          width: 390,
+          height: 844,
+          visible: true,
+          fill: "#FFF9F4",
+        }));
+        markVerifiedStructure(item.data!, operation.action.refs.length);
+      }
+      return result;
+    });
+
+    await expect(runChatTask(current, h.deps)).rejects.toThrow(
+      "native_property_verification_failed",
+    );
+
+    expect(current.status).toBe("failed");
+    expect(current.failure).toMatchObject({ category: "verification", code: "native_property_verification_failed" });
+    expect(current.stages[0]?.completed).toBe(false);
+    expect(current.ledger.filter((entry) => entry.category === "mutation")).toHaveLength(1);
+    expect(current.ledger.filter((entry) => entry.category === "verification")).toHaveLength(1);
+    expect(h.batches.flat().filter((operation) => isCanvasMutationTool(operation.action.tool))).toHaveLength(0);
+  });
+
   it("recovers the reported three-round edit failure when the model returns done after discovery", async () => {
     const h = harness([
       turn("classify_canvas_intent", { intent: "edit" }),
@@ -756,7 +1460,7 @@ describe("progressive conversational canvas tasks", () => {
 
     await runChatTask(current, h.deps);
 
-    expect(h.deps.model).toHaveBeenCalledTimes(6);
+    expect(h.deps.model).toHaveBeenCalledTimes(5);
     expect(h.lifecycles.slice(0, 3)).toEqual(["UNPLANNED", "EDIT_PLANNING", "EDIT_PLANNING"]);
     expect(current.modelRoundTrace.slice(0, 3).map(({ outcome, tools }) => ({ outcome, tools }))).toEqual([
       { outcome: "tool_calls", tools: ["classify_canvas_intent"] },
@@ -2639,7 +3343,7 @@ describe("progressive conversational canvas tasks", () => {
     });
   });
 
-  it("surfaces bounded structural findings, repairs only the planned ref, and reinspects before stage completion", async () => {
+  it("retries a rate-limited native inspection with the same ID and completes after evidence is returned", async () => {
     const h = harness([
       plan(["Product card"], ["product-0"]),
       creates(1),
@@ -2669,22 +3373,19 @@ describe("progressive conversational canvas tasks", () => {
         return {
           ...result,
           data: {
-            nodes:
-              inspections === 2
-                ? []
-                : [
-                    {
-                      ref: "product-0",
-                      type: "FRAME",
-                      name: "product-0",
-                      x: 0,
-                      y: 0,
-                      width: 390,
-                      height: 844,
-                      visible: true,
-                      bounds: { x: 0, y: 0, width: 390, height: 844 },
-                    },
-                  ],
+              nodes: [
+                {
+                  ref: "product-0",
+                  type: "FRAME",
+                  name: "product-0",
+                  x: 0,
+                  y: 0,
+                  width: 390,
+                  height: 844,
+                  visible: true,
+                  bounds: { x: 0, y: 0, width: 390, height: 844 },
+                },
+              ],
           },
         };
       });
@@ -2698,17 +3399,16 @@ describe("progressive conversational canvas tasks", () => {
     await runChatTask(current, h.deps);
     expect(current.status).toBe("completed");
     expect(current.stages[0]).toMatchObject({ completed: true, verified: true, qaAttempts: 1 });
-    expect(inspections).toBe(3);
+    expect(inspections).toBe(2);
     expect(h.deps.wait).toHaveBeenCalledWith(60_100, expect.any(AbortSignal));
     const inspectionOperations = h.batches
       .flat()
       .filter((operation) => operation.action.tool === "inspect_nodes");
     expect(inspectionOperations[0]!.operationId).toBe(inspectionOperations[1]!.operationId);
-    expect(inspectionOperations[1]!.operationId).not.toBe(inspectionOperations[2]!.operationId);
     expect(
       current.ledger.filter((entry) => entry.call.action.tool === "inspect_nodes"),
-    ).toHaveLength(2);
-    expect(JSON.stringify(h.inputs[4])).toContain("missing-ref");
+    ).toHaveLength(1);
+    expect(JSON.stringify(h.inputs)).not.toContain("missing-ref");
     expect(
       current.ledger
         .filter((entry) => entry.call.action.tool === "inspect_nodes")

@@ -884,6 +884,12 @@ function appendDesignNode(
 
   beforeAppend?.(node);
   parent.appendChild(node);
+  if ("logicalRef" in spec && spec.logicalRef)
+    node.setPluginData("fad.design.logical-ref", spec.logicalRef);
+  if ("pattern" in spec && spec.pattern)
+    node.setPluginData("fad.design.pattern", spec.pattern);
+  if ("qualityRole" in spec && spec.qualityRole)
+    node.setPluginData("fad.design.quality-role", spec.qualityRole);
   if ("qualityRole" in spec && (spec.qualityRole === "button" || spec.qualityRole === "input"))
     node.setPluginData("fad.touch-target", spec.qualityRole);
   if (parentLayout) {
@@ -1836,6 +1842,7 @@ export async function renderMultiScreenDesign(
               "Section transaction parent does not match the native screen identity.",
             );
           existingRoot = root;
+          existingRoot.setPluginData("fad.design.logical-ref", `${screen.id}.root`);
         } else if (
           root?.type === "FRAME" &&
           root.getPluginData("fad.generation.commit") === "complete"
@@ -2092,6 +2099,7 @@ export async function renderMultiScreenDesign(
         root.setPluginData(MULTI_SCREEN_BATCH_KEY, batch.id);
         root.setPluginData(MULTI_SCREEN_ID_KEY, screen.id);
         root.setPluginData(SEMANTIC_NODE_ID_KEY, `screen:${screen.id}`);
+        root.setPluginData("fad.design.logical-ref", `${screen.id}.root`);
         if (options.resume) root.setPluginData("fad.generation.commit", "pending");
         root.setPluginData(
           MULTI_SCREEN_META_KEY,

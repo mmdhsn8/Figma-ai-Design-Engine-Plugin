@@ -16,6 +16,7 @@ export const NativeQualityFindingSchema = z
       "empty-text",
       "clipped-child",
       "overlapping-auto-layout",
+      "overlap-analysis-limit",
       "low-contrast",
       "viewport-mismatch",
       "missing-section",
@@ -24,6 +25,9 @@ export const NativeQualityFindingSchema = z
       "inconsistent-cards",
       "missing-native-fallback",
       "excessive-whitespace",
+      "type-mismatch",
+      "parent-mismatch",
+      "value-mismatch",
     ]),
     refs: z.array(z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u)).max(20),
     expected: z.string().max(300),
@@ -66,7 +70,8 @@ export const NativeRepairDecisionSchema = z
   });
 export const NativeRepairPlanSchema = z.array(NativeRepairDecisionSchema).max(24);
 export const NativeQualityCoverageSchema = z.object({
-  complete: z.literal(true),
+  complete: z.boolean(),
+  truncated: z.boolean().optional(),
   nodeCount: z.number().int().nonnegative(),
   findingCount: z.number().int().nonnegative(),
 });

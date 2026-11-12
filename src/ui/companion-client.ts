@@ -1,3 +1,4 @@
+import { ChatTurnTimingSchema } from "../shared/chat-tools";
 import { z } from "zod";
 import { COMPANION_BASE_URL } from "../companion/config";
 import { MAX_SCREEN_BYTES } from "../shared/generation-limits";
@@ -249,7 +250,7 @@ export class CompanionClientError extends Error {
   }
 }
 
-export type AuthorizedChatTurn =
+export type AuthorizedChatTurn = (
   | { kind: "done"; text: string }
   | { kind: "tool_validation"; issues: ChatFunctionCallValidationIssue[] }
   | {
@@ -257,7 +258,7 @@ export type AuthorizedChatTurn =
       calls: ChatFunctionCall[];
       functionCallItems: Extract<ChatInputItem, { type: "function_call" }>[];
       text: string;
-    };
+    }) & { timing?: z.infer<typeof ChatTurnTimingSchema> };
 
 type Fetcher = typeof fetch;
 
@@ -614,6 +615,7 @@ async function readAuthorizedChatStream(
   onProgress?: (elapsedMs: number) => void,
 ): Promise<AuthorizedChatTurn> {
   if (!response.body) throw new CompanionClientError("response_incomplete");
+  const companionHeadersMs = Math.min(600_000, Math.round(performance.now() - startedAt));
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const cancelReader = () => void reader.cancel().catch(() => undefined);
@@ -673,17 +675,19 @@ async function readAuthorizedChatStream(
         .object({
           requestId: z.string(),
           issues: z.array(ChatFunctionCallValidationIssueSchema).min(1).max(8),
+          timing: ChatTurnTimingSchema.optional(),
         })
         .strict()
         .safeParse(payload);
       if (!parsed.success) throw new CompanionClientError("response_invalid");
-      return { kind: "tool_validation", issues: parsed.data.issues };
+      return { kind: "tool_validation", issues: parsed.data.issues, ...(parsed.data.timing ? { timing: { ...parsed.data.timing, companionHeadersMs } } : {}) };
     }
     if (eventName === "tool_calls") {
       const parsed = z
         .object({
           requestId: z.string(),
           calls: z.array(ChatFunctionCallSchema).min(1).max(10),
+          timing: ChatTurnTimingSchema.optional(),
           functionCallItems: z.array(ChatInputItemSchema).min(1).max(10),
           text: z
             .string()
@@ -719,15 +723,16 @@ async function readAuthorizedChatStream(
           { type: "function_call" }
         >[],
         text: parsed.data.text ?? "",
+        ...(parsed.data.timing ? { timing: { ...parsed.data.timing, companionHeadersMs } } : {}),
       };
     }
     if (eventName === "done") {
       const parsed = z
-        .object({ requestId: z.string(), text: z.string().max(256 * 1024) })
+        .object({ requestId: z.string(), text: z.string().max(256 * 1024), timing: ChatTurnTimingSchema.optional() })
         .strict()
         .safeParse(payload);
       if (!parsed.success) throw new CompanionClientError("response_invalid");
-      return { kind: "done", text: parsed.data.text };
+      return { kind: "done", text: parsed.data.text, ...(parsed.data.timing ? { timing: { ...parsed.data.timing, companionHeadersMs } } : {}) };
     }
     if (eventName === "error") {
       const parsed = z

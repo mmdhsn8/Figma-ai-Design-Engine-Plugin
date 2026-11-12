@@ -14,7 +14,13 @@ import {
 import { FigmaCompatibilityError, figmaCompatibilityEngine } from "./figma-compatibility";
 import { createProgressiveDiscoveryScanner } from "./document-discovery";
 import { repairAutoLayoutHierarchy } from "./auto-layout-repair";
-import { auditNativeSection, type NativeVisualNode } from "../shared/native-visual-quality";
+import {
+  auditNativeSection,
+  MAX_NATIVE_QUALITY_SCAN_DEPTH,
+  MAX_NATIVE_QUALITY_SCAN_NODES,
+  MAX_NATIVE_QUALITY_OVERLAP_PAIRS,
+  type NativeVisualNode,
+} from "../shared/native-visual-quality";
 import {
   planNativeQualityRepairs,
   NATIVE_REPAIR_PIPELINE_VERSION,
@@ -641,6 +647,8 @@ function resolveTaskAction(
     return { ...action, childRef: resolve(action.childRef), parentRef: resolve(action.parentRef) };
   if (action.tool === "reparent_node")
     return { ...action, ref: resolve(action.ref), parentRef: resolve(action.parentRef) };
+  if (action.tool === "set_properties" && action.backgroundRootRef)
+    return { ...action, ref: resolve(action.ref), backgroundRootRef: resolve(action.backgroundRootRef, true) };
   if ("ref" in action) return { ...action, ref: resolve(action.ref) };
   return action;
 }
@@ -795,6 +803,16 @@ function summarizeNode(node: SceneNode, ref?: string) {
   const strokeColor = colorHex(strokePaint);
   const textColor = colorHex(textPaint);
   const frame = node.type === "FRAME" || node.type === "COMPONENT" ? node : undefined;
+  const textNode = node.type === "TEXT" ? node : undefined;
+  const fontName =
+    textNode && typeof textNode.fontName === "object" ? textNode.fontName : undefined;
+  const lineHeight =
+    textNode && typeof textNode.lineHeight === "object" ? textNode.lineHeight : undefined;
+  const letterSpacing =
+    textNode && typeof textNode.letterSpacing === "object" ? textNode.letterSpacing : undefined;
+  const effects = "effects" in node && Array.isArray(node.effects) ? node.effects : [];
+  const dropShadows = effects.filter((effect) => effect.type === "DROP_SHADOW" && effect.visible !== false);
+  const singleDropShadow = dropShadows.length === 1 ? dropShadows[0] : undefined;
   return {
     ...(ref ? { ref } : {}),
     type: node.type,
@@ -822,6 +840,9 @@ function summarizeNode(node: SceneNode, ref?: string) {
           fillOpacity: fillPaint.opacity ?? 1,
         }
       : {}),
+    ...( "fillStyleId" in node && typeof node.fillStyleId === "string"
+      ? { fillStyleId: node.fillStyleId }
+      : {}),
     ...(strokeColor ? { stroke: strokeColor } : {}),
     ...(typeof opacity === "number" ? { opacity } : {}),
     ...(typeof strokeWeight === "number" ? { strokeWeight } : {}),
@@ -829,6 +850,17 @@ function summarizeNode(node: SceneNode, ref?: string) {
       ? { cornerRadius: node.cornerRadius }
       : {}),
     ...(node.type === "TEXT" ? { text: node.characters.slice(0, 120) } : {}),
+    ...(textNode && typeof textNode.textAutoResize === "string"
+      ? { textAutoResize: textNode.textAutoResize }
+      : {}),
+    ...(textNode && typeof textNode.textStyleId === "string"
+      ? { textStyleId: textNode.textStyleId }
+      : {}),
+    ...(fontName ? { fontFamily: fontName.family, fontStyle: fontName.style } : {}),
+    ...(lineHeight && lineHeight.unit === "PIXELS" ? { lineHeight: lineHeight.value } : {}),
+    ...(letterSpacing && letterSpacing.unit === "PIXELS"
+      ? { letterSpacing: letterSpacing.value }
+      : {}),
     ...(node.type === "TEXT" && typeof node.fontSize === "number"
       ? {
           fontSize: node.fontSize,
@@ -846,6 +878,20 @@ function summarizeNode(node: SceneNode, ref?: string) {
                 textColorOpacity: textPaint.opacity ?? 1,
               }
             : {}),
+        }
+      : {}),
+    ...(singleDropShadow
+      ? {
+          shadow: {
+            color: `#${[singleDropShadow.color.r, singleDropShadow.color.g, singleDropShadow.color.b]
+              .map((channel) => Math.round(channel * 255).toString(16).padStart(2, "0"))
+              .join("")}`.toUpperCase(),
+            opacity: singleDropShadow.color.a,
+            offsetX: singleDropShadow.offset.x,
+            offsetY: singleDropShadow.offset.y,
+            radius: singleDropShadow.radius,
+            spread: singleDropShadow.spread,
+          },
         }
       : {}),
     ...(frame
@@ -881,6 +927,61 @@ function summarizeNode(node: SceneNode, ref?: string) {
     ...("layoutSizingVertical" in node ? { layoutSizingVertical: node.layoutSizingVertical } : {}),
     ...("layoutPositioning" in node ? { layoutPositioning: node.layoutPositioning } : {}),
   };
+}
+
+// Figma stores children from back to front. Use render bounds for potential
+// occluders, and require a provably opaque, axis-aligned background surface.
+function resolveVisibleBackground(root: FrameNode): SceneNode | undefined {
+  const bounds = root.absoluteBoundingBox;
+  const axisAligned = (node: SceneNode) => {
+    const [[a, b], [c, d]] = node.absoluteTransform;
+    return a > 0 && d > 0 && Math.abs(b) < 0.001 && Math.abs(c) < 0.001;
+  };
+  const opaque = (node: SceneNode) => {
+    if (!("fills" in node) || !Array.isArray(node.fills)) return false;
+    const paints = node.fills.filter((paint) => paint.visible !== false);
+    const paint = paints[0];
+    return paints.length === 1 && paint?.type === "SOLID" &&
+      (paint.opacity ?? 1) === 1 && (!paint.blendMode || paint.blendMode === "NORMAL") &&
+      (!("opacity" in node) || node.opacity === 1) &&
+      (!("blendMode" in node) || node.blendMode === "NORMAL" || node.blendMode === "PASS_THROUGH");
+  };
+  for (let node: BaseNode | null = root; node && node.type !== "PAGE"; node = node.parent) {
+    if (("visible" in node && !node.visible) || ("opacity" in node && node.opacity !== 1))
+      return undefined;
+  }
+  if (!bounds || !bounds.width || !bounds.height || !axisAligned(root) ||
+      root.children.length > 24 || root.children.some((node) => "isMask" in node && node.isMask))
+    return undefined;
+  const layers = root.children.filter((node) => node.visible && (!("opacity" in node) || node.opacity > 0));
+  const covers = (box: Rect) => box.x <= bounds.x && box.y <= bounds.y &&
+    box.x + box.width >= bounds.x + bounds.width && box.y + box.height >= bounds.y + bounds.height;
+  const boxes: Rect[] = [];
+  let candidate: SceneNode = root;
+  for (const node of [...layers].reverse()) {
+    const box = node.absoluteBoundingBox;
+    const render = ("absoluteRenderBounds" in node ? node.absoluteRenderBounds : undefined) ?? box;
+    if (!render) return undefined;
+    if (box && covers(box)) {
+      if (node.type !== "RECTANGLE" || !axisAligned(node) || !opaque(node) || node.cornerRadius !== 0)
+        return undefined;
+      candidate = node;
+      break;
+    }
+    boxes.push(render);
+  }
+  if (!opaque(candidate)) return undefined;
+  // Find a positive-area patch outside all foreground render bounds.
+  const edges = (start: number, end: number, values: number[]) =>
+    [start, ...values.filter((v) => v > start && v < end), end].sort((a, b) => a - b);
+  const xs = edges(bounds.x, bounds.x + bounds.width, boxes.flatMap((b) => [b.x, b.x + b.width]));
+  const ys = edges(bounds.y, bounds.y + bounds.height, boxes.flatMap((b) => [b.y, b.y + b.height]));
+  return xs.some((x, i) => i > 0 && x > xs[i - 1]! && ys.some((y, j) => {
+    if (!j || y <= ys[j - 1]!) return false;
+    const px = (x + xs[i - 1]!) / 2;
+    const py = (y + ys[j - 1]!) / 2;
+    return !boxes.some((b) => px >= b.x && px <= b.x + b.width && py >= b.y && py <= b.y + b.height);
+  })) ? candidate : undefined;
 }
 
 function directChildren(node: SceneNode): readonly SceneNode[] {
@@ -1605,9 +1706,39 @@ export function createFigmaToolExecutor(
         : api.currentPage.selection;
       if (api.currentPage.id !== pageId)
         throw new Error("Figma page changed while resolving inspection targets.");
+      if (action.purpose === "background_verification") {
+        const background = roots[0]?.type === "FRAME" ? resolveVisibleBackground(roots[0]) : undefined;
+        const nodes = roots.map((node, index) => summarizeNode(node, action.refs[index]));
+        if (!background) return {
+          summary: "The effective screen background could not be established.",
+          data: { pageId, nodes },
+        };
+        const root = roots[0]!;
+        const ref = background === root ? action.refs[0]! : registerLogicalRef(
+          state, background, pageId, operation.taskId, action.readOnlyInspection === true,
+        );
+        const evidence = summarizeNode(background, ref);
+        return {
+          summary: "Read the effective screen background.",
+          data: {
+            pageId, nodes: nodes.some((node) => node.ref === ref) ? nodes : [...nodes, evidence],
+            visualBackground: { rootRef: action.refs[0], rootNodeId: root.id, ref,
+              nodeId: background.id, type: background.type, fill: evidence.fill },
+          },
+        };
+      }
       if (action.purpose === "structural_verification") {
         let nodeCount = 0;
-        const snapshot = (node: SceneNode): NativeVisualNode => {
+        let truncated = false;
+        let overlapPairs = 0;
+        const snapshot = async (
+          node: SceneNode,
+          depth: number,
+        ): Promise<NativeVisualNode | undefined> => {
+          if (nodeCount >= MAX_NATIVE_QUALITY_SCAN_NODES) {
+            truncated = true;
+            return undefined;
+          }
           nodeCount++;
           const ref = registerLogicalRef(
             state,
@@ -1616,13 +1747,41 @@ export function createFigmaToolExecutor(
             operation.taskId,
             action.readOnlyInspection === true,
           );
-          return {
+          const output = {
             ...summarizeNode(node, ref),
             ownedByTask: Boolean(
               operation.taskId && node.getPluginData(TASK_PLUGIN_KEY) === operation.taskId,
             ),
-            children: directChildren(node).map(snapshot),
+            children: [],
           } as NativeVisualNode;
+          if (depth >= MAX_NATIVE_QUALITY_SCAN_DEPTH) {
+            if (directChildren(node).length) truncated = true;
+            return output;
+          }
+          const children = directChildren(node);
+          if (node.type === "FRAME" || node.type === "COMPONENT") {
+            const frame = node as FrameNode | ComponentNode;
+            if (frame.layoutMode === "VERTICAL" || frame.layoutMode === "HORIZONTAL") {
+              const pairCount = (children.length * (children.length - 1)) / 2;
+              if (overlapPairs + pairCount > MAX_NATIVE_QUALITY_OVERLAP_PAIRS) {
+                truncated = true;
+                return output;
+              }
+              overlapPairs += pairCount;
+            }
+          }
+          for (const child of children) {
+            if (nodeCount >= MAX_NATIVE_QUALITY_SCAN_NODES) {
+              truncated = true;
+              break;
+            }
+            const childSnapshot = await snapshot(child, depth + 1);
+            if (childSnapshot) output.children!.push(childSnapshot);
+            if (nodeCount % 64 === 0)
+              await new Promise<void>((resolve) => setTimeout(resolve, 0));
+            if (truncated) break;
+          }
+          return output;
         };
         const qualityRoots = roots.map((node) => {
           while (
@@ -1647,15 +1806,50 @@ export function createFigmaToolExecutor(
           return true;
         });
         // Full native QA returns compact findings without expanding raw-node exposure limits.
-        const nodes = independentRoots.map(snapshot);
-        const findings = auditNativeSection(nodes, action.refs);
+        const nodes: NativeVisualNode[] = [];
+        for (const root of independentRoots) {
+          const snapshotRoot = await snapshot(root, 0);
+          if (snapshotRoot) nodes.push(snapshotRoot);
+          if (truncated) break;
+        }
+        const findings = truncated ? [] : auditNativeSection(nodes, action.refs);
+        const incompleteCoverage =
+          truncated || findings.some((finding) => finding.code === "overlap-analysis-limit");
+        // Keep the full tree private to the native QA pass, but return one compact native value
+        // summary per explicitly requested ref so the task controller can verify mutations.
+        const verifiedRoots = roots.slice(0, action.maxNodes).map((node, index) => {
+          const ref = registerLogicalRef(
+            state,
+            node,
+            pageId,
+            operation.taskId,
+            action.readOnlyInspection === true,
+          );
+          // The evidence is tied to the exact requested reference. A stable stored ref may
+          // differ from an approved task alias, so returning it here would make valid native
+          // evidence appear missing to the controller.
+          return summarizeNode(node, action.refs[index] ?? ref);
+        });
         return {
           summary: `Verified ${nodeCount} native layers; ${findings.length} structural finding(s).`,
           data: {
             pageId,
             repairPipelineVersion: NATIVE_REPAIR_PIPELINE_VERSION,
-            nodes: [],
-            qualityCoverage: { complete: true, nodeCount, findingCount: findings.length },
+            nodes: verifiedRoots,
+            nativeIdentities: roots.slice(0, action.maxNodes).map((node, index) => ({
+              ref: action.refs[index], nodeId: node.id, parentId: node.parent?.id, type: node.type,
+            })),
+            frameBackgrounds: Object.fromEntries(roots.flatMap((root, index) => {
+              if (root.type !== "FRAME") return [];
+              const effective = resolveVisibleBackground(root);
+              return [[action.refs[index], effective === root ? "root" : effective ? "covered" : "unknown"]];
+            })),
+            qualityCoverage: {
+              complete: !incompleteCoverage,
+              truncated: incompleteCoverage,
+              nodeCount,
+              findingCount: findings.length,
+            },
             qualityFindings: findings.slice(0, 24).map((finding) => ({
               code: finding.code,
               refs: finding.refs ?? (finding.ref ? [finding.ref] : []),
@@ -2018,6 +2212,12 @@ export function createFigmaToolExecutor(
       };
     }
     if (action.tool === "set_properties") {
+      if (action.backgroundRootRef) {
+        const root = await resolveRef(state, action.backgroundRootRef, pageId, true);
+        const effective = root.type === "FRAME" ? resolveVisibleBackground(root) : undefined;
+        if (!effective || effective.id !== (await resolveRef(state, action.ref, pageId)).id)
+          throw new Error("The visible background changed since inspection. Reinspect before editing.");
+      }
       const node = await resolveRef(state, action.ref, pageId);
       const properties = action.properties;
       const changesText =
@@ -2452,7 +2652,7 @@ export function createFigmaToolExecutor(
       }
       const refreshNativeVerification =
         operation.action.tool === "inspect_nodes" &&
-        operation.action.purpose === "structural_verification";
+        operation.action.purpose !== undefined;
       const retryReadOnlyInspection =
         (operation.action.tool === "inspect_nodes" ||
           operation.action.tool === "get_document_context") &&
