@@ -16,6 +16,8 @@ import {
 } from "../shared/chat-tools";
 
 export const COMPANION_URL = COMPANION_BASE_URL;
+const DEFAULT_CLIENT_REQUEST_TIMEOUT_MS = 20_000;
+const SMOKE_REQUEST_TIMEOUT_MS = 180_000;
 
 const StatusSchema = z
   .object({
@@ -62,7 +64,9 @@ const PairingCancelSchema = z.object({ cancelled: z.literal(true) }).strict();
 const ModelSchema = z
   .object({ slug: z.string().min(1).max(200), displayName: z.string().min(1).max(200) })
   .strict();
-const ModelListSchema = z.object({ models: z.array(ModelSchema).max(100) }).passthrough();
+const ModelListSchema = z
+  .object({ models: z.array(ModelSchema).max(100), status: StatusSchema.optional() })
+  .passthrough();
 export const InferenceDiagnosticSchema = z
   .object({
     requestId: z
@@ -395,10 +399,22 @@ export async function reopenChatGPTSignIn(
 export async function discoverAuthorizedModels(
   token: string,
   fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
 ): Promise<CompanionModel[]> {
-  const body = ModelListSchema.safeParse(await request("/v1/models", token, {}, fetcher));
+  return (await discoverAuthorizedModelCatalog(token, fetcher, signal)).models;
+}
+
+export async function discoverAuthorizedModelCatalog(
+  token: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<{ models: CompanionModel[]; status?: CompanionStatus }> {
+  const body = ModelListSchema.safeParse(await request("/v1/models", token, {}, fetcher, signal));
   if (!body.success) throw new CompanionClientError("unknown");
-  return body.data.models;
+  return {
+    models: body.data.models,
+    ...(body.data.status ? { status: body.data.status } : {}),
+  };
 }
 
 export async function runSmokeRequest(
@@ -407,7 +423,9 @@ export async function runSmokeRequest(
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
 ): Promise<{ text: string; status?: CompanionStatus; diagnostic?: InferenceDiagnostic }> {
-  const body = SmokeSchema.safeParse(await request("/v1/smoke", token, { model }, fetcher, signal));
+  const body = SmokeSchema.safeParse(
+    await request("/v1/smoke", token, { model }, fetcher, signal, SMOKE_REQUEST_TIMEOUT_MS),
+  );
   if (!body.success) throw new CompanionClientError("unknown");
   return {
     text: body.data.text,
@@ -900,9 +918,30 @@ async function request(
   body: Record<string, unknown> | undefined,
   fetcher: Fetcher,
   signal?: AbortSignal,
+  timeoutMs = DEFAULT_CLIENT_REQUEST_TIMEOUT_MS,
 ): Promise<unknown> {
-  const response = await fetchResponse(path, token, body, fetcher, signal);
-  const result = await readLimitedJson(response, signal);
+  if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => controller.abort();
+  signal?.addEventListener("abort", abortFromCaller, { once: true });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  let response: Response;
+  let result: unknown;
+  try {
+    response = await fetchResponse(path, token, body, fetcher, controller.signal);
+    result = await readLimitedJson(response, controller.signal);
+  } catch (error) {
+    if (signal?.aborted) throw new CompanionClientError("request_cancelled");
+    if (timedOut) throw new CompanionClientError("request_timed_out");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abortFromCaller);
+  }
   if (!response.ok) throwResponseError(result);
   return result;
 }

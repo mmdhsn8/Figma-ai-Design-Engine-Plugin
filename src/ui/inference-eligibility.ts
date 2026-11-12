@@ -21,7 +21,10 @@ export function retainSelectedAccountModel(
   selectedModel: string,
   verifiedModel?: string,
 ): string {
-  if (models.some(({ slug }) => slug === selectedModel)) return selectedModel;
+  // Existing conversation and saved user choices remain authoritative even if
+  // the refreshed catalog no longer contains them. The caller can then show
+  // an unavailable state and let the user choose explicitly.
+  if (selectedModel) return selectedModel;
   if (verifiedModel && models.some(({ slug }) => slug === verifiedModel)) return verifiedModel;
   return models[0]?.slug ?? "";
 }

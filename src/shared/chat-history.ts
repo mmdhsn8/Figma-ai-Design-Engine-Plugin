@@ -21,7 +21,7 @@ export const ChatHistoryConversationSchema = z
     title: z.string().min(1).max(120),
     createdAt: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     updatedAt: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
-    model: z.string().max(100).optional(),
+    model: z.string().max(200).optional(),
     taskId: ChatHistoryChatIdSchema.optional(),
     taskState: z.enum(["new", "ready", "running", "stopped", "failed", "completed"]),
     messages: z.array(ChatHistoryMessageSchema).max(CHAT_HISTORY_MAX_MESSAGES),
@@ -93,7 +93,7 @@ export function newChatHistoryConversation(
     title: "New chat",
     createdAt: now,
     updatedAt: now,
-    ...(model ? { model: model.slice(0, 100) } : {}),
+    ...(model ? { model: model.slice(0, 200) } : {}),
     taskState: "new",
     messages: [],
   };

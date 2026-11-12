@@ -739,7 +739,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
         sendJson(response, 400, { error: "invalid_json" });
         return;
       }
-      await handleModels(response);
+      await handleModels(request, response);
       return;
     }
     if (url.pathname === "/v1/smoke" && request.method === "POST") {
@@ -1349,16 +1349,32 @@ export function createCompanionServer(options: CompanionServerOptions) {
     }
   }
 
-  async function handleModels(response: ServerResponse): Promise<void> {
+  async function handleModels(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const session = await getAuthorizedSession();
     if (!session.ok) {
       sendJson(response, session.statusCode, { error: session.error, status: status() });
       return;
     }
+    const clientAbort = new AbortController();
+    const abortForClient = () => clientAbort.abort();
+    const abortForClosedResponse = () => {
+      if (!response.writableEnded) clientAbort.abort();
+    };
+    request.once("aborted", abortForClient);
+    response.once("close", abortForClosedResponse);
     try {
-      const result = await fetchWithTimeout(`${RESPONSES_RESOURCE}/models`, {
-        headers: { Authorization: `Bearer ${session.value.accessToken}` },
-      });
+      const result = await fetchWithTimeout(
+        `${RESPONSES_RESOURCE}/models`,
+        {
+          headers: { Authorization: `Bearer ${session.value.accessToken}` },
+        },
+        clientAbort.signal,
+      );
+      if (clientAbort.signal.aborted) return;
+      if (liveSession !== session.value) {
+        sendJson(response, 409, { error: "account_mismatch", status: status() });
+        return;
+      }
       if (!result.ok) {
         const category = classifyHttpStatus(result.status);
         await applySessionHttpFailure(category);
@@ -1368,6 +1384,11 @@ export function createCompanionServer(options: CompanionServerOptions) {
       const body = (await readJsonResponse(result, 1_024 * 1_024, timeoutMs)) as {
         models?: unknown;
       };
+      if (clientAbort.signal.aborted) return;
+      if (liveSession !== session.value) {
+        sendJson(response, 409, { error: "account_mismatch", status: status() });
+        return;
+      }
       const models: AccountModel[] = Array.isArray(body.models)
         ? body.models
             .filter(
@@ -1385,12 +1406,20 @@ export function createCompanionServer(options: CompanionServerOptions) {
       session.value.models = models;
       sendJson(response, 200, { models, status: status() });
     } catch (error) {
+      if (clientAbort.signal.aborted) return;
+      if (liveSession !== session.value) {
+        sendJson(response, 409, { error: "account_mismatch", status: status() });
+        return;
+      }
       const category = classifyError(error);
       if (category === "quota_or_rate_limit" || category === "plan_use_not_admitted") {
         authStatus = "scope_granted";
       }
       safeMessage = category;
       sendJson(response, 502, { error: category, status: status() });
+    } finally {
+      request.off("aborted", abortForClient);
+      response.off("close", abortForClosedResponse);
     }
   }
 

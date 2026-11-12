@@ -129,6 +129,35 @@ describe("plugin message contract", () => {
     ).toBe(false);
   });
 
+  it("validates model preference reads and writes without accepting arbitrary IDs", () => {
+    expect(
+      UIToPluginSchema.safeParse({ type: "load-model-preference", requestId: "pref-load-1" })
+        .success,
+    ).toBe(true);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "save-model-preference",
+        requestId: "pref-save-1",
+        selectedModel: "provider/model-a",
+      }).success,
+    ).toBe(true);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "save-model-preference",
+        requestId: "pref-save-2",
+        selectedModel: "provider model with spaces",
+      }).success,
+    ).toBe(false);
+    expect(
+      PluginToUISchema.safeParse({
+        type: "model-preference-loaded",
+        requestId: "pref-load-1",
+        state: "valid",
+        selectedModel: "provider/model-a",
+      }).success,
+    ).toBe(true);
+  });
+
   it("accepts typed validate and generate requests", () => {
     expect(
       UIToPluginSchema.safeParse({ type: "validate", requestId: "r1", json: "{}" }).success,

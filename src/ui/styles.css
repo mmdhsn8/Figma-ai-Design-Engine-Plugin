@@ -4401,3 +4401,15 @@ body:has(.app-shell.is-chat-view) #root {
     width: 100%;
   }
 }
+
+.model-management-status,
+.model-management-task-choice {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.model-management-status code,
+.model-management-task-choice code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}

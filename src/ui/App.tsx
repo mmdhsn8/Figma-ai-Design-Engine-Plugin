@@ -81,13 +81,18 @@ import {
   retainSelectedAccountModel,
   type InferenceEligibility,
 } from "./inference-eligibility";
+import {
+  modelCatalogState,
+  taskModelForExecution,
+  type ModelCatalogState,
+} from "../shared/model-preference";
 import { inspectEmbeddedImage, parseSafeSvg } from "../shared/visual-assets";
 import {
   CompanionClientError,
   cancelLocalPairing,
   disconnectChatGPT,
   disconnectLocalSession,
-  discoverAuthorizedModels,
+  discoverAuthorizedModelCatalog,
   getCompanionHealth,
   getCompanionStatus,
   generateAuthorizedDesign,
@@ -201,6 +206,23 @@ export type CompanionConnectionState =
   | "connected";
 
 export type ModelDiscoveryState = "idle" | "loading" | "loaded" | "empty" | "error";
+type ModelPreferenceState = "loading" | "empty" | "valid" | "invalid" | "unavailable";
+export function modelCatalogStateLabel(state: ModelCatalogState): string {
+  return (
+    {
+      checking: "Checking model and account availability",
+      companion_unavailable: "Local Companion unavailable",
+      authentication_required: "ChatGPT sign-in or plan-use permission required",
+      session_expired: "ChatGPT session expired · sign in again",
+      provider_unavailable: "Provider temporarily unavailable",
+      rate_limited: "Provider rate limit reached",
+      model_unavailable: "Saved model unavailable for this account",
+      model_unverified: "Model needs a successful Responses check",
+      ready: "Selected model verified for this session",
+      unknown_error: "Model availability could not be confirmed",
+    } satisfies Record<ModelCatalogState, string>
+  )[state];
+}
 type GenerationTarget = DesignGenerationRequest["target"];
 type GenerationLanguage = DesignGenerationRequest["language"];
 type GenerationState =
@@ -463,6 +485,18 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const [approvalPageBusy, setApprovalPageBusy] = useState(false);
   const [companionModels, setCompanionModels] = useState<CompanionModel[]>([]);
   const [selectedCompanionModel, setSelectedCompanionModel] = useState("");
+  const [savedModelPreference, setSavedModelPreference] = useState("");
+  const [modelPreferenceState, setModelPreferenceState] = useState<ModelPreferenceState>("loading");
+  const [modelPreferenceError, setModelPreferenceError] = useState<string | null>(null);
+  const [modelCatalogError, setModelCatalogError] = useState<string | null>(null);
+  const modelPreferenceResponses = useRef(
+    new Map<string, { resolve: (message: PluginToUIMessage | null) => void; timeout: number }>(),
+  );
+  const modelPreferenceSelectionRevision = useRef(0);
+  const modelPreferenceWriteRevision = useRef(0);
+  const pendingDefaultModelPreference = useRef<string | null>(null);
+  const modelCatalogRequestRevision = useRef(0);
+  const modelCatalogAbort = useRef<AbortController | null>(null);
   const [smokeResult, setSmokeResult] = useState<string | null>(null);
   const [smokeDiagnostic, setSmokeDiagnostic] = useState<InferenceDiagnostic | null>(null);
   const [smokeInFlight, setSmokeInFlight] = useState(false);
@@ -562,8 +596,27 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     selectedModel: selectedCompanionModel,
     smokeInFlight,
   });
+  const pinnedChatModel =
+    chatTaskSnapshot?.status !== "completed" ? chatTaskSnapshot?.model : undefined;
+  const chatExecutionModel = pinnedChatModel || selectedCompanionModel;
+  const chatInferenceEligibility = getInferenceEligibility({
+    companionConnected: Boolean(companionToken) && companionConnectionState === "connected",
+    status: companionStatus,
+    models: companionModels,
+    selectedModel: chatExecutionModel,
+    smokeInFlight,
+  });
+  const companionModelState: ModelCatalogState = modelCatalogState({
+    reachable: companionConnectionState === "connected",
+    auth: companionStatus?.auth,
+    catalogLoaded: modelDiscovery === "loaded" || modelDiscovery === "empty",
+    catalogError: modelCatalogError ?? companionStatus?.safeMessage ?? null,
+    selectedModel: selectedCompanionModel || savedModelPreference,
+    availableModels: companionModels.map(({ slug }) => slug),
+    verifiedModel: companionStatus?.inferenceVerifiedModel,
+  });
   const chatReady =
-    inferenceEligibility.eligible && Boolean(companionToken && selectedCompanionModel);
+    chatInferenceEligibility.eligible && Boolean(companionToken && chatExecutionModel);
 
   useEffect(() => {
     let active = true;
@@ -682,13 +735,14 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     const taskId = chatTaskSnapshot?.id;
     const taskStatus = chatTaskSnapshot?.status;
     const updatedAt = Date.now();
+    const savedModel = chatTaskSnapshot?.model || selectedCompanionModel || existing?.model;
     const conversation: ChatHistoryConversation = {
       id: activeChatId,
       title:
         existing && existing.title !== "New chat" ? existing.title : chatHistoryTitle(messages),
       createdAt: existing?.createdAt ?? updatedAt,
       updatedAt,
-      ...(selectedCompanionModel ? { model: selectedCompanionModel.slice(0, 100) } : {}),
+      ...(savedModel ? { model: savedModel.slice(0, 200) } : {}),
       ...(taskId ? { taskId } : existing?.taskId ? { taskId: existing.taskId } : {}),
       taskState: chatBusy ? "running" : (taskStatus ?? existing?.taskState ?? "new"),
       messages,
@@ -712,6 +766,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     chatHistoryLoaded,
     chatMessages,
     chatTaskSnapshot?.id,
+    chatTaskSnapshot?.model,
     chatTaskSnapshot?.status,
     historyDocumentId,
     selectedCompanionModel,
@@ -772,6 +827,12 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       generationRequest.current = null;
       generationAbort.current?.abort();
       chatAbort.current?.abort();
+      modelCatalogAbort.current?.abort();
+      for (const pending of modelPreferenceResponses.current.values()) {
+        window.clearTimeout(pending.timeout);
+        pending.resolve(null);
+      }
+      modelPreferenceResponses.current.clear();
       const activeBatchId = toolBatchId.current;
       if (activeBatchId)
         postToPlugin({ type: "tool-cancel", protocolVersion: 1, batchId: activeBatchId });
@@ -854,6 +915,15 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           window.clearTimeout(pending.timeout);
           restoreTicketWrites.current.delete(message.requestId);
           pending.resolve(message.success);
+        }
+        return;
+      }
+      if (message.type === "model-preference-loaded" || message.type === "model-preference-saved") {
+        const pending = modelPreferenceResponses.current.get(message.requestId);
+        if (pending) {
+          window.clearTimeout(pending.timeout);
+          modelPreferenceResponses.current.delete(message.requestId);
+          pending.resolve(message);
         }
         return;
       }
@@ -1068,11 +1138,14 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           } catch (error) {
             if (cancelled) return;
             if (error instanceof CompanionClientError && error.category === "pairing_required") {
+              modelCatalogAbort.current?.abort();
+              modelCatalogRequestRevision.current += 1;
               setCompanionToken(null);
               setCompanionStatus(null);
               setCompanionModels([]);
-              setSelectedCompanionModel("");
               setModelDiscovery("idle");
+              setModelCatalogError(null);
+              pendingDefaultModelPreference.current = null;
               setCompanionConnectionState(restoreTicket ? "reconnecting" : "available");
             } else {
               setCompanionConnectionState("reconnecting");
@@ -1170,6 +1243,105 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
   const nextRequestId = () => `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+  const requestModelPreference = useCallback(
+    (
+      type: "load-model-preference" | "save-model-preference",
+      selectedModel?: string,
+    ): Promise<PluginToUIMessage | null> =>
+      new Promise((resolve) => {
+        const requestId = `model-pref-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const timeout = window.setTimeout(() => {
+          modelPreferenceResponses.current.delete(requestId);
+          resolve(null);
+        }, 5_000);
+        modelPreferenceResponses.current.set(requestId, { resolve, timeout });
+        const message: UIToPluginMessage =
+          type === "load-model-preference"
+            ? { type, requestId }
+            : { type, requestId, selectedModel: selectedModel ?? "" };
+        if (!postToPlugin(message)) {
+          window.clearTimeout(timeout);
+          modelPreferenceResponses.current.delete(requestId);
+          resolve(null);
+        }
+      }),
+    [],
+  );
+
+  const saveSelectedModelPreference = useCallback(
+    (model: string) => {
+      modelPreferenceSelectionRevision.current += 1;
+      const revision = ++modelPreferenceWriteRevision.current;
+      setModelPreferenceError(null);
+      void requestModelPreference("save-model-preference", model).then((message) => {
+        if (revision !== modelPreferenceWriteRevision.current) return;
+        if (message?.type === "model-preference-saved" && message.success) {
+          setSavedModelPreference(model);
+          setModelPreferenceState("valid");
+          return;
+        }
+        setModelPreferenceError("Figma could not save this model choice. The current task and saved history were not changed.");
+        setModelPreferenceState("unavailable");
+      });
+    },
+    [requestModelPreference],
+  );
+
+  const selectSettingsModel = useCallback(
+    (model: string) => {
+      activeChatModel.current = model;
+      setSelectedCompanionModel(model);
+      setSmokeResult(null);
+      setSmokeDiagnostic(null);
+      saveSelectedModelPreference(model);
+    },
+    [saveSelectedModelPreference],
+  );
+
+  useEffect(() => {
+    let active = true;
+    const selectionRevision = modelPreferenceSelectionRevision.current;
+    void requestModelPreference("load-model-preference").then((message) => {
+      if (!active) return;
+      if (message?.type !== "model-preference-loaded") {
+        setModelPreferenceState("unavailable");
+        setModelPreferenceError("Figma could not read the saved model preference. Your other saved data is untouched.");
+        return;
+      }
+      setModelPreferenceState(message.state);
+      const pendingDefault = pendingDefaultModelPreference.current;
+      if (message.state !== "empty") pendingDefaultModelPreference.current = null;
+      if (message.state === "valid" && message.selectedModel) {
+        setSavedModelPreference(message.selectedModel);
+        const chatSelectionWasExplicit =
+          activeChatModel.current && activeChatModel.current !== pendingDefault;
+        if (
+          selectionRevision === modelPreferenceSelectionRevision.current &&
+          !activeChatIdRef.current &&
+          !chatSelectionWasExplicit
+        ) {
+          activeChatModel.current = message.selectedModel;
+          setSelectedCompanionModel(message.selectedModel);
+        }
+      }
+      if (message.state === "empty") {
+        pendingDefaultModelPreference.current = null;
+        if (pendingDefault && !activeChatIdRef.current) {
+          saveSelectedModelPreference(pendingDefault);
+        }
+      }
+      if (message.state === "invalid") {
+        setModelPreferenceError("The saved model preference is damaged or from a newer version. It is preserved until you choose a model.");
+      }
+      if (message.state === "unavailable") {
+        setModelPreferenceError("Figma could not read the saved model preference. Your other saved data is untouched.");
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [requestModelPreference, saveSelectedModelPreference]);
+
   const canSwitchChats =
     chatHistoryLoaded && Boolean(historyDocumentId) && !chatBusy && !toolBusy && !chatSwitchBusy;
   const canSwitchChatsNow = () =>
@@ -1209,6 +1381,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     const existing = chatHistoryRef.current.find((conversation) => conversation.id === id);
     const now = Date.now();
     const task = chatTask.current;
+    const savedModel = task?.model || selectedCompanionModel || existing?.model;
     return {
       id,
       title:
@@ -1217,7 +1390,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           : chatHistoryTitle(chatMessages),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
-      ...(selectedCompanionModel ? { model: selectedCompanionModel.slice(0, 100) } : {}),
+      ...(savedModel ? { model: savedModel.slice(0, 200) } : {}),
       ...(task ? { taskId: task.id } : existing?.taskId ? { taskId: existing.taskId } : {}),
       taskState: chatBusy ? "running" : (task?.status ?? existing?.taskState ?? "new"),
       messages: boundedHistoryMessages(chatMessages),
@@ -1483,7 +1656,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       chatSwitchBusy
     )
       return;
-    if (!companionToken || !selectedCompanionModel || !chatReady) return;
+    if (!companionToken || !chatExecutionModel || !chatReady) return;
     if (!retry && chatTask.current && chatTask.current.status !== "completed") return;
     const text = chatInput.trim();
     if (!retry && !text) return;
@@ -1517,6 +1690,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           referenceScope: "task-v1",
           documentId: loaded.documentId,
           prompt: text,
+          model: selectedCompanionModel,
           lifecycle: "UNPLANNED",
           modelRoundTrace: [],
           context: chatTask.current?.documentId === loaded.documentId ? chatModelInput.current : [],
@@ -1553,6 +1727,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       }
       const task = chatTask.current;
       if (!task) return;
+      const executionModel = taskModelForExecution(task.model, selectedCompanionModel);
+      if (!executionModel) throw new Error("Choose an account-visible model before resuming this task.");
+      task.model = executionModel;
       setChatRetryMessageId(null);
       setChatPendingTool(true);
       setChatMessages((messages) =>
@@ -1577,7 +1754,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           streamAuthorizedChat(
             companionToken,
             nextRequestId(),
-            selectedCompanionModel,
+            executionModel,
             input,
             lifecycle,
             fetch,
@@ -1850,8 +2027,19 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     }
   };
 
+  const invalidateModelCatalog = () => {
+    modelCatalogAbort.current?.abort();
+    modelCatalogAbort.current = null;
+    modelCatalogRequestRevision.current += 1;
+    setCompanionModels([]);
+    setModelDiscovery("idle");
+    setModelCatalogError(null);
+    pendingDefaultModelPreference.current = null;
+  };
+
   const signInWithChatGPT = async () => {
     if (!companionToken) return;
+    invalidateModelCatalog();
     setCompanionBusy(true);
     setCompanionError(null);
     setSmokeResult(null);
@@ -1883,16 +2071,31 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   };
 
   const discoverModels = async () => {
-    if (!companionToken) return;
+    const token = companionToken;
+    if (!token) return;
+    modelCatalogAbort.current?.abort();
+    const controller = new AbortController();
+    modelCatalogAbort.current = controller;
+    const revision = ++modelCatalogRequestRevision.current;
     setCompanionBusy(true);
     setModelDiscovery("loading");
+    setModelCatalogError(null);
     setCompanionError(null);
     try {
-      const models = await discoverAuthorizedModels(companionToken);
-      const status = await getCompanionStatus(companionToken);
+      const catalog = await discoverAuthorizedModelCatalog(token, fetch, controller.signal);
+      const status = catalog.status ?? (await getCompanionStatus(token));
+      if (
+        controller.signal.aborted ||
+        revision !== modelCatalogRequestRevision.current ||
+        token !== companionToken
+      )
+        return;
+      const models = catalog.models;
+      const previousSelection =
+        activeChatModel.current || selectedCompanionModel || savedModelPreference;
       const nextModel = retainSelectedAccountModel(
         models,
-        activeChatModel.current || selectedCompanionModel,
+        previousSelection,
         status.inferenceVerifiedModel,
       );
       setCompanionModels(models);
@@ -1906,12 +2109,32 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       setCompanionError(
         models.length ? null : "No account-visible model was returned for this session.",
       );
+      setModelCatalogError(null);
       setCompanionStatus(status);
+      if (!previousSelection && nextModel) {
+        if (modelPreferenceState === "empty") saveSelectedModelPreference(nextModel);
+        else if (modelPreferenceState === "loading") {
+          pendingDefaultModelPreference.current = nextModel;
+        }
+      }
     } catch (error) {
+      if (
+        controller.signal.aborted ||
+        revision !== modelCatalogRequestRevision.current ||
+        token !== companionToken
+      )
+        return;
       setModelDiscovery("error");
+      setCompanionModels([]);
+      setModelCatalogError(
+        error instanceof CompanionClientError ? error.category : "unknown",
+      );
       setCompanionError(companionErrorText(error));
     } finally {
-      setCompanionBusy(false);
+      if (revision === modelCatalogRequestRevision.current) {
+        if (modelCatalogAbort.current === controller) modelCatalogAbort.current = null;
+        setCompanionBusy(false);
+      }
     }
   };
 
@@ -1974,6 +2197,38 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
   const cancelCompanionSmoke = () => smokeAbort.current?.abort();
 
+  const changeActiveTaskModel = async () => {
+    const task = chatTask.current;
+    const chatId = activeChatIdRef.current;
+    const selectedModel = selectedCompanionModel;
+    if (
+      !task ||
+      !chatId ||
+      !historyDocumentId ||
+      chatBusy ||
+      toolBusy ||
+      task.status === "completed" ||
+      !selectedModel ||
+      !inferenceEligibility.eligible
+    )
+      return;
+    const updated = { ...task, model: selectedModel };
+    try {
+      await chatTaskBridge({
+        type: "chat-task-save",
+        requestId: nextRequestId(),
+        documentId: updated.documentId,
+        chatId,
+        task: updated,
+      });
+      chatTask.current = updated;
+      setChatTaskSnapshot(structuredClone(updated));
+      setCompanionError(null);
+    } catch {
+      setCompanionError("The task model could not be changed in its checkpoint. Its previous model and canvas changes remain saved.");
+    }
+  };
+
   const clearConnectedAccountDetails = () => {
     setSavedDraft(null);
     setScreenStages({});
@@ -1983,9 +2238,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       setGenerationPreview(null);
       setGenerationState("cancelled");
     }
-    setCompanionModels([]);
-    setSelectedCompanionModel("");
-    setModelDiscovery("idle");
+    invalidateModelCatalog();
     setSmokeResult(null);
     setSmokeDiagnostic(null);
   };
@@ -2016,6 +2269,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
   const disconnectCompanion = async (switchAccount = false) => {
     if (!companionToken) return;
+    modelCatalogAbort.current?.abort();
+    modelCatalogRequestRevision.current += 1;
+    pendingDefaultModelPreference.current = null;
     setCompanionBusy(true);
     try {
       const result = switchAccount
@@ -3771,14 +4027,15 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                   <select
                     id="design-model"
                     value={selectedCompanionModel}
-                    onChange={(event) => {
-                      activeChatModel.current = event.target.value;
-                      setSelectedCompanionModel(event.target.value);
-                      setSmokeResult(null);
-                      setSmokeDiagnostic(null);
-                    }}
+                    onChange={(event) => selectSettingsModel(event.target.value)}
                     disabled={companionBusy || generationInFlight}
                   >
+                    {selectedCompanionModel &&
+                      !companionModels.some(({ slug }) => slug === selectedCompanionModel) && (
+                        <option value={selectedCompanionModel} disabled>
+                          Saved model unavailable: {selectedCompanionModel}
+                        </option>
+                      )}
                     {companionModels.map((model) => (
                       <option key={model.slug} value={model.slug}>
                         {model.displayName}
@@ -4315,6 +4572,50 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                 )[companionConnectionState]}
             </span>
           </div>
+          <p className="ai-gate-note model-management-status" role="status" aria-live="polite">
+            <strong>{modelCatalogStateLabel(companionModelState)}.</strong>{" "}
+            Companion reachability, account authorization, provider model discovery, and model
+            verification are checked separately. Default preference: {savedModelPreference ? (
+              <bdi dir="ltr"><code>{savedModelPreference}</code></bdi>
+            ) : "none"}. Current selection: {selectedCompanionModel ? (
+              <bdi dir="ltr"><code>{selectedCompanionModel}</code></bdi>
+            ) : "none"}.
+            {chatTaskSnapshot?.model && chatTaskSnapshot.status !== "completed" && (
+              <> Active task model: <bdi dir="ltr"><code>{chatTaskSnapshot.model}</code></bdi>.</>
+            )}
+            {generationInFlight && savedDraft?.manifest.model && (
+              <> Active generation model: <bdi dir="ltr"><code>{savedDraft.manifest.model}</code></bdi>.</>
+            )}
+            {modelPreferenceState === "loading" && " Reading the saved choice…"}
+            {modelPreferenceError && <> {modelPreferenceError}</>}
+          </p>
+          {chatTaskSnapshot &&
+            chatTaskSnapshot.status !== "completed" &&
+            selectedCompanionModel &&
+            chatTaskSnapshot.model !== selectedCompanionModel && (
+              <div className="ai-gate-note model-management-task-choice">
+                <p>
+                  This saved task is pinned to <bdi dir="ltr"><code>{chatTaskSnapshot.model || "an unrecorded legacy model"}</code></bdi>.
+                  Changing it affects future inference for this task and requires an explicit checkpoint update.
+                </p>
+                <button
+                  className="secondary-action"
+                  type="button"
+                  onClick={() => void changeActiveTaskModel()}
+                  disabled={
+                    chatBusy ||
+                    toolBusy ||
+                    companionBusy ||
+                    !inferenceEligibility.eligible ||
+                    !activeChatId
+                  }
+                >
+                  {chatBusy || toolBusy
+                    ? "Wait for the current task operation"
+                    : `Use ${selectedCompanionModel} for this task`}
+                </button>
+              </div>
+            )}
           {restoreStorageWarning && (
             <p className="ai-gate-note" role="status">
               Secure session restoration is unavailable. This connection works now, but Figma or the
@@ -4443,14 +4744,15 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                       <span>Account-visible model</span>
                       <select
                         value={selectedCompanionModel}
-                        onChange={(event) => {
-                          activeChatModel.current = event.target.value;
-                          setSelectedCompanionModel(event.target.value);
-                          setSmokeResult(null);
-                          setSmokeDiagnostic(null);
-                        }}
+                        onChange={(event) => selectSettingsModel(event.target.value)}
                         disabled={companionBusy || generationInFlight}
                       >
+                        {selectedCompanionModel &&
+                          !companionModels.some(({ slug }) => slug === selectedCompanionModel) && (
+                            <option value={selectedCompanionModel} disabled>
+                              Saved model unavailable: {selectedCompanionModel}
+                            </option>
+                          )}
                         {companionModels.map((model) => (
                           <option key={model.slug} value={model.slug}>
                             {model.displayName}

@@ -17,6 +17,7 @@ import {
   FigmaToolProgressSchema,
   FigmaToolStateDiagnosticSchema,
 } from "./figma-tools";
+import { ModelIdSchema } from "./model-preference";
 
 const RequestSchema = z.object({
   requestId: z.string().min(1).max(100),
@@ -288,6 +289,14 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
         .nullable(),
     })
     .strict(),
+  z.object({ type: z.literal("load-model-preference"), requestId: z.string().min(1).max(100) }).strict(),
+  z
+    .object({
+      type: z.literal("save-model-preference"),
+      requestId: z.string().min(1).max(100),
+      selectedModel: ModelIdSchema,
+    })
+    .strict(),
   RequestSchema.extend({ type: z.literal("validate") }).strict(),
   RequestSchema.extend({ type: z.literal("generate") }).strict(),
   RequestSchema.extend({
@@ -302,6 +311,21 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
 ]);
 
 export const PluginToUISchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("model-preference-loaded"),
+      requestId: z.string().min(1).max(100),
+      state: z.enum(["empty", "valid", "invalid", "unavailable"]),
+      selectedModel: ModelIdSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("model-preference-saved"),
+      requestId: z.string().min(1).max(100),
+      success: z.boolean(),
+    })
+    .strict(),
   z
     .object({
       type: z.literal("chat-history-result"),

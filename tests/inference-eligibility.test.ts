@@ -85,9 +85,22 @@ describe("model-specific inference eligibility", () => {
 
   it("does not reset a smoke-tested selection when models are refreshed", () => {
     expect(retainSelectedAccountModel(models, "gpt-6-luna")).toBe("gpt-6-luna");
-    expect(retainSelectedAccountModel(models, "removed-model")).toBe("gpt-6-luna");
+    expect(retainSelectedAccountModel(models, "removed-model")).toBe("removed-model");
     expect(retainSelectedAccountModel([...models].reverse(), "", "gpt-6-luna")).toBe("gpt-6-luna");
-    expect(retainSelectedAccountModel([], "gpt-6-luna")).toBe("");
+    expect(retainSelectedAccountModel([], "gpt-6-luna")).toBe("gpt-6-luna");
+  });
+
+  it("keeps a removed saved choice visible and ineligible until the user chooses another model", () => {
+    expect(
+      getInferenceEligibility({
+        companionConnected: true,
+        status: verifiedStatus,
+        models,
+        selectedModel: "removed-model",
+        smokeInFlight: false,
+      }),
+    ).toMatchObject({ eligible: false, reason: "model_not_account_visible" });
+    expect(retainSelectedAccountModel(models, "removed-model", "gpt-6-luna")).toBe("removed-model");
   });
 
   it("invalidates authorization after account switch or companion session restoration", () => {

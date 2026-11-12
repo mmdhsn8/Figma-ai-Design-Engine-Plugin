@@ -51,6 +51,32 @@ afterEach(async () => {
 });
 
 describe("loopback companion", () => {
+  it("rejects a delayed model catalog response after the authenticated account changes", async () => {
+    const harness = await createHarness();
+    const token = await harness.pair();
+    await request(harness.handle, "/v1/auth/start", { token, body: {} });
+    await completeLogin(harness);
+    await request(harness.handle, "/v1/models", { token, body: {} });
+
+    const gate = harness.stallNextModelsResponse();
+    const oldCatalog = request(harness.handle, "/v1/models", { token, body: {} });
+    await gate.started;
+    await request(harness.handle, "/v1/account/switch", { token, body: {} });
+    await request(harness.handle, "/v1/auth/start", { token, body: {} });
+    harness.changeSubject("a-different-account-subject");
+    await completeLogin(harness);
+    gate.release();
+
+    const staleResponse = await oldCatalog;
+    expect(staleResponse.status).toBe(409);
+    await expect(staleResponse.json()).resolves.toMatchObject({ error: "account_mismatch" });
+    const currentStatus = await request(harness.handle, "/v1/status", { token });
+    await expect(currentStatus.json()).resolves.toMatchObject({
+      auth: "scope_granted",
+      planUseAuthorized: true,
+    });
+  });
+
   it("continues a persisted one-commit task without colliding with an inspected page alias", async () => {
     let sequence = 0;
     const call = (name: string, args: unknown) => ({
@@ -3681,6 +3707,9 @@ async function createHarness(
   let authNonce = "";
   let authTransactionUrl: URL | undefined;
   let currentSubject = "opaque-subject";
+  let nextModelFetchGate:
+    | { started: Promise<void>; markStarted: () => void; wait: Promise<void>; release: () => void }
+    | undefined;
   const credentialStore = createMemoryCredentialStore();
   const store = {
     async load() {
@@ -3731,6 +3760,12 @@ async function createHarness(
       });
     }
     if (url === "https://api.openai.com/v1/models") {
+      const gate = nextModelFetchGate;
+      if (gate) {
+        nextModelFetchGate = undefined;
+        gate.markStarted();
+        await gate.wait;
+      }
       if (options.modelsUnauthorized) {
         return Response.json({ error: "invalid_token" }, { status: 401 });
       }
@@ -4040,6 +4075,18 @@ async function createHarness(
     },
     changeSubject(subject: string) {
       currentSubject = subject;
+    },
+    stallNextModelsResponse() {
+      let markStarted!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const wait = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      nextModelFetchGate = { started, markStarted, wait, release };
+      return { started, release };
     },
     storeSnapshot() {
       return JSON.stringify(storeData);

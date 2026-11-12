@@ -141,6 +141,11 @@ describe("plugin UI navigation and capability states", () => {
     expect(createHash("sha256").update(appSource.slice(chatStart, chatEnd)).digest("hex")).toBe(
       "56d6d0c34d076ab32942bfcd8feb754f951d67593311864946298383b2e50522",
     );
+    expect(appSource).toContain(
+      "const executionModel = taskModelForExecution(task.model, selectedCompanionModel);",
+    );
+    expect(appSource).toContain("model: selectedCompanionModel,");
+    expect(appSource).toContain("executionModel,");
 
     const css = readFileSync("src/ui/styles.css", "utf8");
     const nonChatMarker = "/* Phase 7 non-Chat refinements.";
@@ -148,6 +153,8 @@ describe("plugin UI navigation and capability states", () => {
     expect(createHash("sha256").update(frozenCss).digest("hex")).toBe(
       "e268f69387f50a007b7a3ce54b258f711241c9f02c693dbcb1164e4811b2bdf6",
     );
+    expect(css.slice(css.indexOf(nonChatMarker))).toContain(".model-management-status");
+    expect(css.slice(css.indexOf(nonChatMarker))).toContain(".model-management-task-choice");
   });
 
   it("switches between areas and Settings without losing the selected area", () => {

@@ -466,6 +466,16 @@ function reportedPartialEditTask() {
 }
 
 describe("progressive conversational canvas tasks", () => {
+  it("accepts legacy task checkpoints and preserves a pinned model in new snapshots", () => {
+    const legacy = task();
+    expect(legacy.model).toBeUndefined();
+    const pinned = ChatTaskSchema.parse({ ...legacy, model: "provider/model-exact" });
+    expect(pinned.model).toBe("provider/model-exact");
+    expect(ChatTaskSchema.safeParse({ ...legacy, model: "provider/model with spaces" }).success).toBe(
+      false,
+    );
+  });
+
   it("closes the reported 11-round repeated-context failure with one model request and bounded inspection", async () => {
     const classification = () => turn("classify_canvas_intent", { intent: "inspect", targetName: "Charm" });
     const reportedCallSequence = [

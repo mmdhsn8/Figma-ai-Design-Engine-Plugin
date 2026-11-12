@@ -14,6 +14,7 @@ import { createGenerationController } from "./generation-controller";
 import { createFigmaToolExecutor } from "./figma-tool-executor";
 import { handleChatTaskStorage } from "./chat-task-storage";
 import { handleChatHistoryStorage } from "./chat-history-storage";
+import { handleModelPreferenceStorage } from "./model-preference-storage";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
 const COMPANION_RESTORE_TICKET_KEY = "companion-restore-ticket-v1";
@@ -197,6 +198,14 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       requestId: message.data.requestId,
       success,
     });
+    return;
+  }
+
+  if (
+    message.data.type === "load-model-preference" ||
+    message.data.type === "save-model-preference"
+  ) {
+    send(await handleModelPreferenceStorage(figma.clientStorage, message.data));
     return;
   }
 

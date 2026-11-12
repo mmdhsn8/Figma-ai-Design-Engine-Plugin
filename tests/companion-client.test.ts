@@ -4,6 +4,7 @@ import {
   CompanionClientError,
   disconnectLocalSession,
   discoverAuthorizedModels,
+  discoverAuthorizedModelCatalog,
   getCompanionHealth,
   getCompanionStatus,
   generateAuthorizedDesign,
@@ -200,6 +201,54 @@ describe("Figma UI companion client", () => {
     expect(await discoverAuthorizedModels("x".repeat(40), fetcher)).toEqual([
       { slug: "model-slug", displayName: "Model Display Name" },
     ]);
+  });
+
+  it("returns the authenticated catalog and its same-response status together", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () =>
+      Response.json({
+        models: [{ slug: "provider/model-a", displayName: "Model A" }],
+        status: {
+          companion: "connected",
+          auth: "scope_granted",
+          authLabel: "Scope granted",
+          planUseAuthorized: true,
+          modelCount: 1,
+        },
+      }),
+    );
+    await expect(discoverAuthorizedModelCatalog("s".repeat(40), fetcher)).resolves.toMatchObject({
+      models: [{ slug: "provider/model-a" }],
+      status: { auth: "scope_granted", modelCount: 1 },
+    });
+  });
+
+  it("bounds local Companion requests and distinguishes timeout from caller cancellation", async () => {
+    vi.useFakeTimers();
+    try {
+      const hanging = vi.fn<typeof fetch>(
+        async (_input, init) =>
+          await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("Aborted", "AbortError")),
+              { once: true },
+            );
+          }),
+      );
+      const timedOut = getCompanionHealth(hanging);
+      const timeoutAssertion = expect(timedOut).rejects.toMatchObject({
+        category: "request_timed_out",
+      });
+      await vi.advanceTimersByTimeAsync(20_001);
+      await timeoutAssertion;
+
+      const controller = new AbortController();
+      const cancelled = discoverAuthorizedModels("s".repeat(40), hanging, controller.signal);
+      controller.abort();
+      await expect(cancelled).rejects.toMatchObject({ category: "request_cancelled" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("sends only the selected account-visible model through the smoke action", async () => {
