@@ -334,6 +334,8 @@ export const FigmaToolOperationSchema = z
       .optional(),
     chatId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u).optional(),
     designName: z.string().trim().min(1).max(100).optional(),
+    documentId: z.string().min(1).max(300).optional(),
+    reconcileOnly: z.literal(true).optional(),
     expectedCreationOperationId: OperationIdSchema.optional(),
     action: FigmaToolActionSchema,
   })
@@ -631,8 +633,8 @@ export const FigmaToolDeleteConsentResultSchema = z
 export const FigmaToolOperationStatusSchema = z
   .object({
     operationId: OperationIdSchema,
-    status: z.enum(["running", "completed", "failed"]),
-    updatedAt: z.number().int().nonnegative(),
+    status: z.enum(["running", "completed", "failed", "unknown", "not_attempted", "blocked"]),
+    updatedAt: z.number().int().nonnegative().optional(),
     result: z.record(z.string(), z.unknown()).optional(),
   })
   .strict();

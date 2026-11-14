@@ -438,6 +438,10 @@ export const ChatTaskSchema = z
     designName: z.string().trim().min(1).max(100).optional(),
     referenceScope: z.literal("task-v1").optional(),
     documentId: z.string().min(1).max(300),
+    accountScope: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .optional(),
     prompt: z.string().min(1).max(8_000),
     // Optional for legacy checkpoints. New executions persist the exact model
     // chosen at task start so retries cannot silently switch providers/models.
@@ -701,37 +705,35 @@ export function chatTaskCommittedOperationCount(task: ChatTask): number {
 }
 
 export function mutationAccounting(entries: ChatTask["ledger"]) {
-  const mutations = entries.filter((entry) => chatTaskLedgerCategory(entry) === "mutation");
-  return {
-    attemptedMutations: mutations.filter(
-      (entry) =>
-        ["running", "completed", "failed", "repaired"].includes(entry.status) &&
-        entry.acknowledgementStatus !== "not_attempted",
-    ).length,
-    confirmedMutations: mutations.filter(
-      (entry) =>
-        entry.status === "completed" &&
-        !entry.reused &&
-        entry.acknowledgementStatus !== "verified_idempotent_replay" &&
-        entry.acknowledgementStatus !== "ambiguous" &&
-        entry.acknowledgementStatus !== "rejected" &&
-        entry.acknowledgementStatus !== "not_attempted" &&
-        entry.acknowledgementStatus !== "read_only",
-    ).length,
-    rejectedMutations: mutations.filter(
-      (entry) =>
-        (entry.status === "failed" || entry.status === "repaired") &&
-        entry.acknowledgementStatus === "rejected",
-    ).length,
-    ambiguousMutations: mutations.filter(
-      (entry) => entry.status === "running" || entry.acknowledgementStatus === "ambiguous",
-    ).length,
-    verifiedIdempotentReplays: mutations.filter(
-      (entry) =>
-        (entry.status === "completed" || entry.status === "repaired") &&
-        (entry.reused || entry.acknowledgementStatus === "verified_idempotent_replay"),
-    ).length,
+  const counts = {
+    attemptedMutations: 0,
+    confirmedMutations: 0,
+    rejectedMutations: 0,
+    ambiguousMutations: 0,
+    verifiedIdempotentReplays: 0,
   };
+  for (const entry of entries) {
+    if (chatTaskLedgerCategory(entry) !== "mutation" || entry.status === "pending") continue;
+    const acknowledgement = entry.acknowledgementStatus;
+    if (acknowledgement === "not_attempted" && entry.status !== "running") continue;
+    counts.attemptedMutations++;
+    if (
+      entry.status === "completed" &&
+      (acknowledgement === "confirmed_mutation" ||
+        acknowledgement === "verified_idempotent_replay" ||
+        acknowledgement === undefined)
+    ) {
+      if (entry.reused || acknowledgement === "verified_idempotent_replay")
+        counts.verifiedIdempotentReplays++;
+      else counts.confirmedMutations++;
+    } else if (
+      (entry.status === "failed" || entry.status === "repaired") &&
+      acknowledgement === "rejected"
+    ) {
+      counts.rejectedMutations++;
+    } else counts.ambiguousMutations++;
+  }
+  return counts;
 }
 
 export function chatTaskLedgerCategory(
@@ -1046,6 +1048,9 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
     lifecycleTransitions: task.lifecycleTransitions,
     ...(stageIndex >= 0 ? { stageId: `stage-${stageIndex + 1}` } : {}),
     ...(operation ? { callId: operation.call.callId, tool: operation.call.action.tool } : {}),
+    ...(operation?.call.action.tool === "get_operation_status"
+      ? { lookupTargetOperationId: operation.call.action.operationId }
+      : {}),
     ...(task.failure?.operationId ? { operationId: task.failure.operationId } : {}),
     ...(parenting ? { parenting } : {}),
     ...(partialCommitReconciliation ? { partialCommitReconciliation } : {}),
@@ -1105,6 +1110,16 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
                 (entry.status === "pending" || entry.status === "running"),
             ).length,
             failedOperations: stageEntries.filter((entry) => entry.status === "failed").length,
+            failedMutations: stageEntries.filter(
+              (entry) => entry.status === "failed" && chatTaskLedgerCategory(entry) === "mutation",
+            ).length,
+            failedReadOnlyOperations: stageEntries.filter(
+              (entry) => entry.status === "failed" && chatTaskLedgerCategory(entry) === "read_only",
+            ).length,
+            failedVerificationOperations: stageEntries.filter(
+              (entry) =>
+                entry.status === "failed" && chatTaskLedgerCategory(entry) === "verification",
+            ).length,
             mutationCapacityPerSegment: CHAT_EXECUTION_SEGMENT_MAX_MUTATIONS,
             segments: stage.segments.map(
               ({

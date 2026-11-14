@@ -2485,7 +2485,103 @@ describe("progressive conversational canvas tasks", () => {
     const dispatched = h.deps.execute.mock.calls[1]![0];
     const resume = harness([finish(), done]);
     await runChatTask(ChatTaskSchema.parse(h.checkpoints.at(-1)), resume.deps);
-    expect(resume.batches[0]).toEqual(dispatched);
+    expect(resume.batches[0]).toEqual(dispatched.map((op) => ({ ...op, reconcileOnly: true })));
+  });
+
+  it("keeps the original attempt uncertain when its reconciliation probe is skipped", async () => {
+    const current = task();
+    const initial = harness([plan(["Frame"]), creates(2)]);
+    initial.deps.execute.mockImplementationOnce(async (ops) => success(ops));
+    initial.deps.execute.mockRejectedValueOnce(new Error("Lost original batch acknowledgement"));
+    await expect(runChatTask(current, initial.deps)).rejects.toThrow("Lost original");
+    const retry = harness([]);
+    retry.deps.execute.mockImplementationOnce(async (ops) => ({
+      ...success([]),
+      success: false,
+      cancelled: true,
+      results: ops.map(({ operationId }) => ({
+        operationId,
+        success: false,
+        replayed: false,
+        acknowledgementStatus: "not_attempted",
+      })),
+    }));
+    await expect(runChatTask(current, retry.deps)).rejects.toThrow("Stopped");
+    expect(current.ledger.filter(({ category }) => category === "mutation")).toEqual(
+      Array.from({ length: 2 }, () =>
+        expect.objectContaining({ status: "running", acknowledgementStatus: "ambiguous" }),
+      ),
+    );
+    expect(retry.deps.model).not.toHaveBeenCalled();
+  });
+
+  it("reads both IDs from the reported partial stage without allocating mutation IDs or advancing", async () => {
+    const current = task();
+    const setup = harness(
+      [plan(["Storefront"], ["fixture-0"]), new Error("Fixture boundary")],
+      false,
+    );
+    await expect(runChatTask(current, setup.deps)).rejects.toThrow("Fixture boundary");
+    current.lifecycle = "EXECUTING_STAGE";
+    current.batches = 8;
+    current.ledger = Array.from({ length: 15 }, (_, index) => {
+      const response = creates(1, `fixture-${index}`) as Extract<
+        AuthorizedChatTurn,
+        { kind: "tool_calls" }
+      >;
+      return {
+        call: response.calls[0]!,
+        operationId: `${current.id}-op-${index + 1}`,
+        stage: 0,
+        category: "mutation",
+        status: index < 12 ? "completed" : "failed",
+        acknowledgementStatus: index < 12 ? "confirmed_mutation" : "rejected",
+        output: JSON.stringify(index < 12 ? {} : { error: "Invalid parent" }),
+      };
+    });
+    const op16 = `${current.id}-op-16`;
+    const op17 = `${current.id}-op-17`;
+    current.ledger.push({
+      call: (
+        turn("get_operation_status", { operationId: op16 }) as Extract<
+          AuthorizedChatTurn,
+          { kind: "tool_calls" }
+        >
+      ).calls[0]!,
+      operationId: op17,
+      stage: 0,
+      status: "failed",
+      category: "read_only",
+    });
+    const resume = harness(
+      [
+        turn("get_operation_status", { operationId: op16 }),
+        turn("get_operation_status", { operationId: op17 }),
+        finish(),
+        new Error("Stop after checking incomplete stage"),
+      ],
+      false,
+    );
+    await expect(runChatTask(current, resume.deps)).rejects.toThrow("Stop after checking");
+    expect(resume.deps.execute).not.toHaveBeenCalled();
+    expect(resume.inputs.map((input) => JSON.stringify(input)).join(" ")).toContain(op17);
+    expect(current.ledger).toHaveLength(16);
+    expect(chatTaskSafeDiagnostic(current)).toMatchObject({
+      lifecycle: "EXECUTING_STAGE",
+      nativeBatches: 8,
+      mutationAccounting: {
+        attemptedMutations: 15,
+        confirmedMutations: 12,
+        rejectedMutations: 3,
+        ambiguousMutations: 0,
+      },
+      activeStageProgress: { failedOperations: 4, failedMutations: 3, failedReadOnlyOperations: 1 },
+    });
+    expect(current.stages[0]).toMatchObject({
+      completed: false,
+      verified: false,
+      completionReason: "pending_or_failed_mutations",
+    });
   });
 
   it("waits on executor rate limits and reuses the rejected operation IDs", async () => {
@@ -2645,6 +2741,20 @@ describe("progressive conversational canvas tasks", () => {
       finish([failedId]),
       done,
     ]);
+    retry.deps.execute.mockImplementationOnce(async (ops) => ({
+      ...success([]),
+      success: false,
+      partialOperationIds: [failedId],
+      results: [
+        {
+          operationId: ops[0]!.operationId,
+          success: false,
+          replayed: true,
+          acknowledgementStatus: "ambiguous",
+          error: "Original property write remains uncertain",
+        },
+      ],
+    }));
     await expect(runChatTask(current, retry.deps)).rejects.toThrow();
     expect(current.stages[0]!.completed).toBe(false);
     expect(current.ledger[1]!.status).toBe("failed");

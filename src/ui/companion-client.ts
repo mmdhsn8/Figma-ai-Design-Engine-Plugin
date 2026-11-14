@@ -40,6 +40,10 @@ const StatusSchema = z
       .string()
       .regex(/^[A-Za-z0-9_-]{16,64}$/u)
       .optional(),
+    accountScope: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .optional(),
     inferenceVerifiedModel: z.string().min(1).max(200).optional(),
     safeMessage: z.string().max(80).optional(),
   })

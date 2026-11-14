@@ -2252,7 +2252,11 @@ export function chatTaskInput(task: ChatTask): ChatInputItem[] {
   syncCapacityAccounting(task);
   const capacity = chatTaskCapacityUsage(task);
   const confirmed = task.ledger
-    .filter((entry) => entry.status === "completed" || entry.status === "failed")
+    .filter(
+      (entry) =>
+        entry.call.action.tool !== "get_operation_status" &&
+        (entry.status === "completed" || entry.status === "failed"),
+    )
     .map(({ call, operationId, status, stage, output, acknowledgementStatus }) => {
       const action = call.action;
       return {
@@ -3453,6 +3457,27 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
   delete task.failure;
   try {
     await save();
+    if (wasRetry && task.intent !== "edit") {
+      const uncertain = task.ledger.filter(
+        (entry) =>
+          entry.stage === task.stages.findIndex((stage) => !stage.completed) &&
+          isCanvasMutationTool(entry.call.action.tool) &&
+          entry.acknowledgementStatus === "ambiguous",
+      );
+      if (uncertain.length) {
+        const retryable = new Map(
+          [...uncertain.map(({ call }) => call), ...task.pending].map((call) => [
+            call.callId,
+            call,
+          ]),
+        );
+        if (retryable.size > 10)
+          throw new Error("Too many operations require reconciliation. Inspect the saved stage.");
+        for (const entry of uncertain) entry.status = "running";
+        task.pending = [...retryable.values()];
+        await save();
+      }
+    }
     if (wasRetry && task.intent === "edit") await reconcileSavedEditOnResume();
     const unfinished = task.stages.findIndex((stage) => !stage.completed);
     if (
@@ -3677,6 +3702,95 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           failUnavailableRepair(correctionStageIndex);
       }
       if (task.pending.length) {
+        const statusCalls = task.pending.filter(
+          ({ action }) => action.tool === "get_operation_status",
+        );
+        if (statusCalls.length && !readOnly()) {
+          activePhase = "inspection";
+          for (const { callId, action } of statusCalls) {
+            if (action.tool !== "get_operation_status") continue;
+            const targetId = action.operationId;
+            const entry = task.ledger.find(
+              (item) =>
+                item.operationId === targetId && isCanvasMutationTool(item.call.action.tool),
+            );
+            const pageId =
+              entry && "pageId" in entry.call.action
+                ? (entry.call.action.pageId ?? task.stages[entry.stage]?.pageId)
+                : entry && task.stages[entry.stage]?.pageId;
+            let status: Record<string, unknown> = { operationId: targetId, status: "unknown" };
+            if (entry && (!action.pageId || action.pageId === pageId)) {
+              const requestId = `${task.id}-lookup-${task.rounds}-${task.recent.length}`;
+              const response = await deps.execute([
+                {
+                  operationId: requestId,
+                  idempotencyKey: `chat:${requestId}`,
+                  ...(task.referenceScope ? { taskId: task.id, documentId: task.documentId } : {}),
+                  action: { ...action, pageId },
+                },
+              ]);
+              check();
+              const [item] = response.results;
+              if (
+                response.results.length !== 1 ||
+                !item ||
+                item.operationId !== requestId ||
+                response.committedOperationIds.length ||
+                response.partialOperationIds.length
+              )
+                throw new Error("Figma returned inconsistent operation status correlation.");
+              const native = item.data;
+              if (
+                response.success &&
+                item.success &&
+                item.acknowledgementStatus === "read_only" &&
+                native?.operationId === targetId &&
+                ["running", "completed", "failed"].includes(String(native.status))
+              ) {
+                status = {
+                  operationId: targetId,
+                  status: native.status,
+                  ...(native.result ? { result: native.result } : {}),
+                };
+              } else if (
+                response.success &&
+                item.success &&
+                native?.status === "unknown" &&
+                native.operationId === targetId
+              ) {
+                const outcome = JSON.parse(entry.output ?? "{}");
+                const acknowledgement = entry.acknowledgementStatus;
+                status = {
+                  operationId: targetId,
+                  source: "checkpoint",
+                  status:
+                    acknowledgement === "not_attempted" || entry.status === "pending"
+                      ? "not_attempted"
+                      : acknowledgement === "rejected"
+                        ? "failed"
+                        : "blocked",
+                  ...(acknowledgement === "rejected" && typeof outcome.error === "string"
+                    ? {
+                        result: {
+                          success: false,
+                          acknowledgementStatus: acknowledgement,
+                          error: outcome.error,
+                        },
+                      }
+                    : {}),
+                };
+              } else {
+                status = { operationId: targetId, status: "blocked", error: item.error };
+              }
+            }
+            task.recent.push(output(callId, status));
+          }
+          task.pending = task.pending.filter(
+            ({ action }) => action.tool !== "get_operation_status",
+          );
+          await save();
+          continue;
+        }
         const calls = task.pending;
         const intentCalls = calls.filter((call) => call.action.tool === "classify_canvas_intent");
         if (intentCalls.length) {
@@ -4001,6 +4115,13 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 const failed = task.ledger[failedIndex];
                 if (!failed || !stage || failed.stage !== stageIndex)
                   throw new Error("The repair references an unknown failed operation.");
+                if (
+                  isCanvasMutationTool(failed.call.action.tool) &&
+                  !["rejected", "not_attempted"].includes(failed.acknowledgementStatus ?? "")
+                )
+                  throw new Error(
+                    "Reconcile the original uncertain mutation before marking it repaired.",
+                  );
                 const failedAction = failed.call.action;
                 const repair = task.ledger.slice(failedIndex + 1).some((entry) => {
                   const repairAction = entry.call.action;
@@ -4037,6 +4158,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               }
               if (
                 !stage ||
+                mutationAccounting(task.ledger.filter((entry) => entry.stage === stageIndex))
+                  .ambiguousMutations > 0 ||
                 task.ledger.some(
                   (entry) =>
                     entry.stage === stageIndex &&
@@ -4579,6 +4702,19 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         const newCalls = calls.filter(
           (call) => !task.ledger.some((entry) => entry.call.callId === call.callId),
         );
+        if (
+          newCalls.some(({ action }) => isCanvasMutationTool(action.tool)) &&
+          task.ledger.some(
+            (entry) =>
+              entry.stage === stageIndex &&
+              isCanvasMutationTool(entry.call.action.tool) &&
+              mutationAccounting([entry]).ambiguousMutations > 0 &&
+              !calls.some(({ callId }) => callId === entry.call.callId),
+          )
+        )
+          throw new Error(
+            "Reconcile the original uncertain operations before scheduling new mutations.",
+          );
         const capacity = chatTaskCapacityUsage(task);
         const newMutations = newCalls.filter((call) =>
           isCanvasMutationTool(call.action.tool),
@@ -4665,7 +4801,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           if (task.stages[remaining[0]!.stage]?.awaitingQualityRepair && entries.length > 1)
             entries = entries.slice(0, 1);
           const operationsFor = () =>
-            entries.map(({ call, operationId }) => {
+            entries.map(({ call, operationId, status, acknowledgementStatus }) => {
               const ref = "ref" in call.action ? call.action.ref : undefined;
               const original =
                 ref &&
@@ -4690,7 +4826,12 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               return {
                 operationId,
                 idempotencyKey: `chat:${operationId}`,
-                ...(task.referenceScope ? { taskId: task.id } : {}),
+                ...(task.referenceScope ? { taskId: task.id, documentId: task.documentId } : {}),
+                ...(isCanvasMutationTool(call.action.tool) &&
+                (acknowledgementStatus === "ambiguous" ||
+                  (wasRetry && status === "running" && task.referenceScope))
+                  ? { reconcileOnly: true as const }
+                  : {}),
                 ...(task.chatId ? { chatId: task.chatId } : {}),
                 ...(task.designName ? { designName: task.designName } : {}),
                 ...(original ? { expectedCreationOperationId: original.operationId } : {}),
@@ -4716,6 +4857,11 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             batchId: "chat-batch-placeholder",
             operations: operationsFor(),
           });
+          const reconciliationIds = new Set(
+            batch.operations
+              .filter(({ reconcileOnly }) => reconcileOnly)
+              .map(({ operationId }) => operationId),
+          );
           if (utf8Bytes(JSON.stringify(batch)) > 60 * 1024)
             throw new Error("One operation exceeds the safe batch byte budget; it was not sent.");
           task.starts = task.starts.filter((started) => started > now() - 60_100);
@@ -4840,9 +4986,21 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               continue;
             }
             if (!item.success && /Local tool rate limit reached/u.test(item.error ?? "")) {
-              entry.status = "pending";
-              entry.acknowledgementStatus = "not_attempted";
+              if (!reconciliationIds.has(entry.operationId)) {
+                entry.status = "pending";
+                entry.acknowledgementStatus = "not_attempted";
+              }
               limited = true;
+              continue;
+            }
+            if (
+              reconciliationIds.has(entry.operationId) &&
+              item.acknowledgementStatus === "not_attempted" &&
+              !item.replayed
+            ) {
+              // A skipped probe says nothing about the original write.
+              entry.status = "running";
+              entry.acknowledgementStatus = "ambiguous";
               continue;
             }
             entry.acknowledgementStatus = item.acknowledgementStatus;
@@ -4854,7 +5012,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                     : "native_noop"
                   : "native_rejected";
             entry.status =
-              item.acknowledgementStatus === "not_attempted"
+              item.acknowledgementStatus === "not_attempted" && !item.replayed
                 ? "pending"
                 : item.success
                   ? "completed"
@@ -5028,7 +5186,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             }
             if (entry.output.length > 7_500)
               entry.output = JSON.stringify({ ...payload, data: undefined });
-            failed ||= !item.success && item.acknowledgementStatus !== "not_attempted";
+            failed ||=
+              !item.success && (item.acknowledgementStatus !== "not_attempted" || item.replayed);
           }
           if (!failed && !limited) delete task.failure;
           await save();

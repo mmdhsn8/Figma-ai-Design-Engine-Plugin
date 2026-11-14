@@ -1,5 +1,7 @@
 # Final Live Acceptance Matrix
 
+Native partial commit and scoped status recovery remain **BLOCKED / NOT RUN** in Desktop. Mock results and crash boundaries are in [Native partial commit recovery](native-partial-commit-recovery-fix.md). The existing Test Shop file is outside live acceptance scope.
+
 - **Date:** 2026-11-14
 - **Status vocabulary:** PASS, FAIL, BLOCKED, NOT RUN, PARTIAL.
 - **Live evidence:** None captured. No disposable Figma document or authorized account session was confirmed; no existing Charm Home or Test Shop canvas was touched.

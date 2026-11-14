@@ -1,5 +1,7 @@
 # Final Regression Ledger
 
+Native partial commit recovery adds the 15/12/3 regression, read-only status correlation, scoped reload, write fault injection and three-screen RTL fixture. Live recovery remains pending. See [Native partial commit recovery](native-partial-commit-recovery-fix.md).
+
 **Date:** 2026-11-14. Statuses refer to evidence from this audit; mock/source PASS is not a live PASS.
 
 | Origin / ID          | Regression gate                                                                   | Source and automated evidence                                                                                                                                     | Status             | Remaining acceptance                                                                                                                                  |

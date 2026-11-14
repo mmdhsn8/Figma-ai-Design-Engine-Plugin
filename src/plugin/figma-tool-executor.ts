@@ -34,6 +34,7 @@ const STORAGE_PREFIX = "fad.figma-tools.v1";
 const REF_PLUGIN_KEY = "fad.tool.logical-ref.v1";
 const OP_PLUGIN_KEY = "fad.tool.operation-id.v1";
 const FINGERPRINT_PLUGIN_KEY = "fad.tool.operation-fingerprint.v1";
+const CREATION_READBACK_KEY = "fad.tool.creation-readback.v1";
 const TASK_PLUGIN_KEY = "fad.tool.task-id.v1";
 const DESIGN_NAME_PLUGIN_KEY = "fad.design.name.v1";
 const DESIGN_CHAT_PLUGIN_KEY = "fad.design.chat-id.v1";
@@ -622,7 +623,7 @@ function resolveTaskAction(
           saved.taskId === taskId &&
           saved.creationRef === ref &&
           saved.operationId !== operation.operationId &&
-          saved.status !== "completed",
+          (saved.status === "running" || saved.result?.acknowledgementStatus === "ambiguous"),
       )
     )
       throw new ReferenceResolutionError("unconfirmed_creation", ref);
@@ -929,6 +930,17 @@ function summarizeNode(node: SceneNode, ref?: string) {
   };
 }
 
+function creationReadback(node: SceneNode): string {
+  return fingerprint(
+    JSON.stringify([
+      node.id,
+      node.parent?.id,
+      summarizeNode(node),
+      node.type === "TEXT" ? node.characters : null,
+    ]),
+  );
+}
+
 // Figma stores children from back to front. Use render bounds for potential
 // occluders, and require a provably opaque, axis-aligned background surface.
 function resolveVisibleBackground(root: FrameNode): SceneNode | undefined {
@@ -1087,6 +1099,7 @@ export function createFigmaToolExecutor(
   const cancellation = new Map<string, { cancelled: boolean; pauseRequested: boolean }>();
   const deleteConsents = new Map<string, { token: string; ref: string; expiresAt: number }>();
   const startedOperations: number[] = [];
+  let pendingStateWrite: Promise<void> | undefined;
   type DiscoverySnapshot = {
     pages: Array<{ id: string; name: string; current: boolean }>;
     frames: Array<Record<string, unknown>>;
@@ -1113,10 +1126,17 @@ export function createFigmaToolExecutor(
     initializeDocumentIdentity = true,
   ): Promise<void> => {
     try {
-      await timed(
-        api.clientStorage.setAsync(documentPageKey(pageId, initializeDocumentIdentity), state),
-        "Tool state save",
+      if (pendingStateWrite) throw new Error("A previous tool state write is still settling.");
+      const write = api.clientStorage.setAsync(
+        documentPageKey(pageId, initializeDocumentIdentity),
+        state,
       );
+      pendingStateWrite = write;
+      const settled = () => {
+        if (pendingStateWrite === write) pendingStateWrite = undefined;
+      };
+      void write.then(settled, settled);
+      await timed(write, "Tool state save");
     } catch {
       throw toolStateError("storage_unavailable", "save", 3);
     }
@@ -1128,6 +1148,7 @@ export function createFigmaToolExecutor(
   ): Promise<StoredState> => {
     let raw: unknown;
     try {
+      if (pendingStateWrite) throw new Error("A previous tool state write is still settling.");
       raw = await timed(
         api.clientStorage.getAsync(documentPageKey(pageId, !readOnlyInspection)),
         "Tool state read",
@@ -1157,7 +1178,7 @@ export function createFigmaToolExecutor(
   ): Promise<void> =>
     writeStoredState(compactStoredState(state), pageId, !readOnlyInspection);
 
-  const assertTaskPageScope = (documentId: string, pageId: string, taskId: string): void => {
+  const assertTaskPageScope = (documentId: string, pageId: string): void => {
     const localDocumentId = api.root.getPluginData("fad.document-id");
     const fileId = api.fileKey ?? localDocumentId;
     const activeDocumentId = fileId ? `${fileId}-${pageId.replaceAll(":", "_")}` : undefined;
@@ -1165,16 +1186,15 @@ export function createFigmaToolExecutor(
       throw new Error(
         "The active Figma document or page changed. Reopen this task before inspecting it.",
       );
-    if (!taskId) throw new Error("A task ID is required for native inspection.");
   };
 
   const inspectTaskNativeNodes = async (
     message: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
   ) => {
     const pageId = api.currentPage.id;
-    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    assertTaskPageScope(message.documentId, pageId);
     const state = await loadState(pageId);
-    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    assertTaskPageScope(message.documentId, pageId);
     const owned = api.currentPage.findAll(
       (node) => node.getPluginData(TASK_PLUGIN_KEY) === message.taskId,
     );
@@ -1279,7 +1299,7 @@ export function createFigmaToolExecutor(
         });
       }
     }
-    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    assertTaskPageScope(message.documentId, pageId);
     return { nodes, unresolvedRefs, truncated: owned.length > visibleNodes.length };
   };
 
@@ -1287,9 +1307,9 @@ export function createFigmaToolExecutor(
     message: Extract<UIToPluginMessage, { type: "task-native-focus" }>,
   ): Promise<string[]> => {
     const pageId = api.currentPage.id;
-    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    assertTaskPageScope(message.documentId, pageId);
     const nodes = await Promise.all(message.nodeIds.map((id) => api.getNodeByIdAsync(id)));
-    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    assertTaskPageScope(message.documentId, pageId);
     if (
       nodes.some(
         (node) =>
@@ -1305,7 +1325,7 @@ export function createFigmaToolExecutor(
     const sceneNodes = nodes as SceneNode[];
     if (message.mode === "select") api.currentPage.selection = sceneNodes;
     api.viewport.scrollAndZoomIntoView(sceneNodes);
-    assertTaskPageScope(message.documentId, pageId, message.taskId);
+    assertTaskPageScope(message.documentId, pageId);
     return sceneNodes.map(({ id }) => id);
   };
 
@@ -1903,19 +1923,6 @@ export function createFigmaToolExecutor(
         data: { pageId, nodes: rootNodes },
       };
     }
-    if (action.tool === "get_operation_status") {
-      const saved = state.operations[action.operationId];
-      if (!saved) throw new Error(`Operation “${action.operationId}” has no saved status.`);
-      return {
-        summary: `Operation ${saved.status}.`,
-        data: {
-          operationId: saved.operationId,
-          status: saved.status,
-          updatedAt: saved.updatedAt,
-          ...(saved.result ? { result: saved.result } : {}),
-        },
-      };
-    }
     if (
       action.tool === "create_frame" ||
       action.tool === "create_rectangle" ||
@@ -2120,6 +2127,7 @@ export function createFigmaToolExecutor(
           child.layoutSizingHorizontal = textAction!.horizontalSizing;
           child.layoutSizingVertical = textAction!.verticalSizing;
         }
+        created.setPluginData(CREATION_READBACK_KEY, creationReadback(created));
       } catch (error) {
         createdNode?.remove();
         throw error;
@@ -2576,10 +2584,72 @@ export function createFigmaToolExecutor(
     reportProgress: (message: string) => void = () => undefined,
   ): Promise<OperationResult> => {
     const requestedAction = operation.action;
+    if (requestedAction.tool === "get_operation_status") {
+      const targetId = requestedAction.operationId;
+      const saved = Object.hasOwn(state.operations, targetId)
+        ? state.operations[targetId]
+        : undefined;
+      const scoped = saved?.taskId === operation.taskId ? saved : undefined;
+      return {
+        operationId: operation.operationId,
+        success: true,
+        replayed: false,
+        acknowledgementStatus: "read_only",
+        data: {
+          operationId: targetId,
+          status: scoped?.status ?? "unknown",
+          ...(scoped ? { updatedAt: scoped.updatedAt } : {}),
+          ...(scoped?.result ? { result: scoped.result } : {}),
+        },
+      };
+    }
     const readOnlyInspection =
       (requestedAction.tool === "get_document_context" || requestedAction.tool === "inspect_nodes") &&
       requestedAction.readOnlyInspection === true;
     const alias = isCreation(operation.action) ? operation.action.ref : undefined;
+    const requestedFingerprint = actionFingerprint(requestedAction);
+    const original = state.operations[operation.operationId];
+    if (
+      original?.status === "failed" &&
+      (original.result?.acknowledgementStatus === "rejected" ||
+        original.result?.acknowledgementStatus === "not_attempted") &&
+      original.fingerprint === requestedFingerprint &&
+      original.taskId === operation.taskId &&
+      original.idempotencyKey === operation.idempotencyKey
+    )
+      return { ...original.result, replayed: true };
+    if (operation.reconcileOnly && original?.taskId !== operation.taskId && original)
+      return {
+        operationId: operation.operationId,
+        success: false,
+        replayed: false,
+        acknowledgementStatus: "ambiguous",
+        error: "The saved operation does not belong to the current task.",
+      };
+    const persistPreflightRejection = async (result: OperationResult) => {
+      if (
+        isMutatingAction(requestedAction.tool) &&
+        !operation.reconcileOnly &&
+        !original &&
+        !Object.values(state.operations).some(
+          (saved) => saved.idempotencyKey === operation.idempotencyKey,
+        )
+      ) {
+        state.operations[operation.operationId] = {
+          operationId: operation.operationId,
+          idempotencyKey: operation.idempotencyKey,
+          ...(operation.taskId ? { taskId: operation.taskId } : {}),
+          fingerprint: requestedFingerprint,
+          status: "failed",
+          updatedAt: Date.now(),
+          result: compactResult(result),
+        };
+        await saveState(state, pageId, readOnlyInspection);
+      }
+      if (operation.reconcileOnly)
+        return { ...result, acknowledgementStatus: "ambiguous" as const };
+      return result;
+    };
     if (operation.taskId) {
       try {
         operation = {
@@ -2591,7 +2661,7 @@ export function createFigmaToolExecutor(
       } catch (error) {
         if (!(error instanceof ReferenceResolutionError)) throw error;
         const result = referenceFailure(operation.operationId, error);
-        if (!isParentingAction(requestedAction)) return result;
+        if (!isParentingAction(requestedAction)) return persistPreflightRejection(result);
         const sourceLogicalRef =
           requestedAction.tool === "append_child" ? requestedAction.childRef : requestedAction.ref;
         const parenting = FigmaToolParentingDiagnosticSchema.parse({
@@ -2605,7 +2675,7 @@ export function createFigmaToolExecutor(
           decision: "rejected_stale_or_ambiguous",
           acknowledgementStatus: "rejected",
         });
-        return { ...result, data: { ...result.data, parenting } };
+        return persistPreflightRejection({ ...result, data: { ...result.data, parenting } });
       }
     }
     if (api.currentPage.id !== pageId)
@@ -2632,7 +2702,7 @@ export function createFigmaToolExecutor(
           operationId: operation.operationId,
           success: false,
           replayed: true,
-          acknowledgementStatus: "rejected",
+          acknowledgementStatus: operation.reconcileOnly ? "ambiguous" : "rejected",
           error: "Operation ID or idempotency key was already used with different input.",
         };
       if (
@@ -2647,7 +2717,10 @@ export function createFigmaToolExecutor(
             throw new ReferenceResolutionError("ownership_conflict", operation.action.ref);
         } catch (error) {
           if (!(error instanceof ReferenceResolutionError)) throw error;
-          return referenceFailure(operation.operationId, error);
+          const result = referenceFailure(operation.operationId, error);
+          return operation.reconcileOnly
+            ? { ...result, acknowledgementStatus: "ambiguous" }
+            : result;
         }
       }
       const refreshNativeVerification =
@@ -2769,7 +2842,7 @@ export function createFigmaToolExecutor(
             };
             return persistParentingRecovery(result);
           }
-          if (parentingDecision === "ready") resumeParenting = true;
+          if (parentingDecision === "ready" && !operation.reconcileOnly) resumeParenting = true;
           else {
             const diagnostic = parentingDiagnostic(
               operation.operationId,
@@ -2809,7 +2882,11 @@ export function createFigmaToolExecutor(
           return persistParentingRecovery({
             ...failed,
             replayed: true,
-            data: { ...failed.data, parenting: diagnostic },
+            acknowledgementStatus: "ambiguous",
+            data: {
+              ...failed.data,
+              parenting: { ...diagnostic, acknowledgementStatus: "ambiguous" },
+            },
           });
         }
       }
@@ -2863,7 +2940,8 @@ export function createFigmaToolExecutor(
             .length === 1 &&
           (!operation.taskId || recovered.getPluginData(TASK_PLUGIN_KEY) === operation.taskId) &&
           recovered.getPluginData(REF_PLUGIN_KEY) === operation.action.ref &&
-          recovered.getPluginData(FINGERPRINT_PLUGIN_KEY) === fingerprint
+          recovered.getPluginData(FINGERPRINT_PLUGIN_KEY) === fingerprint &&
+          recovered.getPluginData(CREATION_READBACK_KEY) === creationReadback(recovered)
         ) {
           state.refs[operation.action.ref] = {
             nodeId: recovered.id,
@@ -2945,10 +3023,13 @@ export function createFigmaToolExecutor(
         (node) => node.getPluginData(OP_PLUGIN_KEY) === operation.operationId,
       );
       if (candidates.length > 1)
-        return referenceFailure(
-          operation.operationId,
-          new ReferenceResolutionError("ambiguous", operation.action.ref),
-        );
+        return {
+          ...referenceFailure(
+            operation.operationId,
+            new ReferenceResolutionError("ambiguous", operation.action.ref),
+          ),
+          acknowledgementStatus: "ambiguous",
+        };
       const recovered = candidates[0];
       if (recovered) {
         const expectedType =
@@ -2973,13 +3054,14 @@ export function createFigmaToolExecutor(
             .length !== 1 ||
           (operation.taskId && recovered.getPluginData(TASK_PLUGIN_KEY) !== operation.taskId) ||
           recovered.getPluginData(REF_PLUGIN_KEY) !== operation.action.ref ||
-          recovered.getPluginData(FINGERPRINT_PLUGIN_KEY) !== fingerprint
+          recovered.getPluginData(FINGERPRINT_PLUGIN_KEY) !== fingerprint ||
+          recovered.getPluginData(CREATION_READBACK_KEY) !== creationReadback(recovered)
         )
           return {
             operationId: operation.operationId,
             success: false,
             replayed: true,
-            acknowledgementStatus: "rejected",
+            acknowledgementStatus: "ambiguous",
             error: "This operation ID is already attached to a different native node.",
           };
         state.refs[operation.action.ref] = {
@@ -3015,6 +3097,15 @@ export function createFigmaToolExecutor(
         return result;
       }
     }
+    if (operation.reconcileOnly)
+      return {
+        operationId: operation.operationId,
+        success: false,
+        replayed: true,
+        acknowledgementStatus: "ambiguous",
+        error:
+          "No terminal outcome or matching native readback exists. Inspect the original target before continuing.",
+      };
     const now = Date.now();
     while (startedOperations.length && startedOperations[0]! < now - 60_000)
       startedOperations.shift();
@@ -3195,6 +3286,8 @@ export function createFigmaToolExecutor(
                     }
                   : {}),
       };
+      // A failed outcome write leaves the previous durable intent available for recovery.
+      if (error instanceof ToolStateError) return result;
       state.operations[operation.operationId] = {
         ...state.operations[operation.operationId]!,
         status: "failed",
@@ -3282,6 +3375,7 @@ export function createFigmaToolExecutor(
       }
       for (const [index, operation] of batch.operations.entries()) {
         if (token.cancelled) break;
+        if (operation.documentId) assertTaskPageScope(operation.documentId, pageId);
         send({
           type: "tool-progress",
           protocolVersion: 1,
@@ -3302,7 +3396,10 @@ export function createFigmaToolExecutor(
         const targetPage = api.root.children.find(({ id }) => id === operationPageId);
         if (!targetPage)
           throw new Error("The requested page is not available in this Figma document.");
-        if (api.currentPage.id !== operationPageId) {
+        if (
+          api.currentPage.id !== operationPageId &&
+          operation.action.tool !== "get_operation_status"
+        ) {
           try {
             await timed(api.setCurrentPageAsync(targetPage), "Target page load");
           } catch (error) {
@@ -3314,8 +3411,10 @@ export function createFigmaToolExecutor(
           activePageId = operationPageId;
         }
         const readOnlyInspection =
-          (operation.action.tool === "get_document_context" || operation.action.tool === "inspect_nodes") &&
-          operation.action.readOnlyInspection === true;
+          operation.action.tool === "get_operation_status" ||
+          ((operation.action.tool === "get_document_context" ||
+            operation.action.tool === "inspect_nodes") &&
+            operation.action.readOnlyInspection === true);
         const state = await loadState(operationPageId, readOnlyInspection);
         currentOperation = operation;
         const nativeStartedAt = Date.now();
@@ -3401,6 +3500,55 @@ export function createFigmaToolExecutor(
             ? "Not attempted because the batch was cancelled before this operation."
             : "Not attempted because an earlier operation failed; confirmed work was retained.",
         });
+      // Preserve the untouched tail if the UI never receives the batch acknowledgement.
+      // Existing outcomes always win, including when this was a reconciliation batch.
+      if (
+        nextIndex < batch.operations.length &&
+        api.currentPage.id === activePageId &&
+        !results.some(({ error }) => error?.startsWith("Local tool rate limit reached"))
+      ) {
+        const skipped = batch.operations
+          .slice(nextIndex)
+          .filter(
+            (operation) =>
+              operation.taskId &&
+              !operation.reconcileOnly &&
+              isMutatingAction(operation.action.tool) &&
+              (!("pageId" in operation.action) ||
+                !operation.action.pageId ||
+                operation.action.pageId === pageId),
+          );
+        if (skipped.length) {
+          try {
+            const state = await loadState(pageId);
+            let changed = false;
+            for (const operation of skipped) {
+              if (
+                state.operations[operation.operationId] ||
+                Object.values(state.operations).some(
+                  (entry) => entry.idempotencyKey === operation.idempotencyKey,
+                )
+              )
+                continue;
+              state.operations[operation.operationId] = {
+                operationId: operation.operationId,
+                idempotencyKey: operation.idempotencyKey,
+                taskId: operation.taskId!,
+                fingerprint: actionFingerprint(operation.action),
+                status: "failed",
+                updatedAt: Date.now(),
+                result: compactResult(
+                  results.find((item) => item.operationId === operation.operationId)!,
+                ),
+              };
+              changed = true;
+            }
+            if (changed) await saveState(state, pageId);
+          } catch {
+            // An unrecorded tail stays uncertain if the acknowledgement is also lost.
+          }
+        }
+      }
       sendResult(
         !cancelled &&
           results.length === batch.operations.length &&

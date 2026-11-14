@@ -1682,7 +1682,13 @@ describe("safe Figma tool executor", () => {
       },
     ]);
     expect(resultFor(messages, inspected)).toMatchObject({ success: true });
-    const edited = await run(executor, [edit]);
+    const edited = await run(executor, [
+      {
+        ...edit,
+        operationId: "followup-edit-002",
+        idempotencyKey: "idem:followup-edit-002",
+      },
+    ]);
     expect(resultFor(messages, edited)).toMatchObject({ success: true });
     expect(firstHeader.name).toBe("Edited original header");
     expect(mock.find("task-second-001-header")!.name).toBe("task-second-001-header");
@@ -3876,12 +3882,12 @@ describe("safe Figma tool executor", () => {
       }),
     ]);
     expect(resultFor(messages, status)).toMatchObject({ success: true });
-    expect(mock.storage.get(storageKey)).toMatchObject({ version: 3 });
+    expect(mock.storage.get(storageKey)).toEqual(legacyState);
     expect(mock.find("Migration text")?.id).toBe(nodeId);
     expect(mock.nodes.filter((node) => !node.removed)).toHaveLength(1);
   });
 
-  it("migrates a legacy state larger than 256 KiB without losing operation history", async () => {
+  it("reads a legacy state larger than 256 KiB without writing or losing operation history", async () => {
     const mock = createMockApi();
     const messages: PluginToUIMessage[] = [];
     const operations = Object.fromEntries(
@@ -3919,13 +3925,63 @@ describe("safe Figma tool executor", () => {
     ]);
 
     expect(resultFor(messages, status)).toMatchObject({ success: true });
-    const migrated = mock.storage.get(TOOL_STATE_STORAGE_KEY) as {
-      version: number;
-      operations: Record<string, unknown>;
-    };
-    expect(migrated.version).toBe(3);
-    expect(migrated.operations["legacy-migration-0000"]).toBeDefined();
-    expect(Object.keys(migrated.operations)).toHaveLength(301);
+    expect(mock.storage.get(TOOL_STATE_STORAGE_KEY)).toEqual(legacy);
+  });
+
+  it("persists scoped preflight rejections and never saves or caches lookup requests", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const taskId = "chat-recovery-001";
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const rejected = await run(executor, [
+      operation(
+        "native-rejected-001",
+        {
+          tool: "create_frame",
+          ref: "missing-child",
+          name: "Child",
+          parent: { kind: "node", ref: "missing-parent" },
+          size: { width: 390, height: 844 },
+        },
+        taskId,
+      ),
+    ]);
+    const rejection = resultFor(messages, rejected);
+    const reason = rejection?.type === "tool-result" ? rejection.results[0]?.error : undefined;
+    expect(reason).toBeTruthy();
+    const saved = structuredClone(mock.storage.get(TOOL_STATE_STORAGE_KEY));
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const query = (target: string, owner = taskId) =>
+      operation("status-request-001", { tool: "get_operation_status", operationId: target }, owner);
+    const known = await run(executor, [query("native-rejected-001")]);
+    expect(resultFor(messages, known)).toMatchObject({
+      success: true,
+      committedOperationIds: [],
+      partialOperationIds: [],
+      results: [
+        {
+          operationId: "status-request-001",
+          acknowledgementStatus: "read_only",
+          data: {
+            operationId: "native-rejected-001",
+            status: "failed",
+            result: { error: reason },
+          },
+        },
+      ],
+    });
+    for (const request of [
+      query("status-request-001"),
+      query("native-rejected-001", "another-task-001"),
+    ]) {
+      const lookup = await run(executor, [request]);
+      expect(resultFor(messages, lookup)).toMatchObject({
+        success: true,
+        results: [{ data: { status: "unknown" } }],
+      });
+    }
+    expect(mock.storage.get(TOOL_STATE_STORAGE_KEY)).toEqual(saved);
+    expect(mock.nodes).toHaveLength(0);
   });
 
   it("migrates a legacy state over 4 MiB and allows a new design with over 20,000 refs", async () => {
@@ -4096,6 +4152,148 @@ describe("safe Figma tool executor", () => {
     });
     expect(mock.find("Original native frame")?.id).toBe(originalId);
     expect(mock.nodes.filter((node) => !node.removed)).toHaveLength(1);
+  });
+
+  it.each(["intent", "outcome", "drift"] as const)(
+    "fails closed or reconciles the original node after %s fault across executor restart",
+    async (boundary) => {
+      const mock = createMockApi();
+      const messages: PluginToUIMessage[] = [];
+      const taskId = "chat-recovery-fault";
+      const documentId = "file-test-56-page_current";
+      const create = {
+        ...operation(
+          "native-crash-001",
+          {
+            tool: "create_frame",
+            ref: "screen",
+            name: "صفحه اصلی",
+            parent: { kind: "page" },
+            size: { width: 390, height: 844 },
+            fill: "#FFF0F5",
+          },
+          taskId,
+        ),
+        documentId,
+      };
+      const storage = mock.api.clientStorage;
+      const write = storage.setAsync.bind(storage);
+      let writes = 0;
+      storage.setAsync = async (key, value) => {
+        if (++writes >= (boundary === "intent" ? 1 : 2)) throw new Error("Injected quota failure");
+        await write(key, value);
+      };
+      let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+      const interrupted = await run(executor, [create]);
+      expect(resultFor(messages, interrupted)).toMatchObject({
+        success: false,
+        results: [{ acknowledgementStatus: boundary === "intent" ? "not_attempted" : "ambiguous" }],
+      });
+      const original = mock.find("صفحه اصلی");
+      expect(Boolean(original)).toBe(boundary !== "intent");
+      if (boundary === "drift") original!.name = "Changed";
+      storage.setAsync = write;
+      executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+      const continuation = { ...create, reconcileOnly: true as const };
+      const wrong = await run(executor, [{ ...continuation, documentId: "wrong-document" }]);
+      expect(resultFor(messages, wrong)).toMatchObject({ success: false });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const retry = await run(executor, [continuation]);
+        expect(resultFor(messages, retry)).toMatchObject({
+          success: boundary === "outcome",
+          results: [
+            { acknowledgementStatus: boundary === "outcome" ? "confirmed_mutation" : "ambiguous" },
+          ],
+        });
+      }
+      expect(mock.nodes.filter((node) => !node.removed).map(({ id }) => id)).toEqual(
+        original ? [original.id] : [],
+      );
+    },
+  );
+
+  it("keeps three 390px RTL storefront roots and their children after a partial batch and reload", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const taskId = "storefront-recovery-rtl";
+    let executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const screen = (index: number) =>
+      operation(
+        `storefront-screen-${index}`,
+        {
+          tool: "create_frame",
+          ref: `screen-${index}`,
+          name: `صفحه ${index}`,
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+          autoLayout: { direction: "vertical", gap: 8 },
+        },
+        taskId,
+      );
+    const title = (index: number, parent: string, suffix = "original") =>
+      operation(
+        `storefront-title-${index}-${suffix}`,
+        {
+          tool: "create_text",
+          ref: `title-${index}`,
+          name: `عنوان ${index}`,
+          parent: { kind: "node", ref: parent },
+          text: "فروشگاه کفش",
+          direction: "RTL",
+          size: { width: 320, height: 40 },
+        },
+        taskId,
+      );
+    const first = screen(1);
+    const skipped = screen(2);
+    const partial = await run(executor, [first, title(1, "bad-parent"), skipped]);
+    const originalId = mock.find("صفحه 1")!.id;
+    expect(resultFor(messages, partial)).toMatchObject({
+      success: false,
+      committedOperationIds: [first.operationId],
+      results: [
+        { acknowledgementStatus: "confirmed_mutation" },
+        { acknowledgementStatus: "rejected" },
+        { acknowledgementStatus: "not_attempted" },
+      ],
+    });
+    executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const replay = await run(executor, [{ ...first, reconcileOnly: true }]);
+    expect(resultFor(messages, replay)).toMatchObject({
+      success: true,
+      results: [{ replayed: true }],
+    });
+    const tail = await run(executor, [{ ...skipped, reconcileOnly: true }]);
+    expect(resultFor(messages, tail)).toMatchObject({
+      success: false,
+      results: [{ acknowledgementStatus: "not_attempted", replayed: true }],
+    });
+    const repaired = await run(executor, [
+      title(1, "screen-1", "repair"),
+      {
+        ...skipped,
+        operationId: "storefront-screen-2-repair",
+        idempotencyKey: "idem:storefront-screen-2-repair",
+      },
+      title(2, "screen-2"),
+      screen(3),
+      title(3, "screen-3"),
+    ]);
+    expect(resultFor(messages, repaired)).toMatchObject({ success: true });
+    const roots = [1, 2, 3].map((index) => mock.find(`صفحه ${index}`)!);
+    expect(roots[0]!.id).toBe(originalId);
+    expect(new Set(roots.map(({ id }) => id)).size).toBe(3);
+    for (const [index, root] of roots.entries()) {
+      expect(root).toMatchObject({ width: 390, layoutMode: "VERTICAL", parent: mock.page });
+      expect(root.children).toHaveLength(1);
+      expect(root.children[0]).toMatchObject({
+        characters: "فروشگاه کفش",
+        textAlignHorizontal: "RIGHT",
+        parent: root,
+      });
+      if (index > 0) expect(root.x - roots[index - 1]!.x).toBeGreaterThanOrEqual(390 + 120);
+    }
+    expect(mock.nodes.filter((node) => !node.removed)).toHaveLength(6);
   });
 
   it("centralizes incompatible target, parent, property, and local-style rejection before writes", async () => {

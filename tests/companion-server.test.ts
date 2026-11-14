@@ -2085,7 +2085,7 @@ describe("loopback companion", () => {
       await request(harness.handle, "/v1/status", {
         token: paired.sessionToken,
       })
-    ).json()) as { sessionId: string };
+    ).json()) as { sessionId: string; accountScope: string };
     const authorizationUrl = harness.openedUrl;
     await request(harness.handle, "/v1/models", { token: paired.sessionToken, body: {} });
     const smoke = await request(harness.handle, "/v1/smoke", {
@@ -2108,6 +2108,8 @@ describe("loopback companion", () => {
     expect(statusBody).toMatchObject({ auth: "scope_granted", planUseAuthorized: true });
     expect(statusBody).not.toHaveProperty("inferenceVerifiedModel");
     expect(statusBody.sessionId).not.toBe(initialSession.sessionId);
+    expect(statusBody.accountScope).toMatch(/^[a-f0-9]{64}$/u);
+    expect(statusBody.accountScope).toBe(initialSession.accountScope);
     expect(harness.openedUrl).toBe(authorizationUrl);
     expect(harness.refreshRequest).toBeUndefined();
   });

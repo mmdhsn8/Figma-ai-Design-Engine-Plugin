@@ -992,8 +992,10 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       if (
         (nextSessionId && previousSessionId && nextSessionId !== previousSessionId) ||
         (observedCompanionAuthorization.current && !authenticated)
-      )
+      ) {
+        chatAbort.current?.abort();
         invalidateModelCatalog();
+      }
       if (
         authenticated &&
         companionConnectionState !== "connected" &&
@@ -1900,6 +1902,19 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     chatAbort.current = controller;
     let assistantId = chatTask.current?.id ?? "";
     try {
+      const session = await getCompanionStatus(companionToken);
+      if (
+        controller.signal.aborted ||
+        !session.planUseAuthorized ||
+        !session.sessionId ||
+        !session.accountScope ||
+        session.sessionId !== observedCompanionSessionId.current
+      )
+        throw new Error("Wait for the current Companion account to reconnect before running Chat.");
+      const checkChatSession = () => {
+        if (controller.signal.aborted || observedCompanionSessionId.current !== session.sessionId)
+          throw new Error("Stopped because the Companion session changed.");
+      };
       if (!retry) {
         const loaded = await chatTaskBridge({
           type: "chat-task-load",
@@ -1967,6 +1982,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           chatId: taskChatId,
           referenceScope: "task-v1",
           documentId: loaded.documentId,
+          accountScope: session.accountScope,
           prompt: text,
           model: selectedCompanionModel,
           ...(selectedBrand ? { brandKit: pinBrandKit(selectedBrand) } : {}),
@@ -2007,6 +2023,10 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       }
       const task = chatTask.current;
       if (!task) return;
+      checkChatSession();
+      if (task.accountScope && task.accountScope !== session.accountScope)
+        throw new Error("Return to the Companion account that started this saved task.");
+      task.accountScope ??= session.accountScope;
       const executionModel = taskModelForExecution(task.model, selectedCompanionModel);
       if (!executionModel)
         throw new Error("Choose an account-visible model before resuming this task.");
@@ -2043,13 +2063,24 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             () => setChatActivity("Receiving the next bounded stage…"),
             (elapsedMs) => setChatActivity(`Model is working · ${Math.ceil(elapsedMs / 1_000)}s`),
           ),
-        execute: (operations) =>
-          new Promise<ChatToolResult>((resolve, reject) =>
-            runToolOperations(operations, {
-              onResult: resolve,
-              onFailure: (message) => reject(new Error(message)),
-            }),
-          ),
+        execute: async (operations) => {
+          const latest = await getCompanionStatus(companionToken);
+          checkChatSession();
+          if (latest.sessionId !== session.sessionId || !latest.planUseAuthorized)
+            throw new Error("Stopped because the Companion session changed.");
+          return new Promise<ChatToolResult>((resolve, reject) =>
+            runToolOperations(
+              operations.map((operation) => ({
+                ...operation,
+                documentId: task.documentId,
+              })),
+              {
+                onResult: resolve,
+                onFailure: (message) => reject(new Error(message)),
+              },
+            ),
+          );
+        },
       });
       chatModelInput.current = chatTaskInput({ ...task, recent: [] }).filter(
         (item) => "role" in item,

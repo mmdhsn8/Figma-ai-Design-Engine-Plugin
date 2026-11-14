@@ -123,6 +123,7 @@ export interface CompanionStatus {
   planUseAuthorized: boolean;
   modelCount: number;
   sessionId?: string;
+  accountScope?: string;
   inferenceVerifiedModel?: string;
   safeMessage?: string;
 }
@@ -356,7 +357,16 @@ export function createCompanionServer(options: CompanionServerOptions) {
       authLabel: STATUS_TEXT[authStatus],
       planUseAuthorized: Boolean(liveSession?.scopes.has(PLAN_USE_SCOPE)),
       modelCount: liveSession?.models.length ?? 0,
-      ...(liveSession ? { sessionId: liveSession.sessionId } : {}),
+      ...(liveSession
+        ? {
+            sessionId: liveSession.sessionId,
+            accountScope: createHash("sha256")
+              .update(
+                JSON.stringify(["chat-recovery-v1", liveSession.clientId, liveSession.subjectHash]),
+              )
+              .digest("hex"),
+          }
+        : {}),
       ...(liveSession?.verifiedModel ? { inferenceVerifiedModel: liveSession.verifiedModel } : {}),
       ...(safeMessage ? { safeMessage } : {}),
     };
