@@ -6,7 +6,11 @@ import {
   type NativeVisualNode,
 } from "./native-visual-quality.js";
 
-export const NATIVE_REPAIR_PIPELINE_VERSION = "native-quality-repair-v1";
+export const NATIVE_REPAIR_PIPELINE_VERSION = "native-quality-repair-v2";
+export const NativeRepairPipelineVersionSchema = z.enum([
+  "native-quality-repair-v1",
+  NATIVE_REPAIR_PIPELINE_VERSION,
+]);
 export const NativeQualityFindingSchema = z
   .object({
     code: z.enum([
@@ -130,7 +134,13 @@ export function planNativeQualityRepairs(
       else if (!parent?.ref) decision.reason = "parent_reference_unavailable";
       else if (parent.ownedByTask === false || node?.ownedByTask === false)
         decision.reason = "unowned_content";
-      else if (parent.layoutMode !== "VERTICAL" || node?.layoutPositioning === "ABSOLUTE")
+      else if (
+        (parent.layoutMode !== "VERTICAL" &&
+          !(
+            parent.layoutMode === "HORIZONTAL" && isMeasuredHorizontalAutoLayoutOverflow(finding)
+          )) ||
+        node?.layoutPositioning === "ABSOLUTE"
+      )
         decision.reason = "intentional_or_unsupported_clip";
       else {
         decision.eligible = true;
@@ -138,7 +148,7 @@ export function planNativeQualityRepairs(
         decision.action = FigmaToolActionSchema.parse({
           tool: "set_auto_layout",
           ref: parent.ref,
-          layout: { direction: "vertical" },
+          layout: { direction: parent.layoutMode === "HORIZONTAL" ? "horizontal" : "vertical" },
           repairOverflow: true,
         });
       }
@@ -157,4 +167,22 @@ export function planNativeQualityRepairs(
     decisions.set(key, decision);
   }
   return [...decisions.values()];
+}
+
+function isMeasuredHorizontalAutoLayoutOverflow(finding: NativeVisualFinding): boolean {
+  try {
+    const actual = JSON.parse(finding.actual);
+    return (
+      actual.classification === "auto-layout-overflow" &&
+      actual.parentLayout?.mode === "HORIZONTAL" &&
+      actual.parentLayout?.overflowDirection !== "HORIZONTAL" &&
+      actual.parentLayout?.overflowDirection !== "BOTH" &&
+      actual.childLayoutPositioning !== "ABSOLUTE" &&
+      Number.isFinite(actual.required?.width) &&
+      Number.isFinite(actual.available?.width) &&
+      actual.required.width > actual.available.width + 0.001
+    );
+  } catch {
+    return false;
+  }
 }

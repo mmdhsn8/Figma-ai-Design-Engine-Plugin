@@ -2,13 +2,152 @@ import { describe, expect, it, vi } from "vitest";
 import { ChatTaskSchema, chatTaskSafeDiagnostic, type ChatTask } from "../src/shared/chat-task";
 import { parseResponsesFunctionCalls, type ChatInputItem } from "../src/shared/chat-tools";
 import { FigmaToolBatchSchema, type FigmaToolOperation } from "../src/shared/figma-tools";
+import { planNativeQualityRepairs } from "../src/shared/native-quality-repair";
+import type { NativeVisualFinding, NativeVisualNode } from "../src/shared/native-visual-quality";
 import type { PluginToUIMessage } from "../src/shared/messages";
+import { repairAutoLayoutHierarchy } from "../src/plugin/auto-layout-repair";
 import { createFigmaToolExecutor } from "../src/plugin/figma-tool-executor";
 import { runChatTask } from "../src/ui/chat-task";
 import type { AuthorizedChatTurn } from "../src/ui/companion-client";
-import { createMockApi } from "./figma-mock";
+import { createMockApi, type MockNode } from "./figma-mock";
 
 describe("registered plugin saved verification recovery", () => {
+  it("plans and applies native HUG for measured horizontal Auto Layout overflow", () => {
+    const taskId = "task-horizontal-overflow";
+    const nodes: NativeVisualNode[] = [
+      {
+        ref: "screen",
+        type: "FRAME",
+        name: "Screen",
+        x: 0,
+        y: 0,
+        width: 390,
+        height: 844,
+        visible: true,
+        ownedByTask: true,
+        children: [
+          {
+            ref: "row",
+            type: "FRAME",
+            name: "Row",
+            x: 0,
+            y: 0,
+            width: 350,
+            height: 310,
+            visible: true,
+            ownedByTask: true,
+            layoutMode: "HORIZONTAL",
+            clipsContent: true,
+            children: [
+              {
+                ref: "card",
+                type: "FRAME",
+                name: "Card",
+                x: 354,
+                y: 0,
+                width: 150,
+                height: 130,
+                visible: true,
+                ownedByTask: true,
+                layoutPositioning: "AUTO",
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    const finding: NativeVisualFinding = {
+      code: "clipped-child",
+      refs: ["card"],
+      message: "Measured horizontal Auto Layout overflow.",
+      expected: "inside row",
+      actual: JSON.stringify({
+        parentRef: "row",
+        available: { width: 350, height: 310 },
+        required: { width: 504, height: 280 },
+        classification: "auto-layout-overflow",
+        parentLayout: { mode: "HORIZONTAL", overflowDirection: "NONE" },
+        childLayoutPositioning: "AUTO",
+      }),
+    };
+    const [decision] = planNativeQualityRepairs(nodes, [finding], [], true);
+
+    expect(decision).toMatchObject({
+      eligible: true,
+      action: {
+        tool: "set_auto_layout",
+        ref: "row",
+        layout: { direction: "horizontal" },
+        repairOverflow: true,
+      },
+    });
+    const intentionalScrollFinding: NativeVisualFinding = {
+      ...finding,
+      actual: JSON.stringify({
+        ...JSON.parse(finding.actual),
+        parentLayout: { mode: "HORIZONTAL", overflowDirection: "HORIZONTAL" },
+      }),
+    };
+    expect(planNativeQualityRepairs(nodes, [intentionalScrollFinding], [], true)[0]).toMatchObject({
+      eligible: false,
+      reason: "intentional_or_unsupported_clip",
+    });
+
+    const mock = createMockApi();
+    const root = mock.api.createFrame() as unknown as MockNode;
+    root.setPluginData("fad.tool.task-id.v1", taskId);
+    root.layoutMode = "NONE";
+    const row = mock.api.createFrame() as unknown as MockNode;
+    row.setPluginData("fad.tool.task-id.v1", taskId);
+    row.setPluginData("fad.tool.logical-ref.v1", "row");
+    row.layoutMode = "HORIZONTAL";
+    row.clipsContent = true;
+    Object.assign(row, { width: 350, height: 310 });
+    row.itemSpacing = 27;
+    row.primaryAxisSizingMode = "FIXED";
+    root.appendChild(row);
+    for (let index = 0; index < 3; index++) {
+      const card = mock.api.createFrame() as unknown as MockNode;
+      card.setPluginData("fad.tool.task-id.v1", taskId);
+      Object.assign(card, { width: 150, height: 100 });
+      row.appendChild(card);
+    }
+    let primarySizing: "AUTO" | "FIXED" = "FIXED";
+    Object.defineProperty(row, "primaryAxisSizingMode", {
+      configurable: true,
+      get: () => primarySizing,
+      set: (value: "AUTO" | "FIXED") => {
+        primarySizing = value;
+        if (value === "AUTO") row.resize(504, row.height);
+      },
+    });
+    const markNativeMutation = vi.fn();
+
+    const repairs = repairAutoLayoutHierarchy(
+      row as unknown as SceneNode,
+      taskId,
+      markNativeMutation,
+    );
+
+    expect(row.width).toBe(504);
+    expect(row.primaryAxisSizingMode).toBe("AUTO");
+    expect(markNativeMutation).toHaveBeenCalledOnce();
+    expect(repairs).toEqual([
+      expect.objectContaining({
+        strategy: "hug-horizontal-content",
+        stopReason: "native-remeasurement-required",
+      }),
+    ]);
+    primarySizing = "FIXED";
+    row.resize(350, row.height);
+    row.overflowDirection = "HORIZONTAL";
+    expect(
+      repairAutoLayoutHierarchy(row as unknown as SceneNode, taskId, markNativeMutation),
+    ).toEqual([]);
+    expect(row.width).toBe(350);
+    expect(markNativeMutation).toHaveBeenCalledOnce();
+  });
+
   it.each([true, false])(
     "dispatches both repairs after five failed checks and 33 preserved commits (legacy awaiting flag: %s)",
     async (awaitingQualityRepair) => {
@@ -294,7 +433,7 @@ describe("registered plugin saved verification recovery", () => {
       expect(stage.repairOperationsAttempted).toBe(0);
       const checkpoint = ChatTaskSchema.parse(structuredClone(task));
       expect(chatTaskSafeDiagnostic(checkpoint)).toMatchObject({
-        repairPipelineVersion: "native-quality-repair-v1",
+        repairPipelineVersion: "native-quality-repair-v2",
       });
       const beforeRetry = actions.length;
       resuming = true;
@@ -332,9 +471,9 @@ describe("registered plugin saved verification recovery", () => {
         "inspect_nodes",
       ]);
       expect(mock.find("section")!.height).toBe(246);
-      expect(checkpoint.stages[0].nativeRepairPipelineVersion).toBe("native-quality-repair-v1");
+      expect(checkpoint.stages[0].nativeRepairPipelineVersion).toBe("native-quality-repair-v2");
       expect(chatTaskSafeDiagnostic(checkpoint)).toMatchObject({
-        repairPipelineVersion: "native-quality-repair-v1",
+        repairPipelineVersion: "native-quality-repair-v2",
       });
     },
   );

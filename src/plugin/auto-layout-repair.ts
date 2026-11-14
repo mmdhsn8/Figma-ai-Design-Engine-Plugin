@@ -26,6 +26,74 @@ export function repairAutoLayoutHierarchy(
     if (node.getPluginData("fad.tool.task-id.v1") !== taskId) return;
     if (node.type !== "FRAME" && node.type !== "COMPONENT") return;
     for (const child of node.children) visit(child);
+    if (node.layoutMode === "HORIZONTAL") {
+      const children = node.children.filter(
+        (child) =>
+          child.visible &&
+          (!("layoutPositioning" in child) || child.layoutPositioning !== "ABSOLUTE"),
+      );
+      if (!children.length) return;
+
+      const requiredWidth =
+        node.paddingLeft +
+        node.paddingRight +
+        children.reduce((width, child) => width + child.width, 0) +
+        Math.max(0, children.length - 1) * node.itemSpacing;
+      if (requiredWidth <= node.width + 0.001) return;
+      if (
+        node.clipsContent &&
+        (node.overflowDirection === "HORIZONTAL" || node.overflowDirection === "BOTH")
+      )
+        return;
+
+      const before = {
+        width: node.width,
+        height: node.height,
+        primarySizing: node.primaryAxisSizingMode,
+      };
+      const fixedBoundary = node.parent?.type === "PAGE" || node.layoutSizingHorizontal === "FILL";
+      const fillCycle = children.some(
+        (child) =>
+          ("layoutSizingHorizontal" in child && child.layoutSizingHorizontal === "FILL") ||
+          ("layoutGrow" in child && child.layoutGrow > 0),
+      );
+      const foreignContent = children.some(
+        (child) => child.getPluginData("fad.tool.task-id.v1") !== taskId,
+      );
+      const grewWidth =
+        !fixedBoundary && !fillCycle && !foreignContent && node.primaryAxisSizingMode !== "AUTO";
+      if (grewWidth) {
+        markNativeMutation();
+        node.primaryAxisSizingMode = "AUTO";
+      }
+
+      const remainingWidth = requiredWidth > node.width + 0.001;
+      repairs.push({
+        ref: node.getPluginData("fad.tool.logical-ref.v1"),
+        parentRef:
+          node.parent && node.parent.type !== "PAGE"
+            ? node.parent.getPluginData("fad.tool.logical-ref.v1")
+            : undefined,
+        strategy: grewWidth ? "hug-horizontal-content" : "unsupported-preserve-layout",
+        required: { width: requiredWidth, height: node.height },
+        before,
+        after: {
+          width: node.width,
+          height: node.height,
+          primarySizing: node.primaryAxisSizingMode,
+        },
+        stopReason: remainingWidth
+          ? fixedBoundary
+            ? "fixed-viewport-or-fill-boundary"
+            : fillCycle
+              ? "primary-fill-cycle"
+              : foreignContent
+                ? "unowned-content"
+                : "native-remeasurement-required"
+          : "native-remeasurement-required",
+      });
+      return;
+    }
     if (node.layoutMode !== "VERTICAL") return;
 
     const children = node.children.filter(

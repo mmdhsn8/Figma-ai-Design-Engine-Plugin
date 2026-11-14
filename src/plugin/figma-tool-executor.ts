@@ -2184,7 +2184,7 @@ export function createFigmaToolExecutor(
         });
         return {
           summary: changed
-            ? "Grew undersized task-owned vertical containers using native HUG; fresh structural verification is required."
+            ? "Grew undersized task-owned Auto Layout containers using native HUG; fresh structural verification is required."
             : "No safe hierarchy sizing change was available; existing layout was preserved. Inspect remaining findings and repair stop reasons.",
           ...(!changed
             ? { replayed: true, acknowledgementStatus: "verified_idempotent_replay" as const }

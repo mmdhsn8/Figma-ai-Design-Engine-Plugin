@@ -4,6 +4,7 @@ import { PinnedBrandKitSchema } from "./brand-kit";
 import { PinnedDesignSkillsSchema } from "./design-skill";
 import {
   NATIVE_REPAIR_PIPELINE_VERSION,
+  NativeRepairPipelineVersionSchema,
   NativeRepairPlanSchema,
   NativeQualityCoverageSchema,
 } from "./native-quality-repair.js";
@@ -574,7 +575,7 @@ export const ChatTaskSchema = z
             awaitingQualityRepair: z.boolean().default(false),
             nativeRepairPlan: NativeRepairPlanSchema.optional(),
             nativeQualityCoverage: NativeQualityCoverageSchema.optional(),
-            nativeRepairPipelineVersion: z.literal(NATIVE_REPAIR_PIPELINE_VERSION).optional(),
+            nativeRepairPipelineVersion: NativeRepairPipelineVersionSchema.optional(),
             completionReason: z
               .enum([
                 "required_refs_and_native_verification_confirmed",

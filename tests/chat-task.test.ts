@@ -211,7 +211,7 @@ function success(ops: FigmaToolOperation[]): Result {
 }
 function markVerifiedStructure(data: Record<string, unknown>, nodeCount: number): void {
   Object.assign(data, {
-    repairPipelineVersion: "native-quality-repair-v1",
+    repairPipelineVersion: "native-quality-repair-v2",
     qualityFindings: [],
     nativeRepairPlan: [],
     qualityCoverage: { complete: true, nodeCount, findingCount: 0 },
@@ -542,6 +542,27 @@ describe("progressive conversational canvas tasks", () => {
     expect(ChatTaskSchema.safeParse({ ...legacy, model: "provider/model with spaces" }).success).toBe(
       false,
     );
+  });
+
+  it("keeps version 1 native-repair checkpoints readable after the repair upgrade", () => {
+    const restored = ChatTaskSchema.parse({
+      ...task(),
+      stages: [
+        {
+          title: "Saved stage",
+          completed: false,
+          operations: 0,
+          rounds: 0,
+          nativeRepairPipelineVersion: "native-quality-repair-v1",
+        },
+      ],
+    });
+
+    expect(restored.stages[0]?.nativeRepairPipelineVersion).toBe("native-quality-repair-v1");
+    expect(chatTaskSafeDiagnostic(restored)).toMatchObject({
+      repairPipelineVersion: "native-quality-repair-v2",
+      lastNativeRepairPipelineVersion: "native-quality-repair-v1",
+    });
   });
 
   it("closes the reported 11-round repeated-context failure with one model request and bounded inspection", async () => {
@@ -1284,7 +1305,7 @@ describe("progressive conversational canvas tasks", () => {
           ...(ref === current.editTarget!.ref ? { fill: "#FFF0F5" } : {}),
         }));
         Object.assign(item.data!, {
-          repairPipelineVersion: "native-quality-repair-v1",
+          repairPipelineVersion: "native-quality-repair-v2",
           qualityFindings: [],
           nativeRepairPlan: [],
           qualityCoverage: {

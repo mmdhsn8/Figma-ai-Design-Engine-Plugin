@@ -99,7 +99,7 @@ assert.ok(
   "Registered plugin/UI artifacts are missing bounded-QA markers or fail-closed incomplete-coverage handling.",
 );
 assert.ok(
-  uiHtml.includes("native-quality-repair-v1") && uiHtml.includes("native_quality_unrepairable"),
+  uiHtml.includes("native-quality-repair-v2") && uiHtml.includes("native_quality_unrepairable"),
   "Registered UI is missing repair dispatch and versioned diagnostics.",
 );
 assert.ok(uiHtml.includes("AI Chat"), "UI bundle is missing the AI Chat navigation entry.");
