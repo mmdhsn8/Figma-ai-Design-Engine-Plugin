@@ -1,6 +1,11 @@
 import { z } from "zod";
+import { FIGMA_CLIENT_STORAGE_QUOTA_BYTES } from "./client-storage-limits.js";
 import { parseSafeSvg, inspectEmbeddedImage } from "./visual-assets.js";
 import { VisualAssetSchema, type VisualAsset } from "./visual-schema.js";
+import { BrandColorRoleSchema, type BrandColorRole } from "./brand-color-role.js";
+
+export { BrandColorRoleSchema } from "./brand-color-role.js";
+export type { BrandColorRole } from "./brand-color-role.js";
 
 export const BRAND_KIT_SCHEMA_VERSION = 1 as const;
 export const BRAND_KIT_MAX_RECORDS = 100;
@@ -18,20 +23,7 @@ function decodeUtf8Base64(value: string): string {
 
 const SafeId = z.string().regex(/^[A-Za-z0-9_-]{8,80}$/u);
 const HexColor = z.string().regex(/^#[\da-f]{6}$/iu);
-const ColorRoles = [
-  "primary",
-  "secondary",
-  "accent",
-  "background",
-  "surface",
-  "text",
-  "mutedText",
-  "border",
-  "success",
-  "warning",
-  "error",
-] as const;
-export type BrandColorRole = (typeof ColorRoles)[number];
+const ColorRoles = BrandColorRoleSchema.options;
 
 const PaletteSchema = z
   .object({
@@ -311,7 +303,7 @@ export const BrandKitStorageResultSchema = z
   })
   .strict();
 
-export const BRAND_KIT_STORAGE_QUOTA_BYTES = 5 * 1024 * 1024;
+export const BRAND_KIT_STORAGE_QUOTA_BYTES = FIGMA_CLIENT_STORAGE_QUOTA_BYTES;
 
 export const BrandKitExportSchema = z
   .object({

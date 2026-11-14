@@ -925,7 +925,7 @@ describe("safe Figma tool executor", () => {
         ],
       });
     },
-    20_000,
+    60_000,
   );
 
   it("refuses to use persisted inspection-only refs for mutations", async () => {

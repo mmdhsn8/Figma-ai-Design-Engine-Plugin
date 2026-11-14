@@ -1,0 +1,1 @@
+export const FIGMA_CLIENT_STORAGE_QUOTA_BYTES = 5 * 1024 * 1024;

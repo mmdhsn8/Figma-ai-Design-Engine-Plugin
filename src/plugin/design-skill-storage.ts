@@ -14,8 +14,10 @@ import {
   type DesignSkillStorageResult,
   type DesignSkillStoreSnapshot,
 } from "../shared/design-skill";
+import { FIGMA_CLIENT_STORAGE_QUOTA_BYTES } from "../shared/client-storage-limits";
 import { utf8Bytes } from "../shared/generation-limits";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
+import { measureClientStorage, serializeClientStorage } from "./client-storage-budget";
 
 const INDEX_KEY = "fad.design-skills.v1:index";
 const PRESERVED_KEY = "fad.design-skills.v1:preserved";
@@ -35,8 +37,6 @@ type Recovered = {
   integrity: DesignSkillStoreSnapshot["integrity"];
   future: boolean;
 };
-
-const queues = new WeakMap<object, Promise<void>>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -61,19 +61,6 @@ function emptyIndex(now: number): DesignSkillIndex {
 
 function nextIndexTimestamp(index: DesignSkillIndex, now: number): number {
   return Math.max(now, index.updatedAt + 1);
-}
-
-function enqueue<T>(storage: object, operation: () => Promise<T>): Promise<T> {
-  const previous = queues.get(storage) ?? Promise.resolve();
-  const next = previous.catch(() => undefined).then(operation);
-  queues.set(
-    storage,
-    next.then(
-      () => undefined,
-      () => undefined,
-    ),
-  );
-  return next;
 }
 
 function parseSidecar(value: unknown): Sidecar {
@@ -255,37 +242,27 @@ async function recover(storage: DesignSkillStorageApi, now = Date.now()): Promis
   };
 }
 
-async function currentStorageBytes(
+async function currentStorageUsage(
   storage: DesignSkillStorageApi,
   changes: Map<string, unknown>,
-): Promise<number> {
-  let keys: string[];
-  try {
-    keys = await storage.keysAsync();
-  } catch {
-    throw new Error("storage_unavailable");
-  }
-  const managed = new Set(keys.filter((key) => key.startsWith("fad.design-skills.v1:")));
-  for (const key of changes.keys()) managed.add(key);
-  let total = 0;
-  for (const key of managed) {
-    if (changes.has(key)) total += byteSize(changes.get(key));
-    else {
-      try {
-        total += byteSize(await storage.getAsync(key));
-      } catch {
-        throw new Error("storage_unavailable");
-      }
-    }
-  }
-  return total;
+): Promise<{ totalBytes: number; namespaceBytes: number }> {
+  const { totalBytes, trackedBytes } = await measureClientStorage(
+    storage,
+    changes,
+    "fad.design-skills.v1:",
+  );
+  return { totalBytes, namespaceBytes: trackedBytes };
 }
 
 async function ensureBudget(
   storage: DesignSkillStorageApi,
   changes: Map<string, unknown>,
 ): Promise<void> {
-  if ((await currentStorageBytes(storage, changes)) > DESIGN_SKILL_STORAGE_BUDGET_BYTES)
+  const usage = await currentStorageUsage(storage, changes);
+  if (
+    usage.namespaceBytes > DESIGN_SKILL_STORAGE_BUDGET_BYTES ||
+    usage.totalBytes > FIGMA_CLIENT_STORAGE_QUOTA_BYTES
+  )
     throw new Error("quota_exceeded");
 }
 
@@ -294,7 +271,7 @@ async function makeSnapshot(
   recovered: Recovered,
   preservedCount: number,
 ): Promise<DesignSkillStoreSnapshot> {
-  const storageBytes = await currentStorageBytes(storage, new Map());
+  const { namespaceBytes: storageBytes } = await currentStorageUsage(storage, new Map());
   return DesignSkillStoreSnapshotSchema.parse({
     version: 1,
     skills: recovered.skills,
@@ -337,7 +314,7 @@ function safeError(code: string): string {
     revision_conflict: "This Skill changed in another view. Reload it before saving.",
     invalid_record: "The Skill record is invalid or its source fingerprint does not match.",
     quota_exceeded:
-      "The local Skills storage budget is full. Export or archive Skills before adding more.",
+      "The shared Figma client storage quota or the Skills limit is full. Export or archive data before adding more.",
     archive_failed: "Damaged Skill data could not be preserved; the write was stopped.",
     not_found: "The requested Skill revision is not available.",
     default_invalid:
@@ -634,7 +611,9 @@ export async function handleDesignSkillStorage(
 ): Promise<PluginToUIMessage> {
   try {
     const command = DesignSkillStorageCommandSchema.parse(message.command);
-    const result = await enqueue(storage as object, () => handleCommand(storage, command));
+    const result = await serializeClientStorage(storage as object, () =>
+      handleCommand(storage, command),
+    );
     return { type: "design-skills-result", requestId: message.requestId, success: true, ...result };
   } catch (error) {
     const code = errorCode(error);

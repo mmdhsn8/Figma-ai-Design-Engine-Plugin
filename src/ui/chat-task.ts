@@ -8,6 +8,7 @@ import {
   type ChatInputItem,
 } from "../shared/chat-tools";
 import {
+  FigmaToolActionSchema,
   FigmaToolBatchSchema,
   INSPECT_NODES_LIMITS,
   FigmaToolOperationSchema,
@@ -18,7 +19,11 @@ import {
 } from "../shared/figma-tools";
 import { type PluginToUIMessage } from "../shared/messages";
 import { utf8Bytes } from "../shared/generation-limits";
-import { resolveBrandReadingDirection } from "../shared/brand-kit";
+import {
+  resolveBrandKitTokens,
+  resolveBrandReadingDirection,
+  type BrandColorRole,
+} from "../shared/brand-kit";
 import { DESIGN_SKILL_CONTEXT_MARKER } from "../shared/design-skill";
 import {
   auditNativeSection,
@@ -55,6 +60,77 @@ import {
 } from "../shared/native-quality-repair";
 
 type Result = Extract<PluginToUIMessage, { type: "tool-result" }>;
+
+const briefBrandRole = {
+  primary: "primary",
+  background: "background",
+  surface: "surface",
+  accent: "accent",
+  text: "text",
+  mutedText: "muted",
+} as const satisfies Partial<
+  Record<BrandColorRole, "primary" | "background" | "surface" | "accent" | "text" | "muted">
+>;
+
+function resolveChatBrandColorTokens(actionValue: unknown, task: ChatTask): FigmaToolAction {
+  const action = FigmaToolActionSchema.parse(actionValue);
+  const hasTokens =
+    ("fillToken" in action && action.fillToken !== undefined) ||
+    ("strokeToken" in action && action.strokeToken !== undefined) ||
+    ("colorToken" in action && action.colorToken !== undefined) ||
+    (action.tool === "set_properties" &&
+      (action.properties.fillToken !== undefined ||
+        action.properties.strokeToken !== undefined ||
+        action.properties.colorToken !== undefined));
+  if (!hasTokens) {
+    return action.tool === "create_text" && action.color === undefined
+      ? { ...action, color: "#1F2937" }
+      : action;
+  }
+  if (!task.brandKit)
+    throw new Error("A semantic brand color requires the immutable Brand Kit pinned to this task.");
+
+  const palette = resolveBrandKitTokens(task.brandKit).palette;
+  const colorFor = (role: BrandColorRole): string => {
+    const briefRole =
+      role in briefBrandRole ? briefBrandRole[role as keyof typeof briefBrandRole] : undefined;
+    const briefValue = briefRole ? task.brief?.palette[briefRole] : undefined;
+    const value = briefValue && /^#[\da-f]{6}$/iu.test(briefValue) ? briefValue : palette[role];
+    if (!value || !/^#[\da-f]{6}$/iu.test(value))
+      throw new Error(`The pinned Brand Kit has no valid color for the ${role} role.`);
+    return value.toUpperCase();
+  };
+
+  if (action.tool === "create_frame" || action.tool === "create_rectangle") {
+    const { fillToken, strokeToken, ...rest } = action;
+    return FigmaToolActionSchema.parse({
+      ...rest,
+      ...(fillToken ? { fill: colorFor(fillToken) } : {}),
+      ...(strokeToken ? { stroke: colorFor(strokeToken) } : {}),
+    });
+  }
+  if (action.tool === "create_text") {
+    const { colorToken, ...rest } = action;
+    return FigmaToolActionSchema.parse({
+      ...rest,
+      color: colorToken ? colorFor(colorToken) : (action.color ?? "#1F2937"),
+    });
+  }
+  if (action.tool === "set_properties") {
+    const { fillToken, strokeToken, colorToken, ...rest } = action.properties;
+    return FigmaToolActionSchema.parse({
+      ...action,
+      properties: {
+        ...rest,
+        ...(fillToken ? { fill: colorFor(fillToken) } : {}),
+        ...(strokeToken ? { stroke: colorFor(strokeToken) } : {}),
+        ...(colorToken ? { color: colorFor(colorToken) } : {}),
+      },
+    });
+  }
+  return action;
+}
+
 type Dependencies = {
   model(input: ChatInputItem[], lifecycle: ChatLifecycleState): Promise<AuthorizedChatTurn>;
   execute(operations: FigmaToolOperation[]): Promise<Result>;
@@ -2116,15 +2192,16 @@ export function applyPinnedBrandToChatBrief(
     const match = pattern.exec(task.prompt);
     if (match?.[1]) overrides[role] = match[1].toUpperCase();
   }
+  const resolvedTokens = resolveBrandKitTokens(brand);
   const palette = {
     ...brief.palette,
     source: Object.keys(overrides).length ? ("user-requested" as const) : ("brand-kit" as const),
-    background: overrides.background ?? brand.tokens.palette.background,
-    surface: overrides.surface ?? brand.tokens.palette.surface,
-    primary: overrides.primary ?? brand.tokens.palette.primary,
-    accent: overrides.accent ?? brand.tokens.palette.accent,
-    text: overrides.text ?? brand.tokens.palette.text,
-    muted: overrides.muted ?? brand.tokens.palette.mutedText,
+    background: overrides.background ?? resolvedTokens.palette.background,
+    surface: overrides.surface ?? resolvedTokens.palette.surface,
+    primary: overrides.primary ?? resolvedTokens.palette.primary,
+    accent: overrides.accent ?? resolvedTokens.palette.accent,
+    text: overrides.text ?? resolvedTokens.palette.text,
+    muted: overrides.muted ?? resolvedTokens.palette.mutedText,
   };
   return {
     ...brief,
@@ -4605,10 +4682,11 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                         ),
                     )
                   : undefined;
+              const resolvedAction = resolveChatBrandColorTokens(call.action, task);
               const action =
-                stage?.pageId && "pageId" in call.action
-                  ? { ...call.action, pageId: call.action.pageId ?? stage.pageId }
-                  : call.action;
+                stage?.pageId && "pageId" in resolvedAction
+                  ? { ...resolvedAction, pageId: resolvedAction.pageId ?? stage.pageId }
+                  : resolvedAction;
               return {
                 operationId,
                 idempotencyKey: `chat:${operationId}`,

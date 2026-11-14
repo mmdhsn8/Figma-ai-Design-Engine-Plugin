@@ -21,12 +21,12 @@ import type { VisualAsset } from "../shared/visual-schema";
 import { embeddedImageBytes } from "../shared/visual-assets";
 import { utf8Bytes } from "../shared/generation-limits";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
+import { measureClientStorage, serializeClientStorage } from "./client-storage-budget";
 
 const INDEX_KEY = "fad.brand-kits.v1:index";
 const PRESERVED_KEY = "fad.brand-kits.v1:preserved";
 const REVISION_PREFIX = "fad.brand-kits.v1:revision:";
 const ASSET_PREFIX = "fad.brand-kits.v1:asset:";
-const queues = new WeakMap<object, Promise<void>>();
 const STORAGE_ERROR = "Brand Kit data could not be saved. Existing records were kept.";
 
 export type BrandKitStorageApi = Pick<
@@ -61,19 +61,6 @@ function byteSize(value: unknown): number {
 
 function emptyIndex(now: number): BrandKitIndex {
   return { version: 1, entries: [], defaultBrandId: null, updatedAt: now };
-}
-
-function enqueue<T>(storage: object, operation: () => Promise<T>): Promise<T> {
-  const prior = queues.get(storage) ?? Promise.resolve();
-  const next = prior.catch(() => undefined).then(operation);
-  queues.set(
-    storage,
-    next.then(
-      () => undefined,
-      () => undefined,
-    ),
-  );
-  return next;
 }
 
 function parseSidecar(value: unknown): PreservedSidecar {
@@ -279,26 +266,11 @@ async function ensureQuota(
   storage: BrandKitStorageApi,
   writes: Array<{ key: string; value: unknown }>,
 ): Promise<void> {
-  let keys: string[];
-  try {
-    keys = await storage.keysAsync();
-  } catch {
-    throw new Error("storage_unavailable");
-  }
-  let total = 0;
-  for (const key of keys) {
-    try {
-      total += key.length + byteSize(await storage.getAsync(key));
-    } catch {
-      throw new Error("storage_unavailable");
-    }
-  }
-  const updates = new Map(writes.map(({ key, value }) => [key, value]));
-  for (const [key, value] of updates) {
-    if (keys.includes(key)) total -= key.length + byteSize(await storage.getAsync(key));
-    total += key.length + byteSize(value);
-  }
-  if (total > BRAND_KIT_STORAGE_QUOTA_BYTES) throw new Error("quota_exceeded");
+  const { totalBytes } = await measureClientStorage(
+    storage,
+    new Map(writes.map(({ key, value }) => [key, value])),
+  );
+  if (totalBytes > BRAND_KIT_STORAGE_QUOTA_BYTES) throw new Error("quota_exceeded");
 }
 
 async function ensureAssetBudget(storage: BrandKitStorageApi, newBytes: number): Promise<void> {
@@ -444,7 +416,7 @@ function safeError(code: ReturnType<typeof errorCode>): string {
     future_version: "این داده با نسخهٔ جدیدتری ساخته شده است؛ برای حفظ آن، ویرایش متوقف شد.",
     revision_conflict: "این برند در محل دیگری تغییر کرده است. نسخهٔ تازه را بارگذاری کنید.",
     invalid_record: "ساختار برند معتبر نیست؛ دادهٔ قبلی دست‌نخورده ماند.",
-    quota_exceeded: "فضای محلی برند کافی نیست؛ هیچ رکورد قبلی حذف نشد.",
+    quota_exceeded: "فضای اشتراکی ذخیره‌سازی Figma کافی نیست؛ هیچ رکورد قبلی حذف نشد.",
     archive_failed: "آرشیو امن دادهٔ ناسازگار ممکن نشد؛ ذخیره متوقف شد.",
     asset_missing: "فایل نشان پیدا نشد؛ بازبینی یا بازگردانی لازم است.",
     asset_invalid: "فایل نشان معتبر یا ایمن نیست.",
@@ -609,7 +581,9 @@ export async function handleBrandKitStorage(
 ): Promise<PluginToUIMessage> {
   try {
     const command = BrandKitStorageCommandSchema.parse(message.command);
-    const result = await enqueue(storage as object, () => handleCommand(storage, command));
+    const result = await serializeClientStorage(storage as object, () =>
+      handleCommand(storage, command),
+    );
     return { type: "brand-kit-result", requestId: message.requestId, success: true, ...result };
   } catch (error) {
     const code = errorCode(error);

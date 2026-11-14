@@ -2031,7 +2031,7 @@ export function createFigmaToolExecutor(
           text.fontName = loaded.font;
           text.fontSize = action.fontSize;
           text.characters = action.text;
-          text.fills = [{ type: "SOLID", color: color(action.color) }];
+          text.fills = [{ type: "SOLID", color: color(action.color ?? "#1F2937") }];
           text.textAlignHorizontal =
             action.align ?? (action.direction === "RTL" ? "RIGHT" : "LEFT");
           if (action.lineHeight !== undefined)

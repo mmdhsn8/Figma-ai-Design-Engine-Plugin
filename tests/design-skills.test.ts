@@ -11,11 +11,13 @@ import {
   type DesignSkillRevision,
   type DesignSkillStorageCommand,
 } from "../src/shared/design-skill";
+import { FIGMA_CLIENT_STORAGE_QUOTA_BYTES } from "../src/shared/client-storage-limits";
 import { selectDesignSkills } from "../src/shared/design-skill-selection";
 import {
   handleDesignSkillStorage,
   type DesignSkillStorageApi,
 } from "../src/plugin/design-skill-storage";
+import { handleBrandKitStorage } from "../src/plugin/brand-kit-storage";
 import type { UIToPluginMessage } from "../src/shared/messages";
 import {
   createDesignInputText,
@@ -30,6 +32,7 @@ import { ChatTaskSchema } from "../src/shared/chat-task";
 import { chatTaskInput } from "../src/ui/chat-task";
 import { pinBrandKit, resolveBrandKitTokens } from "../src/shared/brand-kit";
 import { newBrandKit } from "../src/ui/brand-kit-manager";
+import { utf8Bytes } from "../src/shared/generation-limits";
 
 const INDEX_KEY = "fad.design-skills.v1:index";
 const REVISION_PREFIX = "fad.design-skills.v1:revision:";
@@ -59,6 +62,27 @@ async function send(storage: MemoryStorage, command: DesignSkillStorageCommand) 
     command,
   } satisfies Extract<UIToPluginMessage, { type: "design-skills-storage" }>);
   if (result.type !== "design-skills-result") throw new Error("Unexpected storage response type.");
+  return result;
+}
+
+function storageBytes(storage: MemoryStorage): number {
+  let total = 0;
+  for (const [key, value] of storage.values)
+    total += utf8Bytes(key) + utf8Bytes(JSON.stringify(value) ?? "");
+  return total;
+}
+
+async function saveBrand(
+  storage: MemoryStorage,
+  kit: ReturnType<typeof newBrandKit>,
+  requestId: string,
+) {
+  const result = await handleBrandKitStorage(storage, {
+    type: "brand-kit-storage",
+    requestId,
+    command: { action: "save", kit, expectedRevision: null },
+  });
+  if (result.type !== "brand-kit-result") throw new Error("Unexpected Brand Kit response type.");
   return result;
 }
 
@@ -480,6 +504,43 @@ describe("Design Skills safety and deterministic planning", () => {
     expect([...unsafeRecovery.values.keys()].some((key) => key.startsWith(REVISION_PREFIX))).toBe(
       false,
     );
+  });
+
+  it("enforces the aggregate Figma clientStorage quota across concurrent Brand Kit and Skill writes", async () => {
+    const kit = newBrandKit("Shared quota");
+    const imported = skill({ id: "skill-quota-01", revisionId: "skill-quota-01.r1" });
+    const skillCommand: DesignSkillStorageCommand = {
+      action: "save",
+      skill: imported,
+      expectedRevision: null,
+    };
+    const brandProbe = new MemoryStorage();
+    const skillProbe = new MemoryStorage();
+    expect((await saveBrand(brandProbe, kit, "brand-quota-probe")).success).toBe(true);
+    expect((await send(skillProbe, skillCommand)).success).toBe(true);
+    const brandBytes = storageBytes(brandProbe);
+    const skillBytes = storageBytes(skillProbe);
+    const headroom =
+      Math.max(brandBytes, skillBytes) + Math.ceil(Math.min(brandBytes, skillBytes) / 2);
+    expect(headroom).toBeGreaterThan(Math.max(brandBytes, skillBytes));
+    expect(brandBytes + skillBytes).toBeGreaterThan(headroom);
+
+    const shared = new MemoryStorage();
+    const otherFeatureKey = "fad.chat-history.v2:quota-fixture";
+    shared.values.set(
+      otherFeatureKey,
+      "x".repeat(FIGMA_CLIENT_STORAGE_QUOTA_BYTES - headroom - utf8Bytes(otherFeatureKey) - 2),
+    );
+    expect(storageBytes(shared) + headroom).toBe(FIGMA_CLIENT_STORAGE_QUOTA_BYTES);
+
+    const [brandResult, skillResult] = await Promise.all([
+      saveBrand(shared, kit, "brand-quota-concurrent"),
+      send(shared, skillCommand),
+    ]);
+    const results = [brandResult, skillResult];
+    expect(results.filter(({ success }) => success)).toHaveLength(1);
+    expect(results.filter(({ errorCode }) => errorCode === "quota_exceeded")).toHaveLength(1);
+    expect(storageBytes(shared)).toBeLessThanOrEqual(FIGMA_CLIENT_STORAGE_QUOTA_BYTES);
   });
 
   it("fails closed on stale defaults and preserves future-version stores as read-only", async () => {

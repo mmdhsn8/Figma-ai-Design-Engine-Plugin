@@ -298,15 +298,15 @@ const descriptions: Record<ChatToolName, string> = {
     "Read current document/page identity, selection, tokens, and progressively scan accessible page trees in bounded yielding slices. Optionally pass a project/screen query or pageId to scope discovery. The native controller owns continuation, checkpoints, cancellation, and exact coverage reporting; never request repeated context calls or offset pagination for inspection. Multiple matches are valid for inspecting all frames, but ambiguous for editing one. Only a verified unique native target may be edited. No canvas edits are performed by this tool.",
   inspect_nodes: `Read-only inspection. Use at most ${INSPECT_NODES_LIMITS.refs} refs. pageId must be copied from document context when inspecting another page. depth is an integer from ${INSPECT_NODES_LIMITS.depth.min}–${INSPECT_NODES_LIMITS.depth.max} (default ${INSPECT_NODES_LIMITS.depth.default}); maxNodes is an integer from ${INSPECT_NODES_LIMITS.maxNodes.min}–${INSPECT_NODES_LIMITS.maxNodes.max} (default ${INSPECT_NODES_LIMITS.maxNodes.default}). Finite numbers outside either range are clamped locally. Invalid types and in-range fractions are rejected. Never inspect more than ${INSPECT_NODES_LIMITS.maxNodes.max} nodes. Set selection:true when refs is empty. Returns stable logical refs for follow-up edits. For INSPECTING requests, the plugin controller chooses targets and sequences operations; do not repeat inspection. A failed pre-plan inspection does not block a new design; existing-node edits still require successful inspection.`,
   create_frame:
-    "Create one native editable frame. Omit x/y for safe non-overlapping page placement.",
+    "Create one native editable frame. When a pinned Brand Kit is active, use fillToken/strokeToken for semantic brand colors; the local runner resolves them from the immutable task revision. Explicit user colors must remain literal. Omit x/y for safe non-overlapping page placement.",
   create_text:
-    "Create editable text with a loaded/fallback font. For Persian, use right alignment; direction is an alignment hint and does not guarantee bidirectional shaping.",
+    "Create editable text with a loaded/fallback font. When a pinned Brand Kit is active, use colorToken for semantic text colors; the local runner resolves it from the immutable task revision. Explicit user colors must remain literal. For Persian, use right alignment; direction is an alignment hint and does not guarantee bidirectional shaping.",
   create_rectangle:
-    "Create one bounded native rectangle with an optional solid fill or local paint style.",
+    "Create one bounded native rectangle with an optional solid fill or local paint style. When a pinned Brand Kit is active, use fillToken/strokeToken for semantic brand colors; the local runner resolves them from the immutable task revision. Explicit user colors must remain literal.",
   set_auto_layout:
     "Set Auto Layout on a frame/component and optionally normalize its direct children by logical ref.",
   set_properties:
-    "Change only explicitly requested, allowlisted properties on an inspected/created logical ref.",
+    "Change only explicitly requested, allowlisted properties on an inspected/created logical ref. When a pinned Brand Kit is active, use fillToken/colorToken/strokeToken for semantic brand colors; the local runner resolves them from the immutable task revision. Explicit user colors must remain literal.",
   append_child:
     "Append only a current page-root native node to a frame using logical refs. If it is already a direct child of that frame, the executor verifies a no-op; if it has another parent, this call is rejected. Never call inspect_nodes only to decide parent state and never use this to move a nested node.",
   reparent_node:
@@ -337,11 +337,26 @@ function toolParameters(name: ChatToolName): Record<string, unknown> {
   if (Array.isArray(parameters.required))
     parameters.required = parameters.required.filter((field) => field !== "tool");
   if (name === "create_frame" || name === "create_rectangle")
-    parameters.not = { required: ["fill", "paintStyleId"] };
+    parameters.not = {
+      anyOf: [
+        { required: ["fill", "fillToken"] },
+        { required: ["fill", "paintStyleId"] },
+        { required: ["fillToken", "paintStyleId"] },
+        { required: ["stroke", "strokeToken"] },
+      ],
+    };
   if (name === "set_properties") {
     const nested = properties.properties as Record<string, unknown>;
     nested.minProperties = 1;
-    nested.not = { required: ["fill", "paintStyleId"] };
+    nested.not = {
+      anyOf: [
+        { required: ["fill", "fillToken"] },
+        { required: ["fill", "paintStyleId"] },
+        { required: ["fillToken", "paintStyleId"] },
+        { required: ["color", "colorToken"] },
+        { required: ["stroke", "strokeToken"] },
+      ],
+    };
     nested.allOf = [
       {
         not: {

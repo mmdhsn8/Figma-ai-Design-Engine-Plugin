@@ -20,6 +20,7 @@ import { CompanionClientError, type AuthorizedChatTurn } from "../src/ui/compani
 import type { FigmaToolOperation } from "../src/shared/figma-tools";
 import type { PluginToUIMessage } from "../src/shared/messages";
 import { MAX_NATIVE_QUALITY_SCAN_NODES } from "../src/shared/native-visual-quality";
+import { BrandKitRevisionSchema, pinBrandKit } from "../src/shared/brand-kit";
 
 type Result = Extract<PluginToUIMessage, { type: "tool-result" }>;
 let callNumber = 0;
@@ -78,6 +79,73 @@ function task(): ChatTask {
     status: "ready",
     text: "",
   });
+}
+
+function chatBrandKit(themePrimary?: string) {
+  return pinBrandKit(
+    BrandKitRevisionSchema.parse({
+      schemaVersion: 1,
+      id: "brand_chat_01",
+      revision: 4,
+      name: "Chat fixture",
+      locale: "fa",
+      direction: "rtl",
+      createdAt: 1,
+      updatedAt: 1,
+      status: "active",
+      tokens: {
+        palette: {
+          primary: "#2463EB",
+          secondary: "#1E3A8A",
+          accent: "#F97316",
+          background: "#F8FAFC",
+          surface: "#FFFFFF",
+          text: "#0F172A",
+          mutedText: "#64748B",
+          border: "#CBD5E1",
+          success: "#15803D",
+          warning: "#B45309",
+          error: "#B91C1C",
+          custom: {},
+        },
+        typography: Object.fromEntries(
+          ["display", "heading1", "heading2", "heading3", "body", "caption", "button"].map(
+            (role) => [
+              role,
+              {
+                requestedFamily: "Inter",
+                fallbackFamily: "Inter",
+                style: "Regular",
+                weight: 400,
+                size: 16,
+                lineHeight: 24,
+                letterSpacing: 0,
+                alignment: "right",
+                direction: "rtl",
+              },
+            ],
+          ),
+        ),
+        spacing: [4, 8, 12, 16],
+        radii: [4, 8, 12],
+        stroke: 1,
+        shadow: { color: "#0F172A", opacity: 0.12, offsetX: 0, offsetY: 6, radius: 18 },
+        grid: {
+          mobileColumns: 4,
+          desktopColumns: 12,
+          mobileGutter: 12,
+          desktopGutter: 24,
+          desktopBreakpoint: 900,
+        },
+        density: "comfortable",
+        components: { buttonRadius: 12, cardRadius: 16, inputRadius: 10, buttonHeight: 48 },
+        themes: themePrimary
+          ? [{ mode: "light", inherits: "base", palette: { primary: themePrimary } }]
+          : [],
+      },
+      assets: [],
+    }),
+  );
 }
 function success(ops: FigmaToolOperation[]): Result {
   return {
@@ -1847,6 +1915,55 @@ describe("progressive conversational canvas tasks", () => {
       ["completionCriteria", "estimatedMutations", "goal", "logicalRefs", "title"].sort(),
     );
     expect(current.stages[0]).toHaveProperty("completed", true);
+  });
+
+  it("resolves Chat semantic color roles to the pinned Brand Kit before native dispatch", async () => {
+    const current = task();
+    current.brandKit = chatBrandKit("#765432");
+    const h = harness([
+      plan(["Page surface"]),
+      turn("create_rectangle", {
+        ref: "product-0",
+        name: "Page surface",
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+        fillToken: "primary",
+      }),
+      finish(),
+      done,
+    ]);
+
+    await runChatTask(current, h.deps);
+
+    const dispatched = h.batches.flat().find(({ action }) => action.tool === "create_rectangle");
+    expect(dispatched?.action).toMatchObject({ fill: "#765432" });
+    expect(dispatched?.action).not.toHaveProperty("fillToken");
+    expect(
+      current.ledger.find(({ call }) => call.action.tool === "create_rectangle")?.call.action,
+    ).toMatchObject({ fillToken: "primary" });
+  });
+
+  it("keeps an explicit user palette color ahead of the pinned Brand Kit token", async () => {
+    const current = task();
+    current.brandKit = chatBrandKit();
+    current.prompt = "Use primary #ABCDEF for the interface.";
+    const h = harness([
+      plan(["Page surface"]),
+      turn("create_rectangle", {
+        ref: "product-0",
+        name: "Page surface",
+        parent: { kind: "page" },
+        size: { width: 390, height: 844 },
+        fillToken: "primary",
+      }),
+      finish(),
+      done,
+    ]);
+
+    await runChatTask(current, h.deps);
+
+    const dispatched = h.batches.flat().find(({ action }) => action.tool === "create_rectangle");
+    expect(dispatched?.action).toMatchObject({ fill: "#ABCDEF" });
   });
 
   it("normalizes exactly the reported runtime stage contamination but still rejects unsupported design fields", () => {

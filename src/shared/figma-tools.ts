@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { BrandColorRoleSchema } from "./brand-color-role.js";
 
 const RefSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u);
 const PageIdSchema = z.string().min(1).max(200);
@@ -149,7 +150,9 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
       x: z.number().finite().min(-100_000).max(100_000).optional(),
       y: z.number().finite().min(-100_000).max(100_000).optional(),
       fill: ColorSchema.optional(),
+      fillToken: BrandColorRoleSchema.optional(),
       stroke: ColorSchema.optional(),
+      strokeToken: BrandColorRoleSchema.optional(),
       strokeWeight: z.number().finite().min(0).max(100).optional(),
       cornerRadius: z.number().finite().min(0).max(500).default(0),
       paintStyleId: z.string().min(1).max(100).optional(),
@@ -160,7 +163,10 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
     })
     .strict()
     .refine(
-      (value) => !(value.fill && value.paintStyleId),
+      (value) =>
+        !(value.fill && value.fillToken) &&
+        !((value.fill || value.fillToken) && value.paintStyleId) &&
+        !(value.stroke && value.strokeToken),
       "Choose a fill color or a local paint style.",
     ),
   z
@@ -174,7 +180,8 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
       size: DimensionsSchema,
       font: TextFontSchema.default({ family: "Inter", style: "Regular" }),
       fontSize: z.number().finite().min(1).max(300).default(16),
-      color: ColorSchema.default("#1F2937"),
+      color: ColorSchema.optional(),
+      colorToken: BrandColorRoleSchema.optional(),
       align: z.enum(["LEFT", "CENTER", "RIGHT", "JUSTIFIED"]).optional(),
       direction: z.enum(["LTR", "RTL"]).default("LTR"),
       horizontalSizing: z.enum(["FIXED", "HUG", "FILL"]).default("FIXED"),
@@ -183,7 +190,8 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
       letterSpacing: z.number().finite().min(-1_000).max(1_000).optional(),
       textAutoResize: z.enum(["NONE", "HEIGHT", "WIDTH_AND_HEIGHT", "TRUNCATE"]).default("HEIGHT"),
     })
-    .strict(),
+    .strict()
+    .refine((value) => !(value.color && value.colorToken), "Choose a text color or a brand token."),
   z
     .object({
       tool: z.literal("create_rectangle"),
@@ -195,7 +203,9 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
       x: z.number().finite().min(-100_000).max(100_000).optional(),
       y: z.number().finite().min(-100_000).max(100_000).optional(),
       fill: ColorSchema.optional(),
+      fillToken: BrandColorRoleSchema.optional(),
       stroke: ColorSchema.optional(),
+      strokeToken: BrandColorRoleSchema.optional(),
       strokeWeight: z.number().finite().min(0).max(100).default(1),
       cornerRadius: z.number().finite().min(0).max(500).default(0),
       opacity: z.number().finite().min(0).max(1).optional(),
@@ -204,7 +214,10 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
     })
     .strict()
     .refine(
-      (value) => !(value.fill && value.paintStyleId),
+      (value) =>
+        !(value.fill && value.fillToken) &&
+        !((value.fill || value.fillToken) && value.paintStyleId) &&
+        !(value.stroke && value.strokeToken),
       "Choose a fill color or a local paint style.",
     ),
   z
@@ -227,6 +240,7 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
         .object({
           name: z.string().min(1).max(100).optional(),
           fill: ColorSchema.optional(),
+          fillToken: BrandColorRoleSchema.optional(),
           paintStyleId: z.string().min(1).max(100).optional(),
           visible: z.boolean().optional(),
           width: z.number().finite().min(1).max(20_000).optional(),
@@ -234,9 +248,11 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
           text: z.string().max(20_000).optional(),
           fontSize: z.number().finite().min(1).max(300).optional(),
           color: ColorSchema.optional(),
+          colorToken: BrandColorRoleSchema.optional(),
           textStyleId: z.string().min(1).max(100).optional(),
           align: z.enum(["LEFT", "CENTER", "RIGHT", "JUSTIFIED"]).optional(),
           stroke: ColorSchema.optional(),
+          strokeToken: BrandColorRoleSchema.optional(),
           strokeWeight: z.number().finite().min(0).max(100).optional(),
           cornerRadius: z.number().finite().min(0).max(500).optional(),
           opacity: z.number().finite().min(0).max(1).optional(),
@@ -250,7 +266,11 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
         .strict()
         .refine((value) => Object.keys(value).length > 0, "At least one property is required.")
         .refine(
-          (value) => !(value.fill && value.paintStyleId),
+          (value) =>
+            !(value.fill && value.fillToken) &&
+            !((value.fill || value.fillToken) && value.paintStyleId) &&
+            !(value.color && value.colorToken) &&
+            !(value.stroke && value.strokeToken),
           "Choose a fill color or a local paint style.",
         )
         .refine(
@@ -265,6 +285,7 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
               value.letterSpacing,
               value.align,
               value.textAutoResize,
+              value.colorToken,
             ].some((entry) => entry !== undefined),
           "Choose a text style or explicit typography changes.",
         ),
