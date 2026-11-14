@@ -21,6 +21,7 @@ import {
   validateGenerationTransaction,
 } from "./generation-transaction.js";
 import { PinnedBrandKitSchema } from "./brand-kit.js";
+import { PinnedDesignSkillsSchema } from "./design-skill.js";
 
 export const DraftIdentitySchema = z.string().regex(/^[a-zA-Z0-9_-]{8,100}$/u);
 export const DraftManifestSchema = z
@@ -31,6 +32,7 @@ export const DraftManifestSchema = z
     model: z.string().min(1).max(200),
     request: DesignGenerationRequestSchema,
     brandKit: PinnedBrandKitSchema.optional(),
+    designSkills: PinnedDesignSkillsSchema.optional(),
     createdAt: z.number().int().nonnegative(),
   })
   .strict();
@@ -50,7 +52,7 @@ export type SavedDraft = {
 };
 
 export function validateDraftScreen(manifest: DraftManifest, value: unknown): GeneratedDesign {
-  const plan = createDesignPlan(manifest.request, manifest.brandKit);
+  const plan = createDesignPlan(manifest.request, manifest.brandKit, manifest.designSkills);
   if (!plan.success) throw new Error("draft_plan_invalid");
   const raw = JSON.stringify(value);
   if (utf8Bytes(raw) > MAX_SCREEN_BYTES) throw new Error("draft_screen_too_large");
@@ -72,7 +74,7 @@ export function validateDraftSection(
   if (utf8Bytes(JSON.stringify(design)) > MAX_SECTION_BYTES)
     throw new Error("draft_section_1MiB_limit");
   const screen = design.screens[0]!;
-  const plan = createDesignPlan(manifest.request, manifest.brandKit);
+  const plan = createDesignPlan(manifest.request, manifest.brandKit, manifest.designSkills);
   if (!plan.success) throw new Error("draft_plan_invalid");
   const plannedScreen = plan.data.screens.find(({ id }) => id === screen.id);
   const section = createDesignSections(plan.data).find(({ id }) => id === transaction.section_id);

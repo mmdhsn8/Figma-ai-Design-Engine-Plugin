@@ -13,6 +13,7 @@ import {
   inferRequestedDesignPatterns,
   type DesignPatternId,
 } from "./design-patterns.js";
+import type { DesignSkillPrompt } from "./design-skill.js";
 
 export const DESIGN_BRIEF_VERSION = 1 as const;
 export const VISUAL_DESIGN_SPEC_VERSION = 1 as const;
@@ -49,6 +50,19 @@ export const DesignBriefSchema = z
     direction: z.enum(["rtl", "ltr"]),
     brandDirection: z.string().trim().max(240),
     brandKit: PinnedBrandKitSchema.optional(),
+    skillSources: z
+      .array(
+        z
+          .object({
+            id: z.string().regex(/^[a-z0-9][a-z0-9_-]{7,79}$/u),
+            revisionId: z.string().min(10).max(120),
+            name: z.string().trim().min(1).max(100),
+            requiredPatterns: z.array(z.enum(DESIGN_PATTERN_IDS)).max(4),
+          })
+          .strict(),
+      )
+      .max(3)
+      .default([]),
     requestedPatterns: z.array(z.enum(DESIGN_PATTERN_IDS)).max(18),
     assetPolicy: z.literal("provided-or-document-assets; otherwise-labeled-native-placeholder"),
     acceptanceCriteria: z.array(z.string().trim().min(1).max(240)).min(3).max(10),
@@ -168,7 +182,7 @@ export const VisualDesignSpecSchema = z
           .strict(),
       )
       .max(500),
-    nativeAssertions: z.array(z.string().trim().min(1).max(240)).min(2).max(12),
+    nativeAssertions: z.array(z.string().trim().min(1).max(240)).min(2).max(15),
   })
   .strict();
 export type VisualDesignSpec = z.infer<typeof VisualDesignSpecSchema>;
@@ -239,6 +253,7 @@ export function createVisualDesignSpec(input: {
   requireHighFidelityStructure?: boolean;
   palette: VisualDesignPalette;
   semanticTokens?: z.infer<typeof BrandKitTokensSchema>;
+  designSkills?: readonly DesignSkillPrompt[];
   children: readonly VisualSpecSourceNode[];
 }): { success: true; data: VisualDesignSpec } | { success: false; errors: string[] } {
   const nodes: VisualDesignNodeSpec[] = [];
@@ -525,19 +540,27 @@ export function createVisualDesignSpec(input: {
         : {}),
     nodes,
     requiredPatterns: [
-      ...(input.requiredPatterns ??
-        inferPatternsForScreen(
-          input.brief.prompt,
-          input.brief.domain,
-          input.screen.familyName,
-          input.projectScreenCount,
-          input.brief.fidelity === "high_fidelity",
-        )),
+      ...new Set([
+        ...(input.requiredPatterns ??
+          inferPatternsForScreen(
+            input.brief.prompt,
+            input.brief.domain,
+            input.screen.familyName,
+            input.projectScreenCount,
+            input.brief.fidelity === "high_fidelity",
+          )),
+        ...(input.designSkills ?? []).flatMap(({ requiredPatterns }) => requiredPatterns),
+      ]),
     ],
     usedPatterns: used,
     imagePlaceholders,
     nativeAssertions: [
       ...input.brief.acceptanceCriteria,
+      ...(input.brief.skillSources.length
+        ? [
+            `Verify required patterns from pinned Skills ${input.brief.skillSources.map(({ id, revisionId }) => `${id}@${revisionId}`).join(", ")} are present and tagged in the native layer tree.`,
+          ]
+        : []),
       "Confirm the existing screen identity and every declared logical reference with a fresh native read.",
       "Report zero canvas mutations only for an inspection or an actually verified no-op.",
     ],
@@ -626,7 +649,16 @@ export function createDesignBrief(input: {
   direction: "rtl" | "ltr";
   brandDirection?: string;
   brandKit?: PinnedBrandKit;
+  designSkills?: readonly DesignSkillPrompt[];
 }): DesignBrief {
+  const skillSources = (input.designSkills ?? []).map(
+    ({ id, revisionId, name, requiredPatterns }) => ({
+      id,
+      revisionId,
+      name,
+      requiredPatterns,
+    }),
+  );
   return DesignBriefSchema.parse({
     version: DESIGN_BRIEF_VERSION,
     prompt: input.prompt,
@@ -642,12 +674,18 @@ export function createDesignBrief(input: {
         ? `${input.brandKit.name} · immutable revision ${input.brandKit.revision}`
         : "Use the user's explicit brand constraints; otherwise choose a coherent restrained visual direction."),
     ...(input.brandKit ? { brandKit: input.brandKit } : {}),
+    skillSources,
     requestedPatterns: inferRequestedDesignPatterns(input.prompt),
     assetPolicy: "provided-or-document-assets; otherwise-labeled-native-placeholder",
     acceptanceCriteria: [
       "Preserve the user's exact requested content and restrictions; do not invent real product or customer facts.",
       "Represent the requested hierarchy as nested, editable native layers with stable parent relationships.",
       "Verify the rendered native geometry, text presence, visibility, and requested content before reporting completion.",
+      ...(skillSources.length
+        ? [
+            `Represent the patterns required by pinned Design Skills ${skillSources.map(({ name, revisionId }) => `${name} (${revisionId})`).join(", ")} as tagged editable native layers.`,
+          ]
+        : []),
       ...(input.fidelity === "high_fidelity"
         ? [
             "Use a deliberate visual hierarchy, coherent tokens, and screen-appropriate pattern composition.",

@@ -20,23 +20,6 @@ import {
 
 const unavailable: Partial<Record<PluginView, { title: string; eyebrow: string; detail: string }>> =
   {
-    skills: {
-      title: "Skills Manager",
-      eyebrow: "LOCAL GUIDANCE",
-      detail:
-        "SKILL.md import, trust controls, and generation integration are not available in this Phase A build. No skill text is loaded or executed.",
-    },
-    "skill-detail": {
-      title: "Skill Details",
-      eyebrow: "LOCAL GUIDANCE",
-      detail: "There are no imported skills to inspect in this build.",
-    },
-    "skill-add": {
-      title: "Add a Skill",
-      eyebrow: "LOCAL GUIDANCE",
-      detail:
-        "Local SKILL.md parsing and import are scheduled for a later implementation phase. No file is read or executed here.",
-    },
   };
 
 function RouteShell({
@@ -301,24 +284,6 @@ export function WorkspaceDetailView({
             This route is intentionally explicit; it does not show a fake form or report a
             successful action.
           </p>
-          {view === "skills" && (
-            <button
-              className="secondary-action"
-              type="button"
-              onClick={() => onNavigate("skill-add")}
-            >
-              Add local SKILL.md
-            </button>
-          )}
-          {view === "skills" && (
-            <button
-              className="text-button"
-              type="button"
-              onClick={() => onNavigate("skill-detail")}
-            >
-              Skill details
-            </button>
-          )}
           <button className="text-button" type="button" onClick={() => onNavigate("home")}>
             Back to Home
           </button>
@@ -355,32 +320,58 @@ export function WorkspaceDetailView({
     return (
       <RouteShell title={title} eyebrow={eyebrow} description={description} onNavigate={onNavigate}>
         {task ? (
-          view === "progress" ? (
-            <GenerationProgressView
-              task={task}
-              isRunning={isRunning}
-              canResume={canResume}
-              onStop={onStop}
-              onResume={onResume}
-              onNavigate={onNavigate}
-            />
-          ) : view === "results" || view === "layers" ? (
-            <TaskNativeDetailView
-              view={view}
-              task={task}
-              isRunning={isRunning}
-              onNavigate={onNavigate}
-            />
-          ) : (
-            <ActivityTaskDetails
-              task={task}
-              isRunning={isRunning}
-              canResume={canResume}
-              onStop={onStop}
-              onResume={onResume}
-              onNavigate={onNavigate}
-            />
-          )
+          <>
+            {task.designSkills?.length ? (
+              <section className="route-card task-skills-card" aria-label="Pinned Design Skills">
+                <h2>Pinned Design Skills</h2>
+                <p>
+                  These immutable task snapshots remain fixed across edits, archiving, and resume.
+                </p>
+                <ul>
+                  {task.designSkills.map((skill) => (
+                    <li key={`${skill.id}-${skill.revisionId}`}>
+                      <strong dir="auto">{skill.name}</strong>
+                      <small dir="ltr">
+                        {skill.id} · {skill.revisionId} · {skill.selectionReason}
+                      </small>
+                      <span>
+                        {skill.trust === "unverified"
+                          ? "Unverified imported guidance"
+                          : "Local guidance"}{" "}
+                        · required patterns: {skill.requiredPatterns.join(", ") || "none"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+            {view === "progress" ? (
+              <GenerationProgressView
+                task={task}
+                isRunning={isRunning}
+                canResume={canResume}
+                onStop={onStop}
+                onResume={onResume}
+                onNavigate={onNavigate}
+              />
+            ) : view === "results" || view === "layers" ? (
+              <TaskNativeDetailView
+                view={view}
+                task={task}
+                isRunning={isRunning}
+                onNavigate={onNavigate}
+              />
+            ) : (
+              <ActivityTaskDetails
+                task={task}
+                isRunning={isRunning}
+                canResume={canResume}
+                onStop={onStop}
+                onResume={onResume}
+                onNavigate={onNavigate}
+              />
+            )}
+          </>
         ) : (
           <div className="capability-state">
             <strong>No task data for this chat</strong>

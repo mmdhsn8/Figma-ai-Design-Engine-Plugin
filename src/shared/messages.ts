@@ -19,6 +19,7 @@ import {
 } from "./figma-tools";
 import { ModelIdSchema } from "./model-preference";
 import { BrandKitStorageCommandSchema, BrandKitStorageResultSchema } from "./brand-kit";
+import { DesignSkillStorageCommandSchema, DesignSkillStorageResultSchema } from "./design-skill";
 
 const RequestSchema = z.object({
   requestId: z.string().min(1).max(100),
@@ -163,6 +164,13 @@ const MultiScreenRenderResultSchema = z
 export const UIToPluginSchema = z.discriminatedUnion("type", [
   z
     .object({
+      type: z.literal("design-skills-storage"),
+      requestId: z.string().min(1).max(100),
+      command: DesignSkillStorageCommandSchema,
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("brand-kit-storage"),
       requestId: z.string().min(1).max(100),
       command: BrandKitStorageCommandSchema,
@@ -297,7 +305,9 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
         .nullable(),
     })
     .strict(),
-  z.object({ type: z.literal("load-model-preference"), requestId: z.string().min(1).max(100) }).strict(),
+  z
+    .object({ type: z.literal("load-model-preference"), requestId: z.string().min(1).max(100) })
+    .strict(),
   z
     .object({
       type: z.literal("save-model-preference"),
@@ -319,6 +329,7 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
 ]);
 
 export const PluginToUISchema = z.discriminatedUnion("type", [
+  DesignSkillStorageResultSchema,
   BrandKitStorageResultSchema,
   z
     .object({
@@ -354,7 +365,10 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       documentId: z.string().max(300),
       task: ChatTaskSchema.nullable().optional(),
       errorCategory: z.enum(["checkpoint_storage"]).optional(),
-      errorCode: z.string().regex(/^[a-z_]{1,80}$/u).optional(),
+      errorCode: z
+        .string()
+        .regex(/^[a-z_]{1,80}$/u)
+        .optional(),
       error: z.string().max(500).optional(),
     })
     .strict(),

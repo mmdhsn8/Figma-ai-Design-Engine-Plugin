@@ -230,8 +230,7 @@ export function MoreMenu({
         {
           view: "skills",
           title: "Design Skills",
-          description: "Planned for a later phase",
-          future: true,
+          description: "Local guidance, revisions, and task defaults",
         },
       ],
     },

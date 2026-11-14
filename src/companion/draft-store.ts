@@ -102,7 +102,7 @@ export function createDraftStore(directory: string) {
     start: (owner: string, input: DraftManifest) =>
       serial(async () => {
         const manifest = DraftManifestSchema.parse(input);
-        if (!createDesignPlan(manifest.request, manifest.brandKit).success)
+        if (!createDesignPlan(manifest.request, manifest.brandKit, manifest.designSkills).success)
           throw new Error("draft_plan_invalid");
         if (Buffer.byteLength(JSON.stringify(manifest)) > 16 * 1024)
           throw new Error("draft_manifest_16KiB_limit");
@@ -335,7 +335,7 @@ export function createDraftStore(directory: string) {
             );
           }
         }
-        const plan = createDesignPlan(manifest.request, manifest.brandKit);
+        const plan = createDesignPlan(manifest.request, manifest.brandKit, manifest.designSkills);
         if (!plan.success) throw new Error("draft_plan_invalid");
         const order = new Map(plan.data.screens.map((screen) => [screen.id, screen.order]));
         transactions.sort(

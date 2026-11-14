@@ -16,6 +16,7 @@ import { handleChatTaskStorage } from "./chat-task-storage";
 import { handleChatHistoryStorage } from "./chat-history-storage";
 import { handleModelPreferenceStorage } from "./model-preference-storage";
 import { handleBrandKitStorage } from "./brand-kit-storage";
+import { handleDesignSkillStorage } from "./design-skill-storage";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
 const COMPANION_RESTORE_TICKET_KEY = "companion-restore-ticket-v1";
@@ -132,6 +133,10 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
   }
   if (message.data.type === "brand-kit-storage") {
     send(await handleBrandKitStorage(figma.clientStorage, message.data));
+    return;
+  }
+  if (message.data.type === "design-skills-storage") {
+    send(await handleDesignSkillStorage(figma.clientStorage, message.data));
     return;
   }
   if (

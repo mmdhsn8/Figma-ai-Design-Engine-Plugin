@@ -4,6 +4,7 @@ import {
   INSPECT_NODES_LIMITS,
   type FigmaToolAction,
 } from "./figma-tools.js";
+import { DESIGN_PATTERN_IDS } from "./design-patterns.js";
 
 export const CHAT_TOOL_NAMES = [
   "classify_canvas_intent",
@@ -107,6 +108,13 @@ export const ChatDesignBriefSchema = z
     imagePolicy: z.enum(["authorized-assets-only", "labeled-native-fallback"]),
     interactionPriorities: z.array(z.string().min(1).max(120)).min(1).max(8),
     readingDirection: z.enum(["LTR", "RTL"]),
+    requiredPatterns: z.array(z.enum(DESIGN_PATTERN_IDS)).max(18).optional(),
+    skillSources: z.array(z.object({
+      id: z.string().regex(/^[a-z0-9][a-z0-9_-]{7,79}$/u),
+      revisionId: z.string().min(10).max(120),
+      name: z.string().trim().min(1).max(100),
+      requiredPatterns: z.array(z.enum(DESIGN_PATTERN_IDS)).max(4),
+    }).strict()).max(3).optional(),
   })
   .strict();
 

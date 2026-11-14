@@ -130,6 +130,7 @@ export function prepareGeneratedDesign(
       screen,
       projectScreenCount: plan.request.screenCount * (plan.request.target === "both" ? 2 : 1),
       requiredPatterns: requestedPatterns,
+      designSkills: plan.designSkills,
       requireHighFidelityStructure: options.scope !== "section",
       palette: design.palette,
       ...(plan.brandKit

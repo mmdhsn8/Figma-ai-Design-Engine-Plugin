@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { ModelIdSchema } from "./model-preference";
 import { PinnedBrandKitSchema } from "./brand-kit";
+import { PinnedDesignSkillsSchema } from "./design-skill";
 import {
   NATIVE_REPAIR_PIPELINE_VERSION,
   NativeRepairPlanSchema,
@@ -442,6 +443,7 @@ export const ChatTaskSchema = z
     // chosen at task start so retries cannot silently switch providers/models.
     model: ModelIdSchema.optional(),
     brandKit: PinnedBrandKitSchema.optional(),
+    designSkills: PinnedDesignSkillsSchema.optional(),
     lifecycle: ChatLifecycleStateSchema.default("UNPLANNED"),
     inspectionOutcome: ReadOnlyInspectionOutcomeSchema.optional(),
     inspectionSummary: ReadOnlyInspectionSummarySchema.optional(),

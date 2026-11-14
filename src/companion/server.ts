@@ -39,6 +39,7 @@ import {
   DesignGenerationRequestSchema,
 } from "../shared/design-generation.js";
 import { PinnedBrandKitSchema } from "../shared/brand-kit.js";
+import { DesignSkillPromptListSchema } from "../shared/design-skill.js";
 import {
   CHAT_FUNCTION_TOOLS,
   ChatFunctionCallSchema,
@@ -2052,6 +2053,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       "repairTargets",
       "section",
       "brandKit",
+      "designSkills",
     ]);
     if (Object.keys(body.value).some((key) => !allowedKeys.has(key))) {
       sendJson(response, 400, {
@@ -2102,6 +2104,16 @@ export function createCompanionServer(options: CompanionServerOptions) {
       body.value.brandKit === undefined
         ? undefined
         : PinnedBrandKitSchema.safeParse(body.value.brandKit);
+    const parsedDesignSkills = DesignSkillPromptListSchema.safeParse(body.value.designSkills ?? []);
+    if (!parsedDesignSkills.success) {
+      sendJson(response, 400, {
+        error: "invalid_design_request",
+        issues: [
+          "The bounded pinned Design Skill context failed validation or contains conflicts.",
+        ],
+      });
+      return;
+    }
     if (parsedBrandKit && !parsedBrandKit.success) {
       sendJson(response, 400, {
         error: "invalid_design_request",
@@ -2208,7 +2220,11 @@ export function createCompanionServer(options: CompanionServerOptions) {
         sendJson(response, 403, { error: "inference_not_verified", status: status() });
         return;
       }
-      const completePlan = createDesignPlan(parsedRequest.data, parsedBrandKit?.data);
+      const completePlan = createDesignPlan(
+        parsedRequest.data,
+        parsedBrandKit?.data,
+        parsedDesignSkills.data,
+      );
       if (!completePlan.success) {
         sendJson(response, 400, { error: "invalid_design_request", issues: completePlan.errors });
         return;

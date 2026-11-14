@@ -5,6 +5,7 @@ import { MAX_SCREEN_BYTES } from "../shared/generation-limits";
 import type { DesignGenerationRequest, GenerationRepairTarget } from "../shared/design-generation";
 import type { DesignSection } from "../shared/design-generation";
 import type { PinnedBrandKit } from "../shared/brand-kit";
+import { designSkillsForPrompt, type PinnedDesignSkill } from "../shared/design-skill";
 import { MAX_SECTION_BYTES } from "../shared/generation-limits";
 import {
   ChatFunctionCallValidationIssueSchema,
@@ -263,7 +264,8 @@ export type AuthorizedChatTurn = (
       calls: ChatFunctionCall[];
       functionCallItems: Extract<ChatInputItem, { type: "function_call" }>[];
       text: string;
-    }) & { timing?: z.infer<typeof ChatTurnTimingSchema> };
+    }
+) & { timing?: z.infer<typeof ChatTurnTimingSchema> };
 
 type Fetcher = typeof fetch;
 
@@ -450,6 +452,7 @@ export async function generateAuthorizedDesign(
   onLiveProgress?: (diagnostic: InferenceDiagnostic) => void,
   section?: Pick<DesignSection, "id" | "sequence">,
   brandKit?: PinnedBrandKit,
+  designSkills?: PinnedDesignSkill[],
 ): Promise<string> {
   let retriedIncompleteStream = false;
   let polling = true;
@@ -494,6 +497,7 @@ export async function generateAuthorizedDesign(
             ...(repairTargets?.length ? { repairTargets } : {}),
             ...(section ? { section } : {}),
             ...(brandKit ? { brandKit } : {}),
+            ...(designSkills?.length ? { designSkills: designSkillsForPrompt(designSkills) } : {}),
           },
           fetcher,
           signal,
@@ -701,7 +705,11 @@ async function readAuthorizedChatStream(
         .strict()
         .safeParse(payload);
       if (!parsed.success) throw new CompanionClientError("response_invalid");
-      return { kind: "tool_validation", issues: parsed.data.issues, ...(parsed.data.timing ? { timing: { ...parsed.data.timing, companionHeadersMs } } : {}) };
+      return {
+        kind: "tool_validation",
+        issues: parsed.data.issues,
+        ...(parsed.data.timing ? { timing: { ...parsed.data.timing, companionHeadersMs } } : {}),
+      };
     }
     if (eventName === "tool_calls") {
       const parsed = z
@@ -749,11 +757,19 @@ async function readAuthorizedChatStream(
     }
     if (eventName === "done") {
       const parsed = z
-        .object({ requestId: z.string(), text: z.string().max(256 * 1024), timing: ChatTurnTimingSchema.optional() })
+        .object({
+          requestId: z.string(),
+          text: z.string().max(256 * 1024),
+          timing: ChatTurnTimingSchema.optional(),
+        })
         .strict()
         .safeParse(payload);
       if (!parsed.success) throw new CompanionClientError("response_invalid");
-      return { kind: "done", text: parsed.data.text, ...(parsed.data.timing ? { timing: { ...parsed.data.timing, companionHeadersMs } } : {}) };
+      return {
+        kind: "done",
+        text: parsed.data.text,
+        ...(parsed.data.timing ? { timing: { ...parsed.data.timing, companionHeadersMs } } : {}),
+      };
     }
     if (eventName === "error") {
       const parsed = z

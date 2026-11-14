@@ -5044,3 +5044,369 @@ body:has(.app-shell.is-chat-view) #root {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.skills-page {
+  min-width: 0;
+  overflow-x: hidden;
+}
+
+.skills-page-heading,
+.skills-library-toolbar,
+.skills-item-heading,
+.skills-storage-heading,
+.skills-editor-heading,
+.skills-source-heading,
+.skills-save-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.skills-page-heading > div,
+.skills-layout,
+.skills-library,
+.skills-detail,
+.skills-item,
+.skills-editor,
+.skills-detail-card,
+.skills-history-card {
+  min-width: 0;
+}
+
+.skills-policy-card,
+.skills-storage-card,
+.skills-library,
+.skills-detail > .route-card {
+  margin-block: 12px;
+}
+
+.skills-policy-card p,
+.skills-policy-card small,
+.skills-storage-card small,
+.skills-item p,
+.skills-detail-card p,
+.skills-detail-empty p,
+.skills-untrusted-note,
+.skills-confirm p,
+.skills-markdown-preview,
+.task-skills-card li span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.skills-policy-card p,
+.skills-item p,
+.skills-detail-card p,
+.skills-detail-empty p,
+.skills-confirm p {
+  margin: 8px 0;
+  line-height: 1.6;
+}
+
+.skills-storage-heading span,
+.skills-source-heading span {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.skills-storage-card progress {
+  width: 100%;
+  height: 8px;
+  margin-block: 10px;
+  accent-color: var(--accent-strong);
+}
+
+.skills-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.skills-library-toolbar h2,
+.skills-editor-heading h2,
+.skills-source-heading h3,
+.task-skills-card h2 {
+  margin: 0;
+}
+
+.skills-library-toolbar h2 span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.skills-file-input {
+  display: none;
+}
+
+.skills-search-label,
+.skills-filters label,
+.skills-form-grid > label,
+.skills-source-label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.skills-search-label input,
+.skills-filters select,
+.skills-form-grid input,
+.skills-form-grid select,
+.skills-source-label textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--surface-raised);
+  font: inherit;
+}
+
+.skills-filters,
+.skills-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.skills-list {
+  display: grid;
+  gap: 9px;
+  max-height: min(330px, 45vh);
+  overflow: auto;
+  margin-top: 12px;
+  padding-inline-end: 3px;
+}
+
+.skills-item,
+.skills-empty,
+.skills-import-conflict,
+.skills-confirm,
+.task-skills-card li {
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface);
+}
+
+.skills-item.is-selected {
+  border-color: var(--accent);
+}
+
+.skills-item-heading {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.skills-title-button {
+  padding: 0;
+  border: 0;
+  color: var(--text);
+  background: transparent;
+  font: inherit;
+  font-weight: 650;
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+
+.skills-source-badge,
+.skills-meta-row span {
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface-raised);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.skills-source-badge.is-unverified {
+  color: #ffd28a;
+}
+
+.skills-meta-row,
+.skills-item-controls,
+.skills-actions,
+.skills-editor-heading > div,
+.skills-save-row,
+.skills-history-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.skills-item-controls {
+  justify-content: space-between;
+  margin-block: 8px;
+}
+
+.skills-toggle,
+.skills-choice-field label {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.skills-actions > *,
+.skills-history-row > * {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.skills-choice-field {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.skills-choice-field legend,
+.skills-choice-field small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.skills-choice-field small {
+  flex-basis: 100%;
+}
+
+.skills-source-heading {
+  margin-top: 14px;
+}
+
+.skills-source-label textarea {
+  min-height: 220px;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.skills-markdown-preview {
+  max-height: 320px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.skills-markdown-preview h3 {
+  color: var(--text);
+}
+
+.skills-markdown-code {
+  max-width: 100%;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--bg);
+  direction: ltr;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.skills-markdown-list-item {
+  margin-inline-start: 14px;
+}
+
+.skills-history-row {
+  justify-content: space-between;
+  padding-block: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.skills-history-row > div,
+.task-skills-card li {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.skills-history-row small,
+.task-skills-card small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.skills-error,
+.skills-warning {
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--red) 50%, transparent);
+  border-radius: 9px;
+  color: var(--red);
+  overflow-wrap: anywhere;
+}
+
+.skills-warning {
+  color: #ffd28a;
+  border-color: color-mix(in srgb, #ffd28a 45%, transparent);
+}
+
+.skills-saving {
+  position: sticky;
+  bottom: 4px;
+  padding: 8px;
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--surface-raised);
+}
+
+.skills-page :is(button, input, select, textarea):focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+}
+
+.task-skills-card {
+  margin-bottom: 12px;
+}
+
+.task-skills-card ul {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding-inline-start: 0;
+  list-style: none;
+}
+
+@media (min-width: 860px) {
+  .skills-layout {
+    grid-template-columns: minmax(260px, 0.9fr) minmax(340px, 1.3fr);
+    align-items: start;
+  }
+
+  .skills-list {
+    position: sticky;
+    top: 8px;
+    max-height: min(620px, 70vh);
+  }
+}
+
+@media (max-width: 390px) {
+  .skills-page-heading,
+  .skills-library-toolbar,
+  .skills-save-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .skills-form-grid,
+  .skills-filters {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

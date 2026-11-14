@@ -16,6 +16,8 @@ import type { CompanionStatus } from "../src/ui/companion-client";
 import { NavigationDrawer } from "../src/ui/workspace-navigation";
 import { BrandKitManager, newBrandKit } from "../src/ui/brand-kit-manager";
 import type { BrandKitStoreSnapshot } from "../src/shared/brand-kit";
+import { DesignSkillsManager } from "../src/ui/design-skills-manager";
+import type { DesignSkillStoreSnapshot } from "../src/shared/design-skill";
 
 function render(view: PluginView = "design"): string {
   return renderToStaticMarkup(<App initialView={view} />);
@@ -42,6 +44,23 @@ function renderBrandKitManager(
       loading={loading}
       loadError={loadError}
       onSnapshot={() => undefined}
+      onNavigate={() => undefined}
+    />,
+  );
+}
+
+function renderSkillsManager(
+  snapshot: DesignSkillStoreSnapshot | null = null,
+  loading = true,
+  loadError = "",
+): string {
+  return renderToStaticMarkup(
+    <DesignSkillsManager
+      snapshot={snapshot}
+      loading={loading}
+      loadError={loadError}
+      onSnapshot={() => undefined}
+      onRetry={() => undefined}
       onNavigate={() => undefined}
     />,
   );
@@ -100,7 +119,7 @@ describe("plugin UI navigation and capability states", () => {
     expect(more).not.toContain("Settings &amp; Model Health");
   });
 
-  it("replaces the Brand Kit placeholder with its persistent manager and keeps Skills truthful", () => {
+  it("replaces the Brand Kit and Skills placeholders with persistent local managers", () => {
     const brandKit = render("brand-kit");
     expect(brandKit).toContain("مدیریت کیت برند");
     expect(brandKit).toContain("در حال بارگذاری برندهای محلی");
@@ -108,8 +127,10 @@ describe("plugin UI navigation and capability states", () => {
       "Brand Kit creation, editing, and generation integration are not available",
     );
     expect(render("brand-kit-create")).toContain("مدیریت کیت برند");
-    expect(render("skills")).toContain("No skill text is loaded or executed");
-    expect(render("skill-add")).toContain("No file is read or executed here");
+    expect(render("skills")).toContain("مدیریت مهارت‌های طراحی");
+    expect(render("skill-add")).toContain("مدیریت مهارت‌های طراحی");
+    expect(renderSkillsManager()).toContain("واردکردن Markdown");
+    expect(renderSkillsManager()).toContain("در حال بارگذاری کتابخانهٔ محلی");
   });
 
   it("shows empty, integrity and storage-error states in the Brand Kit manager", () => {
@@ -171,7 +192,7 @@ describe("plugin UI navigation and capability states", () => {
     const html = render("chat");
     expect(html).toMatchSnapshot("approved Chat page markup");
 
-    const appSource = readFileSync("src/ui/App.tsx", "utf8");
+    const appSource = readFileSync("src/ui/App.tsx", "utf8").replace(/\r\n/gu, "\n");
     const controllerRef = appSource.indexOf("const chatTask = useRef<ChatTask | null>(null);");
     const appPageRender = appSource.indexOf("return (\n    <main className={`app-shell");
     expect(controllerRef).toBeGreaterThan(-1);
