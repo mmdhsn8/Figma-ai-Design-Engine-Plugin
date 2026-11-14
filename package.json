@@ -12,6 +12,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run",
+    "qa:native-repair": "vitest run tests/native-repair-recovery.test.ts tests/native-visual-quality.test.ts --maxWorkers=1",
     "verify:phase5": "node scripts/verify-phase5-build.mjs",
     "bench:phase5": "node scripts/benchmark-phase5.mjs"
   },

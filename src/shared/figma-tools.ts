@@ -47,7 +47,12 @@ const LayoutSchema = z
 export const AutoLayoutRepairReportSchema = z.object({
   ref: RefSchema,
   parentRef: RefSchema.optional(),
-  strategy: z.enum(["hug-vertical-content", "unsupported-preserve-layout"]),
+  strategy: z.enum([
+    "hug-vertical-content",
+    "fill-cross-axis-and-hug-vertical-content",
+    "unsupported-preserve-layout",
+  ]),
+  resizedChildren: z.array(RefSchema).max(100).optional(),
   required: DimensionsSchema,
   before: z.object({
     width: z.number().finite(),
@@ -159,6 +164,7 @@ export const FigmaToolActionSchema = z.discriminatedUnion("tool", [
       opacity: z.number().finite().min(0).max(1).optional(),
       shadow: ShadowSchema.optional(),
       clipsContent: z.boolean().optional(),
+      overflowDirection: z.enum(["NONE", "HORIZONTAL", "VERTICAL", "BOTH"]).optional(),
       autoLayout: LayoutSchema.optional(),
     })
     .strict()

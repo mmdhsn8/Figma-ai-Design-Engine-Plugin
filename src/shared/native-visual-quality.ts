@@ -63,6 +63,7 @@ export interface NativeVisualNode {
   layoutPositioning?: string;
   textAlignHorizontal?: string;
   clipsContent?: boolean;
+  overflowDirection?: "NONE" | "HORIZONTAL" | "VERTICAL" | "BOTH";
   absoluteTransform?: [[number, number, number], [number, number, number]];
   bounds?: { x: number; y: number; width: number; height: number };
   children?: NativeVisualNode[];
@@ -158,6 +159,7 @@ export const NativeVisualNodeSchema: z.ZodType<NativeVisualNode> = z.lazy(() =>
       layoutPositioning: z.string().max(40).optional(),
       textAlignHorizontal: z.string().max(40).optional(),
       clipsContent: z.boolean().optional(),
+      overflowDirection: z.enum(["NONE", "HORIZONTAL", "VERTICAL", "BOTH"]).optional(),
       absoluteTransform: z
         .tuple([
           z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]),
@@ -426,6 +428,24 @@ function overflowAmount(parent: NativeVisualNode, child: NativeVisualNode): numb
   );
 }
 
+function isIntentionalScrollOverflow(parent: NativeVisualNode, child: NativeVisualNode): boolean {
+  const direction = parent.overflowDirection;
+  if (!direction || direction === "NONE") return false;
+  const relative = childBoundsInParent(parent, child);
+  const outer = relative
+    ? { x: 0, y: 0, width: parent.width, height: parent.height }
+    : rect(parent);
+  const inner = relative ?? rect(child);
+  const epsilon = 1e-3;
+  const overflowsX =
+    inner.x < outer.x - epsilon || inner.x + inner.width > outer.x + outer.width + epsilon;
+  const overflowsY =
+    inner.y < outer.y - epsilon || inner.y + inner.height > outer.y + outer.height + epsilon;
+  const allowsX = direction === "HORIZONTAL" || direction === "BOTH";
+  const allowsY = direction === "VERTICAL" || direction === "BOTH";
+  return (!overflowsX || allowsX) && (!overflowsY || allowsY);
+}
+
 export function auditNativeSection(
   roots: NativeVisualNode[],
   expectedRefs: string[],
@@ -472,7 +492,11 @@ export function auditNativeSection(
         expected: "visible=true",
         actual: "visible=false",
       });
-    if (parent?.clipsContent && !contains(parent, node)) {
+    if (
+      parent?.clipsContent &&
+      !contains(parent, node) &&
+      !isIntentionalScrollOverflow(parent, node)
+    ) {
       const flow = (parent.children ?? []).filter(
         (child) => child.visible && child.layoutPositioning !== "ABSOLUTE",
       );
@@ -521,6 +545,7 @@ export function auditNativeSection(
             counterSizing: parent.counterAxisSizingMode,
             horizontal: parent.layoutSizingHorizontal,
             vertical: parent.layoutSizingVertical,
+            overflowDirection: parent.overflowDirection ?? "NONE",
           },
           childLayoutPositioning: node.layoutPositioning ?? "AUTO",
         }),

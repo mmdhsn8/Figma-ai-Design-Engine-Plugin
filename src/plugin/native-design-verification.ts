@@ -43,6 +43,7 @@ type InspectableNode = SceneNode & {
   layoutSizingVertical?: string;
   layoutPositioning?: string;
   clipsContent?: boolean;
+  overflowDirection?: "NONE" | "HORIZONTAL" | "VERTICAL" | "BOTH";
   cornerRadius?: number | symbol;
   opacity?: number;
   strokeWeight?: number;
@@ -168,6 +169,7 @@ function snapshotNode(node: InspectableNode): NativeVisualNode {
     ...(node.layoutSizingVertical ? { layoutSizingVertical: node.layoutSizingVertical } : {}),
     ...(node.layoutPositioning ? { layoutPositioning: node.layoutPositioning } : {}),
     ...(node.clipsContent !== undefined ? { clipsContent: node.clipsContent } : {}),
+    ...(node.overflowDirection ? { overflowDirection: node.overflowDirection } : {}),
     ...(node.absoluteBoundingBox ? { bounds: node.absoluteBoundingBox } : {}),
     ...(transform
       ? { absoluteTransform: transform as [[number, number, number], [number, number, number]] }

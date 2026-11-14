@@ -431,4 +431,37 @@ describe("professional native-design quality baseline", () => {
     };
     expect(auditNativeSection([rtlLayout], ["rtl-root", "rtl-nested", "rtl-copy"])).toEqual([]);
   });
+
+  it("allows configured vertical scroll overflow while retaining cross-axis clipping findings", () => {
+    const root: NativeVisualNode = {
+      ref: "scroll-root",
+      type: "FRAME",
+      name: "Mobile viewport",
+      x: 0,
+      y: 0,
+      width: 390,
+      height: 844,
+      visible: true,
+      clipsContent: true,
+      overflowDirection: "VERTICAL",
+      children: [
+        {
+          ref: "long-content",
+          type: "FRAME",
+          name: "Long content",
+          x: 0,
+          y: 0,
+          width: 390,
+          height: 900,
+          visible: true,
+        },
+      ],
+    };
+    expect(auditNativeSection([root], ["scroll-root", "long-content"])).toEqual([]);
+
+    root.children![0]!.width = 400;
+    expect(auditNativeSection([root], ["scroll-root", "long-content"])).toMatchObject([
+      { code: "clipped-child", ref: "long-content" },
+    ]);
+  });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { ChatTaskSchema, chatTaskSafeDiagnostic } from "../src/shared/chat-task";
-import { parseResponsesFunctionCalls } from "../src/shared/chat-tools";
+import { ChatTaskSchema, chatTaskSafeDiagnostic, type ChatTask } from "../src/shared/chat-task";
+import { parseResponsesFunctionCalls, type ChatInputItem } from "../src/shared/chat-tools";
 import { FigmaToolBatchSchema, type FigmaToolOperation } from "../src/shared/figma-tools";
 import type { PluginToUIMessage } from "../src/shared/messages";
 import { createFigmaToolExecutor } from "../src/plugin/figma-tool-executor";
@@ -338,4 +338,278 @@ describe("registered plugin saved verification recovery", () => {
       });
     },
   );
+
+  it("rejects a short mobile root, repairs 330px content into a 310px body, and completes three stages", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    let callNumber = 0;
+    const turn = (actions: Array<Record<string, unknown>>): AuthorizedChatTurn => {
+      const calls = parseResponsesFunctionCalls(
+        actions.map(({ tool, ...args }) => ({
+          type: "function_call",
+          call_id: `layout_call_${++callNumber}`,
+          name: tool,
+          arguments: JSON.stringify(args),
+        })),
+      );
+      return {
+        kind: "tool_calls",
+        calls,
+        functionCallItems: calls.map((call) => call.functionCall),
+        text: "",
+      };
+    };
+    const frame = (
+      ref: string,
+      parent: string | undefined,
+      width: number,
+      height: number,
+      extra: Record<string, unknown> = {},
+    ) => ({
+      tool: "create_frame",
+      ref,
+      name: ref,
+      parent: parent ? { kind: "node", ref: parent } : { kind: "page" },
+      size: { width, height },
+      ...extra,
+    });
+    const brief = {
+      platform: "mobile",
+      viewport: { width: 390, height: 844 },
+      brandDirection: "Clothing store",
+      audience: "Shoppers",
+      content: ["Header", "Products", "Details"],
+      hierarchy: "Scrollable product content below a fixed mobile viewport",
+      typography: { family: "Inter", style: "Regular", headingSize: 28, bodySize: 14 },
+      spacingScale: [8, 16],
+      radiusScale: [8, 16],
+      palette: {
+        source: "curated-default",
+        background: "#FFFFFF",
+        surface: "#FFFFFF",
+        primary: "#006699",
+        accent: "#99CCDD",
+        text: "#111111",
+        muted: "#777777",
+      },
+      imagePolicy: "labeled-native-fallback",
+      interactionPriorities: ["Browse"],
+      readingDirection: "LTR",
+    };
+    const pageRoot = (ref: string) =>
+      frame(ref, undefined, 390, 844, {
+        clipsContent: true,
+        overflowDirection: "VERTICAL",
+        fill: "#FFFFFF",
+        autoLayout: {
+          direction: "vertical",
+          primarySizing: "FIXED",
+          counterSizing: "FIXED",
+          padding: { top: 20, right: 20, bottom: 20, left: 20 },
+        },
+      });
+    const turns: AuthorizedChatTurn[] = [
+      turn([{ tool: "classify_canvas_intent", intent: "create" }]),
+      turn([{ tool: "get_document_context" }]),
+      turn([
+        {
+          tool: "plan_canvas_task",
+          brief,
+          stages: [
+            {
+              title: "Storefront",
+              goal: "Create the native mobile storefront with scrollable content.",
+              logicalRefs: ["screen-1", "body-1", "content-1"],
+              completionCriteria: ["Viewport dimensions and native content fit are verified."],
+            },
+            {
+              title: "Product detail",
+              goal: "Create the native product detail screen.",
+              logicalRefs: ["screen-2"],
+              completionCriteria: ["The product detail screen matches the mobile viewport."],
+            },
+            {
+              title: "Cart",
+              goal: "Create the native cart screen.",
+              logicalRefs: ["screen-3"],
+              completionCriteria: ["The cart screen matches the mobile viewport."],
+            },
+          ],
+        },
+      ]),
+      turn([{ ...pageRoot("screen-1"), size: { width: 390, height: 201 } }]),
+      turn([
+        pageRoot("screen-1"),
+        frame("body-1", "screen-1", 350, 145, {
+          clipsContent: true,
+          autoLayout: {
+            direction: "vertical",
+            primarySizing: "FIXED",
+            counterSizing: "FIXED",
+            padding: { top: 20, right: 20, bottom: 20, left: 20 },
+          },
+        }),
+        frame("content-1", "body-1", 330, 835, { fill: "#EEEEEE" }),
+      ]),
+      turn([
+        {
+          tool: "set_properties",
+          ref: "screen-1",
+          properties: { height: 201 },
+        },
+      ]),
+      turn([{ tool: "complete_canvas_stage", summary: "Verify storefront" }]),
+      turn([{ tool: "complete_canvas_stage", summary: "Complete repaired storefront" }]),
+      turn([pageRoot("screen-2")]),
+      turn([{ tool: "complete_canvas_stage", summary: "Verify product detail" }]),
+      turn([pageRoot("screen-3")]),
+      turn([{ tool: "complete_canvas_stage", summary: "Verify cart" }]),
+      { kind: "done", text: "All three mobile screens passed native verification." },
+    ];
+    const task = ChatTaskSchema.parse({
+      version: 1,
+      id: "chat-native-layout-390px",
+      referenceScope: "task-v1",
+      documentId: "file-test-56-page_current",
+      prompt: "Create a three-screen mobile clothing store.",
+      context: [],
+      stages: [],
+      ledger: [],
+      pending: [],
+      recent: [],
+      starts: [],
+      rounds: 0,
+      status: "ready",
+      text: "",
+    });
+    const nativeActions: FigmaToolOperation[] = [];
+    const checkpoints: ChatTask[] = [];
+    const modelInputs: ChatInputItem[][] = [];
+    let batchNumber = 0;
+    let clock = Date.now();
+    let reflowInstalled = false;
+    const execute = async (operations: FigmaToolOperation[]) => {
+      nativeActions.push(...operations);
+      if (
+        !reflowInstalled &&
+        operations.some(
+          ({ action }) =>
+            action.tool === "inspect_nodes" && action.purpose === "structural_verification",
+        )
+      ) {
+        const body = mock.find("body-1")!;
+        const content = mock.find("content-1")!;
+        let horizontal = content.layoutSizingHorizontal as "FIXED" | "HUG" | "FILL";
+        Object.defineProperty(content, "layoutSizingHorizontal", {
+          configurable: true,
+          get: () => horizontal,
+          set: (value: "FIXED" | "HUG" | "FILL") => {
+            horizontal = value;
+            if (value === "FILL")
+              content.resize(
+                body.width - Number(body.paddingLeft) - Number(body.paddingRight),
+                content.height,
+              );
+          },
+        });
+        let primary = body.primaryAxisSizingMode as "AUTO" | "FIXED";
+        Object.defineProperty(body, "primaryAxisSizingMode", {
+          configurable: true,
+          get: () => primary,
+          set: (value: "AUTO" | "FIXED") => {
+            primary = value;
+            if (value === "AUTO")
+              body.resize(
+                body.width,
+                Number(body.paddingTop) + content.height + Number(body.paddingBottom),
+              );
+          },
+        });
+        reflowInstalled = true;
+      }
+      const batchId = `layout_batch_${++batchNumber}`;
+      await executor(
+        FigmaToolBatchSchema.parse({
+          type: "tool-execute",
+          protocolVersion: 1,
+          batchId,
+          operations,
+        }),
+      );
+      const result = messages.find(
+        (message) => message.type === "tool-result" && message.batchId === batchId,
+      );
+      if (result?.type !== "tool-result") throw new Error("Native acknowledgement missing");
+      return result;
+    };
+    const controller = new AbortController();
+    const model = vi.fn(async (input: ChatInputItem[]) => {
+      modelInputs.push(input);
+      const next = turns.shift();
+      if (!next) throw new Error("Unexpected model request after the three-stage fixture.");
+      return next;
+    });
+
+    await runChatTask(task, {
+      model,
+      execute,
+      progress: () => {},
+      now: () => clock,
+      wait: async (ms) => {
+        clock += ms;
+      },
+      signal: controller.signal,
+      save: async (checkpoint) => {
+        ChatTaskSchema.parse(checkpoint);
+        checkpoints.push(structuredClone(checkpoint));
+      },
+    });
+
+    expect(task.status).toBe("completed");
+    expect(task.validationCorrections).toBe(2);
+    expect(task.stages.map(({ completed }) => completed)).toEqual([true, true, true]);
+    expect(task.stages[0]).toMatchObject({
+      repairOperationsExecuted: 1,
+      repairFindingsResolved: 1,
+      qualityFindings: [],
+      nativeQualityCoverage: { complete: true, findingCount: 0 },
+    });
+    expect(mock.nodes).toHaveLength(5);
+    expect(mock.find("screen-1")!.height).toBe(844);
+    expect(mock.find("screen-1")!.overflowDirection).toBe("VERTICAL");
+    expect(mock.find("screen-2")!.height).toBe(844);
+    expect(mock.find("screen-3")!.height).toBe(844);
+    expect(mock.find("content-1")!.width).toBe(310);
+    expect(mock.find("body-1")!.height).toBe(875);
+    expect(new Set(mock.nodes.map(({ name }) => name)).size).toBe(mock.nodes.length);
+    expect(nativeActions.filter(({ action }) => action.tool === "set_auto_layout")).toHaveLength(1);
+    expect(nativeActions.filter(({ action }) => action.tool === "create_frame")).toHaveLength(5);
+    expect(nativeActions.some(({ action }) => action.tool === "set_properties")).toBe(false);
+    expect(
+      nativeActions.some(
+        ({ action }) => action.tool === "create_frame" && action.size.height === 201,
+      ),
+    ).toBe(false);
+    expect(
+      modelInputs.some((input) =>
+        input.some(
+          (item) =>
+            "role" in item &&
+            item.role === "user" &&
+            item.content.includes("mobile_viewport_contract"),
+        ),
+      ),
+    ).toBe(true);
+    expect(checkpoints.at(-1)?.stages.map(({ completed }) => completed)).toEqual([
+      true,
+      true,
+      true,
+    ]);
+    expect(
+      task.ledger.filter(
+        ({ acknowledgementStatus }) => acknowledgementStatus === "confirmed_mutation",
+      ),
+    ).toHaveLength(6);
+  });
 });

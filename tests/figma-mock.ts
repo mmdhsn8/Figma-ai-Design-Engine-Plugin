@@ -100,6 +100,7 @@ export function createMockApi() {
       cornerRadius: 0,
       effects: [] as readonly Effect[],
       clipsContent: false,
+      overflowDirection: "NONE",
       layoutMode: "NONE",
       primaryAxisSizingMode: "FIXED",
       counterAxisSizingMode: "FIXED",

@@ -118,6 +118,8 @@ const TaskNativeNodeSchema = z
     height: z.number().finite().nonnegative(),
     visible: z.boolean(),
     layoutMode: z.string().max(20).optional(),
+    clipsContent: z.boolean().optional(),
+    overflowDirection: z.enum(["NONE", "HORIZONTAL", "VERTICAL", "BOTH"]).optional(),
     itemSpacing: z.number().finite().optional(),
     padding: z
       .object({

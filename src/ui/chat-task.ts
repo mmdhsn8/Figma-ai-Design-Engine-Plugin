@@ -4,6 +4,7 @@ import {
   modelPlanStages,
   CHAT_PLAN_VERSION,
   chatFunctionToolsForState,
+  type ChatFunctionCall,
   type ChatLifecycleState,
   type ChatInputItem,
 } from "../shared/chat-tools";
@@ -1921,6 +1922,75 @@ function editMutationBlocker(
     }
   }
   reservations?.push(...additions);
+  return undefined;
+}
+
+function mobileRootFrameBlocker(
+  task: ChatTask,
+  calls: Array<{ action: ChatFunctionCall["action"] }>,
+): string | undefined {
+  const brief = task.brief;
+  if (task.intent !== "create" || brief?.platform !== "mobile") return undefined;
+  const stage = task.stages.find((candidate) => !candidate.completed);
+  const viewportRootRef = stage?.logicalRefs[0];
+  if (!viewportRootRef) return undefined;
+  const rootCreation = calls.find(
+    ({ action }) =>
+      action.tool === "create_frame" &&
+      action.parent.kind === "page" &&
+      action.ref === viewportRootRef,
+  )?.action;
+  const savedRootCreation = task.ledger.find(
+    (entry) =>
+      entry.call.action.tool === "create_frame" &&
+      entry.call.action.ref === viewportRootRef &&
+      entry.call.action.parent.kind === "page",
+  )?.call.action;
+  const rootWidth =
+    (rootCreation?.tool === "create_frame" ? rootCreation.size.width : undefined) ??
+    (savedRootCreation?.tool === "create_frame" ? savedRootCreation.size.width : undefined) ??
+    brief.viewport.width;
+  const isMobileWidth = rootWidth >= 320 && rootWidth <= 500;
+  for (const { action } of calls) {
+    if (
+      action.tool !== "create_frame" ||
+      action.parent.kind !== "page" ||
+      action.ref !== viewportRootRef ||
+      action.size.width < 320 ||
+      action.size.width > 500
+    )
+      continue;
+    if (
+      Math.abs(action.size.width - brief.viewport.width) <= 1 &&
+      Math.abs(action.size.height - brief.viewport.height) <= 1
+    ) {
+      if (
+        action.autoLayout &&
+        (action.autoLayout.primarySizing === "AUTO" || action.autoLayout.counterSizing === "AUTO")
+      )
+        return `mobile_viewport_contract: Page-root frame “${action.name}” uses AUTO sizing on a viewport axis. Keep the ${brief.viewport.width}×${brief.viewport.height} screen boundary fixed and put content sizing on nested frames.`;
+      continue;
+    }
+    return `mobile_viewport_contract: Page-root frame “${action.name}” is ${action.size.width}×${action.size.height}; the saved mobile viewport is ${brief.viewport.width}×${brief.viewport.height}. Correct the root frame dimensions before any native mutation. Put flowing content in nested frames and set overflowDirection=VERTICAL only when vertical scrolling is intentional.`;
+  }
+  if (!isMobileWidth) return undefined;
+  for (const { action } of calls) {
+    if (action.tool === "set_properties" && action.ref === viewportRootRef) {
+      const width = action.properties.width;
+      const height = action.properties.height;
+      if (
+        (width !== undefined && Math.abs(width - brief.viewport.width) > 1) ||
+        (height !== undefined && Math.abs(height - brief.viewport.height) > 1)
+      )
+        return `mobile_viewport_contract: Properties on screen root ${action.ref} would change the saved ${brief.viewport.width}×${brief.viewport.height} viewport. Keep the root dimensions fixed and resize only its nested content frames.`;
+    }
+    if (
+      action.tool === "set_auto_layout" &&
+      action.ref === viewportRootRef &&
+      (action.layout.primarySizing === "AUTO" || action.layout.counterSizing === "AUTO")
+    )
+      return `mobile_viewport_contract: Auto Layout on screen root ${action.ref} would size a viewport axis to content. Keep the ${brief.viewport.width}×${brief.viewport.height} root fixed and size nested content frames instead.`;
+  }
   return undefined;
 }
 
@@ -5683,6 +5753,18 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           "New layers in an existing design must use declared new refs and stay inside the existing screen.",
           "planning",
         );
+        return;
+      }
+      const mobileViewportBlocker = mobileRootFrameBlocker(task, calls);
+      if (mobileViewportBlocker) {
+        if (task.validationCorrections < CHAT_TASK_MAX_VALIDATION_CORRECTIONS) {
+          task.validationCorrections++;
+          task.validationFeedback = `The entire native batch was rejected before dispatch. ${mobileViewportBlocker} Return corrected operations in dependency order.`;
+          task.recent = [];
+          await save();
+          continue;
+        }
+        await stopEdit("mobile_viewport_contract", mobileViewportBlocker, "native_execution");
         return;
       }
       const reservations: string[] = [];

@@ -911,6 +911,7 @@ function summarizeNode(node: SceneNode, ref?: string) {
           primaryAxisAlignItems: frame.primaryAxisAlignItems,
           counterAxisAlignItems: frame.counterAxisAlignItems,
           clipsContent: frame.clipsContent,
+          overflowDirection: frame.overflowDirection,
           childCount: frame.children.length,
         }
       : {}),
@@ -2063,6 +2064,8 @@ export function createFigmaToolExecutor(
           if (action.opacity !== undefined) frame.opacity = action.opacity;
           if (action.shadow) frame.effects = [shadowEffect(action.shadow)];
           if (action.clipsContent !== undefined) frame.clipsContent = action.clipsContent;
+          if (action.overflowDirection !== undefined)
+            frame.overflowDirection = action.overflowDirection;
           if (paintStyle)
             await timed(frame.setFillStyleIdAsync(paintStyle.id), "Paint token apply");
           if (action.autoLayout)
