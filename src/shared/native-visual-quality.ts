@@ -14,6 +14,7 @@ export interface NativeVisualNode {
   ownedByTask?: boolean;
   ref?: string;
   logicalRef?: string;
+  assetId?: string;
   pattern?: string;
   qualityRole?: "button" | "input" | "image" | "heading" | "body" | "decorative";
   type: string;
@@ -88,6 +89,7 @@ export const NativeVisualNodeSchema: z.ZodType<NativeVisualNode> = z.lazy(() =>
     .object({
       ref: z.string().max(80).optional(),
       logicalRef: z.string().max(120).optional(),
+      assetId: z.string().max(100).optional(),
       pattern: z.string().max(40).optional(),
       qualityRole: z.enum(["button", "input", "image", "heading", "body", "decorative"]).optional(),
       type: z.string().max(40),

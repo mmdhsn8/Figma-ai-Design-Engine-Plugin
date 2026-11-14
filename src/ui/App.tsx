@@ -74,7 +74,7 @@ import {
   type DesignPlan,
 } from "../shared/design-generation";
 import { createGenerationTransaction } from "../shared/generation-transaction";
-import { prepareGeneratedDesign } from "./design-generation";
+import { applyPinnedBrandLogoToSection, prepareGeneratedDesign } from "./design-generation";
 import {
   getInferenceEligibility,
   getInferenceStatusLabel,
@@ -87,6 +87,12 @@ import {
   type ModelCatalogState,
 } from "../shared/model-preference";
 import { inspectEmbeddedImage, parseSafeSvg } from "../shared/visual-assets";
+import {
+  pinBrandKit,
+  type BrandKitStoreSnapshot,
+} from "../shared/brand-kit";
+import { brandKitRequest, resolvePinnedBrandAssets } from "./brand-kit-bridge";
+import { BrandKitManager } from "./brand-kit-manager";
 import {
   CompanionClientError,
   cancelLocalPairing,
@@ -420,6 +426,40 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     return () => window.cancelAnimationFrame(focusFrame);
   }, [activeView, settingsOpen]);
   const [prompt, setPrompt] = useState("");
+  const [brandKitStore, setBrandKitStore] = useState<BrandKitStoreSnapshot | null>(null);
+  const [brandKitLoading, setBrandKitLoading] = useState(true);
+  const [brandKitLoadError, setBrandKitLoadError] = useState("");
+  const brandKitStoreRef = useRef<BrandKitStoreSnapshot | null>(null);
+  const brandKitLoadInFlight = useRef<Promise<BrandKitStoreSnapshot> | null>(null);
+  const ensureBrandKitLoaded = useCallback(async () => {
+    if (brandKitStoreRef.current) return brandKitStoreRef.current;
+    if (brandKitLoadInFlight.current) return brandKitLoadInFlight.current;
+    const load = brandKitRequest({ action: "load" }).then((result) => {
+      if (!result.success || !result.snapshot) throw new Error(result.error ?? "Brand Kit storage is unavailable.");
+      brandKitStoreRef.current = result.snapshot;
+      setBrandKitStore(result.snapshot);
+      setBrandKitLoadError("");
+      return result.snapshot;
+    }).finally(() => {
+      brandKitLoadInFlight.current = null;
+      setBrandKitLoading(false);
+    });
+    brandKitLoadInFlight.current = load;
+    return load;
+  }, []);
+  useEffect(() => {
+    let current = true;
+    void ensureBrandKitLoaded().catch((error: unknown) => {
+      if (current) setBrandKitLoadError(error instanceof Error ? error.message : "Brand Kit storage is unavailable.");
+    }).finally(() => current && setBrandKitLoading(false));
+    return () => { current = false; };
+  }, [ensureBrandKitLoaded]);
+  const acceptBrandKitSnapshot = (snapshot: BrandKitStoreSnapshot) => {
+    brandKitStoreRef.current = snapshot;
+    setBrandKitStore(snapshot);
+    setBrandKitLoadError("");
+  };
+  const defaultBrandKit = brandKitStore?.brands.find(({ id, status }) => id === brandKitStore.defaultBrandId && status === "active");
   const [generationTarget, setGenerationTarget] = useState<GenerationTarget>("mobile");
   const [generationScreenCount, setGenerationScreenCount] = useState(2);
   const [generationScreenNames, setGenerationScreenNames] = useState("");
@@ -576,8 +616,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     ],
   );
   const generationPlan = useMemo(
-    () => createDesignPlan(designGenerationInput),
-    [designGenerationInput],
+    () => createDesignPlan(designGenerationInput, defaultBrandKit ? pinBrandKit(defaultBrandKit) : undefined),
+    [defaultBrandKit, designGenerationInput],
   );
   const generationInFlight = [
     "planning",
@@ -1017,6 +1057,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           title: message.generatedScreens + " of " + message.totalScreens + " screens generated",
           details: multiScreenResultLines(message),
         });
+      } else if (message.type === "brand-kit-result") {
+        // The Brand Kit bridge owns these request-scoped responses.
+        return;
       } else {
         const counts = message.counts;
         const fonts = [
@@ -1682,6 +1725,10 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             "This chat has a saved task that needs recovery. Resume it before starting another request.",
           );
         const id = `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const brandStore = await ensureBrandKitLoaded();
+        const selectedBrand = brandStore.brands.find(
+          ({ id: brandId, status }) => brandId === brandStore.defaultBrandId && status === "active",
+        );
         assistantId = id;
         chatTask.current = {
           version: 1,
@@ -1691,6 +1738,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           documentId: loaded.documentId,
           prompt: text,
           model: selectedCompanionModel,
+          ...(selectedBrand ? { brandKit: pinBrandKit(selectedBrand) } : {}),
           lifecycle: "UNPLANNED",
           modelRoundTrace: [],
           context: chatTask.current?.documentId === loaded.documentId ? chatModelInput.current : [],
@@ -2318,12 +2366,26 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
   const generateDesignFromBrief = async () => {
     if (generationRequest.current) return;
-    const planResult = createDesignPlan(designGenerationInput);
+    let brandStore: BrandKitStoreSnapshot;
+    try {
+      brandStore = await ensureBrandKitLoaded();
+    } catch (error) {
+      setGenerationState("failed");
+      setGenerationErrors([error instanceof Error ? error.message : "Brand Kit storage is unavailable."]);
+      return;
+    }
+    const selectedBrand = brandStore.brands.find(
+      ({ id, status }) => id === brandStore.defaultBrandId && status === "active",
+    );
+    let pinnedBrand = selectedBrand ? pinBrandKit(selectedBrand) : undefined;
+    let brandVisualAssets: Awaited<ReturnType<typeof resolvePinnedBrandAssets>>;
+    const planResult = createDesignPlan(designGenerationInput, pinnedBrand);
     if (!planResult.success) {
       setGenerationState("failed");
       setGenerationErrors(planResult.errors);
       return;
     }
+    let planData: DesignPlan = planResult.data;
     if (generationBlockReason || !companionToken || !selectedCompanionModel) {
       setGenerationState("failed");
       setGenerationErrors([generationBlockReason ?? "Connect the authorized companion first."]);
@@ -2366,7 +2428,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
     const draftKey = JSON.stringify({
       model: selectedCompanionModel,
-      request: planResult.data.request,
+      request: planData.request,
     });
     let draft: GenerationDraft = {
       screens: [],
@@ -2376,13 +2438,14 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         documentId,
         generationId: `generation-${nextRequestId()}`,
         model: selectedCompanionModel,
-        request: planResult.data.request,
+        request: planData.request,
+        ...(pinnedBrand ? { brandKit: pinnedBrand } : {}),
         createdAt: Date.now(),
       },
     };
     setGenerationScreenProgress({
       completed: 0,
-      total: planResult.data.screens.length,
+      total: planData.screens.length,
       retrying: false,
     });
     const nativeWarnings: string[] = [];
@@ -2405,7 +2468,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         group.push(transaction);
         groups.set(id, group);
       }
-      return planResult.data.screens.flatMap((screen) => {
+      return planData.screens.flatMap((screen) => {
         const group = [...(groups.get(screen.id) ?? [])].sort(
           (a, b) => a.transaction.sequence - b.transaction.sequence,
         );
@@ -2421,7 +2484,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       });
     };
     const updateScreenProgress = () => {
-      const complete = planResult.data.screens.filter(
+      const complete = planData.screens.filter(
         (screen) =>
           legacyScreenIds.has(screen.id) ||
           draft.transactions.some(
@@ -2430,7 +2493,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       ).length;
       setGenerationScreenProgress({
         completed: complete,
-        total: planResult.data.screens.length,
+        total: planData.screens.length,
         retrying: false,
       });
     };
@@ -2525,15 +2588,15 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         );
       const recovered = await loadSavedDraft(companionToken, documentId);
       if (recovered) {
-        if (
-          JSON.stringify({
-            model: recovered.manifest.model,
-            request: recovered.manifest.request,
-          }) !== draftKey
-        )
+        if (JSON.stringify({ model: recovered.manifest.model, request: recovered.manifest.request }) !== draftKey)
           throw new Error(
             "A different saved draft exists for this document/page. Resume it or explicitly clear its checkpoint before starting another project.",
           );
+        pinnedBrand = recovered.manifest.brandKit;
+        const recoveredPlan = createDesignPlan(recovered.manifest.request, pinnedBrand);
+        if (!recoveredPlan.success) throw new Error("Saved plan is invalid; its original brand pin was preserved.");
+        planData = recoveredPlan.data;
+        brandVisualAssets = await resolvePinnedBrandAssets(pinnedBrand);
         draft = {
           manifest: recovered.manifest,
           screens: recovered.screens.flatMap(({ design }) => design.screens),
@@ -2542,6 +2605,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           palette: recovered.screens[0]?.design.palette,
         };
       } else {
+        brandVisualAssets = await resolvePinnedBrandAssets(pinnedBrand);
         await draftRequest(
           companionToken,
           documentId,
@@ -2600,7 +2664,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       }
       updateScreenProgress();
 
-      const skeletonScreenIds = planResult.data.screens
+      const skeletonScreenIds = planData.screens
         .filter((screen) => !legacyScreenIds.has(screen.id))
         .map(({ id }) => id);
       if (skeletonScreenIds.length) {
@@ -2614,10 +2678,10 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         });
       }
 
-      for (const screen of planResult.data.screens) {
+      for (const screen of planData.screens) {
         if (legacyScreenIds.has(screen.id)) continue;
-        const screenPlan = { ...planResult.data, screens: [screen] };
-        const sections = createDesignSections(planResult.data);
+        const screenPlan = { ...planData, screens: [screen] };
+        const sections = createDesignSections(planData);
         setScreenStages((stages) => ({ ...stages, [screen.id]: "generating sections" }));
         for (const section of sections) {
           activeSectionKey = sectionKey(screen.id, section.id);
@@ -2650,7 +2714,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               companionToken,
               screenRequestId,
               selectedCompanionModel,
-              planResult.data.request,
+              planData.request,
               repairIssues,
               fetch,
               controller.signal,
@@ -2679,6 +2743,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                 }));
               },
               { id: section.id, sequence: section.sequence },
+              draft.manifest.brandKit,
             );
             setStageMetrics((metrics) => ({
               ...metrics,
@@ -2699,11 +2764,12 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             const validated = normalizeGeneratedDesignResponse(raw, screenPlan);
             const issues = validated.success ? [] : validated.errors;
             if (validated.success) {
-              const generated = {
+              let generated = {
                 ...validated.data.design,
                 projectName: draft.projectName ?? validated.data.design.projectName,
                 palette: draft.palette ?? validated.data.design.palette,
               };
+              generated = applyPinnedBrandLogoToSection(generated, screenPlan, section.id, brandVisualAssets);
               const sectionRoot = generated.screens[0]?.children[0];
               if (
                 generated.screens[0]?.children.length !== 1 ||
@@ -2812,7 +2878,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
       const completeScreens = composeScreens();
       if (
-        completeScreens.length !== planResult.data.screens.length ||
+        completeScreens.length !== planData.screens.length ||
         !draft.projectName ||
         !draft.palette
       )
@@ -2824,11 +2890,12 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         palette: draft.palette,
         screens: completeScreens,
       } satisfies GeneratedDesign);
-      const prepared = prepareGeneratedDesign(raw, planResult.data);
+      const prepared = prepareGeneratedDesign(raw, planData, { assets: brandVisualAssets });
       if (!prepared.success)
         throw new Error(
           `Saved sections did not compose into a valid complete design. ${prepared.errors.join(" ")}`,
         );
+      nativeWarnings.push(...prepared.data.brandConflicts);
       setGenerationState("validating");
       for (const screen of completeScreens) {
         const verificationStarted = performance.now();
@@ -2860,7 +2927,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       ];
       setGenerationPreview({
         json: prepared.data.json,
-        plan: planResult.data,
+        plan: planData,
         projectName: prepared.data.batch.name,
         nodeCount: prepared.data.nodeCount,
         repairAttempts,
@@ -3296,12 +3363,20 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           onNavigate={(view) => dispatchNavigation({ type: "navigate", view })}
           onOpenSettings={() => dispatchNavigation({ type: "open-settings" })}
         />
+      ) : activeView === "brand-kit" || activeView === "brand-kit-create" ? (
+        <BrandKitManager
+          key={activeView}
+          snapshot={brandKitStore}
+          loading={brandKitLoading}
+          loadError={brandKitLoadError}
+          createNew={activeView === "brand-kit-create"}
+          onSnapshot={acceptBrandKitSnapshot}
+          onNavigate={(view) => dispatchNavigation({ type: "navigate", view })}
+        />
       ) : activeView === "progress" ||
         activeView === "activity" ||
         activeView === "results" ||
         activeView === "layers" ||
-        activeView === "brand-kit" ||
-        activeView === "brand-kit-create" ||
         activeView === "skills" ||
         activeView === "skill-detail" ||
         activeView === "skill-add" ||
@@ -3834,6 +3909,11 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             </div>
             <span className="availability-tag">Preview</span>
           </div>
+
+          <section className="brand-kit-generation-selection" aria-label="برند انتخاب‌شده برای ساخت تازه">
+            <div><span className="section-kicker">برند کارهای تازه</span><strong>{brandKitLoading ? "در حال بررسی انتخاب برند…" : defaultBrandKit ? <><bdi>{defaultBrandKit.name}</bdi> · نسخهٔ {defaultBrandKit.revision}</> : "بدون برند؛ ساخت معمولی ادامه دارد"}</strong></div>
+            <button className="text-button" type="button" onClick={() => dispatchNavigation({ type: "navigate", view: "brand-kit" })}>مدیریت برندها</button>
+          </section>
 
           <section className="prompt-card" aria-labelledby="prompt-label">
             <label className="prompt-label" id="prompt-label" htmlFor="design-prompt">

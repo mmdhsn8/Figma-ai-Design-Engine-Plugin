@@ -14,6 +14,8 @@ import App, {
 } from "../src/ui/App";
 import type { CompanionStatus } from "../src/ui/companion-client";
 import { NavigationDrawer } from "../src/ui/workspace-navigation";
+import { BrandKitManager, newBrandKit } from "../src/ui/brand-kit-manager";
+import type { BrandKitStoreSnapshot } from "../src/shared/brand-kit";
 
 function render(view: PluginView = "design"): string {
   return renderToStaticMarkup(<App initialView={view} />);
@@ -27,6 +29,22 @@ function status(auth: CompanionStatus["auth"]): CompanionStatus {
     planUseAuthorized: auth === "scope_granted" || auth === "ready",
     modelCount: 0,
   };
+}
+
+function renderBrandKitManager(
+  snapshot: BrandKitStoreSnapshot,
+  loading = false,
+  loadError = "",
+): string {
+  return renderToStaticMarkup(
+    <BrandKitManager
+      snapshot={snapshot}
+      loading={loading}
+      loadError={loadError}
+      onSnapshot={() => undefined}
+      onNavigate={() => undefined}
+    />,
+  );
 }
 
 describe("plugin UI navigation and capability states", () => {
@@ -82,13 +100,42 @@ describe("plugin UI navigation and capability states", () => {
     expect(more).not.toContain("Settings &amp; Model Health");
   });
 
-  it("shows honest Phase A capability states for Brand Kit and Skills routes", () => {
-    expect(render("brand-kit")).toContain(
+  it("replaces the Brand Kit placeholder with its persistent manager and keeps Skills truthful", () => {
+    const brandKit = render("brand-kit");
+    expect(brandKit).toContain("مدیریت کیت برند");
+    expect(brandKit).toContain("در حال بارگذاری برندهای محلی");
+    expect(brandKit).not.toContain(
       "Brand Kit creation, editing, and generation integration are not available",
     );
-    expect(render("brand-kit-create")).toContain("No kit has been created");
+    expect(render("brand-kit-create")).toContain("مدیریت کیت برند");
     expect(render("skills")).toContain("No skill text is loaded or executed");
     expect(render("skill-add")).toContain("No file is read or executed here");
+  });
+
+  it("shows empty, integrity and storage-error states in the Brand Kit manager", () => {
+    const empty: BrandKitStoreSnapshot = {
+      version: 1,
+      brands: [],
+      defaultBrandId: null,
+      integrity: "clean",
+      preservedRecordCount: 0,
+    };
+    expect(renderBrandKitManager(empty)).toContain("هنوز برندی در این فهرست نیست");
+    expect(
+      renderBrandKitManager({ ...empty, integrity: "recovered", preservedRecordCount: 2 }),
+    ).toContain("2 مورد");
+    expect(renderBrandKitManager({ ...empty, integrity: "future-readonly" })).toContain(
+      "نسخهٔ جدیدتر",
+    );
+    expect(renderBrandKitManager(empty, false, "Local storage unavailable")).toContain(
+      "Local storage unavailable",
+    );
+
+    const kit = newBrandKit("KAJ Studio");
+    const populated = renderBrandKitManager({ ...empty, brands: [kit], defaultBrandId: kit.id });
+    expect(populated).toContain("KAJ Studio");
+    expect(populated).toContain("پیش‌فرض");
+    expect(populated).toContain("مرتب‌سازی");
   });
 
   it("exposes saved history loading and the task detail routes", () => {
@@ -155,6 +202,8 @@ describe("plugin UI navigation and capability states", () => {
     );
     expect(css.slice(css.indexOf(nonChatMarker))).toContain(".model-management-status");
     expect(css.slice(css.indexOf(nonChatMarker))).toContain(".model-management-task-choice");
+    expect(frozenCss).not.toContain("brand-kit");
+    expect(css.slice(css.indexOf(nonChatMarker))).toContain(".brand-kit-page");
   });
 
   it("switches between areas and Settings without losing the selected area", () => {

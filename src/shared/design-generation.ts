@@ -1,7 +1,12 @@
 import { z } from "zod";
 import { MAX_PROJECT_BYTES, MAX_GENERATED_NODES, utf8Bytes } from "./generation-limits.js";
 import { DESIGN_ICON_PATHS, type DesignIconName } from "./design-icons.js";
-import { DESIGN_PATTERN_IDS, designPatternInstructions, inferPatternsForScreen, type DesignPatternId } from "./design-patterns.js";
+import {
+  DESIGN_PATTERN_IDS,
+  designPatternInstructions,
+  inferPatternsForScreen,
+  type DesignPatternId,
+} from "./design-patterns.js";
 import {
   createDesignBrief,
   inferDesignDomain,
@@ -10,6 +15,7 @@ import {
   type DesignDomain,
   type DesignFidelity,
 } from "./visual-design-spec.js";
+import { PinnedBrandKitSchema, resolveBrandKitTokens, type PinnedBrandKit } from "./brand-kit.js";
 
 export const GENERATED_NODE_ROLES = [
   "brand",
@@ -30,7 +36,10 @@ export const DesignGenerationRequestSchema = z
       .number()
       .int()
       .min(1)
-      .max(400, "A generation batch supports up to 400 screens; resume large work in bounded batches."),
+      .max(
+        400,
+        "A generation batch supports up to 400 screens; resume large work in bounded batches.",
+      ),
     screenNames: z.array(z.string().trim().min(1).max(100)).optional(),
     language: z.enum(["auto", "fa", "en"]),
     style: z.string().trim().max(160),
@@ -85,6 +94,7 @@ export type DesignPlan = {
   domain: DesignDomain;
   fidelity: DesignFidelity;
   brief: DesignBrief;
+  brandKit?: PinnedBrandKit;
   screens: PlannedDesignScreen[];
 };
 
@@ -111,7 +121,7 @@ const defaultScreenNames = {
   },
 } as const;
 
-export function createDesignPlan(input: unknown): DesignPlanResult {
+export function createDesignPlan(input: unknown, pinnedBrand?: PinnedBrandKit): DesignPlanResult {
   const parsed = DesignGenerationRequestSchema.safeParse(input);
   if (!parsed.success) {
     return {
@@ -191,6 +201,7 @@ export function createDesignPlan(input: unknown): DesignPlanResult {
   const domain = inferDesignDomain(request.prompt, projectType);
   const fidelity = inferDesignFidelity(request.prompt, request.fidelity);
   const platform = request.target === "both" ? "responsive" : request.target;
+  const brandKit = pinnedBrand ? PinnedBrandKitSchema.parse(pinnedBrand) : undefined;
   const brief = createDesignBrief({
     prompt: request.prompt,
     fidelity,
@@ -199,8 +210,22 @@ export function createDesignPlan(input: unknown): DesignPlanResult {
     locale: language,
     direction,
     brandDirection: request.style,
+    brandKit,
   });
-  return { success: true, data: { request, language, direction, projectType, domain, fidelity, brief, screens } };
+  return {
+    success: true,
+    data: {
+      request,
+      language,
+      direction,
+      projectType,
+      domain,
+      fidelity,
+      brief,
+      screens,
+      ...(brandKit ? { brandKit } : {}),
+    },
+  };
 }
 
 export function createDesignSections(plan: DesignPlan): DesignSection[] {
@@ -465,7 +490,7 @@ export interface GeneratedDesignNode {
   height: number;
   fontSize: number;
   fontStyle: "Regular" | "Medium" | "Bold";
-  textAlign: "left" | "center" | "right";
+  textAlign: "left" | "center" | "right" | "justified";
   fontFamily?: string;
   lineHeight?: number;
   letterSpacing?: number;
@@ -479,6 +504,7 @@ export interface GeneratedDesignNode {
   strokePalette?: Exclude<(typeof GENERATED_NODE_ROLES)[number], "none">;
   opacity?: number;
   iconName?: DesignIconName;
+  assetId?: string;
   placeholder?: true;
   sectionId?: "identity" | "primary" | "supporting";
   children: GeneratedDesignNode[];
@@ -506,7 +532,7 @@ const NodeSchema: z.ZodType<GeneratedDesignNode> = z.lazy(() =>
       height: z.number().finite().min(1).max(10_000),
       fontSize: z.number().finite().min(8).max(64),
       fontStyle: z.enum(["Regular", "Medium", "Bold"]),
-      textAlign: z.enum(["left", "center", "right"]),
+      textAlign: z.enum(["left", "center", "right", "justified"]),
       fontFamily: z.string().trim().min(1).max(100).optional(),
       lineHeight: z.number().finite().positive().max(256).optional(),
       letterSpacing: z.number().finite().min(-10).max(100).optional(),
@@ -517,9 +543,17 @@ const NodeSchema: z.ZodType<GeneratedDesignNode> = z.lazy(() =>
       padding: z.number().finite().min(0).max(100),
       qualityRole: z.enum(["button", "input", "image", "heading", "body", "decorative"]),
       pattern: z.enum(DESIGN_PATTERN_IDS).optional(),
-      strokePalette: z.enum(["brand", "accent", "page", "surface", "text", "muted", "border"]).optional(),
+      strokePalette: z
+        .enum(["brand", "accent", "page", "surface", "text", "muted", "border"])
+        .optional(),
       opacity: z.number().finite().min(0).max(1).optional(),
-      iconName: z.enum(Object.keys(DESIGN_ICON_PATHS) as [DesignIconName, ...DesignIconName[]]).optional(),
+      iconName: z
+        .enum(Object.keys(DESIGN_ICON_PATHS) as [DesignIconName, ...DesignIconName[]])
+        .optional(),
+      assetId: z
+        .string()
+        .regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/u)
+        .optional(),
       placeholder: z.literal(true).optional(),
       sectionId: z.enum(["identity", "primary", "supporting"]).optional(),
       children: z.array(NodeSchema),
@@ -527,9 +561,27 @@ const NodeSchema: z.ZodType<GeneratedDesignNode> = z.lazy(() =>
     .strict()
     .superRefine((node, context) => {
       if (node.type === "icon" && !node.iconName)
-        context.addIssue({ code: "custom", path: ["iconName"], message: "Choose an allowlisted native icon name." });
-      if (node.type === "image" && (node.placeholder !== true || node.qualityRole !== "image"))
-        context.addIssue({ code: "custom", path: ["placeholder"], message: "Without a verified asset, image nodes must be labeled editable placeholders with qualityRole=image." });
+        context.addIssue({
+          code: "custom",
+          path: ["iconName"],
+          message: "Choose an allowlisted native icon name.",
+        });
+      if (node.assetId && node.type !== "image")
+        context.addIssue({
+          code: "custom",
+          path: ["assetId"],
+          message: "Only image nodes may reference an approved asset.",
+        });
+      if (
+        node.type === "image" &&
+        ((!node.assetId && node.placeholder !== true) || node.qualityRole !== "image")
+      )
+        context.addIssue({
+          code: "custom",
+          path: ["placeholder"],
+          message:
+            "Without a verified asset, image nodes must be labeled editable placeholders with qualityRole=image.",
+        });
     }),
 );
 
@@ -714,7 +766,15 @@ function parseGeneratedDesignResponse(
       // Commit only if the entire repaired layout fits; otherwise preserve exact validation paths.
       const margin = planned.devicePreset === "mobile" ? 20 : 32;
       const gap = planned.devicePreset === "mobile" ? 16 : 24;
-      if (layoutFits(repaired, "vertical", planned.width - margin * 2, planned.height - margin * 2, gap)) {
+      if (
+        layoutFits(
+          repaired,
+          "vertical",
+          planned.width - margin * 2,
+          planned.height - margin * 2,
+          gap,
+        )
+      ) {
         screen.children = repaired;
       }
     }
@@ -965,7 +1025,8 @@ function checkNode(
 ): void {
   addCount(1);
   if (depth > 8) issues.push(`${path} exceeds the renderer's maximum depth of 8.`);
-  if (node.sectionId && depth !== 1) issues.push(`${path} sectionId is reserved for a screen's top-level section root.`);
+  if (node.sectionId && depth !== 1)
+    issues.push(`${path} sectionId is reserved for a screen's top-level section root.`);
   if (node.type === "frame") {
     if (node.text !== null) issues.push(`${path} frame nodes cannot contain text.`);
     if (node.children.length > 0 && node.layout === "none") {
@@ -973,7 +1034,9 @@ function checkNode(
     }
   } else {
     if (node.children.length || node.layout !== "none") {
-      issues.push(`${path} only frame nodes may contain children or layout; image slots and icons are leaves.`);
+      issues.push(
+        `${path} only frame nodes may contain children or layout; image slots and icons are leaves.`,
+      );
     }
     if (node.type === "text" ? !node.text?.trim() : node.text !== null) {
       issues.push(`${path} has text content that does not match its layer type.`);
@@ -982,7 +1045,9 @@ function checkNode(
       issues.push(`${path} text layers need a visible palette role.`);
     }
     if (node.type === "image" && (node.placeholder !== true || node.qualityRole !== "image"))
-      issues.push(`${path} must be an explicitly labeled editable placeholder because no authorized image asset is attached to this generation request.`);
+      issues.push(
+        `${path} must be an explicitly labeled editable placeholder because no authorized image asset is attached to this generation request.`,
+      );
     if (node.type === "icon" && (!node.iconName || !(node.iconName in DESIGN_ICON_PATHS)))
       issues.push(`${path} must use a bundled native icon name.`);
   }
@@ -1005,7 +1070,7 @@ const generatedNodeJsonSchema = {
     height: { type: "number" },
     fontSize: { type: "number" },
     fontStyle: { type: "string", enum: ["Regular", "Medium", "Bold"] },
-    textAlign: { type: "string", enum: ["left", "center", "right"] },
+    textAlign: { type: "string", enum: ["left", "center", "right", "justified"] },
     fontFamily: { type: "string", maxLength: 100 },
     lineHeight: { type: "number" },
     letterSpacing: { type: "number" },
@@ -1019,7 +1084,10 @@ const generatedNodeJsonSchema = {
       enum: ["button", "input", "image", "heading", "body", "decorative"],
     },
     pattern: { type: "string", enum: [...DESIGN_PATTERN_IDS] },
-    strokePalette: { type: "string", enum: ["brand", "accent", "page", "surface", "text", "muted", "border"] },
+    strokePalette: {
+      type: "string",
+      enum: ["brand", "accent", "page", "surface", "text", "muted", "border"],
+    },
     opacity: { type: "number" },
     iconName: { type: "string", enum: Object.keys(DESIGN_ICON_PATHS) },
     placeholder: { type: "boolean", enum: [true] },
@@ -1101,6 +1169,15 @@ export function createDesignInstructions(plan: DesignPlan, repairIssues: string[
     "Return compact JSON. Prefer meaningful Auto Layout depth, concise layer names, and only enough nodes to realize the requirements; do not pad to a target node count. Mark actual interactive controls as button/input roles. This generation is a native editable layer tree, not a flat text list or single bitmap.",
     `Project type: ${plan.projectType}; domain: ${plan.domain}. Theme: ${plan.request.theme}. Visual direction: ${plan.request.style || "professional, refined, contemporary product UI"}. Requested screen plan:\n${screens}`,
   ];
+  if (plan.brandKit) {
+    const tokens = resolveBrandKitTokens(
+      plan.brandKit,
+      plan.request.theme === "dark" ? "dark" : "light",
+    );
+    instructions.push(
+      `Pinned Brand Kit ${plan.brandKit.name} revision ${plan.brandKit.revision} (token hash ${plan.brandKit.tokenHash}). Precedence: explicit user task constraints > pinned Brand Kit > domain defaults > safe fallback. Semantic colors: ${JSON.stringify(tokens.palette)}. Typography roles: ${JSON.stringify(tokens.typography)}. Spacing=${tokens.spacing.join(",")}; radii=${tokens.radii.join(",")}; stroke=${tokens.stroke}; shadow=${JSON.stringify(tokens.shadow)}; grid/breakpoints=${JSON.stringify(tokens.grid)}; density=${tokens.density}; component defaults=${JSON.stringify(tokens.components)}. Use the requested font family; Figma will verify availability and disclose a recorded fallback. A user-provided logo asset is applied by the local renderer when present; never invent or substitute a logo.`,
+    );
+  }
   if (repairIssues.length) {
     instructions.push(
       `This is one bounded repair attempt. Correct the exact paths below, adjusting ancestor dimensions only as needed to fit the controls, padding, and gaps. Preserve RTL, copy, palette, and the original brief and screen plan; return only the requested screen IDs:\n${repairIssues
@@ -1126,5 +1203,10 @@ export function createDesignInputText(plan: DesignPlan): string {
       )
       .join("\n"),
     "Return screen content only in the requested schema. Use palette names for node colors, and populate shared palette values as six-digit hex colors.",
+    ...(plan.brandKit
+      ? [
+          `Brand Kit is pinned as ${plan.brandKit.name} revision ${plan.brandKit.revision}. The local renderer applies this revision's semantic colors, type roles, spacing, radii and effects. Do not claim remote assets or fonts were loaded.`,
+        ]
+      : []),
   ].join("\n\n");
 }

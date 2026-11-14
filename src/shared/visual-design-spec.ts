@@ -1,5 +1,11 @@
 import { z } from "zod";
 import { MAX_GENERATED_NODES } from "./generation-limits.js";
+import {
+  PinnedBrandKitSchema,
+  BrandKitTokensSchema,
+  resolveBrandTextAlignment,
+  type PinnedBrandKit,
+} from "./brand-kit.js";
 import { DESIGN_ICON_PATHS, type DesignIconName } from "./design-icons.js";
 import {
   DESIGN_PATTERN_IDS,
@@ -42,6 +48,7 @@ export const DesignBriefSchema = z
     locale: z.enum(["fa", "en"]),
     direction: z.enum(["rtl", "ltr"]),
     brandDirection: z.string().trim().max(240),
+    brandKit: PinnedBrandKitSchema.optional(),
     requestedPatterns: z.array(z.enum(DESIGN_PATTERN_IDS)).max(18),
     assetPolicy: z.literal("provided-or-document-assets; otherwise-labeled-native-placeholder"),
     acceptanceCriteria: z.array(z.string().trim().min(1).max(240)).min(3).max(10),
@@ -70,15 +77,40 @@ const VisualNodeSchema = z
     typography: z
       .object({
         family: z.string().trim().min(1).max(100).optional(),
-        style: z.enum(["Regular", "Medium", "Bold"]),
+        fallbackFamily: z.string().trim().min(1).max(100).optional(),
+        fallbackStyle: z.string().trim().min(1).max(80).optional(),
+        style: z.string().trim().min(1).max(80),
         size: z.number().finite().min(8).max(96),
         lineHeight: z.number().finite().positive().optional(),
         letterSpacing: z.number().finite().optional(),
-        alignment: z.enum(["left", "center", "right"]),
+        alignment: z.enum(["left", "center", "right", "justified"]),
+      })
+      .strict()
+      .optional(),
+    cornerRadius: z.number().finite().min(0).max(128).optional(),
+    stroke: z
+      .object({
+        color: z.string().regex(/^#[\da-f]{6}$/iu),
+        width: z.number().finite().min(0.25).max(16),
+      })
+      .strict()
+      .optional(),
+    shadow: z
+      .object({
+        color: z.string().regex(/^#[\da-f]{6}$/iu),
+        opacity: z.number().min(0).max(1),
+        offsetX: z.number().min(-100).max(100),
+        offsetY: z.number().min(-100).max(100),
+        radius: z.number().min(0).max(128),
       })
       .strict()
       .optional(),
     iconName: z.string().max(30).optional(),
+    assetId: z
+      .string()
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/u)
+      .optional(),
+    alt: z.string().trim().max(300).optional(),
     placeholder: z.boolean().optional(),
   })
   .strict();
@@ -112,6 +144,7 @@ export const VisualDesignSpecSchema = z
           .strict(),
       })
       .strict(),
+    semanticTokens: BrandKitTokensSchema.optional(),
     tokens: z
       .object({
         brand: z.string().regex(/^#[\da-f]{6}$/iu),
@@ -148,16 +181,21 @@ export interface VisualSpecSourceNode {
   height: number;
   fontSize: number;
   fontStyle: "Regular" | "Medium" | "Bold";
-  textAlign: "left" | "center" | "right";
+  textAlign: "left" | "center" | "right" | "justified";
   fontFamily?: string;
   lineHeight?: number;
   letterSpacing?: number;
+  assetId?: string;
+  alt?: string;
   palette: "brand" | "accent" | "page" | "surface" | "text" | "muted" | "border" | "none";
   layout: "none" | "vertical" | "horizontal";
   padding: number;
   gap: number;
   qualityRole: "button" | "input" | "image" | "heading" | "body" | "decorative";
   pattern?: DesignPatternId;
+  cornerRadius?: number;
+  strokePalette?: Exclude<VisualDesignPaletteRole, "none">;
+  elevation?: "none" | "soft";
   iconName?: string;
   placeholder?: true;
   sectionId?: "identity" | "primary" | "supporting";
@@ -174,6 +212,18 @@ export interface VisualDesignPalette {
   border: string;
 }
 
+type VisualDesignPaletteRole = VisualDesignPalette["brand"] extends string
+  ? "brand" | "accent" | "page" | "surface" | "text" | "muted" | "border" | "none"
+  : never;
+
+function nearestToken(value: number, tokens: number[]): number {
+  return tokens.reduce(
+    (closest, candidate) =>
+      Math.abs(candidate - value) < Math.abs(closest - value) ? candidate : closest,
+    tokens[0] ?? value,
+  );
+}
+
 export function createVisualDesignSpec(input: {
   brief: DesignBrief;
   screen: {
@@ -188,6 +238,7 @@ export function createVisualDesignSpec(input: {
   requiredPatterns?: readonly DesignPatternId[];
   requireHighFidelityStructure?: boolean;
   palette: VisualDesignPalette;
+  semanticTokens?: z.infer<typeof BrandKitTokensSchema>;
   children: readonly VisualSpecSourceNode[];
 }): { success: true; data: VisualDesignSpec } | { success: false; errors: string[] } {
   const nodes: VisualDesignNodeSpec[] = [];
@@ -223,6 +274,53 @@ export function createVisualDesignSpec(input: {
             : node.type === "icon"
               ? "VECTOR"
               : "FRAME";
+    const typographyRole =
+      node.qualityRole === "heading"
+        ? node.fontSize >= 30
+          ? "heading1"
+          : node.fontSize >= 22
+            ? "heading2"
+            : "heading3"
+        : node.qualityRole === "button"
+          ? "button"
+          : node.qualityRole === "decorative"
+            ? "caption"
+            : "body";
+    const typographyToken = input.semanticTokens?.typography[typographyRole];
+    const componentRadius =
+      node.qualityRole === "button"
+        ? input.semanticTokens?.components.buttonRadius
+        : node.qualityRole === "input"
+          ? input.semanticTokens?.components.inputRadius
+          : node.pattern === "product-card" || node.pattern === "stat-card"
+            ? input.semanticTokens?.components.cardRadius
+            : undefined;
+    const cornerRadius =
+      componentRadius ??
+      (node.cornerRadius
+        ? nearestToken(node.cornerRadius, input.semanticTokens?.radii ?? [node.cornerRadius])
+        : undefined);
+    const spacing = input.semanticTokens?.spacing;
+    const paletteRoleForGenerated: Record<Exclude<VisualDesignPaletteRole, "none">, string> = {
+      brand: input.palette.brand,
+      accent: input.palette.accent,
+      page: input.palette.page,
+      surface: input.palette.surface,
+      text: input.palette.text,
+      muted: input.palette.muted,
+      border: input.palette.border,
+    };
+    const strokeColor = node.strokePalette
+      ? (input.semanticTokens?.palette[
+          node.strokePalette === "brand"
+            ? "primary"
+            : node.strokePalette === "page"
+              ? "background"
+              : node.strokePalette === "muted"
+                ? "mutedText"
+                : node.strokePalette
+        ] ?? paletteRoleForGenerated[node.strokePalette])
+      : undefined;
     nodes.push({
       logicalRef: ref,
       parentRef,
@@ -235,24 +333,58 @@ export function createVisualDesignSpec(input: {
       width: node.width,
       height: node.height,
       layout: node.type === "frame" ? node.layout : node.type === "image" ? "vertical" : "none",
-      padding: node.padding,
-      gap: node.gap,
+      padding: spacing ? nearestToken(node.padding, spacing) : node.padding,
+      gap: spacing ? nearestToken(node.gap, spacing) : node.gap,
       paletteRole: node.palette,
+      ...(cornerRadius ? { cornerRadius } : {}),
+      ...(strokeColor
+        ? { stroke: { color: strokeColor, width: input.semanticTokens?.stroke ?? 1 } }
+        : {}),
+      ...(node.elevation === "soft"
+        ? {
+            shadow: input.semanticTokens?.shadow ?? {
+              color: "#0F172A",
+              opacity: 0.1,
+              offsetX: 0,
+              offsetY: 4,
+              radius: 12,
+            },
+          }
+        : {}),
       ...(node.type === "text" && !interactiveText
         ? {
             text: node.text ?? "",
             typography: {
-              ...(node.fontFamily ? { family: node.fontFamily } : {}),
-              style: node.fontStyle,
-              size: node.fontSize,
-              ...(node.lineHeight ? { lineHeight: node.lineHeight } : {}),
-              ...(node.letterSpacing !== undefined ? { letterSpacing: node.letterSpacing } : {}),
-              alignment: node.textAlign,
+              ...((typographyToken?.requestedFamily ?? node.fontFamily)
+                ? { family: typographyToken?.requestedFamily ?? node.fontFamily }
+                : {}),
+              ...(typographyToken
+                ? { fallbackFamily: typographyToken.fallbackFamily, fallbackStyle: "Regular" }
+                : {}),
+              style: typographyToken?.style ?? node.fontStyle,
+              size: typographyToken?.size ?? node.fontSize,
+              ...((typographyToken?.lineHeight ?? node.lineHeight)
+                ? { lineHeight: typographyToken?.lineHeight ?? node.lineHeight }
+                : {}),
+              ...(typographyToken?.letterSpacing !== undefined || node.letterSpacing !== undefined
+                ? { letterSpacing: typographyToken?.letterSpacing ?? node.letterSpacing }
+                : {}),
+              alignment: typographyToken
+                ? resolveBrandTextAlignment(
+                    input.semanticTokens,
+                    typographyRole,
+                    input.brief.prompt,
+                    node.textAlign,
+                  )
+                : node.textAlign,
             },
           }
         : {}),
       ...(node.type === "icon" && node.iconName ? { iconName: node.iconName } : {}),
-      ...(node.type === "image" ? { placeholder: true } : {}),
+      ...(node.type === "image" && node.assetId
+        ? { assetId: node.assetId, alt: node.alt ?? node.name }
+        : {}),
+      ...(node.type === "image" && !node.assetId ? { placeholder: true } : {}),
     });
     if (node.pattern) usedPatterns.add(node.pattern);
     if (interactiveText) {
@@ -274,15 +406,34 @@ export function createVisualDesignSpec(input: {
         text: node.text ?? "",
         typography: {
           ...(node.fontFamily ? { family: node.fontFamily } : {}),
-          style: node.fontStyle,
-          size: node.fontSize,
-          ...(node.lineHeight ? { lineHeight: node.lineHeight } : {}),
-          ...(node.letterSpacing !== undefined ? { letterSpacing: node.letterSpacing } : {}),
-          alignment: input.brief.direction === "rtl" ? "right" : node.textAlign,
+          ...((typographyToken?.requestedFamily ?? node.fontFamily)
+            ? { family: typographyToken?.requestedFamily ?? node.fontFamily }
+            : {}),
+          ...(typographyToken
+            ? { fallbackFamily: typographyToken.fallbackFamily, fallbackStyle: "Regular" }
+            : {}),
+          style: typographyToken?.style ?? node.fontStyle,
+          size: typographyToken?.size ?? node.fontSize,
+          ...((typographyToken?.lineHeight ?? node.lineHeight)
+            ? { lineHeight: typographyToken?.lineHeight ?? node.lineHeight }
+            : {}),
+          ...(typographyToken?.letterSpacing !== undefined || node.letterSpacing !== undefined
+            ? { letterSpacing: typographyToken?.letterSpacing ?? node.letterSpacing }
+            : {}),
+          alignment: typographyToken
+            ? resolveBrandTextAlignment(
+                input.semanticTokens,
+                typographyRole,
+                input.brief.prompt,
+                node.textAlign,
+              )
+            : input.brief.direction === "rtl"
+              ? "right"
+              : node.textAlign,
         },
       });
     }
-    if (node.type === "image") {
+    if (node.type === "image" && !node.assetId) {
       const illustrationRef = `${ref}.illustration`;
       const illustrationSize = Math.min(36, Math.max(20, node.width - 16));
       nodes.push({
@@ -323,7 +474,7 @@ export function createVisualDesignSpec(input: {
         typography: {
           style: "Regular",
           size: 10,
-          alignment: input.brief.direction === "rtl" ? "right" : "left",
+          alignment: "center",
         },
       });
       imagePlaceholders.push({ ref, name: node.name, disclosure });
@@ -351,10 +502,27 @@ export function createVisualDesignSpec(input: {
           : { top: 32, right: 32, bottom: 32, left: 32 },
       grid:
         input.screen.devicePreset === "mobile"
-          ? { columns: 4, gutter: 12, margin: 20 }
-          : { columns: 12, gutter: 24, margin: 32 },
+          ? {
+              columns: input.semanticTokens?.grid.mobileColumns ?? 4,
+              gutter: input.semanticTokens?.grid.mobileGutter ?? 12,
+              margin: 20,
+            }
+          : {
+              columns: input.semanticTokens?.grid.desktopColumns ?? 12,
+              gutter: input.semanticTokens?.grid.desktopGutter ?? 24,
+              margin: 32,
+            },
     },
-    tokens: { ...input.palette, spacing: [4, 8, 12, 16, 24, 32], radii: [4, 8, 12, 20] },
+    tokens: {
+      ...input.palette,
+      spacing: input.semanticTokens?.spacing ?? [4, 8, 12, 16, 24, 32],
+      radii: input.semanticTokens?.radii ?? [4, 8, 12, 20],
+    },
+    ...(input.semanticTokens
+      ? { semanticTokens: input.semanticTokens }
+      : input.brief.brandKit
+        ? { semanticTokens: input.brief.brandKit.tokens }
+        : {}),
     nodes,
     requiredPatterns: [
       ...(input.requiredPatterns ??
@@ -457,6 +625,7 @@ export function createDesignBrief(input: {
   locale: "fa" | "en";
   direction: "rtl" | "ltr";
   brandDirection?: string;
+  brandKit?: PinnedBrandKit;
 }): DesignBrief {
   return DesignBriefSchema.parse({
     version: DESIGN_BRIEF_VERSION,
@@ -469,7 +638,10 @@ export function createDesignBrief(input: {
     direction: input.direction,
     brandDirection:
       input.brandDirection ??
-      "Use the user's explicit brand constraints; otherwise choose a coherent restrained visual direction.",
+      (input.brandKit
+        ? `${input.brandKit.name} · immutable revision ${input.brandKit.revision}`
+        : "Use the user's explicit brand constraints; otherwise choose a coherent restrained visual direction."),
+    ...(input.brandKit ? { brandKit: input.brandKit } : {}),
     requestedPatterns: inferRequestedDesignPatterns(input.prompt),
     assetPolicy: "provided-or-document-assets; otherwise-labeled-native-placeholder",
     acceptanceCriteria: [
@@ -479,6 +651,11 @@ export function createDesignBrief(input: {
       ...(input.fidelity === "high_fidelity"
         ? [
             "Use a deliberate visual hierarchy, coherent tokens, and screen-appropriate pattern composition.",
+          ]
+        : []),
+      ...(input.brandKit
+        ? [
+            "Resolve explicit user task constraints before the pinned Brand Kit; apply the pinned semantic palette, typography, spacing, radius and effects to native properties; disclose requested fonts that require fallback.",
           ]
         : []),
     ],

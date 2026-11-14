@@ -38,6 +38,7 @@ import {
   DESIGN_GENERATION_OUTPUT_SCHEMA,
   DesignGenerationRequestSchema,
 } from "../shared/design-generation.js";
+import { PinnedBrandKitSchema } from "../shared/brand-kit.js";
 import {
   CHAT_FUNCTION_TOOLS,
   ChatFunctionCallSchema,
@@ -2050,6 +2051,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       "screenIds",
       "repairTargets",
       "section",
+      "brandKit",
     ]);
     if (Object.keys(body.value).some((key) => !allowedKeys.has(key))) {
       sendJson(response, 400, {
@@ -2096,6 +2098,17 @@ export function createCompanionServer(options: CompanionServerOptions) {
       return;
     }
     const parsedRequest = DesignGenerationRequestSchema.safeParse(body.value.request);
+    const parsedBrandKit =
+      body.value.brandKit === undefined
+        ? undefined
+        : PinnedBrandKitSchema.safeParse(body.value.brandKit);
+    if (parsedBrandKit && !parsedBrandKit.success) {
+      sendJson(response, 400, {
+        error: "invalid_design_request",
+        issues: ["The pinned Brand Kit revision failed validation or integrity checking."],
+      });
+      return;
+    }
     const repairIssues = body.value.repairIssues;
     const repairTargets = body.value.repairTargets;
     const sectionInput = body.value.section;
@@ -2195,7 +2208,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
         sendJson(response, 403, { error: "inference_not_verified", status: status() });
         return;
       }
-      const completePlan = createDesignPlan(parsedRequest.data);
+      const completePlan = createDesignPlan(parsedRequest.data, parsedBrandKit?.data);
       if (!completePlan.success) {
         sendJson(response, 400, { error: "invalid_design_request", issues: completePlan.errors });
         return;

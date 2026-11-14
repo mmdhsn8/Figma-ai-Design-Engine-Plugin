@@ -95,7 +95,7 @@ export const ChatDesignBriefSchema = z
     radiusScale: z.array(z.number().finite().min(0).max(128)).min(2).max(6),
     palette: z
       .object({
-        source: z.enum(["existing-document", "user-requested", "curated-default"]),
+        source: z.enum(["existing-document", "user-requested", "curated-default", "brand-kit"]),
         background: z.string().min(1).max(100),
         surface: z.string().min(1).max(100),
         primary: z.string().min(1).max(100),

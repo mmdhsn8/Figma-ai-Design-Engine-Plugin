@@ -4,6 +4,7 @@ import { COMPANION_BASE_URL } from "../companion/config";
 import { MAX_SCREEN_BYTES } from "../shared/generation-limits";
 import type { DesignGenerationRequest, GenerationRepairTarget } from "../shared/design-generation";
 import type { DesignSection } from "../shared/design-generation";
+import type { PinnedBrandKit } from "../shared/brand-kit";
 import { MAX_SECTION_BYTES } from "../shared/generation-limits";
 import {
   ChatFunctionCallValidationIssueSchema,
@@ -448,6 +449,7 @@ export async function generateAuthorizedDesign(
   onMetrics?: (metrics: Record<string, number>) => void,
   onLiveProgress?: (diagnostic: InferenceDiagnostic) => void,
   section?: Pick<DesignSection, "id" | "sequence">,
+  brandKit?: PinnedBrandKit,
 ): Promise<string> {
   let retriedIncompleteStream = false;
   let polling = true;
@@ -491,6 +493,7 @@ export async function generateAuthorizedDesign(
             ...(screenIds ? { screenIds } : {}),
             ...(repairTargets?.length ? { repairTargets } : {}),
             ...(section ? { section } : {}),
+            ...(brandKit ? { brandKit } : {}),
           },
           fetcher,
           signal,

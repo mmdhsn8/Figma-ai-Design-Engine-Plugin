@@ -21,8 +21,11 @@ import { parseDesignValue, type DesignSpec } from "../src/shared/schema";
 import {
   createDesignPlan,
   normalizeGeneratedDesignResponse,
+  type GeneratedDesign,
 } from "../src/shared/design-generation";
+import { pinBrandKit } from "../src/shared/brand-kit";
 import { prepareGeneratedDesign } from "../src/ui/design-generation";
+import { newBrandKit } from "../src/ui/brand-kit-manager";
 import { createGenerationController } from "../src/plugin/generation-controller";
 import { verifyNativeDesign } from "../src/plugin/native-design-verification";
 import { UIToPluginSchema, PluginToUISchema } from "../src/shared/messages";
@@ -39,6 +42,7 @@ interface MockNode {
   width: number;
   height: number;
   visible: boolean;
+  textAlignHorizontal?: string;
   layoutMode?: string;
   itemSpacing?: number;
   paddingLeft?: number;
@@ -82,15 +86,17 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
     const targetIndex = siblings.indexOf(target);
     if (parent.layoutMode === "VERTICAL") {
       localX = parent.paddingLeft ?? 0;
-      localY = (parent.paddingTop ?? 0) + siblings.slice(0, targetIndex).reduce(
-        (sum, child) => sum + child.height + (parent.itemSpacing ?? 0),
-        0,
-      );
+      localY =
+        (parent.paddingTop ?? 0) +
+        siblings
+          .slice(0, targetIndex)
+          .reduce((sum, child) => sum + child.height + (parent.itemSpacing ?? 0), 0);
     } else if (parent.layoutMode === "HORIZONTAL") {
-      localX = (parent.paddingLeft ?? 0) + siblings.slice(0, targetIndex).reduce(
-        (sum, child) => sum + child.width + (parent.itemSpacing ?? 0),
-        0,
-      );
+      localX =
+        (parent.paddingLeft ?? 0) +
+        siblings
+          .slice(0, targetIndex)
+          .reduce((sum, child) => sum + child.width + (parent.itemSpacing ?? 0), 0);
       localY = parent.paddingTop ?? 0;
     }
     const ancestor = absolutePosition(parent);
@@ -340,6 +346,216 @@ describe("renderDesign", () => {
     mock = createMockFigma();
   });
 
+  it.each([
+    {
+      prompt: "فروشگاه اینترنتی فارسی برای محصولات دست‌ساز",
+      language: "fa" as const,
+      projectType: "storefront" as const,
+      family: "خانه",
+      pattern: "product-card" as const,
+      brand: "#7C3AED",
+      sample: "محصول دست‌ساز",
+      needsImage: true,
+    },
+    {
+      prompt: "Create an English SaaS analytics dashboard with key metrics",
+      language: "en" as const,
+      projectType: "dashboard" as const,
+      family: "Overview",
+      pattern: "stat-card" as const,
+      brand: "#047857",
+      sample: "Monthly active users",
+      needsImage: false,
+    },
+  ])("renders and verifies the native $language Brand Kit contract", async (fixture) => {
+    mock = createMockFigma();
+    const kit = newBrandKit(fixture.language === "fa" ? "کاج" : "Northstar");
+    kit.tokens.palette.primary = fixture.brand;
+    kit.tokens.palette.background = "#F5F7FA";
+    kit.tokens.palette.surface = "#FFFFFF";
+    kit.tokens.palette.border = "#AAB5C5";
+    kit.tokens.stroke = 2;
+    kit.tokens.spacing = [6, 10, 18, 24];
+    kit.tokens.radii = [6, 10, 18];
+    kit.tokens.components.cardRadius = 18;
+    kit.tokens.shadow = { color: "#182030", opacity: 0.24, offsetX: 2, offsetY: 5, radius: 10 };
+    kit.tokens.grid.mobileColumns = 5;
+    kit.tokens.grid.mobileGutter = 14;
+    kit.tokens.grid.desktopColumns = 10;
+    kit.tokens.grid.desktopGutter = 22;
+    kit.tokens.typography.heading2.requestedFamily = "Arial";
+    kit.tokens.typography.heading2.fallbackFamily = "Inter";
+    kit.tokens.typography.heading2.style = "Bold";
+    kit.tokens.typography.heading2.weight = 700;
+    kit.tokens.typography.heading2.size = 26;
+    kit.tokens.themes = [
+      {
+        mode: "dark",
+        inherits: "base",
+        palette: {
+          primary: fixture.brand,
+          accent: "#334155",
+          background: "#101827",
+          surface: "#1B2638",
+          text: "#F4F6FA",
+          mutedText: "#FFFFFF",
+        },
+      },
+    ];
+    const planned = createDesignPlan(
+      {
+        prompt: fixture.prompt,
+        target: "mobile",
+        screenCount: 1,
+        screenNames: [fixture.family],
+        language: fixture.language,
+        style: "",
+        projectType: fixture.projectType,
+        theme: "dark",
+        fidelity: "standard",
+      },
+      pinBrandKit(kit),
+    );
+    if (!planned.success) throw new Error(planned.errors.join(" "));
+    const screenId = planned.data.screens[0]!.id;
+    const shared = {
+      type: "text" as const,
+      text: null,
+      palette: "none" as const,
+      width: 320,
+      height: 32,
+      fontSize: 16,
+      fontStyle: "Regular" as const,
+      textAlign: fixture.language === "fa" ? ("right" as const) : ("left" as const),
+      cornerRadius: 0,
+      elevation: "none" as const,
+      layout: "none" as const,
+      gap: 0,
+      padding: 0,
+      qualityRole: "heading" as const,
+      children: [],
+    };
+    const design: GeneratedDesign = {
+      projectName: fixture.language === "fa" ? "فروشگاه کاج" : "Northstar Metrics",
+      palette: {
+        brand: "#223344",
+        accent: "#CC7744",
+        page: "#F7F5F0",
+        surface: "#FFFFFF",
+        text: "#17212B",
+        muted: "#647080",
+        border: "#D8DEE6",
+      },
+      screens: [
+        {
+          id: screenId,
+          children: [
+            {
+              type: "frame",
+              name: fixture.language === "fa" ? "کارت محصول" : "Metric summary",
+              text: null,
+              palette: "surface",
+              width: 350,
+              height: 400,
+              fontSize: 16,
+              fontStyle: "Regular",
+              textAlign: "left",
+              cornerRadius: 13,
+              elevation: "soft",
+              layout: "vertical",
+              gap: 15,
+              padding: 14,
+              qualityRole: "decorative",
+              pattern: fixture.pattern,
+              strokePalette: "border",
+              children: [
+                ...(fixture.needsImage
+                  ? [
+                      {
+                        ...shared,
+                        type: "image" as const,
+                        name: "Product artwork placeholder",
+                        text: null,
+                        palette: "accent" as const,
+                        width: 320,
+                        height: 180,
+                        qualityRole: "image" as const,
+                        placeholder: true as const,
+                      },
+                    ]
+                  : []),
+                {
+                  ...shared,
+                  type: "text",
+                  name: "Brand heading",
+                  text: fixture.sample,
+                  palette: "text",
+                  fontSize: 24,
+                  fontStyle: "Bold",
+                  fontFamily: "Inter",
+                  qualityRole: "heading",
+                },
+                {
+                  ...shared,
+                  type: "text",
+                  name: "Brand summary",
+                  text:
+                    fixture.language === "fa"
+                      ? "طراحی سازگار با زبان فارسی"
+                      : "Growth is trending upward",
+                  palette: "muted",
+                  qualityRole: "body",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const prepared = prepareGeneratedDesign(JSON.stringify(design), planned.data);
+    if (!prepared.success) throw new Error(prepared.errors.join(" "));
+    expect(prepared.data.visualSpecs[0]?.tokens.brand).toBe(fixture.brand);
+    expect(prepared.data.visualSpecs[0]?.semanticTokens?.palette.background).toBe("#101827");
+    expect(prepared.data.visualSpecs[0]?.screen.grid).toMatchObject({ columns: 5, gutter: 14 });
+    expect(prepared.data.visualSpecs[0]?.semanticTokens?.grid.desktopColumns).toBe(10);
+    expect(
+      prepared.data.visualSpecs[0]?.nodes.find(({ name }) => name === "Brand heading")?.typography,
+    ).toMatchObject({ family: "Arial", size: 26 });
+
+    const rendered = await renderMultiScreenDesign(mock.api, prepared.data.batch, { resume: true });
+    expect(rendered.failedScreens).toBe(0);
+    const nodeId = rendered.screens[0]?.nodeId;
+    if (!nodeId) throw new Error("Native branded screen root is missing.");
+    const verification = await verifyNativeDesign(
+      mock.raw as unknown as PluginAPI,
+      nodeId,
+      "0:1",
+      prepared.data.visualSpecs[0]!,
+    );
+    expect(verification.verified, JSON.stringify(verification.findings)).toBe(true);
+    expect(verification).toMatchObject({ verified: true, truncated: false });
+    expect(verification.findings).toEqual([]);
+    const card = mock.find(fixture.language === "fa" ? "کارت محصول" : "Metric summary")!;
+    expect(card).toMatchObject({
+      cornerRadius: 18,
+      strokeWeight: 2,
+      layoutMode: "VERTICAL",
+      itemSpacing: 18,
+      paddingTop: 10,
+      paddingRight: 10,
+    });
+    expect(card.strokes).toContainEqual({
+      type: "SOLID",
+      color: { r: 170 / 255, g: 181 / 255, b: 197 / 255 },
+    });
+    expect(mock.find("Brand heading")).toMatchObject({
+      fontName: { family: "Arial", style: "Bold" },
+      fontSize: 26,
+    });
+    expect(mock.find("Brand heading")?.textAlignHorizontal).toBe("RIGHT");
+    expect(mock.loadedFonts).toContainEqual({ family: "Arial", style: "Bold" });
+  });
+
   it("freshly verifies native generation refs, types, parents, geometry, and visibility", async () => {
     const planned = createDesignPlan({
       prompt: "Create a health interface for native verification.",
@@ -356,23 +572,59 @@ describe("renderDesign", () => {
     const design = {
       projectName: "Native QA fixture",
       palette: {
-        brand: "#223344", accent: "#CC7744", page: "#F7F5F0", surface: "#FFFFFF",
-        text: "#17212B", muted: "#647080", border: "#D8DEE6",
+        brand: "#223344",
+        accent: "#CC7744",
+        page: "#F7F5F0",
+        surface: "#FFFFFF",
+        text: "#17212B",
+        muted: "#647080",
+        border: "#D8DEE6",
       },
-      screens: [{
-        id: planned.data.screens[0]!.id,
-        children: [{
-          type: "frame", name: "Home content", text: null, palette: "surface",
-          width: 350, height: 300, fontSize: 16, fontStyle: "Regular", textAlign: "left",
-          cornerRadius: 12, elevation: "none", layout: "vertical", gap: 12, padding: 12,
-          qualityRole: "decorative", pattern: "service-card", children: [{
-            type: "text", name: "Home title", text: "Wellbeing overview", palette: "text",
-            width: 300, height: 32, fontSize: 24, fontStyle: "Bold", textAlign: "left",
-            cornerRadius: 0, elevation: "none", layout: "none", gap: 0, padding: 0,
-            qualityRole: "heading", children: [],
-          }],
-        }],
-      }],
+      screens: [
+        {
+          id: planned.data.screens[0]!.id,
+          children: [
+            {
+              type: "frame",
+              name: "Home content",
+              text: null,
+              palette: "surface",
+              width: 350,
+              height: 300,
+              fontSize: 16,
+              fontStyle: "Regular",
+              textAlign: "left",
+              cornerRadius: 12,
+              elevation: "none",
+              layout: "vertical",
+              gap: 12,
+              padding: 12,
+              qualityRole: "decorative",
+              pattern: "service-card",
+              children: [
+                {
+                  type: "text",
+                  name: "Home title",
+                  text: "Wellbeing overview",
+                  palette: "text",
+                  width: 300,
+                  height: 32,
+                  fontSize: 24,
+                  fontStyle: "Bold",
+                  textAlign: "left",
+                  cornerRadius: 0,
+                  elevation: "none",
+                  layout: "none",
+                  gap: 0,
+                  padding: 0,
+                  qualityRole: "heading",
+                  children: [],
+                },
+              ],
+            },
+          ],
+        },
+      ],
     };
     const prepared = prepareGeneratedDesign(JSON.stringify(design), planned.data);
     if (!prepared.success) throw new Error(prepared.errors.join(" "));
@@ -534,6 +786,26 @@ describe("renderDesign", () => {
     });
     expect(mock.loadedFonts).toContainEqual({ family: "Inter", style: "Regular" });
     expect(mock.find("Persian Heading")).toMatchObject({ characters: "کالا A-17 — ۱۲۳" });
+  });
+
+  it("prefers the pinned Brand Kit font fallback before the generic Inter fallback", async () => {
+    const design = structuredClone(phase1Sample) as unknown as DesignSpec;
+    const heading = design.document.children[0];
+    if (heading.type === "text") {
+      heading.fontFamily = "Unavailable Brand Typeface";
+      heading.fontFallback = { family: "Arial", style: "Regular" };
+    }
+    const result = await renderDesign(mock.api, design);
+    expect(result.fontSelections[0]).toMatchObject({
+      requestedFamily: "Unavailable Brand Typeface",
+      usedFamily: "Arial",
+      usedStyle: "Regular",
+      fellBack: true,
+    });
+    expect(mock.loadedFonts).toContainEqual({ family: "Arial", style: "Regular" });
+    expect(mock.find("Persian Heading")).toMatchObject({
+      fontName: { family: "Arial", style: "Regular" },
+    });
   });
 
   it("falls back if Figma cannot load an available requested font", async () => {
@@ -1070,7 +1342,8 @@ describe("renderDesign", () => {
     const request = { type: "generation-render" as const, requestId: "render", manifest, design };
     expect(UIToPluginSchema.safeParse(request).success).toBe(true);
     const firstRender = await controller(request);
-    if (firstRender.type !== "generation-result") throw new Error("Unexpected native render response.");
+    if (firstRender.type !== "generation-result")
+      throw new Error("Unexpected native render response.");
     if (!firstRender.success) throw new Error(firstRender.error);
     expect(firstRender).toMatchObject({ success: true });
     const beforeNativeVerify = mock.allCreated.length;
@@ -1081,7 +1354,8 @@ describe("renderDesign", () => {
       manifest,
       design,
     });
-    if (nativeVerification.type !== "generation-result") throw new Error("Unexpected verification response.");
+    if (nativeVerification.type !== "generation-result")
+      throw new Error("Unexpected verification response.");
     expect(nativeVerification).toMatchObject({ success: true, nodeId: expect.any(String) });
     expect(mock.allCreated).toHaveLength(beforeNativeVerify);
     expect(mock.api.currentPage.selection).toEqual(selectionBeforeNativeVerify);

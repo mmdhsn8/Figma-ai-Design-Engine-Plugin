@@ -56,6 +56,7 @@ export interface TextNodeSpec extends DesignNodeMetadata {
   y?: number;
   fontFamily?: string;
   fontStyle?: string;
+  fontFallback?: { family: string; style: string };
   lineHeight?: number | TokenReference;
   letterSpacing?: number | TokenReference;
   textDecoration?: "none" | "underline" | "strikethrough";
@@ -218,7 +219,10 @@ const dimensionSchema = z.number().finite().min(1).max(10_000);
 const radiusSchema = z.number().finite().min(0).max(5_000);
 const nodeColorSchema = TokenColorValueSchema;
 const nodeQualityMeta = {
-  logicalRef: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u).optional(),
+  logicalRef: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u)
+    .optional(),
   pattern: z.enum(DESIGN_PATTERN_IDS).optional(),
   visual: VisualStyleSchema.optional(),
   qualityRole: z.enum(["button", "input", "image", "heading", "body", "decorative"]).optional(),
@@ -307,6 +311,13 @@ const TextNodeSchema = z
     textStyle: TokenReferenceSchema.optional(),
     fontFamily: z.string().trim().min(1).max(100).optional(),
     fontStyle: z.string().trim().min(1).max(100).optional(),
+    fontFallback: z
+      .object({
+        family: z.string().trim().min(1).max(100),
+        style: z.string().trim().min(1).max(100).default("Regular"),
+      })
+      .strict()
+      .optional(),
     lineHeight: lineHeightSchema.optional(),
     letterSpacing: letterSpacingSchema.optional(),
     textDecoration: z.enum(["none", "underline", "strikethrough"]).optional(),
@@ -399,7 +410,10 @@ const ImageNodeSchema = z
 
 const InstanceNodeSchema = z
   .object({
-    logicalRef: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u).optional(),
+    logicalRef: z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u)
+      .optional(),
     pattern: z.enum(DESIGN_PATTERN_IDS).optional(),
     type: z.literal("instance"),
     componentId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,99}$/),

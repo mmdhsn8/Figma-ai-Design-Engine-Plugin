@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { TokenColorValueSchema } from "./design-system-schema";
-import { inspectEmbeddedImage, isFigmaPathData } from "./visual-assets";
+import { TokenColorValueSchema } from "./design-system-schema.js";
+import { inspectEmbeddedImage, isFigmaPathData } from "./visual-assets.js";
 import { DESIGN_PATTERN_IDS } from "./design-patterns.js";
 
 const idSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,99}$/);
@@ -172,7 +172,10 @@ export type VisualAsset = z.infer<typeof VisualAssetSchema>;
 
 export const VisualNodeMetaSchema = z
   .object({
-    logicalRef: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u).optional(),
+    logicalRef: z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u)
+      .optional(),
     pattern: z.enum(DESIGN_PATTERN_IDS).optional(),
     qualityRole: z.enum(["button", "input", "image", "heading", "body", "decorative"]).optional(),
     qualityExceptions: z.array(QualityRuleSchema).max(10).optional(),

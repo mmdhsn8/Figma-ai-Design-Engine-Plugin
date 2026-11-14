@@ -18,6 +18,7 @@ import {
   FigmaToolStateDiagnosticSchema,
 } from "./figma-tools";
 import { ModelIdSchema } from "./model-preference";
+import { BrandKitStorageCommandSchema, BrandKitStorageResultSchema } from "./brand-kit";
 
 const RequestSchema = z.object({
   requestId: z.string().min(1).max(100),
@@ -160,6 +161,13 @@ const MultiScreenRenderResultSchema = z
   .strict();
 
 export const UIToPluginSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("brand-kit-storage"),
+      requestId: z.string().min(1).max(100),
+      command: BrandKitStorageCommandSchema,
+    })
+    .strict(),
   z
     .object({
       type: z.literal("chat-task-load"),
@@ -311,6 +319,7 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
 ]);
 
 export const PluginToUISchema = z.discriminatedUnion("type", [
+  BrandKitStorageResultSchema,
   z
     .object({
       type: z.literal("model-preference-loaded"),

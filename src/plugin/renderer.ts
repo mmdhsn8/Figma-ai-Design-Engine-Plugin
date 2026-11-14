@@ -417,10 +417,20 @@ async function resolveFonts(
     available.map((font) => [fontKey(font.fontName.family, font.fontName.style), font.fontName]),
   );
   const requested = new Map<string, { family: string; style: string }>();
+  const preferredFallbacks = new Map<string, { family: string; style: string }>();
   for (const node of collectTextNodes(spec)) {
     const family = node.fontFamily ?? "Inter";
     const style = node.fontStyle ?? "Regular";
     requested.set(fontKey(family, style), { family, style });
+    if (node.fontFallback) {
+      const key = fontKey(family, style);
+      const existing = preferredFallbacks.get(key);
+      if (!existing || node.fontFallback.family === "Inter")
+        preferredFallbacks.set(key, {
+          family: node.fontFallback.family,
+          style: node.fontFallback.style,
+        });
+    }
   }
   for (const token of typography.values()) {
     requested.set(fontKey(token.fontFamily, token.fontStyle), {
@@ -440,28 +450,36 @@ async function resolveFonts(
 
   for (const [key, request] of requested) {
     const exact = availableByKey.get(key);
-    let chosen = exact ?? fallback;
-    let fellBack = !exact;
-    try {
-      await api.loadFontAsync(chosen);
-    } catch (error) {
-      if (fellBack) {
-        throw new DesignRenderError(
-          `Figma could not load the requested font “${request.family} ${request.style}” or the Inter Regular fallback. Make Inter available in Figma Desktop and try again.`,
-          { cause: error },
-        );
-      }
+    const preferredFallback = preferredFallbacks.get(key);
+    const preferred = preferredFallback
+      ? availableByKey.get(fontKey(preferredFallback.family, preferredFallback.style))
+      : undefined;
+    const candidates = [exact, preferred, fallback].filter(
+      (candidate, index, all): candidate is FontName =>
+        Boolean(candidate) &&
+        all.findIndex(
+          (item) =>
+            item &&
+            fontKey(item.family, item.style) === fontKey(candidate!.family, candidate!.style),
+        ) === index,
+    );
+    let chosen: FontName | undefined;
+    let lastError: unknown;
+    for (const candidate of candidates) {
       try {
-        await api.loadFontAsync(fallback);
-        chosen = fallback;
-        fellBack = true;
-      } catch (fallbackError) {
-        throw new DesignRenderError(
-          `Figma could not load “${request.family} ${request.style}” or the Inter Regular fallback. Make Inter available in Figma Desktop and try again.`,
-          { cause: fallbackError },
-        );
+        await api.loadFontAsync(candidate);
+        chosen = candidate;
+        break;
+      } catch (error) {
+        lastError = error;
       }
     }
+    if (!chosen)
+      throw new DesignRenderError(
+        `Figma could not load “${request.family} ${request.style}” or the configured Brand Kit/Inter fallback.`,
+        { cause: lastError },
+      );
+    const fellBack = fontKey(chosen.family, chosen.style) !== key;
     fonts.set(key, chosen);
     for (const [token, typographyToken] of typography) {
       if (fontKey(typographyToken.fontFamily, typographyToken.fontStyle) === key) {
@@ -886,8 +904,9 @@ function appendDesignNode(
   parent.appendChild(node);
   if ("logicalRef" in spec && spec.logicalRef)
     node.setPluginData("fad.design.logical-ref", spec.logicalRef);
-  if ("pattern" in spec && spec.pattern)
-    node.setPluginData("fad.design.pattern", spec.pattern);
+  if ("assetId" in spec && typeof spec.assetId === "string")
+    node.setPluginData("fad.design.asset-id", spec.assetId);
+  if ("pattern" in spec && spec.pattern) node.setPluginData("fad.design.pattern", spec.pattern);
   if ("qualityRole" in spec && spec.qualityRole)
     node.setPluginData("fad.design.quality-role", spec.qualityRole);
   if ("qualityRole" in spec && (spec.qualityRole === "button" || spec.qualityRole === "input"))

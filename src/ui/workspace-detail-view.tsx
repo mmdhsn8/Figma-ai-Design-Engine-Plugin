@@ -20,18 +20,6 @@ import {
 
 const unavailable: Partial<Record<PluginView, { title: string; eyebrow: string; detail: string }>> =
   {
-    "brand-kit": {
-      title: "Brand Kit",
-      eyebrow: "BRAND WORKSPACE",
-      detail:
-        "Brand Kit creation, editing, and generation integration are not available in this Phase A build. No brand selection is being applied to generation.",
-    },
-    "brand-kit-create": {
-      title: "Create Brand Kit",
-      eyebrow: "BRAND WORKSPACE",
-      detail:
-        "Brand Kit persistence and validation are scheduled for a later implementation phase. No kit has been created.",
-    },
     skills: {
       title: "Skills Manager",
       eyebrow: "LOCAL GUIDANCE",
@@ -313,15 +301,6 @@ export function WorkspaceDetailView({
             This route is intentionally explicit; it does not show a fake form or report a
             successful action.
           </p>
-          {view === "brand-kit" && (
-            <button
-              className="secondary-action"
-              type="button"
-              onClick={() => onNavigate("brand-kit-create")}
-            >
-              Create Brand Kit
-            </button>
-          )}
           {view === "skills" && (
             <button
               className="secondary-action"

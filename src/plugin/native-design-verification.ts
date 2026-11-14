@@ -46,6 +46,7 @@ type InspectableNode = SceneNode & {
   cornerRadius?: number | symbol;
   opacity?: number;
   strokeWeight?: number;
+  effects?: readonly Effect[] | symbol;
 };
 
 function solidPaint(paints: readonly Paint[] | symbol | undefined): SolidPaint | undefined {
@@ -72,6 +73,11 @@ function snapshotNode(node: InspectableNode): NativeVisualNode {
   const fill = solidPaint(node.fills);
   const textFill = node.type === "TEXT" ? fill : undefined;
   const stroke = solidPaint(node.strokes);
+  const dropShadow = Array.isArray(node.effects)
+    ? node.effects.find(
+        (effect): effect is DropShadowEffect => effect.type === "DROP_SHADOW" && effect.visible,
+      )
+    : undefined;
   const fontName =
     node.type === "TEXT" && node.fontName && typeof node.fontName === "object"
       ? (node.fontName as FontName)
@@ -80,6 +86,7 @@ function snapshotNode(node: InspectableNode): NativeVisualNode {
   return {
     ref: node.getPluginData("fad.design.logical-ref") || node.id,
     logicalRef: node.getPluginData("fad.design.logical-ref") || undefined,
+    assetId: node.getPluginData("fad.design.asset-id") || undefined,
     pattern: node.getPluginData("fad.design.pattern") || undefined,
     qualityRole: node.getPluginData("fad.design.quality-role") as NativeVisualNode["qualityRole"],
     type: node.type,
@@ -100,6 +107,18 @@ function snapshotNode(node: InspectableNode): NativeVisualNode {
       : {}),
     ...(stroke ? { stroke: hex(stroke.color), strokeWeight: finiteNumber(node.strokeWeight) } : {}),
     ...(typeof node.cornerRadius === "number" ? { cornerRadius: node.cornerRadius } : {}),
+    ...(dropShadow
+      ? {
+          shadow: {
+            color: hex(dropShadow.color),
+            opacity: dropShadow.color.a,
+            offsetX: dropShadow.offset.x,
+            offsetY: dropShadow.offset.y,
+            radius: dropShadow.radius,
+            spread: dropShadow.spread ?? 0,
+          },
+        }
+      : {}),
     opacity: node.opacity,
     ...(node.type === "TEXT"
       ? {
@@ -236,7 +255,8 @@ export async function verifyNativeDesign(
     if (!node) continue;
     const actual = actualSnapshots.get(expected.logicalRef);
     const expectedNativeType = nativeTypeByNodeType[expected.nativeType];
-    if (node.type !== expectedNativeType)
+    const isImageNode = expected.nodeType === "image" && ["FRAME", "RECTANGLE"].includes(node.type);
+    if (node.type !== expectedNativeType && !isImageNode)
       nativeFindings.push({
         code: "type-mismatch",
         ref: expected.logicalRef,
@@ -291,6 +311,34 @@ export async function verifyNativeDesign(
           actual: actual.textAlignHorizontal ?? "unavailable",
         });
       if (
+        expected.typography.family &&
+        ![expected.typography.family, expected.typography.fallbackFamily, "Inter"].includes(
+          actual.fontFamily ?? "",
+        )
+      )
+        nativeFindings.push({
+          code: "value-mismatch",
+          ref: expected.logicalRef,
+          message: "Fresh native text did not use the requested or declared fallback font family.",
+          expected: [expected.typography.family, expected.typography.fallbackFamily, "Inter"]
+            .filter(Boolean)
+            .join(" / "),
+          actual: actual.fontFamily ?? "unavailable",
+        });
+      if (
+        actual.fontStyle !== expected.typography.style &&
+        actual.fontStyle !== expected.typography.fallbackStyle
+      )
+        nativeFindings.push({
+          code: "value-mismatch",
+          ref: expected.logicalRef,
+          message: "Fresh native text did not use the requested or declared fallback font style.",
+          expected: [expected.typography.style, expected.typography.fallbackStyle]
+            .filter(Boolean)
+            .join(" / "),
+          actual: actual.fontStyle ?? "unavailable",
+        });
+      if (
         expected.typography.lineHeight !== undefined &&
         (actual.lineHeight === undefined ||
           Math.abs(actual.lineHeight - expected.typography.lineHeight) > 0.5)
@@ -315,7 +363,15 @@ export async function verifyNativeDesign(
           actual: String(actual.letterSpacing ?? "unavailable"),
         });
     }
-    if (actual && expected.paletteRole !== "none") {
+    if (actual && expected.assetId && actual.assetId !== expected.assetId)
+      nativeFindings.push({
+        code: "value-mismatch",
+        ref: expected.logicalRef,
+        message: "Fresh native image layer does not reference the pinned Brand Kit asset.",
+        expected: expected.assetId,
+        actual: actual.assetId ?? "missing asset reference",
+      });
+    if (actual && expected.paletteRole !== "none" && !expected.assetId) {
       const expectedFill = spec.tokens[expected.paletteRole].toUpperCase();
       const actualFill = (node.type === "TEXT" ? actual.textColor : actual.fill)?.toUpperCase();
       if (actualFill !== expectedFill)
@@ -327,6 +383,50 @@ export async function verifyNativeDesign(
           actual: actualFill ?? "unavailable",
         });
     }
+    if (
+      actual &&
+      expected.cornerRadius !== undefined &&
+      (actual.cornerRadius === undefined ||
+        Math.abs(actual.cornerRadius - expected.cornerRadius) > 0.5)
+    )
+      nativeFindings.push({
+        code: "value-mismatch",
+        ref: expected.logicalRef,
+        message: "Fresh native corner radius differs from the pinned token scale.",
+        expected: String(expected.cornerRadius),
+        actual: String(actual.cornerRadius ?? "unavailable"),
+      });
+    if (
+      actual &&
+      expected.stroke &&
+      (actual.stroke?.toUpperCase() !== expected.stroke.color.toUpperCase() ||
+        actual.strokeWeight === undefined ||
+        Math.abs(actual.strokeWeight - expected.stroke.width) > 0.5)
+    )
+      nativeFindings.push({
+        code: "value-mismatch",
+        ref: expected.logicalRef,
+        message: "Fresh native stroke differs from the pinned semantic token.",
+        expected: `${expected.stroke.color} / ${expected.stroke.width}`,
+        actual: `${actual.stroke ?? "unavailable"} / ${actual.strokeWeight ?? "unavailable"}`,
+      });
+    if (
+      actual &&
+      expected.shadow &&
+      (!actual.shadow ||
+        actual.shadow.color.toUpperCase() !== expected.shadow.color.toUpperCase() ||
+        Math.abs(actual.shadow.opacity - expected.shadow.opacity) > 0.05 ||
+        Math.abs(actual.shadow.offsetX - expected.shadow.offsetX) > 0.5 ||
+        Math.abs(actual.shadow.offsetY - expected.shadow.offsetY) > 0.5 ||
+        Math.abs(actual.shadow.radius - expected.shadow.radius) > 0.5)
+    )
+      nativeFindings.push({
+        code: "value-mismatch",
+        ref: expected.logicalRef,
+        message: "Fresh native shadow differs from the pinned effects token.",
+        expected: JSON.stringify(expected.shadow),
+        actual: JSON.stringify(actual.shadow ?? "unavailable"),
+      });
     if (actual && ["frame", "image"].includes(expected.nodeType) && expected.layout !== "none") {
       const expectedLayout = expected.layout.toUpperCase();
       if (actual.layoutMode !== expectedLayout)
@@ -345,6 +445,20 @@ export async function verifyNativeDesign(
           message: "Fresh native Auto Layout gap differs from the validated design specification.",
           expected: String(expected.gap),
           actual: String(actual.itemSpacing ?? "unavailable"),
+        });
+      if (
+        !actual.padding ||
+        Math.abs(actual.padding.top - expected.padding) > 0.5 ||
+        Math.abs(actual.padding.right - expected.padding) > 0.5 ||
+        Math.abs(actual.padding.bottom - expected.padding) > 0.5 ||
+        Math.abs(actual.padding.left - expected.padding) > 0.5
+      )
+        nativeFindings.push({
+          code: "value-mismatch",
+          ref: expected.logicalRef,
+          message: "Fresh native Auto Layout padding differs from the pinned spacing tokens.",
+          expected: String(expected.padding),
+          actual: actual.padding ? JSON.stringify(actual.padding) : "unavailable",
         });
     }
   }

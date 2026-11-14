@@ -18,6 +18,7 @@ import {
 } from "../shared/figma-tools";
 import { type PluginToUIMessage } from "../shared/messages";
 import { utf8Bytes } from "../shared/generation-limits";
+import { resolveBrandReadingDirection } from "../shared/brand-kit";
 import {
   auditNativeSection,
   NativeVisualNodeSchema,
@@ -162,11 +163,7 @@ function syncCapacityAccounting(task: ChatTask): void {
     stage.verificationOperations = entries.filter(
       (entry) => entry.category === "verification",
     ).length;
-    if (
-      task.intent !== "edit" &&
-      stage.estimatedMutations === 1 &&
-      stage.logicalRefs.length > 1
-    )
+    if (task.intent !== "edit" && stage.estimatedMutations === 1 && stage.logicalRefs.length > 1)
       stage.estimatedMutations = estimatedStageMutations(stage.logicalRefs);
     const segmentCount = Math.max(
       1,
@@ -305,20 +302,19 @@ function readOnlyCheckpoint(task: ChatTask) {
       // A malformed native result cannot count as evidence or semantic progress.
     }
     if (action.tool === "inspect_nodes")
-      for (const ref of action.refs)
-        attemptedRefs.add(JSON.stringify([action.pageId ?? "", ref]));
+      for (const ref of action.refs) attemptedRefs.add(JSON.stringify([action.pageId ?? "", ref]));
     if (entry.status !== "completed" || payload.success !== true || !payload.data) {
       if (action.tool === "get_document_context") contextFailures++;
       else {
         inspectFailures++;
-        for (const ref of action.refs)
-          failedRefs.add(JSON.stringify([action.pageId ?? "", ref]));
+        for (const ref of action.refs) failedRefs.add(JSON.stringify([action.pageId ?? "", ref]));
       }
       continue;
     }
     const data = payload.data as Record<string, unknown>;
     if (action.tool === "get_document_context") {
-      if (!Array.isArray(data.frames) || !data.discovery || typeof data.discovery !== "object") continue;
+      if (!Array.isArray(data.frames) || !data.discovery || typeof data.discovery !== "object")
+        continue;
       const page = data.page as { id?: string } | undefined;
       const query = action.query?.trim();
       const offset = action.offset ?? 0;
@@ -331,9 +327,13 @@ function readOnlyCheckpoint(task: ChatTask) {
         ...(typeof page?.id === "string" ? { pageId: page.id } : {}),
         discovery,
         pages: Array.isArray(data.pages)
-          ? data.pages.filter((value): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value)))
+          ? data.pages.filter((value): value is Record<string, unknown> =>
+              Boolean(value && typeof value === "object" && !Array.isArray(value)),
+            )
           : [],
-        frames: data.frames.filter((value): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value))),
+        frames: data.frames.filter((value): value is Record<string, unknown> =>
+          Boolean(value && typeof value === "object" && !Array.isArray(value)),
+        ),
         ledgerIndex,
       };
       if (offset === 0) {
@@ -346,8 +346,7 @@ function readOnlyCheckpoint(task: ChatTask) {
         }
       }
     } else {
-      const pageId =
-        action.pageId ?? (typeof data.pageId === "string" ? data.pageId : undefined);
+      const pageId = action.pageId ?? (typeof data.pageId === "string" ? data.pageId : undefined);
       if (!pageId || !Array.isArray(data.nodes)) continue;
       for (const node of data.nodes) {
         if (
@@ -375,21 +374,35 @@ function readOnlyCheckpoint(task: ChatTask) {
       frames.set(JSON.stringify([frame.pageId, identity]), frame);
     }
   }
-  const results: Array<Record<string, unknown> & { verified: boolean; inspectionAttempted: boolean }> = [
-    ...frames.entries(),
-  ].map(([, frame]) => {
+  const results: Array<
+    Record<string, unknown> & { verified: boolean; inspectionAttempted: boolean }
+  > = [...frames.entries()].map(([, frame]) => {
     const pageId = String(frame.pageId);
     const inspectionKey = JSON.stringify([pageId, frame.ref]);
     const node = typeof frame.ref === "string" ? inspected.get(inspectionKey) : undefined;
     const sameSnapshot =
       node &&
       (["type", "x", "y", "width", "height"] as const).every(
-        (field) => frame[field] === undefined || node[field] === undefined || frame[field] === node[field],
+        (field) =>
+          frame[field] === undefined || node[field] === undefined || frame[field] === node[field],
       );
     const nativeInspected = frame.nativeInspected === true;
     return {
       ...Object.fromEntries(
-        ["ref", "pageId", "pageName", "name", "type", "x", "y", "width", "height", "parentName", "depth", "editable"]
+        [
+          "ref",
+          "pageId",
+          "pageName",
+          "name",
+          "type",
+          "x",
+          "y",
+          "width",
+          "height",
+          "parentName",
+          "depth",
+          "editable",
+        ]
           .filter((field) => frame[field] !== undefined)
           .map((field) => [field, frame[field]]),
       ),
@@ -419,11 +432,15 @@ function readOnlyCheckpoint(task: ChatTask) {
   return {
     discoveries,
     frames: results,
-    pages: [...new Map(
-      discoveries.flatMap(({ pages: pageSummaries }) =>
-        pageSummaries.flatMap((page) => typeof page.id === "string" ? [[page.id, page] as const] : []),
-      ),
-    ).values()],
+    pages: [
+      ...new Map(
+        discoveries.flatMap(({ pages: pageSummaries }) =>
+          pageSummaries.flatMap((page) =>
+            typeof page.id === "string" ? [[page.id, page] as const] : [],
+          ),
+        ),
+      ).values(),
+    ],
     pendingOffsets,
     uninspectedRefs: results
       .filter((frame) => typeof frame.ref === "string" && !frame.verified)
@@ -513,15 +530,22 @@ function nextReadOnlyOperation(
   });
   if (options.forceFreshDiscovery && !newOffsetZeroAttempt)
     return {
-      action: { tool: "get_document_context", ...(query ? { query } : {}), readOnlyInspection: true },
-      progress: "Resuming the saved progressive discovery cursor and revalidating accessible pages…",
+      action: {
+        tool: "get_document_context",
+        ...(query ? { query } : {}),
+        readOnlyInspection: true,
+      },
+      progress:
+        "Resuming the saved progressive discovery cursor and revalidating accessible pages…",
     };
   if (
     options.forceFreshDiscovery &&
     newOffsetZeroAttempt &&
     !run.some(({ ledgerIndex }) => ledgerIndex >= options.initialLedgerLength)
   ) {
-    const priorEvidence = framesForDiscoveryRun(checkpoint, queryKey).some((frame) => frame.verified);
+    const priorEvidence = framesForDiscoveryRun(checkpoint, queryKey).some(
+      (frame) => frame.verified,
+    );
     return {
       outcome: priorEvidence ? "PARTIAL" : "BLOCKED",
       reason: "Fresh discovery could not be verified while resuming the saved inspection.",
@@ -540,7 +564,11 @@ function nextReadOnlyOperation(
     });
     if (!failedInitialDiscovery)
       return {
-        action: { tool: "get_document_context", ...(query ? { query } : {}), readOnlyInspection: true },
+        action: {
+          tool: "get_document_context",
+          ...(query ? { query } : {}),
+          readOnlyInspection: true,
+        },
         progress: "Starting a progressive scan of all accessible pages…",
       };
     return { outcome: "BLOCKED", reason: "The initial bounded document discovery failed." };
@@ -630,31 +658,30 @@ function nextReadOnlyOperation(
         entry.status === "failed"
       );
     });
-  const discoveryTruncated = run.some(({ discovery }) =>
-    discovery.truncated === true ||
-    discovery.complete === false ||
-    (typeof discovery.pagesVisited === "number" &&
-      discovery.pagesVisited === 0 &&
-      typeof discovery.pagesAvailable === "number" &&
-      discovery.pagesAvailable > 0) ||
-    (typeof discovery.pagesRemaining === "number" && discovery.pagesRemaining > 0),
+  const discoveryTruncated = run.some(
+    ({ discovery }) =>
+      discovery.truncated === true ||
+      discovery.complete === false ||
+      (typeof discovery.pagesVisited === "number" &&
+        discovery.pagesVisited === 0 &&
+        typeof discovery.pagesAvailable === "number" &&
+        discovery.pagesAvailable > 0) ||
+      (typeof discovery.pagesRemaining === "number" && discovery.pagesRemaining > 0),
   );
   const hasUninspectable = currentFrames.some(
     (frame) => typeof frame.ref !== "string" && frame.nativeInspected !== true,
   );
   const hasUninspected = currentFrames.some((frame) => !frame.verified);
-  const inspectionFailures = task.ledger.filter(
-    (entry) => {
-      const action = entry.call.action;
-      return (
-        action.tool === "inspect_nodes" &&
-        entry.status === "failed" &&
-        action.refs.some((ref) =>
-          currentFrames.some((frame) => frame.ref === ref && frame.pageId === action.pageId),
-        )
-      );
-    },
-  ).length;
+  const inspectionFailures = task.ledger.filter((entry) => {
+    const action = entry.call.action;
+    return (
+      action.tool === "inspect_nodes" &&
+      entry.status === "failed" &&
+      action.refs.some((ref) =>
+        currentFrames.some((frame) => frame.ref === ref && frame.pageId === action.pageId),
+      )
+    );
+  }).length;
   if (
     discoveryTruncated ||
     failedAtCursor ||
@@ -698,7 +725,11 @@ function nextReadOnlyOperation(
   if (currentFrames.length === 0) {
     const lastDiscovery = latest.discovery;
     if (typeof lastDiscovery.matchCount === "number" && lastDiscovery.matchCount > 0)
-      return { outcome: "PARTIAL", reason: "Matching targets were found, but no bounded native inspection sample could be retained." };
+      return {
+        outcome: "PARTIAL",
+        reason:
+          "Matching targets were found, but no bounded native inspection sample could be retained.",
+      };
     if (lastDiscovery.complete === true && lastDiscovery.truncated !== true)
       return { outcome: "NO_MATCH" };
     return { outcome: "PARTIAL", reason: "The requested scope was not fully scanned." };
@@ -766,7 +797,10 @@ function readOnlyInspectionSummary(
     pages.length,
   );
   const nativeResults = task.ledger.flatMap((entry) => {
-    if (entry.call.action.tool !== "get_document_context" && entry.call.action.tool !== "inspect_nodes")
+    if (
+      entry.call.action.tool !== "get_document_context" &&
+      entry.call.action.tool !== "inspect_nodes"
+    )
       return [];
     try {
       const payload = JSON.parse(entry.output ?? "{}");
@@ -777,22 +811,26 @@ function readOnlyInspectionSummary(
   });
   const sumProfile = (field: string) =>
     nativeResults.reduce((total, result) => {
-      const profiling = result.data && typeof result.data === "object"
-        ? (result.data as Record<string, unknown>).profiling
-        : undefined;
-      const value = profiling && typeof profiling === "object"
-        ? (profiling as Record<string, unknown>)[field]
-        : undefined;
+      const profiling =
+        result.data && typeof result.data === "object"
+          ? (result.data as Record<string, unknown>).profiling
+          : undefined;
+      const value =
+        profiling && typeof profiling === "object"
+          ? (profiling as Record<string, unknown>)[field]
+          : undefined;
       return total + (typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0);
     }, 0);
   const profileValues = (field: string) =>
     nativeResults.flatMap((result) => {
-      const profiling = result.data && typeof result.data === "object"
-        ? (result.data as Record<string, unknown>).profiling
-        : undefined;
-      const value = profiling && typeof profiling === "object"
-        ? (profiling as Record<string, unknown>)[field]
-        : undefined;
+      const profiling =
+        result.data && typeof result.data === "object"
+          ? (result.data as Record<string, unknown>).profiling
+          : undefined;
+      const value =
+        profiling && typeof profiling === "object"
+          ? (profiling as Record<string, unknown>)[field]
+          : undefined;
       return typeof value === "number" && Number.isFinite(value) ? [Math.max(0, value)] : [];
     });
   const resultPayloadSizes = profileValues("resultPayloadBytes");
@@ -800,8 +838,10 @@ function readOnlyInspectionSummary(
   const discoveryPerformance = run.reduce(
     (total, { discovery, frames: resultFrames }) => {
       if (discovery.cacheHit !== true) {
-        total.pagesLoaded += typeof discovery.pagesVisited === "number" ? Math.max(0, discovery.pagesVisited) : 0;
-        total.nodesVisited += typeof discovery.nodesVisited === "number" ? Math.max(0, discovery.nodesVisited) : 0;
+        total.pagesLoaded +=
+          typeof discovery.pagesVisited === "number" ? Math.max(0, discovery.pagesVisited) : 0;
+        total.nodesVisited +=
+          typeof discovery.nodesVisited === "number" ? Math.max(0, discovery.nodesVisited) : 0;
       } else total.discoveryCacheHits++;
       total.framesReturned += resultFrames.length;
       return total;
@@ -811,8 +851,11 @@ function readOnlyInspectionSummary(
   const modelTrace = task.modelRoundTrace ?? [];
   const uiRenderProfile =
     typeof window !== "undefined"
-      ? (window as Window & { __fadUiRenderProfile?: { commits?: number; actualDurationMs?: number } })
-          .__fadUiRenderProfile
+      ? (
+          window as Window & {
+            __fadUiRenderProfile?: { commits?: number; actualDurationMs?: number };
+          }
+        ).__fadUiRenderProfile
       : undefined;
   return {
     pagesScanned,
@@ -823,13 +866,15 @@ function readOnlyInspectionSummary(
         : "all_accessible_pages",
     pagesRemaining: Math.max(
       0,
-      typeof latest?.pagesRemaining === "number" ? latest.pagesRemaining : pagesAvailable - pagesScanned,
+      typeof latest?.pagesRemaining === "number"
+        ? latest.pagesRemaining
+        : pagesAvailable - pagesScanned,
     ),
     framesDiscovered: Math.max(reportedFrameCount, frames.length),
     matchingFrames: discoveries.reduce(
-        (max, discovery) =>
-          Math.max(max, typeof discovery.matchCount === "number" ? discovery.matchCount : 0),
-        task.targetName ? 0 : frames.length,
+      (max, discovery) =>
+        Math.max(max, typeof discovery.matchCount === "number" ? discovery.matchCount : 0),
+      task.targetName ? 0 : frames.length,
     ),
     framesInspected:
       typeof latestNativeInspection?.framesInspected === "number"
@@ -850,30 +895,36 @@ function readOnlyInspectionSummary(
     ),
     inaccessiblePages: typeof latest?.inaccessiblePages === "number" ? latest.inaccessiblePages : 0,
     inaccessiblePageSamples: Array.isArray(latest?.inaccessiblePageSamples)
-      ? latest.inaccessiblePageSamples.flatMap((page) =>
-          page && typeof page === "object" && typeof (page as Record<string, unknown>).id === "string"
-            ? [{
-                id: String((page as Record<string, unknown>).id).slice(0, 200),
-                name: typeof (page as Record<string, unknown>).name === "string"
-                  ? String((page as Record<string, unknown>).name).slice(0, 100)
-                  : "",
-                ...(typeof (page as Record<string, unknown>).reason === "string"
-                  ? { reason: String((page as Record<string, unknown>).reason).slice(0, 100) }
-                  : {}),
-              }]
-            : [],
-        ).slice(0, 24)
+      ? latest.inaccessiblePageSamples
+          .flatMap((page) =>
+            page &&
+            typeof page === "object" &&
+            typeof (page as Record<string, unknown>).id === "string"
+              ? [
+                  {
+                    id: String((page as Record<string, unknown>).id).slice(0, 200),
+                    name:
+                      typeof (page as Record<string, unknown>).name === "string"
+                        ? String((page as Record<string, unknown>).name).slice(0, 100)
+                        : "",
+                    ...(typeof (page as Record<string, unknown>).reason === "string"
+                      ? { reason: String((page as Record<string, unknown>).reason).slice(0, 100) }
+                      : {}),
+                  },
+                ]
+              : [],
+          )
+          .slice(0, 24)
       : [],
     complete: latest?.complete === true && latest.truncated !== true,
     continuationAvailable: latest?.continuationAvailable === true,
-    ...(typeof latest?.truncationReason === "string" ? { truncationReason: latest.truncationReason.slice(0, 160) } : {}),
+    ...(typeof latest?.truncationReason === "string"
+      ? { truncationReason: latest.truncationReason.slice(0, 160) }
+      : {}),
     truncated:
       discoveries.some(
-        (discovery) =>
-          discovery.truncated === true ||
-          discovery.complete === false,
-      ) ||
-      checkpoint.pendingOffsets.length > 0,
+        (discovery) => discovery.truncated === true || discovery.complete === false,
+      ) || checkpoint.pendingOffsets.length > 0,
     nativeOperations: Math.min(
       CHAT_TASK_MAX_READ_ONLY_OPERATIONS,
       task.ledger.filter(
@@ -882,24 +933,28 @@ function readOnlyInspectionSummary(
           entry.call.action.tool === "inspect_nodes",
       ).length,
     ),
-    repeatedOperations: Math.min(
-      CHAT_TASK_MAX_READ_ONLY_OPERATIONS,
-      checkpoint.repeatedOperations,
-    ),
+    repeatedOperations: Math.min(CHAT_TASK_MAX_READ_ONLY_OPERATIONS, checkpoint.repeatedOperations),
     nativePerformance: {
-      pagesLoaded:
-        discoveryPerformance.pagesLoaded,
-      loadedPageCacheEntries: typeof latest?.loadedPageCacheEntries === "number" ? latest.loadedPageCacheEntries : 0,
-      trackedPageListeners: typeof latest?.trackedPageListeners === "number" ? latest.trackedPageListeners : 0,
+      pagesLoaded: discoveryPerformance.pagesLoaded,
+      loadedPageCacheEntries:
+        typeof latest?.loadedPageCacheEntries === "number" ? latest.loadedPageCacheEntries : 0,
+      trackedPageListeners:
+        typeof latest?.trackedPageListeners === "number" ? latest.trackedPageListeners : 0,
       globalInvalidationFallback: latest?.globalInvalidationFallback === true,
-      discoveryCacheEntries: typeof latest?.discoveryCacheEntries === "number" ? latest.discoveryCacheEntries : 0,
-      discoveryCacheBytes: typeof latest?.discoveryCacheBytes === "number" ? latest.discoveryCacheBytes : 0,
+      discoveryCacheEntries:
+        typeof latest?.discoveryCacheEntries === "number" ? latest.discoveryCacheEntries : 0,
+      discoveryCacheBytes:
+        typeof latest?.discoveryCacheBytes === "number" ? latest.discoveryCacheBytes : 0,
       nodesVisited: discoveryPerformance.nodesVisited,
       framesReturned:
-        typeof latest?.framesReturned === "number" ? latest.framesReturned : discoveryPerformance.framesReturned,
+        typeof latest?.framesReturned === "number"
+          ? latest.framesReturned
+          : discoveryPerformance.framesReturned,
       slices: typeof latest?.sliceCount === "number" ? latest.sliceCount : 0,
-      nodesPerSliceBudget: typeof latest?.nodesPerSliceBudget === "number" ? latest.nodesPerSliceBudget : 128,
-      pagesPerCheckpoint: typeof latest?.pagesPerCheckpoint === "number" ? latest.pagesPerCheckpoint : 32,
+      nodesPerSliceBudget:
+        typeof latest?.nodesPerSliceBudget === "number" ? latest.nodesPerSliceBudget : 128,
+      pagesPerCheckpoint:
+        typeof latest?.pagesPerCheckpoint === "number" ? latest.pagesPerCheckpoint : 32,
       pagesPerYield: typeof latest?.pagesPerYield === "number" ? latest.pagesPerYield : 4,
       maxNodesPerSliceObserved:
         typeof latest?.maxNodesPerSliceObserved === "number" ? latest.maxNodesPerSliceObserved : 0,
@@ -908,11 +963,23 @@ function readOnlyInspectionSummary(
       averageSliceMs: typeof latest?.averageSliceMs === "number" ? latest.averageSliceMs : 0,
       maxSliceMs: typeof latest?.maxSliceMs === "number" ? latest.maxSliceMs : 0,
       pageLoadMs: run.reduce(
-        (total, { discovery }) => total + (discovery.cacheHit === true ? 0 : typeof discovery.pageLoadMs === "number" ? discovery.pageLoadMs : 0),
+        (total, { discovery }) =>
+          total +
+          (discovery.cacheHit === true
+            ? 0
+            : typeof discovery.pageLoadMs === "number"
+              ? discovery.pageLoadMs
+              : 0),
         0,
       ),
       scanElapsedMs: run.reduce(
-        (total, { discovery }) => total + (discovery.cacheHit === true ? 0 : typeof discovery.scanElapsedMs === "number" ? discovery.scanElapsedMs : 0),
+        (total, { discovery }) =>
+          total +
+          (discovery.cacheHit === true
+            ? 0
+            : typeof discovery.scanElapsedMs === "number"
+              ? discovery.scanElapsedMs
+              : 0),
         0,
       ),
       cacheHit: latest?.cacheHit === true,
@@ -928,14 +995,19 @@ function readOnlyInspectionSummary(
       discoveryCacheHitRate:
         typeof latest?.cacheHitRate === "number"
           ? latest.cacheHitRate
-          : run.length ? discoveryPerformance.discoveryCacheHits / run.length : 0,
+          : run.length
+            ? discoveryPerformance.discoveryCacheHits / run.length
+            : 0,
       nativeExecutionMs: Math.min(86_400_000, sumProfile("nativeExecutionMs")),
       resultSerializationMs: Math.min(86_400_000, sumProfile("resultSerializationMs")),
       resultPayloadBytes: Math.min(10_000_000, sumProfile("resultPayloadBytes")),
       transferPayloadBytes: Math.min(10_000_000, sumProfile("transferPayloadBytes")),
       resultPayloadBytesPeak: Math.min(10_000_000, Math.max(0, ...resultPayloadSizes)),
       transferPayloadBytesPeak: Math.min(10_000_000, Math.max(0, ...transferPayloadSizes)),
-      payloadSamples: Math.min(CHAT_TASK_MAX_READ_ONLY_OPERATIONS, Math.max(resultPayloadSizes.length, transferPayloadSizes.length)),
+      payloadSamples: Math.min(
+        CHAT_TASK_MAX_READ_ONLY_OPERATIONS,
+        Math.max(resultPayloadSizes.length, transferPayloadSizes.length),
+      ),
       modelRequests: Math.min(100, task.rounds + (task.roundBreakdown?.modelRetries ?? 0)),
       modelLatencyMs: Math.min(
         86_400_000,
@@ -947,7 +1019,9 @@ function readOnlyInspectionSummary(
       ),
       uiRenderCommits: Math.min(
         10_000,
-        Number.isFinite(uiRenderProfile?.commits) ? Math.max(0, Math.round(uiRenderProfile!.commits!)) : 0,
+        Number.isFinite(uiRenderProfile?.commits)
+          ? Math.max(0, Math.round(uiRenderProfile!.commits!))
+          : 0,
       ),
       uiRenderDurationMs: Math.min(
         86_400_000,
@@ -1008,52 +1082,100 @@ function readOnlyInspectionReport(
     "Matching frames: " + summary.matchingFrames + ".",
     "Frames inspected natively: " + summary.framesInspected + ".",
     "Frames not inspected: " + summary.uninspectedFrames + ".",
-    "Scan coverage: " + (summary.complete ? "complete" : "partial") +
+    "Scan coverage: " +
+      (summary.complete ? "complete" : "partial") +
       (summary.pagesRemaining ? "; " + summary.pagesRemaining + " pages remain" : "") +
-      (summary.inaccessiblePages ? "; " + summary.inaccessiblePages + " page(s) were inaccessible" : "") +
-      (summary.continuationAvailable ? "; a saved continuation is available" : "") + ".",
-    "Inspection work: " + summary.nativeOperations + " native operations; " +
-      summary.nativePerformance.pagesLoaded + " pages loaded; " +
-      summary.nativePerformance.nodesVisited + " nodes visited; " +
-      summary.nativePerformance.slices + " slices (maximum " +
-      summary.nativePerformance.maxNodesPerSliceObserved + "/" +
-      summary.nativePerformance.nodesPerSliceBudget + " work units per slice; average " + summary.nativePerformance.averageSliceMs +
-      " ms, maximum " + summary.nativePerformance.maxSliceMs + " ms; yield at least every " +
-      summary.nativePerformance.pagesPerYield + " pages and checkpoint every " +
-      summary.nativePerformance.pagesPerCheckpoint + " pages); " +
-      summary.nativePerformance.scanElapsedMs + " ms in traversal; " +
-      summary.nativePerformance.pageLoadMs + " ms loading pages; " +
-      summary.nativePerformance.nativeExecutionMs + " ms native execution; " +
-      summary.nativePerformance.resultPayloadBytes + " result bytes; " +
-      summary.nativePerformance.transferPayloadBytes + " transfer bytes.",
-    "Discovery cache: " + summary.nativePerformance.discoveryCacheHits + "/" +
-      summary.nativePerformance.discoveryCacheLookups + " hits (" +
-      Math.round(summary.nativePerformance.discoveryCacheHitRate * 100) + "% hit rate); " +
-      "revalidated after restart: " + (summary.nativePerformance.revalidatedAfterRestart ? "yes." : "no."),
-    "Resident discovery memory: " + summary.nativePerformance.loadedPageCacheEntries + "/64 tracked loaded-page IDs; " +
-      summary.nativePerformance.trackedPageListeners + "/64 page listeners; " +
-      summary.nativePerformance.discoveryCacheEntries + "/12 cursors (" +
-      summary.nativePerformance.discoveryCacheBytes + " bytes); global invalidation fallback " +
+      (summary.inaccessiblePages
+        ? "; " + summary.inaccessiblePages + " page(s) were inaccessible"
+        : "") +
+      (summary.continuationAvailable ? "; a saved continuation is available" : "") +
+      ".",
+    "Inspection work: " +
+      summary.nativeOperations +
+      " native operations; " +
+      summary.nativePerformance.pagesLoaded +
+      " pages loaded; " +
+      summary.nativePerformance.nodesVisited +
+      " nodes visited; " +
+      summary.nativePerformance.slices +
+      " slices (maximum " +
+      summary.nativePerformance.maxNodesPerSliceObserved +
+      "/" +
+      summary.nativePerformance.nodesPerSliceBudget +
+      " work units per slice; average " +
+      summary.nativePerformance.averageSliceMs +
+      " ms, maximum " +
+      summary.nativePerformance.maxSliceMs +
+      " ms; yield at least every " +
+      summary.nativePerformance.pagesPerYield +
+      " pages and checkpoint every " +
+      summary.nativePerformance.pagesPerCheckpoint +
+      " pages); " +
+      summary.nativePerformance.scanElapsedMs +
+      " ms in traversal; " +
+      summary.nativePerformance.pageLoadMs +
+      " ms loading pages; " +
+      summary.nativePerformance.nativeExecutionMs +
+      " ms native execution; " +
+      summary.nativePerformance.resultPayloadBytes +
+      " result bytes; " +
+      summary.nativePerformance.transferPayloadBytes +
+      " transfer bytes.",
+    "Discovery cache: " +
+      summary.nativePerformance.discoveryCacheHits +
+      "/" +
+      summary.nativePerformance.discoveryCacheLookups +
+      " hits (" +
+      Math.round(summary.nativePerformance.discoveryCacheHitRate * 100) +
+      "% hit rate); " +
+      "revalidated after restart: " +
+      (summary.nativePerformance.revalidatedAfterRestart ? "yes." : "no."),
+    "Resident discovery memory: " +
+      summary.nativePerformance.loadedPageCacheEntries +
+      "/64 tracked loaded-page IDs; " +
+      summary.nativePerformance.trackedPageListeners +
+      "/64 page listeners; " +
+      summary.nativePerformance.discoveryCacheEntries +
+      "/12 cursors (" +
+      summary.nativePerformance.discoveryCacheBytes +
+      " bytes); global invalidation fallback " +
       (summary.nativePerformance.globalInvalidationFallback ? "active." : "inactive."),
-    "Payload sizes: peak " + summary.nativePerformance.resultPayloadBytesPeak + " result bytes and " +
-      summary.nativePerformance.transferPayloadBytesPeak + " transfer bytes across " +
-      summary.nativePerformance.payloadSamples + " native replies.",
-    "Model requests: " + summary.nativePerformance.modelRequests + "; " +
-      summary.nativePerformance.modelLatencyMs + " ms total Companion/model time; " +
-      summary.nativePerformance.modelInputBytes + " input bytes.",
-    "UI rendering: " + summary.nativePerformance.uiRenderCommits + " React commits; " +
-      summary.nativePerformance.uiRenderDurationMs + " ms aggregate render time.",
+    "Payload sizes: peak " +
+      summary.nativePerformance.resultPayloadBytesPeak +
+      " result bytes and " +
+      summary.nativePerformance.transferPayloadBytesPeak +
+      " transfer bytes across " +
+      summary.nativePerformance.payloadSamples +
+      " native replies.",
+    "Model requests: " +
+      summary.nativePerformance.modelRequests +
+      "; " +
+      summary.nativePerformance.modelLatencyMs +
+      " ms total Companion/model time; " +
+      summary.nativePerformance.modelInputBytes +
+      " input bytes.",
+    "UI rendering: " +
+      summary.nativePerformance.uiRenderCommits +
+      " React commits; " +
+      summary.nativePerformance.uiRenderDurationMs +
+      " ms aggregate render time.",
   ];
   if (pages.length)
     lines.push(
-      "Pages visited" + (pages.length < summary.pagesScanned ? " (sample)" : "") + ": " +
-        pages.join(", ") + ".",
+      "Pages visited" +
+        (pages.length < summary.pagesScanned ? " (sample)" : "") +
+        ": " +
+        pages.join(", ") +
+        ".",
     );
   if (summary.inaccessiblePageSamples.length)
     lines.push(
       "Inaccessible page sample: " +
         summary.inaccessiblePageSamples
-          .map(({ name, id, reason }) => `${name || id} (${id}${reason ? ", " + reason.replaceAll("_", " ") : ""})`)
+          .map(
+            ({ name, id, reason }) =>
+              `${name || id} (${id}${reason ? ", " + reason.replaceAll("_", " ") : ""})`,
+          )
           .join(", ") +
         ".",
     );
@@ -1061,7 +1183,9 @@ function readOnlyInspectionReport(
     lines.push("Verified frames:");
     for (const frame of verified.slice(0, 60)) {
       const page =
-        typeof frame.pageName === "string" ? frame.pageName : String(frame.pageId ?? "Unknown page");
+        typeof frame.pageName === "string"
+          ? frame.pageName
+          : String(frame.pageId ?? "Unknown page");
       const name = typeof frame.name === "string" ? frame.name.slice(0, 80) : "Unnamed frame";
       const geometry = [frame.width, frame.height].every(Number.isFinite)
         ? Math.round(Number(frame.width)) + " × " + Math.round(Number(frame.height))
@@ -1071,7 +1195,11 @@ function readOnlyInspectionReport(
         : "";
       const line = "• " + page + " / " + name + " — " + geometry + location + ".";
       if (lines.join("\n").length + line.length > 7_400) {
-        lines.push("Additional verified frames omitted from this short report: " + (verified.length - lines.length + 6) + ".");
+        lines.push(
+          "Additional verified frames omitted from this short report: " +
+            (verified.length - lines.length + 6) +
+            ".",
+        );
         break;
       }
       lines.push(line);
@@ -1082,7 +1210,9 @@ function readOnlyInspectionReport(
   if (summary.truncationReason)
     lines.push("Scan stop reason: " + summary.truncationReason.replaceAll("_", " ") + ".");
   if (summary.nativePerformance.revalidatedAfterRestart)
-    lines.push("A previous executor cursor was stale, so accessible pages were revalidated from the start.");
+    lines.push(
+      "A previous executor cursor was stale, so accessible pages were revalidated from the start.",
+    );
   if (reason) lines.push("Limitation: " + reason.slice(0, 300));
   lines.push("Canvas mutations: 0.");
   return lines.join("\n").slice(0, 8_000);
@@ -1105,7 +1235,13 @@ function autonomousEditTargetCall(task: ChatTask, action: FigmaToolAction) {
   return parseResponsesFunctionCalls([
     {
       type: "function_call",
-      call_id: EDIT_TARGET_CALL_PREFIX + task.id + "_" + (task.ledger.length + 1) + "_" + (task.rounds + 1),
+      call_id:
+        EDIT_TARGET_CALL_PREFIX +
+        task.id +
+        "_" +
+        (task.ledger.length + 1) +
+        "_" +
+        (task.rounds + 1),
       name: tool,
       arguments: JSON.stringify(args),
     },
@@ -1117,10 +1253,47 @@ const EDIT_TARGET_CALL_PREFIX = "edit_target_";
 function editTargetQuery(task: ChatTask): string | undefined {
   if (task.targetName?.trim()) return task.targetName.trim().slice(0, 100);
   const stopWords = new Set([
-    "a", "an", "the", "existing", "design", "redesign", "improve", "update", "change",
-    "make", "better", "please", "of", "for", "in", "on", "page", "screen", "frame",
-    "safhe", "safheye", "ro", "behtar", "kon", "konid", "tarahi", "tarahie", "design", "ye",
-    "یک", "را", "رو", "بهتر", "کن", "کنید", "طراحی", "صفحه", "موجود", "فعلی", "لطفا", "برای",
+    "a",
+    "an",
+    "the",
+    "existing",
+    "design",
+    "redesign",
+    "improve",
+    "update",
+    "change",
+    "make",
+    "better",
+    "please",
+    "of",
+    "for",
+    "in",
+    "on",
+    "page",
+    "screen",
+    "frame",
+    "safhe",
+    "safheye",
+    "ro",
+    "behtar",
+    "kon",
+    "konid",
+    "tarahi",
+    "tarahie",
+    "design",
+    "ye",
+    "یک",
+    "را",
+    "رو",
+    "بهتر",
+    "کن",
+    "کنید",
+    "طراحی",
+    "صفحه",
+    "موجود",
+    "فعلی",
+    "لطفا",
+    "برای",
   ]);
   const terms = task.prompt
     .normalize("NFKC")
@@ -1149,24 +1322,52 @@ function inspectEvidenceTree(nodes: unknown[]): {
   root?: Record<string, unknown>;
 } {
   const fields = [
-    "ref", "type", "name", "x", "y", "width", "height", "visible", "locked", "fill", "stroke",
-    "opacity", "cornerRadius", "text", "fontSize", "textColor", "textAlignHorizontal", "fontFamily",
-    "fontStyle", "lineHeight", "letterSpacing", "layoutMode", "itemSpacing", "paddingTop",
-    "paddingRight", "paddingBottom", "paddingLeft",
+    "ref",
+    "type",
+    "name",
+    "x",
+    "y",
+    "width",
+    "height",
+    "visible",
+    "locked",
+    "fill",
+    "stroke",
+    "opacity",
+    "cornerRadius",
+    "text",
+    "fontSize",
+    "textColor",
+    "textAlignHorizontal",
+    "fontFamily",
+    "fontStyle",
+    "lineHeight",
+    "letterSpacing",
+    "layoutMode",
+    "itemSpacing",
+    "paddingTop",
+    "paddingRight",
+    "paddingBottom",
+    "paddingLeft",
   ];
   const rows: Array<Record<string, unknown>> = [];
   const visit = (value: unknown, parentRef?: string) => {
     if (rows.length >= 25 || !value || typeof value !== "object" || Array.isArray(value)) return;
     const node = value as Record<string, unknown>;
-    const row = Object.fromEntries(fields.filter((field) => node[field] !== undefined).map((field) => [field, node[field]]));
+    const row = Object.fromEntries(
+      fields.filter((field) => node[field] !== undefined).map((field) => [field, node[field]]),
+    );
     if (parentRef) row.parentRef = parentRef;
     rows.push(row);
     if (Array.isArray(node.children))
-      for (const child of node.children) visit(child, typeof node.ref === "string" ? node.ref : parentRef);
+      for (const child of node.children)
+        visit(child, typeof node.ref === "string" ? node.ref : parentRef);
   };
   for (const node of nodes) visit(node);
   return {
-    verifiedRefs: [...new Set(rows.flatMap((row) => typeof row.ref === "string" ? [row.ref] : []))].slice(0, 25),
+    verifiedRefs: [
+      ...new Set(rows.flatMap((row) => (typeof row.ref === "string" ? [row.ref] : []))),
+    ].slice(0, 25),
     nativeEvidence: JSON.stringify(rows).slice(0, 16_000),
     ...(nodes[0] && typeof nodes[0] === "object" && !Array.isArray(nodes[0])
       ? { root: nodes[0] as Record<string, unknown> }
@@ -1179,37 +1380,57 @@ function editTargetFromInspection(
   entry: ChatTask["ledger"][number],
   resultData: Record<string, unknown>,
 ): NonNullable<ChatTask["editTarget"]> | undefined {
-  if (entry.call.action.tool !== "inspect_nodes" || entry.call.action.refs.length !== 1) return undefined;
+  if (entry.call.action.tool !== "inspect_nodes" || entry.call.action.refs.length !== 1)
+    return undefined;
   const ref = entry.call.action.refs[0]!;
   const actionPageId = entry.call.action.pageId;
-  const saved = task.editTarget?.ref === ref && task.editTarget.pageId === actionPageId ? task.editTarget : undefined;
+  const saved =
+    task.editTarget?.ref === ref && task.editTarget.pageId === actionPageId
+      ? task.editTarget
+      : undefined;
   const discoveryEntry = [...task.ledger].reverse().find((candidate) => {
-    if (candidate.status !== "completed" || candidate.call.action.tool !== "get_document_context") return false;
+    if (candidate.status !== "completed" || candidate.call.action.tool !== "get_document_context")
+      return false;
     const query = saved?.query ?? editTargetQuery(task);
-    return normalizeInspectionQuery(candidate.call.action.query) === normalizeInspectionQuery(query);
+    return (
+      normalizeInspectionQuery(candidate.call.action.query) === normalizeInspectionQuery(query)
+    );
   });
   const discoveryPayload = discoveryEntry ? ledgerPayload(discoveryEntry) : undefined;
-  const discoveryData = discoveryPayload?.data && typeof discoveryPayload.data === "object"
-    ? discoveryPayload.data as Record<string, unknown>
-    : undefined;
-  const discoverySummary = discoveryData?.discovery && typeof discoveryData.discovery === "object"
-    ? discoveryData.discovery as Record<string, unknown>
-    : undefined;
+  const discoveryData =
+    discoveryPayload?.data && typeof discoveryPayload.data === "object"
+      ? (discoveryPayload.data as Record<string, unknown>)
+      : undefined;
+  const discoverySummary =
+    discoveryData?.discovery && typeof discoveryData.discovery === "object"
+      ? (discoveryData.discovery as Record<string, unknown>)
+      : undefined;
   const exactNameCount = discoverySummary?.exactNameMatchCount;
   const frame = saved
     ? { ...saved }
-    : (Array.isArray(discoveryData?.frames)
-        ? discoveryData.frames.find((candidate) => candidate && typeof candidate === "object" &&
-            (candidate as Record<string, unknown>).ref === ref &&
-            (candidate as Record<string, unknown>).pageId === actionPageId &&
-            (exactNameCount !== 1 || typeof (candidate as Record<string, unknown>).name === "string" &&
-              normalizeInspectionQuery(String((candidate as Record<string, unknown>).name)) === normalizeInspectionQuery(String(discoverySummary?.query ?? task.targetName ?? ""))))
-        : undefined) as Record<string, unknown> | undefined;
+    : ((Array.isArray(discoveryData?.frames)
+        ? discoveryData.frames.find(
+            (candidate) =>
+              candidate &&
+              typeof candidate === "object" &&
+              (candidate as Record<string, unknown>).ref === ref &&
+              (candidate as Record<string, unknown>).pageId === actionPageId &&
+              (exactNameCount !== 1 ||
+                (typeof (candidate as Record<string, unknown>).name === "string" &&
+                  normalizeInspectionQuery(String((candidate as Record<string, unknown>).name)) ===
+                    normalizeInspectionQuery(
+                      String(discoverySummary?.query ?? task.targetName ?? ""),
+                    ))),
+          )
+        : undefined) as Record<string, unknown> | undefined);
   const roots = Array.isArray(resultData.nodes) ? resultData.nodes : [];
   const inspected = inspectEvidenceTree(roots);
   const root = inspected.root;
   if (
-    !frame || !root || root.ref !== ref || resultData.pageId !== actionPageId ||
+    !frame ||
+    !root ||
+    root.ref !== ref ||
+    resultData.pageId !== actionPageId ||
     !inspected.verifiedRefs.includes(ref) ||
     (typeof frame.nodeId !== "string" && typeof saved?.nodeId !== "string") ||
     (typeof frame.type === "string" && frame.type !== root.type) ||
@@ -1217,20 +1438,38 @@ function editTargetFromInspection(
     !["x", "y", "width", "height"].every((field) => {
       const before = frame[field];
       const after = root[field];
-      return typeof before !== "number" || typeof after === "number" && Math.abs(before - after) < 0.01;
+      return (
+        typeof before !== "number" || (typeof after === "number" && Math.abs(before - after) < 0.01)
+      );
     })
-  ) return undefined;
+  )
+    return undefined;
   const discoveryId = discoveryEntry?.operationId ?? saved?.discoveryOperationId;
   if (!discoveryId) return undefined;
   return {
-    query: saved?.query ?? String(discoveryData?.discovery && typeof discoveryData.discovery === "object"
-      ? (discoveryData.discovery as Record<string, unknown>).query ?? editTargetQuery(task) ?? task.targetName ?? ""
-      : editTargetQuery(task) ?? task.targetName ?? "").slice(0, 100),
+    query:
+      saved?.query ??
+      String(
+        discoveryData?.discovery && typeof discoveryData.discovery === "object"
+          ? ((discoveryData.discovery as Record<string, unknown>).query ??
+              editTargetQuery(task) ??
+              task.targetName ??
+              "")
+          : (editTargetQuery(task) ?? task.targetName ?? ""),
+      ).slice(0, 100),
     ref,
     pageId: actionPageId ?? saved?.pageId ?? "",
-    ...(typeof frame.pageName === "string" ? { pageName: frame.pageName.slice(0, 100) } : saved?.pageName ? { pageName: saved.pageName } : {}),
+    ...(typeof frame.pageName === "string"
+      ? { pageName: frame.pageName.slice(0, 100) }
+      : saved?.pageName
+        ? { pageName: saved.pageName }
+        : {}),
     nodeId: typeof frame.nodeId === "string" ? frame.nodeId : saved!.nodeId,
-    ...(typeof frame.parentNodeId === "string" ? { parentId: frame.parentNodeId } : saved?.parentId ? { parentId: saved.parentId } : {}),
+    ...(typeof frame.parentNodeId === "string"
+      ? { parentId: frame.parentNodeId }
+      : saved?.parentId
+        ? { parentId: saved.parentId }
+        : {}),
     type: String(root.type ?? frame.type ?? "FRAME"),
     name: String(root.name ?? frame.name ?? "Target frame").slice(0, 100),
     x: Number(root.x),
@@ -1248,7 +1487,15 @@ function editTargetFromInspection(
 type EditTargetOperation =
   | { action: FigmaToolAction; progress: string }
   | { ready: true }
-  | { blocked: true; code: "target_not_found" | "target_ambiguous" | "target_not_inspected" | "reference_not_mutation_eligible"; reason: string };
+  | {
+      blocked: true;
+      code:
+        | "target_not_found"
+        | "target_ambiguous"
+        | "target_not_inspected"
+        | "reference_not_mutation_eligible";
+      reason: string;
+    };
 
 function nextEditTargetOperation(
   task: ChatTask,
@@ -1256,93 +1503,204 @@ function nextEditTargetOperation(
 ): EditTargetOperation {
   const query = task.editTarget?.query ?? editTargetQuery(task);
   if (!query)
-    return { blocked: true, code: "target_not_found", reason: "Name the existing frame or screen to edit; no selection was used as a fallback." };
+    return {
+      blocked: true,
+      code: "target_not_found",
+      reason: "Name the existing frame or screen to edit; no selection was used as a fallback.",
+    };
   if (!task.targetName) task.targetName = query;
   if (task.editTarget) {
-    const inspection = task.ledger.find((entry) => entry.operationId === task.editTarget!.inspectionOperationId);
-    const verified = inspection?.status === "completed" && ledgerPayload(inspection)?.success === true;
-    const freshInspection = task.ledger.some((entry, index) => index >= options.initialLedgerLength &&
-      entry.call.callId.startsWith(EDIT_TARGET_CALL_PREFIX) && entry.call.action.tool === "inspect_nodes" &&
-      entry.status === "completed" && ledgerPayload(entry)?.success === true);
+    const inspection = task.ledger.find(
+      (entry) => entry.operationId === task.editTarget!.inspectionOperationId,
+    );
+    const verified =
+      inspection?.status === "completed" && ledgerPayload(inspection)?.success === true;
+    const freshInspection = task.ledger.some(
+      (entry, index) =>
+        index >= options.initialLedgerLength &&
+        entry.call.callId.startsWith(EDIT_TARGET_CALL_PREFIX) &&
+        entry.call.action.tool === "inspect_nodes" &&
+        entry.status === "completed" &&
+        ledgerPayload(entry)?.success === true,
+    );
     if (options.forceFresh && !freshInspection)
       return {
         action: {
-          tool: "inspect_nodes", pageId: task.editTarget.pageId, refs: [task.editTarget.ref],
-          selection: false, depth: INSPECT_NODES_LIMITS.depth.max, maxNodes: INSPECT_NODES_LIMITS.maxNodes.max,
+          tool: "inspect_nodes",
+          pageId: task.editTarget.pageId,
+          refs: [task.editTarget.ref],
+          selection: false,
+          depth: INSPECT_NODES_LIMITS.depth.max,
+          maxNodes: INSPECT_NODES_LIMITS.maxNodes.max,
           readOnlyInspection: false,
         },
         progress: "Revalidating the saved edit target and its native hierarchy…",
       };
     if (!verified && !freshInspection)
-      return { blocked: true, code: "target_not_inspected", reason: "The discovered target has no successful native inspection checkpoint." };
+      return {
+        blocked: true,
+        code: "target_not_inspected",
+        reason: "The discovered target has no successful native inspection checkpoint.",
+      };
     return { ready: true };
   }
 
   const contexts = task.ledger.filter((entry) => {
     const action = entry.call.action;
-    return action.tool === "get_document_context" && action.readOnlyInspection !== true &&
-      (action.offset ?? 0) === 0 && normalizeInspectionQuery(action.query) === normalizeInspectionQuery(query);
+    return (
+      action.tool === "get_document_context" &&
+      action.readOnlyInspection !== true &&
+      (action.offset ?? 0) === 0 &&
+      normalizeInspectionQuery(action.query) === normalizeInspectionQuery(query)
+    );
   });
-  const freshContext = contexts.some((entry) => task.ledger.indexOf(entry) >= options.initialLedgerLength &&
-    entry.status === "completed" && ledgerPayload(entry)?.success === true);
+  const freshContext = contexts.some(
+    (entry) =>
+      task.ledger.indexOf(entry) >= options.initialLedgerLength &&
+      entry.status === "completed" &&
+      ledgerPayload(entry)?.success === true,
+  );
   if (options.forceFresh && !freshContext)
     return {
       action: { tool: "get_document_context", query, readOnlyInspection: false },
       progress: "Resuming the progressive scan and revalidating the named edit target…",
     };
-  const context = [...contexts].reverse().find((entry) => entry.status === "completed" && ledgerPayload(entry)?.success === true);
+  const context = [...contexts]
+    .reverse()
+    .find((entry) => entry.status === "completed" && ledgerPayload(entry)?.success === true);
   if (!context) {
     if (contexts.some((entry) => entry.status === "failed"))
-      return { blocked: true, code: "target_not_found", reason: "Figma could not complete discovery for the requested existing target." };
+      return {
+        blocked: true,
+        code: "target_not_found",
+        reason: "Figma could not complete discovery for the requested existing target.",
+      };
     return {
       action: { tool: "get_document_context", query, readOnlyInspection: false },
       progress: "Progressively discovering the named existing frame across accessible pages…",
     };
   }
   const payload = ledgerPayload(context)!;
-  const data = payload.data && typeof payload.data === "object" ? payload.data as Record<string, unknown> : undefined;
-  const discovery = data?.discovery && typeof data.discovery === "object" ? data.discovery as Record<string, unknown> : {};
-  if (discovery.paused === true || discovery.truncated === true || discovery.complete !== true ||
-      (typeof discovery.pagesRemaining === "number" && discovery.pagesRemaining > 0))
-    return { blocked: true, code: "target_not_inspected", reason: "Target discovery paused or reached a scan limit before full accessible-page coverage; the edit was not planned." };
+  const data =
+    payload.data && typeof payload.data === "object"
+      ? (payload.data as Record<string, unknown>)
+      : undefined;
+  const discovery =
+    data?.discovery && typeof data.discovery === "object"
+      ? (data.discovery as Record<string, unknown>)
+      : {};
+  if (
+    discovery.paused === true ||
+    discovery.truncated === true ||
+    discovery.complete !== true ||
+    (typeof discovery.pagesRemaining === "number" && discovery.pagesRemaining > 0)
+  )
+    return {
+      blocked: true,
+      code: "target_not_inspected",
+      reason:
+        "Target discovery paused or reached a scan limit before full accessible-page coverage; the edit was not planned.",
+    };
   const matchStatus = discovery.matchStatus;
-  if (matchStatus === "ambiguous" || (typeof discovery.matchCount === "number" && discovery.matchCount > 1 && discovery.exactNameMatchCount !== 1))
-    return { blocked: true, code: "target_ambiguous", reason: `“${query}” matches multiple existing frames. Specify which frame to edit; nothing was changed.` };
+  if (
+    matchStatus === "ambiguous" ||
+    (typeof discovery.matchCount === "number" &&
+      discovery.matchCount > 1 &&
+      discovery.exactNameMatchCount !== 1)
+  )
+    return {
+      blocked: true,
+      code: "target_ambiguous",
+      reason: `“${query}” matches multiple existing frames. Specify which frame to edit; nothing was changed.`,
+    };
   if (matchStatus === "no_match" || discovery.matchCount === 0)
-    return { blocked: true, code: "target_not_found", reason: `No existing frame matched “${query}” across the completed accessible-page scan. No replacement was created.` };
+    return {
+      blocked: true,
+      code: "target_not_found",
+      reason: `No existing frame matched “${query}” across the completed accessible-page scan. No replacement was created.`,
+    };
   if (matchStatus === "uneditable")
-    return { blocked: true, code: "reference_not_mutation_eligible", reason: "The matching frame was discovered but could not be promoted to a safe mutation-eligible reference." };
-  const frames = Array.isArray(data?.frames) ? data.frames.filter((frame) => frame && typeof frame === "object") as Array<Record<string, unknown>> : [];
+    return {
+      blocked: true,
+      code: "reference_not_mutation_eligible",
+      reason:
+        "The matching frame was discovered but could not be promoted to a safe mutation-eligible reference.",
+    };
+  const frames = Array.isArray(data?.frames)
+    ? (data.frames.filter((frame) => frame && typeof frame === "object") as Array<
+        Record<string, unknown>
+      >)
+    : [];
   const exactNameUnique = discovery.exactNameMatchCount === 1;
-  const matchingFrames = frames.filter((item) => typeof item.ref === "string" && typeof item.nodeId === "string" && typeof item.pageId === "string");
-  const frame = (exactNameUnique
-    ? matchingFrames.find((item) => normalizeInspectionQuery(String(item.name ?? "")) === normalizeInspectionQuery(query))
-    : matchingFrames[0]);
-  if (matchStatus !== "unique" ||
-      (discovery.matchCount !== 1 && discovery.exactNameMatchCount !== 1) ||
-      !frame)
-    return { blocked: true, code: "target_not_found", reason: "A unique, safely referenced existing frame was not established by discovery." };
-  if (frame.editable !== true || !["FRAME", "COMPONENT", "COMPONENT_SET"].includes(String(frame.type)))
-    return { blocked: true, code: "reference_not_mutation_eligible", reason: "The discovered target is not a verified editable frame/component." };
+  const matchingFrames = frames.filter(
+    (item) =>
+      typeof item.ref === "string" &&
+      typeof item.nodeId === "string" &&
+      typeof item.pageId === "string",
+  );
+  const frame = exactNameUnique
+    ? matchingFrames.find(
+        (item) =>
+          normalizeInspectionQuery(String(item.name ?? "")) === normalizeInspectionQuery(query),
+      )
+    : matchingFrames[0];
+  if (
+    matchStatus !== "unique" ||
+    (discovery.matchCount !== 1 && discovery.exactNameMatchCount !== 1) ||
+    !frame
+  )
+    return {
+      blocked: true,
+      code: "target_not_found",
+      reason: "A unique, safely referenced existing frame was not established by discovery.",
+    };
+  if (
+    frame.editable !== true ||
+    !["FRAME", "COMPONENT", "COMPONENT_SET"].includes(String(frame.type))
+  )
+    return {
+      blocked: true,
+      code: "reference_not_mutation_eligible",
+      reason: "The discovered target is not a verified editable frame/component.",
+    };
   const ref = String(frame.ref);
   const pageId = String(frame.pageId);
-  const inspections = task.ledger.filter((entry) => entry.call.action.tool === "inspect_nodes" &&
-    entry.call.action.readOnlyInspection !== true && entry.call.action.pageId === pageId &&
-    entry.call.action.refs.includes(ref));
-  const inspection = [...inspections].reverse().find((entry) => entry.status === "completed" && ledgerPayload(entry)?.success === true);
+  const inspections = task.ledger.filter(
+    (entry) =>
+      entry.call.action.tool === "inspect_nodes" &&
+      entry.call.action.readOnlyInspection !== true &&
+      entry.call.action.pageId === pageId &&
+      entry.call.action.refs.includes(ref),
+  );
+  const inspection = [...inspections]
+    .reverse()
+    .find((entry) => entry.status === "completed" && ledgerPayload(entry)?.success === true);
   if (!inspection) {
     if (inspections.some((entry) => entry.status === "failed"))
-      return { blocked: true, code: "target_not_inspected", reason: "Native inspection could not verify the discovered target. No edit plan or mutation was created." };
+      return {
+        blocked: true,
+        code: "target_not_inspected",
+        reason:
+          "Native inspection could not verify the discovered target. No edit plan or mutation was created.",
+      };
     return {
       action: {
-        tool: "inspect_nodes", pageId, refs: [ref], selection: false,
-        depth: INSPECT_NODES_LIMITS.depth.max, maxNodes: INSPECT_NODES_LIMITS.maxNodes.max,
+        tool: "inspect_nodes",
+        pageId,
+        refs: [ref],
+        selection: false,
+        depth: INSPECT_NODES_LIMITS.depth.max,
+        maxNodes: INSPECT_NODES_LIMITS.maxNodes.max,
         readOnlyInspection: false,
       },
       progress: `Inspecting “${String(frame.name ?? query).slice(0, 80)}” and its native hierarchy before planning…`,
     };
   }
-  return { blocked: true, code: "target_not_inspected", reason: "Native inspection completed but did not produce durable verified target evidence." };
+  return {
+    blocked: true,
+    code: "target_not_inspected",
+    reason: "Native inspection completed but did not produce durable verified target evidence.",
+  };
 }
 
 function editMutationBlocker(
@@ -1352,18 +1710,24 @@ function editMutationBlocker(
 ): string | undefined {
   const target = task.editTarget;
   if (!target) return "target_not_inspected: the edit target is not checkpointed.";
-  const allowed = new Set((target.plannedRefs ?? []).filter((ref) => target.verifiedRefs.includes(ref)));
+  const allowed = new Set(
+    (target.plannedRefs ?? []).filter((ref) => target.verifiedRefs.includes(ref)),
+  );
   const occupied = new Set(target.verifiedRefs);
   const created = new Set<string>();
   const nonContainerRefs = new Set<string>();
   for (const entry of task.ledger) {
     const action = entry.call.action;
     if (
-      entry.status === "completed" && !entry.reused && entry.acknowledgementStatus === "confirmed_mutation" &&
+      entry.status === "completed" &&
+      !entry.reused &&
+      entry.acknowledgementStatus === "confirmed_mutation" &&
       ["create_frame", "create_text", "create_rectangle"].includes(action.tool) &&
-      "parent" in action && action.parent.kind === "node" &&
+      "parent" in action &&
+      action.parent.kind === "node" &&
       (allowed.has(action.parent.ref) || created.has(action.parent.ref)) &&
-      (!action.pageId || action.pageId === target.pageId) && "ref" in action
+      (!action.pageId || action.pageId === target.pageId) &&
+      "ref" in action
     ) {
       created.add(action.ref);
       if (action.tool !== "create_frame") nonContainerRefs.add(action.ref);
@@ -1383,7 +1747,9 @@ function editMutationBlocker(
   if (!stage) return "native_execution_blocked: no saved edit stage is active.";
   const stageRefs = new Set(stage.logicalRefs);
   const additions: string[] = [];
-  const otherStageRefs = new Set(task.stages.filter((item) => item !== stage).flatMap((item) => item.logicalRefs));
+  const otherStageRefs = new Set(
+    task.stages.filter((item) => item !== stage).flatMap((item) => item.logicalRefs),
+  );
   const inScope = (ref: string) => allowed.has(ref) || created.has(ref);
   for (const { action } of calls) {
     if (!isCanvasMutationTool(action.tool)) continue;
@@ -1402,29 +1768,44 @@ function editMutationBlocker(
           (prior.pageId ?? target.pageId) !== (action.pageId ?? target.pageId)
         )
           return false;
-        return JSON.stringify(
-          Object.entries(prior.properties).sort(([first], [second]) => first.localeCompare(second)),
-        ) === propertiesKey;
+        return (
+          JSON.stringify(
+            Object.entries(prior.properties).sort(([first], [second]) =>
+              first.localeCompare(second),
+            ),
+          ) === propertiesKey
+        );
       });
       if (alreadyConfirmed)
         return `duplicate_confirmed_operation: The exact property update for ${action.ref} is already confirmed in the saved ledger. Do not replay it; request fresh stage verification or continue only with a different outstanding requirement.`;
     }
     if ("pageId" in action && action.pageId && action.pageId !== target.pageId)
       return "native_execution_blocked: edit operations must remain on the verified target page.";
-    if (action.tool === "create_frame" || action.tool === "create_text" || action.tool === "create_rectangle") {
+    if (
+      action.tool === "create_frame" ||
+      action.tool === "create_text" ||
+      action.tool === "create_rectangle"
+    ) {
       if (occupied.has(action.ref) || created.has(action.ref) || /^task-/iu.test(action.ref))
         return `edit_plan_invalid: Creation ref ${action.ref} already identifies a layer or is reserved for native identity. Reuse an existing layer through an edit or supply a fresh alias.`;
       if (action.parent.kind !== "node")
         return `native_execution_blocked: Creation ref ${action.ref} has a page parent. Use the approved existing frame ${target.ref} or an authorized nested parent.`;
-      if (action.tool === "create_frame" && action.name.trim().toLowerCase() === target.name.trim().toLowerCase())
+      if (
+        action.tool === "create_frame" &&
+        action.name.trim().toLowerCase() === target.name.trim().toLowerCase()
+      )
         return `native_execution_blocked: Creation ref ${action.ref} duplicates the existing screen name. Edit the approved screen ${target.ref} in place.`;
       if (nonContainerRefs.has(action.parent.ref))
         return `edit_plan_invalid: Creation ref ${action.ref} has a non-container parent ${action.parent.ref}. Use a frame or reusable container as its parent.`;
       if (!inScope(action.parent.ref))
         return `edit_plan_invalid: Creation ref ${action.ref} uses unresolved parent ${action.parent.ref}. Put its parent creation earlier in the batch or use an approved existing container.`;
       if (!stageRefs.has(action.ref)) {
-        if (!reservations || stage.propertyEdit || otherStageRefs.has(action.ref) ||
-            new Set([target.ref, ...stageRefs, action.ref]).size > INSPECT_NODES_LIMITS.refs)
+        if (
+          !reservations ||
+          stage.propertyEdit ||
+          otherStageRefs.has(action.ref) ||
+          new Set([target.ref, ...stageRefs, action.ref]).size > INSPECT_NODES_LIMITS.refs
+        )
           return `edit_plan_invalid: Creation ref ${action.ref} cannot be reserved in this stage. Use a declared unused alias or reduce the stage's new layers.`;
         stageRefs.add(action.ref);
         additions.push(action.ref);
@@ -1436,17 +1817,29 @@ function editMutationBlocker(
     if (action.tool === "set_properties" || action.tool === "set_auto_layout") {
       if (!inScope(action.ref) || !stageRefs.has(action.ref))
         return `native_execution_blocked: Ref ${action.ref} is outside the approved scope or absent from this stage. Use a verified planned ref or a reserved creation alias.`;
-      if (action.tool === "set_auto_layout" && action.children.some((child) => !inScope(child.ref) || !stageRefs.has(child.ref)))
+      if (
+        action.tool === "set_auto_layout" &&
+        action.children.some((child) => !inScope(child.ref) || !stageRefs.has(child.ref))
+      )
         return "native_execution_blocked: Auto Layout child sizing must use verified or task-created refs listed in the saved stage.";
       continue;
     }
     if (action.tool === "append_child") {
-      if (!inScope(action.childRef) || !stageRefs.has(action.childRef) || !inScope(action.parentRef))
+      if (
+        !inScope(action.childRef) ||
+        !stageRefs.has(action.childRef) ||
+        !inScope(action.parentRef)
+      )
         return "native_execution_blocked: append_child may only connect planned refs inside the verified target subtree.";
       continue;
     }
     if (action.tool === "reparent_node") {
-      if (action.ref === target.ref || !inScope(action.ref) || !stageRefs.has(action.ref) || !inScope(action.parentRef))
+      if (
+        action.ref === target.ref ||
+        !inScope(action.ref) ||
+        !stageRefs.has(action.ref) ||
+        !inScope(action.parentRef)
+      )
         return "native_execution_blocked: reparenting must stay within the verified target subtree and cannot move its root.";
     }
   }
@@ -1457,10 +1850,12 @@ function editMutationBlocker(
 function editCompletionReport(task: ChatTask): string | undefined {
   const target = task.editTarget;
   if (!target) return undefined;
-  const confirmed = task.ledger.filter((entry) =>
-    entry.status === "completed" && !entry.reused &&
-    isCanvasMutationTool(entry.call.action.tool) &&
-    entry.acknowledgementStatus === "confirmed_mutation",
+  const confirmed = task.ledger.filter(
+    (entry) =>
+      entry.status === "completed" &&
+      !entry.reused &&
+      isCanvasMutationTool(entry.call.action.tool) &&
+      entry.acknowledgementStatus === "confirmed_mutation",
   );
   if (!confirmed.length) return undefined;
   const changes = confirmed.slice(0, 24).map(({ call }) => {
@@ -1468,15 +1863,22 @@ function editCompletionReport(task: ChatTask): string | undefined {
     if (action.tool === "set_properties") {
       const values = Object.entries(action.properties)
         .filter(([key]) => key !== "shadow")
-        .map(([key, value]) => `${key} ${typeof value === "string" ? value : JSON.stringify(value)}`)
+        .map(
+          ([key, value]) => `${key} ${typeof value === "string" ? value : JSON.stringify(value)}`,
+        )
         .join(", ");
       return `Verified ${action.ref}: ${values || Object.keys(action.properties).join(", ")}.`;
     }
     if (action.tool === "set_auto_layout")
       return `Set ${action.layout.direction} Auto Layout on ${action.ref}.`;
-    if (action.tool === "create_frame" || action.tool === "create_text" || action.tool === "create_rectangle")
+    if (
+      action.tool === "create_frame" ||
+      action.tool === "create_text" ||
+      action.tool === "create_rectangle"
+    )
       return `Added ${action.tool.replace("create_", "")} “${action.name}” inside ${action.parent.kind === "node" ? action.parent.ref : "the page"}.`;
-    if (action.tool === "append_child") return `Appended ${action.childRef} to ${action.parentRef}.`;
+    if (action.tool === "append_child")
+      return `Appended ${action.childRef} to ${action.parentRef}.`;
     if (action.tool === "reparent_node") return `Moved ${action.ref} inside ${action.parentRef}.`;
     return `Applied ${action.tool}.`;
   });
@@ -1511,17 +1913,25 @@ function nativePropertyChecks(
   };
   nodes.forEach(visit);
   const checks: NativePropertyCheck[] = [];
-  const actions = planned ? [planned] : task.ledger.flatMap((entry) => {
-    const action = entry.call.action;
-    return entry.stage === stageIndex && entry.status === "completed" && !entry.reused &&
-      entry.acknowledgementStatus === "confirmed_mutation" && action.tool === "set_properties"
-      ? [action] : [];
-  });
+  const actions = planned
+    ? [planned]
+    : task.ledger.flatMap((entry) => {
+        const action = entry.call.action;
+        return entry.stage === stageIndex &&
+          entry.status === "completed" &&
+          !entry.reused &&
+          entry.acknowledgementStatus === "confirmed_mutation" &&
+          action.tool === "set_properties"
+          ? [action]
+          : [];
+      });
   for (const action of actions) {
     const ref = knownRef(action.ref);
     const node = byRef.get(ref);
     const expectedProperties = action.properties;
-    const evidenceFields: Partial<Record<keyof typeof expectedProperties, keyof (typeof nodes)[number]>> = {
+    const evidenceFields: Partial<
+      Record<keyof typeof expectedProperties, keyof (typeof nodes)[number]>
+    > = {
       name: "name",
       fill: "fill",
       paintStyleId: "fillStyleId",
@@ -1572,13 +1982,20 @@ function nativePropertyMismatches(checks: NativePropertyCheck[]): NativeProperty
     if (typeof expected === "number" && typeof actual === "number")
       return Math.abs(expected - actual) <= 0.01;
     if (
-      expected && actual &&
-      typeof expected === "object" && typeof actual === "object" &&
-      !Array.isArray(expected) && !Array.isArray(actual)
+      expected &&
+      actual &&
+      typeof expected === "object" &&
+      typeof actual === "object" &&
+      !Array.isArray(expected) &&
+      !Array.isArray(actual)
     ) {
       const expectedEntries = Object.entries(expected);
-      return expectedEntries.length === Object.keys(actual).length &&
-        expectedEntries.every(([key, value]) => equalValue(value, (actual as Record<string, unknown>)[key]));
+      return (
+        expectedEntries.length === Object.keys(actual).length &&
+        expectedEntries.every(([key, value]) =>
+          equalValue(value, (actual as Record<string, unknown>)[key]),
+        )
+      );
     }
     return actual !== undefined && actual === expected;
   };
@@ -1677,6 +2094,58 @@ function compactReadOnlyEvidence(checkpoint: ReadOnlyCheckpoint) {
 }
 
 // Only complete call/output pairs survive compaction; the durable ledger is the source of truth.
+export function applyPinnedBrandToChatBrief(
+  brief: NonNullable<ChatTask["brief"]>,
+  task: ChatTask,
+): NonNullable<ChatTask["brief"]> {
+  const brand = task.brandKit;
+  if (!brand) return brief;
+  const overrides: Partial<
+    Record<"primary" | "background" | "surface" | "accent" | "text" | "muted", string>
+  > = {};
+  const requestedColors: Array<[keyof typeof overrides, RegExp]> = [
+    ["primary", /(?:primary|brand|رنگ\s*(?:اصلی|برند))[^\n#]{0,80}(#[0-9a-f]{6})/iu],
+    ["background", /(?:background|page|پس[‌ ]?زمینه)[^\n#]{0,80}(#[0-9a-f]{6})/iu],
+    ["surface", /(?:surface|سطح)[^\n#]{0,80}(#[0-9a-f]{6})/iu],
+    ["accent", /(?:accent|تأکیدی|تاکیدی)[^\n#]{0,80}(#[0-9a-f]{6})/iu],
+    ["text", /(?:text|متن)[^\n#]{0,80}(#[0-9a-f]{6})/iu],
+    ["muted", /(?:muted|کم[‌ ]?رنگ)[^\n#]{0,80}(#[0-9a-f]{6})/iu],
+  ];
+  for (const [role, pattern] of requestedColors) {
+    const match = pattern.exec(task.prompt);
+    if (match?.[1]) overrides[role] = match[1].toUpperCase();
+  }
+  const palette = {
+    ...brief.palette,
+    source: Object.keys(overrides).length ? ("user-requested" as const) : ("brand-kit" as const),
+    background: overrides.background ?? brand.tokens.palette.background,
+    surface: overrides.surface ?? brand.tokens.palette.surface,
+    primary: overrides.primary ?? brand.tokens.palette.primary,
+    accent: overrides.accent ?? brand.tokens.palette.accent,
+    text: overrides.text ?? brand.tokens.palette.text,
+    muted: overrides.muted ?? brand.tokens.palette.mutedText,
+  };
+  return {
+    ...brief,
+    brandDirection: `${brand.name} · revision ${brand.revision}; preserve explicitly requested task constraints.`,
+    readingDirection: resolveBrandReadingDirection(
+      brand.direction,
+      task.prompt,
+      brief.readingDirection,
+    ),
+    typography: {
+      ...brief.typography,
+      family: brand.tokens.typography.body.requestedFamily,
+      style: brand.tokens.typography.body.style,
+      headingSize: brand.tokens.typography.heading1.size,
+      bodySize: brand.tokens.typography.body.size,
+    },
+    spacingScale: brand.tokens.spacing.slice(0, 8),
+    radiusScale: brand.tokens.radii.slice(0, 6),
+    palette,
+  };
+}
+
 export function chatTaskInput(task: ChatTask): ChatInputItem[] {
   syncCapacityAccounting(task);
   const capacity = chatTaskCapacityUsage(task);
@@ -1730,8 +2199,12 @@ export function chatTaskInput(task: ChatTask): ChatInputItem[] {
       : {}),
     ...(task.designName ? { designName: task.designName } : {}),
     ...(["inspect", "explain"].includes(task.intent ?? "")
-      ? { readOnlyInspection: compactReadOnlyEvidence(readOnlyCheckpoint(task)) } : {}),
+      ? { readOnlyInspection: compactReadOnlyEvidence(readOnlyCheckpoint(task)) }
+      : {}),
     brief: task.brief,
+    pinnedBrandKit: task.brandKit ?? null,
+    brandTokenPrecedence:
+      "explicit user task constraints > pinned brand revision > domain design defaults > safe fallback; preserve the exact pinned revision across resume and never replace unavailable fonts/assets without a disclosed fallback",
     planVersion: CHAT_PLAN_VERSION,
     stages: modelPlanStages(task.stages),
     execution: {
@@ -2116,48 +2589,88 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
 
     // Older checkpoints have no executable action. Recognize the exact legacy
     // verification-only contract without treating prose as write authorization.
-    const legacyFill = /^Confirm native root fill exactly equals (#[0-9a-f]{6}) without mutations\.$/iu
-      .exec(stage.goal)?.[1];
-    const verificationOnly = !stage.propertyEdit && Boolean(
-      legacyFill && stage.completionCriteria.length === 1 &&
-      stage.completionCriteria[0] === `Native fill of existing root frame is ${legacyFill}; no mutation performed.`,
-    );
-    const planned = stage.propertyEdit ?? (verificationOnly && target && legacyFill
-      ? { tool: "set_properties" as const, ref: target.ref, properties: { fill: legacyFill } }
-      : undefined);
+    const legacyFill =
+      /^Confirm native root fill exactly equals (#[0-9a-f]{6}) without mutations\.$/iu.exec(
+        stage.goal,
+      )?.[1];
+    const verificationOnly =
+      !stage.propertyEdit &&
+      Boolean(
+        legacyFill &&
+        stage.completionCriteria.length === 1 &&
+        stage.completionCriteria[0] ===
+          `Native fill of existing root frame is ${legacyFill}; no mutation performed.`,
+      );
+    const planned =
+      stage.propertyEdit ??
+      (verificationOnly && target && legacyFill
+        ? { tool: "set_properties" as const, ref: target.ref, properties: { fill: legacyFill } }
+        : undefined);
     if (!planned) return;
     activePhase = "verification";
-    if (!target || (stage.pageId ?? target.pageId) !== target.pageId ||
+    if (
+      !target ||
+      (stage.pageId ?? target.pageId) !== target.pageId ||
       (planned.pageId ?? target.pageId) !== target.pageId ||
       !target.plannedRefs?.includes(planned.ref) ||
       !stage.logicalRefs.includes(planned.ref) ||
-      stage.logicalRefs.some((ref) => !target.plannedRefs?.includes(ref) || !target.verifiedRefs.includes(ref)))
-      throw new Error("invalid_required_reference: Property stage is outside the inspected edit plan.");
+      stage.logicalRefs.some(
+        (ref) => !target.plannedRefs?.includes(ref) || !target.verifiedRefs.includes(ref),
+      )
+    )
+      throw new Error(
+        "invalid_required_reference: Property stage is outside the inspected edit plan.",
+      );
 
-    const visual = planned.properties.fill !== undefined && target.type === "FRAME" && planned.ref === target.ref;
+    const visual =
+      planned.properties.fill !== undefined &&
+      target.type === "FRAME" &&
+      planned.ref === target.ref;
     let action = { ...planned, pageId: target.pageId };
-    const mutations = task.ledger.filter((entry) =>
-      entry.stage === stageIndex && isCanvasMutationTool(entry.call.action.tool) && !entry.reused);
+    const mutations = task.ledger.filter(
+      (entry) =>
+        entry.stage === stageIndex && isCanvasMutationTool(entry.call.action.tool) && !entry.reused,
+    );
     const matches = (entry: ChatTask["ledger"][number]) => {
       const prior = entry.call.action;
-      return prior.tool === "set_properties" && knownRef(prior.ref) === knownRef(action.ref) &&
+      return (
+        prior.tool === "set_properties" &&
+        knownRef(prior.ref) === knownRef(action.ref) &&
         JSON.stringify(Object.entries(prior.properties).sort()) ===
-          JSON.stringify(Object.entries(action.properties).sort());
+          JSON.stringify(Object.entries(action.properties).sort())
+      );
     };
     const capacity = chatTaskCapacityUsage(task);
-    if (capacity.verificationOperations >= CHAT_TASK_MAX_VERIFICATION_OPERATIONS ||
-        task.ledger.length >= CHAT_TASK_MAX_LEDGER_ENTRIES || task.batches >= 1_000)
+    if (
+      capacity.verificationOperations >= CHAT_TASK_MAX_VERIFICATION_OPERATIONS ||
+      task.ledger.length >= CHAT_TASK_MAX_LEDGER_ENTRIES ||
+      task.batches >= 1_000
+    )
       throw new Error("native_verification_invalid: Property verification capacity exhausted.");
 
     const refs = [...new Set([target.ref, ...stage.logicalRefs])];
     const id = `${task.id}-property-check-${task.ledger.length + 1}`;
-    const call = parseResponsesFunctionCalls([{
-      type: "function_call", call_id: id, name: "inspect_nodes",
-      arguments: JSON.stringify({ pageId: target.pageId, refs, selection: false,
-        depth: 1, maxNodes: 25, purpose: visual ? "background_verification" : "structural_verification" }),
-    }])[0]!;
+    const call = parseResponsesFunctionCalls([
+      {
+        type: "function_call",
+        call_id: id,
+        name: "inspect_nodes",
+        arguments: JSON.stringify({
+          pageId: target.pageId,
+          refs,
+          selection: false,
+          depth: 1,
+          maxNodes: 25,
+          purpose: visual ? "background_verification" : "structural_verification",
+        }),
+      },
+    ])[0]!;
     const entry: ChatTask["ledger"][number] = {
-      call, operationId: id, stage: stageIndex, status: "running", category: "verification",
+      call,
+      operationId: id,
+      stage: stageIndex,
+      status: "running",
+      category: "verification",
     };
     check();
     transition("VERIFYING_STAGE");
@@ -2165,65 +2678,111 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     task.batches++;
     await save();
     deps.progress(`Checking native property values for ${stage.title}…`);
-    const result = await deps.execute([FigmaToolOperationSchema.parse({
-      operationId: id, idempotencyKey: `chat:${id}`,
-      ...(task.referenceScope ? { taskId: task.id } : {}),
-      ...(task.chatId ? { chatId: task.chatId } : {}),
-      action: call.action,
-    })]);
+    const result = await deps.execute([
+      FigmaToolOperationSchema.parse({
+        operationId: id,
+        idempotencyKey: `chat:${id}`,
+        ...(task.referenceScope ? { taskId: task.id } : {}),
+        ...(task.chatId ? { chatId: task.chatId } : {}),
+        action: call.action,
+      }),
+    ]);
     check();
     const item = result.results.length === 1 ? result.results[0] : undefined;
     const nodes = NativeVisualNodeSchema.array().max(25).safeParse(item?.data?.nodes);
-    if (!result.success || !item?.success || item.operationId !== id ||
-        item.data?.pageId !== target.pageId || !nodes.success ||
-        refs.some((ref) => !nodes.data.some((node) => node.ref && knownRef(node.ref) === knownRef(ref)))) {
+    if (
+      !result.success ||
+      !item?.success ||
+      item.operationId !== id ||
+      item.data?.pageId !== target.pageId ||
+      !nodes.success ||
+      refs.some(
+        (ref) => !nodes.data.some((node) => node.ref && knownRef(node.ref) === knownRef(ref)),
+      )
+    ) {
       entry.status = "failed";
       entry.output = JSON.stringify({ success: false, error: item?.error });
       await save();
-      throw new Error(`missing_reference_inspection: ${item?.error ?? "Native evidence did not resolve all property stage refs on the approved page."}`);
+      throw new Error(
+        `missing_reference_inspection: ${item?.error ?? "Native evidence did not resolve all property stage refs on the approved page."}`,
+      );
     }
     let backgroundNodeId: string | undefined;
     if (visual) {
       const proof = item.data?.visualBackground as Record<string, unknown> | undefined;
       const node = nodes.data.find((candidate) => candidate.ref === proof?.ref);
-      if (!proof || proof.rootNodeId !== target.nodeId || proof.rootRef !== knownRef(target.ref) ||
-          typeof proof.nodeId !== "string" || !node?.ref || !node.fill || proof.fill !== node.fill ||
-          (node.ref !== knownRef(target.ref) && node.type !== "RECTANGLE") ||
-          (node.ref !== knownRef(target.ref) && Object.keys(planned.properties).length !== 1)) {
+      if (
+        !proof ||
+        proof.rootNodeId !== target.nodeId ||
+        proof.rootRef !== knownRef(target.ref) ||
+        typeof proof.nodeId !== "string" ||
+        !node?.ref ||
+        !node.fill ||
+        proof.fill !== node.fill ||
+        (node.ref !== knownRef(target.ref) && node.type !== "RECTANGLE") ||
+        (node.ref !== knownRef(target.ref) && Object.keys(planned.properties).length !== 1)
+      ) {
         entry.status = "failed";
         entry.output = JSON.stringify({ success: false, visualOutcomeVerified: false });
         await save();
-        throw new Error("native_property_verification_failed: The visible background could not be verified on the approved frame.");
+        throw new Error(
+          "native_property_verification_failed: The visible background could not be verified on the approved frame.",
+        );
       }
       backgroundNodeId = proof.nodeId;
       action = { ...action, ref: node.ref, backgroundRootRef: target.ref };
     }
-    if (mutations.some((entry) => !matches(entry) || entry.status !== "completed" ||
-        entry.acknowledgementStatus !== "confirmed_mutation"))
-      throw new Error("native_verification_invalid: Saved mutations require reconciliation before this property stage can continue.");
+    if (
+      mutations.some(
+        (entry) =>
+          !matches(entry) ||
+          entry.status !== "completed" ||
+          entry.acknowledgementStatus !== "confirmed_mutation",
+      )
+    )
+      throw new Error(
+        "native_verification_invalid: Saved mutations require reconciliation before this property stage can continue.",
+      );
     const checks = nativePropertyChecks(task, stageIndex, nodes.data, knownRef, action);
     const differences = nativePropertyMismatches(checks);
     entry.status = "completed";
     entry.acknowledgementStatus = "read_only";
     entry.output = JSON.stringify({
-      success: true, propertyVerificationConfirmed: !differences.length,
+      success: true,
+      propertyVerificationConfirmed: !differences.length,
       verifiedNoOp: !mutations.length && !differences.length,
       ...(visual ? { visualOutcomeVerified: !differences.length, backgroundNodeId } : {}),
       checks: checks.map(({ ref, property, actual }) => ({
-        ref, property, available: actual !== undefined,
+        ref,
+        property,
+        available: actual !== undefined,
         ...(property === "fill" ? { actual } : {}),
       })),
     });
     if (differences.length) {
       await save();
-      if (verificationOnly || mutations.length || differences.some((item) => item.actual === undefined))
-        throw new Error(`native_property_verification_failed: ${differences.map(({ property, actual }) =>
-          `${property} ${actual === undefined ? "unavailable" : "differs"}`).join(", ")} on ${action.ref}.`);
+      if (
+        verificationOnly ||
+        mutations.length ||
+        differences.some((item) => item.actual === undefined)
+      )
+        throw new Error(
+          `native_property_verification_failed: ${differences
+            .map(
+              ({ property, actual }) =>
+                `${property} ${actual === undefined ? "unavailable" : "differs"}`,
+            )
+            .join(", ")} on ${action.ref}.`,
+        );
       if (visual && action.ref !== target.ref) {
-        if (target.verifiedRefs.length >= 25 && !target.verifiedRefs.includes(action.ref) ||
-            (target.plannedRefs?.length ?? 0) >= 20 && !target.plannedRefs?.includes(action.ref) ||
-            stage.logicalRefs.length >= 20 && !stage.logicalRefs.includes(action.ref))
-          throw new Error("invalid_required_reference: No room to checkpoint the verified background ref.");
+        if (
+          (target.verifiedRefs.length >= 25 && !target.verifiedRefs.includes(action.ref)) ||
+          ((target.plannedRefs?.length ?? 0) >= 20 && !target.plannedRefs?.includes(action.ref)) ||
+          (stage.logicalRefs.length >= 20 && !stage.logicalRefs.includes(action.ref))
+        )
+          throw new Error(
+            "invalid_required_reference: No room to checkpoint the verified background ref.",
+          );
         target.verifiedRefs = [...new Set([...target.verifiedRefs, action.ref])];
         target.plannedRefs = [...new Set([...(target.plannedRefs ?? []), action.ref])];
         stage.logicalRefs = [...new Set([...stage.logicalRefs, action.ref])];
@@ -2231,9 +2790,14 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       const { tool, ...args } = action;
       const blocker = editMutationBlocker(task, [{ action }]);
       if (blocker) throw new Error(blocker);
-      const setter = parseResponsesFunctionCalls([{
-        type: "function_call", call_id: `${id}-write`, name: tool, arguments: JSON.stringify(args),
-      }])[0]!;
+      const setter = parseResponsesFunctionCalls([
+        {
+          type: "function_call",
+          call_id: `${id}-write`,
+          name: tool,
+          arguments: JSON.stringify(args),
+        },
+      ])[0]!;
       task.pending = [setter];
       transition("EXECUTING_STAGE");
       await save();
@@ -2242,13 +2806,19 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
 
     stage.verified = true;
     stage.completed = true;
-    stage.completionReason = mutations.length ? "required_refs_and_native_verification_confirmed" : "verified_no_op";
+    stage.completionReason = mutations.length
+      ? "required_refs_and_native_verification_confirmed"
+      : "verified_no_op";
     transition("STAGE_COMPLETED");
     if (task.stages.every((item) => item.completed)) {
       task.status = "completed";
-      task.text = task.stages.map((item) =>
-        `${item.title}: ${item.completionReason === "verified_no_op" ? "Verified no-op" : visual ? "Verified visible background edit" : "Verified native edit"}.`).join("\n") +
-        `\nConfirmed canvas mutations: ${chatTaskCommittedOperationCount(task)}.`;
+      task.text =
+        task.stages
+          .map(
+            (item) =>
+              `${item.title}: ${item.completionReason === "verified_no_op" ? "Verified no-op" : visual ? "Verified visible background edit" : "Verified native edit"}.`,
+          )
+          .join("\n") + `\nConfirmed canvas mutations: ${chatTaskCommittedOperationCount(task)}.`;
       task.recent = [];
       delete task.failure;
       transition("TASK_COMPLETED");
@@ -2372,7 +2942,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       });
       await save();
       throw new Error(
-        native?.error ?? "Figma did not confirm native resume inspection; saved changes were not replayed.",
+        native?.error ??
+          "Figma did not confirm native resume inspection; saved changes were not replayed.",
       );
     }
     const parsedNodes = NativeVisualNodeSchema.array().max(25).safeParse(native.data?.nodes);
@@ -2401,9 +2972,14 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     }
     const propertyChecks = nativePropertyChecks(task, stageIndex, parsedNodes.data, knownRef);
     const backgrounds = native.data?.frameBackgrounds as Record<string, unknown> | undefined;
-    if (backgrounds && backgrounds[knownRef(target.ref)] !== "root" &&
-        propertyChecks.some((item) => item.ref === knownRef(target.ref) && item.property === "fill"))
-      throw new Error("native_property_verification_failed: The confirmed frame fill is not established as the visible background.");
+    if (
+      backgrounds &&
+      backgrounds[knownRef(target.ref)] !== "root" &&
+      propertyChecks.some((item) => item.ref === knownRef(target.ref) && item.property === "fill")
+    )
+      throw new Error(
+        "native_property_verification_failed: The confirmed frame fill is not established as the visible background.",
+      );
     const propertyMismatches = nativePropertyMismatches(propertyChecks);
     const findings = readVerification(
       stageIndex,
@@ -2421,11 +2997,13 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       propertyVerificationConfirmed: propertyMismatches.length === 0 && propertyChecks.length > 0,
       ...(propertyMismatches.length
         ? {
-            propertyMismatches: propertyMismatches.slice(0, 12).map(({ ref, property, actual }) => ({
-              ref,
-              property,
-              observation: actual === undefined ? "unavailable" : "different",
-            })),
+            propertyMismatches: propertyMismatches
+              .slice(0, 12)
+              .map(({ ref, property, actual }) => ({
+                ref,
+                property,
+                observation: actual === undefined ? "unavailable" : "different",
+              })),
           }
         : {}),
     });
@@ -2440,10 +3018,11 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           .join(", ")}). The confirmed mutation was not replayed.`,
       );
     }
-    const inspectedPlannedRefs = refs
-      .map(knownRef)
-      .filter((ref) => plannedTargetRefs.has(ref));
-    target.verifiedRefs = [...new Set([...target.verifiedRefs, ...inspectedPlannedRefs])].slice(0, 25);
+    const inspectedPlannedRefs = refs.map(knownRef).filter((ref) => plannedTargetRefs.has(ref));
+    target.verifiedRefs = [...new Set([...target.verifiedRefs, ...inspectedPlannedRefs])].slice(
+      0,
+      25,
+    );
     stage.qualityFindings = safeQualityFindings(findings);
     stage.verificationHistory.push({
       attempt: verificationNumber,
@@ -2459,7 +3038,10 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         role: "user",
         content: `Resume inspection completed. Native structure findings remain: ${findings
           .slice(0, 6)
-          .map((finding) => `${finding.code} on ${(finding.refs ?? (finding.ref ? [finding.ref] : [])).join(",")}`)
+          .map(
+            (finding) =>
+              `${finding.code} on ${(finding.refs ?? (finding.ref ? [finding.ref] : [])).join(",")}`,
+          )
           .join("; ")}. Do not repeat confirmed mutations.`,
       });
     } else {
@@ -2708,7 +3290,11 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     task.status === "failed" || task.status === "stopped" || task.status === "running";
   const initialLedgerLength = task.ledger.length;
   const readOnly = () => task.intent === "inspect" || task.intent === "explain";
-  let activePhase: ChatTaskFailurePhase = readOnly() ? "inspection" : task.stages.length ? "native_execution" : "planning";
+  let activePhase: ChatTaskFailurePhase = readOnly()
+    ? "inspection"
+    : task.stages.length
+      ? "native_execution"
+      : "planning";
   syncCapacityAccounting(task);
   if (readOnly()) transition("INSPECTING");
   else if (!task.stages.length)
@@ -2755,12 +3341,21 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     await save();
     if (wasRetry && task.intent === "edit") await reconcileSavedEditOnResume();
     const unfinished = task.stages.findIndex((stage) => !stage.completed);
-    if (!task.pending.length && task.stages[unfinished]?.completionReason === "missing_creation_operation" &&
-        chatTaskInspectedContinuationRefs(task, unfinished).size > 0) {
-      task.pending = parseResponsesFunctionCalls([{
-        type: "function_call", call_id: `${task.id}_resume_stage`,
-        name: "complete_canvas_stage", arguments: JSON.stringify({ summary: "Reconcile the saved stage against native evidence." }),
-      }]);
+    if (
+      !task.pending.length &&
+      task.stages[unfinished]?.completionReason === "missing_creation_operation" &&
+      chatTaskInspectedContinuationRefs(task, unfinished).size > 0
+    ) {
+      task.pending = parseResponsesFunctionCalls([
+        {
+          type: "function_call",
+          call_id: `${task.id}_resume_stage`,
+          name: "complete_canvas_stage",
+          arguments: JSON.stringify({
+            summary: "Reconcile the saved stage against native evidence.",
+          }),
+        },
+      ]);
       await save();
     }
     if (
@@ -2773,7 +3368,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     while (true) {
       check();
       if (task.intent === "edit" && task.stages.length === 0) {
-        const controllerPending = task.pending.some((call) => call.callId.startsWith(EDIT_TARGET_CALL_PREFIX));
+        const controllerPending = task.pending.some((call) =>
+          call.callId.startsWith(EDIT_TARGET_CALL_PREFIX),
+        );
         if (!controllerPending) {
           const editStep = nextEditTargetOperation(task, {
             forceFresh: wasRetry,
@@ -2787,14 +3384,17 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             transition("EDIT_TARGETING");
             activePhase = "inspection";
             for (const pending of task.pending) {
-              const entry = task.ledger.find((candidate) => candidate.call.callId === pending.callId);
+              const entry = task.ledger.find(
+                (candidate) => candidate.call.callId === pending.callId,
+              );
               if (!entry || !["pending", "running"].includes(entry.status)) continue;
               entry.status = "failed";
               entry.acknowledgementStatus = "not_attempted";
               entry.output = JSON.stringify({
                 success: false,
                 acknowledgementStatus: "not_attempted",
-                error: "The deterministic edit controller must verify the target before accepting model planning or native work.",
+                error:
+                  "The deterministic edit controller must verify the target before accepting model planning or native work.",
               });
             }
             const scheduled = autonomousEditTargetCall(task, editStep.action);
@@ -2862,13 +3462,13 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               ledgerEntry.output = JSON.stringify({
                 success: false,
                 acknowledgementStatus: "not_attempted",
-                error: "Not scheduled; the deterministic inspection controller selected the next required operation.",
+                error:
+                  "Not scheduled; the deterministic inspection controller selected the next required operation.",
               });
             }
           }
           const scheduled = matchingPending ?? autonomousInspectionCall(task, plan.action);
-          const changed =
-            task.pending.length !== 1 || task.pending[0]?.callId !== scheduled.callId;
+          const changed = task.pending.length !== 1 || task.pending[0]?.callId !== scheduled.callId;
           task.pending = [scheduled];
           if (!matchingPending) task.recent = [scheduled.functionCall];
           if (changed || !matchingPending) await save();
@@ -2879,7 +3479,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           task.inspectionOutcome = plan.outcome;
           task.inspectionSummary = readOnlyInspectionSummary(task, inspection);
           if (chatTaskCommittedOperationCount(task) !== 0)
-            throw new Error("Read-only inspection recorded a canvas mutation; completion was refused.");
+            throw new Error(
+              "Read-only inspection recorded a canvas mutation; completion was refused.",
+            );
           task.text = readOnlyInspectionReport(task, inspection, plan.outcome, plan.reason);
           if (["COMPLETED", "PARTIAL", "NO_MATCH"].includes(plan.outcome)) {
             transition("TASK_COMPLETED");
@@ -2962,16 +3564,15 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       }
       if (task.pending.length) {
         const calls = task.pending;
-        const intentCalls = calls.filter(
-          (call) => call.action.tool === "classify_canvas_intent",
-        );
+        const intentCalls = calls.filter((call) => call.action.tool === "classify_canvas_intent");
         if (intentCalls.length) {
           if (calls.length !== 1 || intentCalls.length !== 1)
             throw new Error("Canvas intent must be classified alone before other canvas tools.");
           const call = intentCalls[0]!;
           if (call.action.tool !== "classify_canvas_intent")
             throw new Error("The intent classifier returned an invalid tool action.");
-          const replayed = task.intent === call.action.intent &&
+          const replayed =
+            task.intent === call.action.intent &&
             (!call.action.targetName || call.action.targetName === task.targetName);
           if ((task.intent || task.stages.length) && !replayed)
             throw new Error("Canvas intent is already checkpointed and cannot be changed.");
@@ -2988,8 +3589,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             output(call.callId, {
               success: true,
               replayed,
-                intent: task.intent,
-                ...(task.targetName ? { targetName: task.targetName } : {}),
+              intent: task.intent,
+              ...(task.targetName ? { targetName: task.targetName } : {}),
               instruction:
                 task.intent === "inspect" || task.intent === "explain"
                   ? "Use bounded document discovery and read-only node inspection only; do not plan or mutate."
@@ -3002,9 +3603,16 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           await save();
           continue;
         }
-        if (readOnly() && calls.some(({ action }) =>
-          action.tool !== "get_document_context" && action.tool !== "inspect_nodes"))
-          throw new Error("Read-only intent permits discovery and inspection only; no plan or mutation was executed.");
+        if (
+          readOnly() &&
+          calls.some(
+            ({ action }) =>
+              action.tool !== "get_document_context" && action.tool !== "inspect_nodes",
+          )
+        )
+          throw new Error(
+            "Read-only intent permits discovery and inspection only; no plan or mutation was executed.",
+          );
         if (
           calls.some((call) => call.action.tool === "get_document_context") &&
           calls.length !== 1
@@ -3068,7 +3676,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               if (task.intent === "edit" && !reusingSavedPlan) {
                 const target = task.editTarget;
                 if (!target)
-                  throw new Error("target_not_inspected: the controller did not save verified native target evidence.");
+                  throw new Error(
+                    "target_not_inspected: the controller did not save verified native target evidence.",
+                  );
                 const targetRefs = action.targetRefs ?? [];
                 const uniqueTargetRefs = new Set(targetRefs);
                 if (
@@ -3076,11 +3686,18 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   uniqueTargetRefs.size !== targetRefs.length ||
                   targetRefs.some((ref) => !target.verifiedRefs.includes(ref)) ||
                   action.stages.some((stage) => stage.pageId && stage.pageId !== target.pageId) ||
-                  action.stages.some((stage) => stage.logicalRefs.length > 19 ||
-                    new Set(stage.logicalRefs).size !== stage.logicalRefs.length ||
-                    stage.logicalRefs.some((ref) => /^task-/iu.test(ref) && !target.verifiedRefs.includes(ref))) ||
+                  action.stages.some(
+                    (stage) =>
+                      stage.logicalRefs.length > 19 ||
+                      new Set(stage.logicalRefs).size !== stage.logicalRefs.length ||
+                      stage.logicalRefs.some(
+                        (ref) => /^task-/iu.test(ref) && !target.verifiedRefs.includes(ref),
+                      ),
+                  ) ||
                   action.stages.some((stage) =>
-                    stage.logicalRefs.some((ref) => target.verifiedRefs.includes(ref) && !targetRefs.includes(ref)),
+                    stage.logicalRefs.some(
+                      (ref) => target.verifiedRefs.includes(ref) && !targetRefs.includes(ref),
+                    ),
                   )
                 )
                   throw new Error(
@@ -3089,11 +3706,13 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 target.plannedRefs = targetRefs;
               }
               if (task.intent === "continue") {
-                const discovery = [...task.ledger].reverse().find(
-                  (entry) =>
-                    entry.status === "completed" &&
-                    entry.call.action.tool === "get_document_context",
-                );
+                const discovery = [...task.ledger]
+                  .reverse()
+                  .find(
+                    (entry) =>
+                      entry.status === "completed" &&
+                      entry.call.action.tool === "get_document_context",
+                  );
                 if (!discovery)
                   throw new Error(
                     "Edit/continue requires completed bounded document discovery before planning.",
@@ -3102,8 +3721,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 let discoveryData: Record<string, unknown> | undefined;
                 try {
                   discoveryData = JSON.parse(discovery?.output ?? "{}").data;
-                  discoveryDecision = (discoveryData?.discovery as { matchStatus?: string } | undefined)
-                    ?.matchStatus;
+                  discoveryDecision = (
+                    discoveryData?.discovery as { matchStatus?: string } | undefined
+                  )?.matchStatus;
                 } catch {
                   // Malformed or missing discovery is blocked below.
                 }
@@ -3112,10 +3732,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                     ? discovery.call.action.query
                     : undefined;
                 const namedTarget = discoveryQuery ?? task.targetName;
-                if (
-                  (namedTarget &&
-                    !["unique"].includes(discoveryDecision ?? ""))
-                )
+                if (namedTarget && !["unique"].includes(discoveryDecision ?? ""))
                   throw new Error(
                     discoveryDecision === "ambiguous"
                       ? `“${namedTarget}” matches multiple existing frames. Ask the user which one to edit, or repeat discovery with a more specific target name; no plan or canvas changes were made.`
@@ -3125,11 +3742,12 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                           ? `No match for “${namedTarget}” was found in the bounded scan, which was truncated. Ask for a more specific page/frame or report the discovery limit; do not create a replacement.`
                           : discoveryDecision === "uneditable"
                             ? "The unique matching node has no safe logical reference. Ask the user to select another editable frame or resolve its stale/ambiguous reference; do not guess or recreate it."
-                          : "Edit/continue requires a unique discovery match for the named target before planning. Refine the query or ask the user which frame to edit.",
+                            : "Edit/continue requires a unique discovery match for the named target before planning. Refine the query or ask the user which frame to edit.",
                   );
                 if (namedTarget) {
-                  const target = (discoveryData?.frames as Array<Record<string, unknown>> | undefined)
-                    ?.find((frame) => typeof frame.ref === "string");
+                  const target = (
+                    discoveryData?.frames as Array<Record<string, unknown>> | undefined
+                  )?.find((frame) => typeof frame.ref === "string");
                   const currentPageId = (discoveryData?.page as { id?: string } | undefined)?.id;
                   const inspectedTarget = target
                     ? task.ledger.some((entry) => {
@@ -3143,8 +3761,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                         try {
                           const nodes = JSON.parse(entry.output ?? "{}").data?.nodes;
                           return (
-                            Array.isArray(nodes) &&
-                            nodes.some((node) => node?.ref === target.ref)
+                            Array.isArray(nodes) && nodes.some((node) => node?.ref === target.ref)
                           );
                         } catch {
                           return false;
@@ -3163,19 +3780,21 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                     throw new Error(
                       "No selected target was present. Repeat discovery with the exact project/screen name or ask the user which existing frame to edit; do not guess.",
                     );
-                  if (!task.ledger.some((entry) => {
-                    if (
-                      entry.status !== "completed" ||
-                      entry.call.action.tool !== "inspect_nodes"
-                    )
-                      return false;
-                    try {
-                      const output = JSON.parse(entry.output ?? "{}");
-                      return Array.isArray(output.data?.nodes) && output.data.nodes.length > 0;
-                    } catch {
-                      return false;
-                    }
-                  }))
+                  if (
+                    !task.ledger.some((entry) => {
+                      if (
+                        entry.status !== "completed" ||
+                        entry.call.action.tool !== "inspect_nodes"
+                      )
+                        return false;
+                      try {
+                        const output = JSON.parse(entry.output ?? "{}");
+                        return Array.isArray(output.data?.nodes) && output.data.nodes.length > 0;
+                      } catch {
+                        return false;
+                      }
+                    })
+                  )
                     throw new Error(
                       "Edit/continue is blocked until a non-empty native inspection confirms the selected existing target. No new frame was created.",
                     );
@@ -3183,11 +3802,13 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               }
               if (action.designName) task.designName = action.designName;
               if (!task.stages.length) {
-                const contextEntry = [...task.ledger].reverse().find(
-                  (entry) =>
-                    entry.status === "completed" &&
-                    entry.call.action.tool === "get_document_context",
-                );
+                const contextEntry = [...task.ledger]
+                  .reverse()
+                  .find(
+                    (entry) =>
+                      entry.status === "completed" &&
+                      entry.call.action.tool === "get_document_context",
+                  );
                 let contextPageId: string | undefined;
                 try {
                   contextPageId = JSON.parse(contextEntry?.output ?? "{}").data?.page?.id;
@@ -3205,14 +3826,16 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 );
                 const inspectedPageId =
                   inspectedPageIds.size === 1 ? [...inspectedPageIds][0] : undefined;
-                task.brief = action.brief;
+                task.brief = applyPinnedBrandToChatBrief(action.brief, task);
                 task.stages = action.stages.map((planned) => ({
                   ...planned,
                   ...(!planned.pageId && task.intent === "edit" && task.editTarget
                     ? { pageId: task.editTarget.pageId }
                     : {}),
-                  ...(!planned.pageId && task.intent !== "create" && inspectedPageId
-                    && task.intent !== "edit"
+                  ...(!planned.pageId &&
+                  task.intent !== "create" &&
+                  inspectedPageId &&
+                  task.intent !== "edit"
                     ? { pageId: inspectedPageId }
                     : {}),
                   estimatedMutations:
@@ -3316,10 +3939,11 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               const plannedTargetRefs = target?.plannedRefs
                 ? new Set(target.plannedRefs.map(knownRef))
                 : undefined;
-              const invalidExistingRefs = stage.logicalRefs.filter((ref) =>
-                verifiedTargetRefs.has(knownRef(ref)) &&
-                plannedTargetRefs &&
-                !plannedTargetRefs.has(knownRef(ref)),
+              const invalidExistingRefs = stage.logicalRefs.filter(
+                (ref) =>
+                  verifiedTargetRefs.has(knownRef(ref)) &&
+                  plannedTargetRefs &&
+                  !plannedTargetRefs.has(knownRef(ref)),
               );
               if (invalidExistingRefs.length) {
                 stage.completionReason = "invalid_required_reference";
@@ -3347,14 +3971,22 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 );
               }
               const reusedContinuation = chatTaskInspectedContinuationRefs(task, stageIndex);
-              const offPlanCreations = reusedContinuation.size ? confirmedStageMutations.flatMap((entry) => {
-                const action = entry.call.action;
-                return (action.tool === "create_frame" || action.tool === "create_text" || action.tool === "create_rectangle") &&
-                  !stage.logicalRefs.some((ref) => knownRef(ref) === knownRef(action.ref)) ? [knownRef(action.ref)] : [];
-              }) : [];
+              const offPlanCreations = reusedContinuation.size
+                ? confirmedStageMutations.flatMap((entry) => {
+                    const action = entry.call.action;
+                    return (action.tool === "create_frame" ||
+                      action.tool === "create_text" ||
+                      action.tool === "create_rectangle") &&
+                      !stage.logicalRefs.some((ref) => knownRef(ref) === knownRef(action.ref))
+                      ? [knownRef(action.ref)]
+                      : [];
+                  })
+                : [];
               const hasConfirmedPropertyEdit =
                 task.intent === "edit" &&
-                confirmedStageMutations.some((entry) => entry.call.action.tool === "set_properties");
+                confirmedStageMutations.some(
+                  (entry) => entry.call.action.tool === "set_properties",
+                );
               const propertyVerificationPersisted = task.ledger.some((entry) => {
                 if (
                   entry.stage !== stageIndex ||
@@ -3368,7 +4000,11 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   return false;
                 }
               });
-              if (!stage.verified || offPlanCreations.length || (hasConfirmedPropertyEdit && !propertyVerificationPersisted)) {
+              if (
+                !stage.verified ||
+                offPlanCreations.length ||
+                (hasConfirmedPropertyEdit && !propertyVerificationPersisted)
+              ) {
                 if (stage.qaAttempts >= 3) {
                   stage.completionReason = "native_verification_failed";
                   throw new Error(
@@ -3380,24 +4016,28 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 const refs = offPlanCreations.length
                   ? [...new Set([...stage.logicalRefs, ...offPlanCreations])]
                   : stage.logicalRefs.length
-                  ? task.intent === "edit" && task.editTarget
-                    ? [
-                        ...new Set([
-                          task.editTarget.ref,
-                          ...stage.logicalRefs,
-                          ...confirmedStageMutations.flatMap((entry) =>
-                            entry.call.action.tool === "set_properties" ? [entry.call.action.ref] : [],
-                          ),
-                        ]),
-                      ]
-                    : stage.logicalRefs
-                  : task.ledger
-                      .filter((entry) => entry.stage === stageIndex && "ref" in entry.call.action)
-                      .map((entry) => ("ref" in entry.call.action ? entry.call.action.ref : ""))
-                      .filter(Boolean)
-                      .slice(0, 20);
+                    ? task.intent === "edit" && task.editTarget
+                      ? [
+                          ...new Set([
+                            task.editTarget.ref,
+                            ...stage.logicalRefs,
+                            ...confirmedStageMutations.flatMap((entry) =>
+                              entry.call.action.tool === "set_properties"
+                                ? [entry.call.action.ref]
+                                : [],
+                            ),
+                          ]),
+                        ]
+                      : stage.logicalRefs
+                    : task.ledger
+                        .filter((entry) => entry.stage === stageIndex && "ref" in entry.call.action)
+                        .map((entry) => ("ref" in entry.call.action ? entry.call.action.ref : ""))
+                        .filter(Boolean)
+                        .slice(0, 20);
                 if (refs.length > INSPECT_NODES_LIMITS.refs)
-                  throw new Error("invalid_required_reference: The saved stage exceeds the bounded native verification scope.");
+                  throw new Error(
+                    "invalid_required_reference: The saved stage exceeds the bounded native verification scope.",
+                  );
                 const inspection = parseResponsesFunctionCalls([
                   {
                     type: "function_call",
@@ -3524,7 +4164,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   );
                 }
                 const inspectedRootRefs = new Set(
-                  parsedNodes.data.flatMap((node) => node.ref ? [knownRef(node.ref)] : []),
+                  parsedNodes.data.flatMap((node) => (node.ref ? [knownRef(node.ref)] : [])),
                 );
                 const missingInspectionRefs = refs
                   .map(knownRef)
@@ -3555,13 +4195,17 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   inspectionEntry.status = "completed";
                   inspectionEntry.acknowledgementStatus = "read_only";
                   inspectionEntry.output = JSON.stringify({
-                    success: true, planMismatch: true, refs: refs.map(knownRef),
+                    success: true,
+                    planMismatch: true,
+                    refs: refs.map(knownRef),
                     identities: result.data?.nativeIdentities,
                   });
                   stage.verified = false;
                   stage.completionReason = "invalid_required_reference";
                   await save();
-                  throw new Error("invalid_required_reference: Fresh native inspection confirmed the existing refs and saved additions, but the additions are outside the saved enhancement specification. Review the remaining design work before authorizing a revised plan.");
+                  throw new Error(
+                    "invalid_required_reference: Fresh native inspection confirmed the existing refs and saved additions, but the additions are outside the saved enhancement specification. Review the remaining design work before authorizing a revised plan.",
+                  );
                 }
                 const verifiedRefs = refs.map(knownRef);
                 const findings = readVerification(
@@ -3577,13 +4221,25 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   task.intent === "edit"
                     ? nativePropertyChecks(task, stageIndex, parsedNodes.data, knownRef)
                     : [];
-                const backgrounds = result.data?.frameBackgrounds as Record<string, unknown> | undefined;
-                if (target && backgrounds && backgrounds[knownRef(target.ref)] !== "root" &&
-                    propertyChecks.some((item) => item.ref === knownRef(target.ref) && item.property === "fill")) {
+                const backgrounds = result.data?.frameBackgrounds as
+                  Record<string, unknown> | undefined;
+                if (
+                  target &&
+                  backgrounds &&
+                  backgrounds[knownRef(target.ref)] !== "root" &&
+                  propertyChecks.some(
+                    (item) => item.ref === knownRef(target.ref) && item.property === "fill",
+                  )
+                ) {
                   stage.verified = false;
                   stage.completionReason = "native_property_verification_failed";
-                  inspectionEntry.output = JSON.stringify({ success: false, visualOutcomeVerified: false });
-                  throw new Error("native_property_verification_failed: The confirmed frame fill is not established as the visible background.");
+                  inspectionEntry.output = JSON.stringify({
+                    success: false,
+                    visualOutcomeVerified: false,
+                  });
+                  throw new Error(
+                    "native_property_verification_failed: The confirmed frame fill is not established as the visible background.",
+                  );
                 }
                 const propertyMismatches = nativePropertyMismatches(propertyChecks);
                 inspectionEntry.output = JSON.stringify({
@@ -3596,11 +4252,13 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                     propertyMismatches.length === 0 && propertyChecks.length > 0,
                   ...(propertyMismatches.length
                     ? {
-                        propertyMismatches: propertyMismatches.slice(0, 12).map(({ ref, property, actual }) => ({
-                          ref,
-                          property,
-                          observation: actual === undefined ? "unavailable" : "different",
-                        })),
+                        propertyMismatches: propertyMismatches
+                          .slice(0, 12)
+                          .map(({ ref, property, actual }) => ({
+                            ref,
+                            property,
+                            observation: actual === undefined ? "unavailable" : "different",
+                          })),
                       }
                     : {}),
                 });
@@ -3611,8 +4269,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                   throw new Error(
                     `native_property_verification_failed: Native values did not match the confirmed edit for ${propertyMismatches
                       .slice(0, 5)
-                      .map(({ ref, property, actual }) =>
-                        `${ref}.${property} (${actual === undefined ? "native value unavailable" : "native value differs from the requested value"})`,
+                      .map(
+                        ({ ref, property, actual }) =>
+                          `${ref}.${property} (${actual === undefined ? "native value unavailable" : "native value differs from the requested value"})`,
                       )
                       .join("; ")}. The confirmed mutation is retained; it was not replayed.`,
                   );
@@ -3702,7 +4361,10 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             );
           } catch (error) {
             if (action.tool === "plan_canvas_task" && task.intent === "edit" && !reusingSavedPlan) {
-              const message = error instanceof Error ? error.message : "The edit plan was rejected by the safety validator.";
+              const message =
+                error instanceof Error
+                  ? error.message
+                  : "The edit plan was rejected by the safety validator.";
               const code = message.startsWith("target_not_inspected")
                 ? "target_not_inspected"
                 : message.startsWith("reference_not_mutation_eligible")
@@ -3725,13 +4387,17 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               transition("EXECUTING_STAGE");
             if (error instanceof Error && error.message.startsWith("missing_creation_operation:")) {
               const progress = chatTaskCommittedOperationCount(task);
-              if (task.lastFailureSignature === error.message && task.lastFailureProgress === progress)
+              if (
+                task.lastFailureSignature === error.message &&
+                task.lastFailureProgress === progress
+              )
                 throw error;
               task.lastFailureSignature = error.message;
               task.lastFailureProgress = progress;
-            } else guardRepeatedFailure(
-              `planning:${error instanceof Error ? error.message : "stage_not_confirmed"}`,
-            );
+            } else
+              guardRepeatedFailure(
+                `planning:${error instanceof Error ? error.message : "stage_not_confirmed"}`,
+              );
             task.recent.push(
               output(call.callId, {
                 success: false,
@@ -4023,9 +4689,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 ? item.acknowledgementStatus === "confirmed_mutation" ||
                     item.acknowledgementStatus === "verified_idempotent_replay"
                 : ["rejected", "ambiguous", "not_attempted"].includes(item.acknowledgementStatus);
-            return ["read_only", "rejected", "not_attempted"].includes(
-              item.acknowledgementStatus,
-            );
+            return ["read_only", "rejected", "not_attempted"].includes(item.acknowledgementStatus);
           });
           if (
             !acknowledgementsValid ||
@@ -4091,7 +4755,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               task.intent === "edit" &&
               entry.call.callId.startsWith(EDIT_TARGET_CALL_PREFIX) &&
               entry.call.action.tool === "inspect_nodes" &&
-              item.success && item.data
+              item.success &&
+              item.data
             ) {
               const verifiedTarget = editTargetFromInspection(task, entry, item.data);
               if (verifiedTarget) task.editTarget = verifiedTarget;
@@ -4147,15 +4812,23 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                       })
                     : [],
                   frames: Array.isArray(source.frames)
-                    ? source.frames.slice(0, 8).map((frame) =>
-                        frame && typeof frame === "object"
-                          ? Object.fromEntries(
-                              frameFields
-                                .filter((field) => (frame as Record<string, unknown>)[field] !== undefined)
-                                .map((field) => [field, (frame as Record<string, unknown>)[field]]),
-                            )
-                          : {},
-                      )
+                    ? source.frames
+                        .slice(0, 8)
+                        .map((frame) =>
+                          frame && typeof frame === "object"
+                            ? Object.fromEntries(
+                                frameFields
+                                  .filter(
+                                    (field) =>
+                                      (frame as Record<string, unknown>)[field] !== undefined,
+                                  )
+                                  .map((field) => [
+                                    field,
+                                    (frame as Record<string, unknown>)[field],
+                                  ]),
+                              )
+                            : {},
+                        )
                     : [],
                   discovery: discovery
                     ? Object.fromEntries(
@@ -4415,10 +5088,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
               operationId: entry.operationId,
               ...(prePlanReadOnly
                 ? {
-                  planningGuidance:
-                      readOnly()
-                        ? "Continue read-only discovery/inspection using exact refs and pageIds. Follow nextOffset for remaining matches. Once the returned frames are verified, report their names, locations and limits and finish with prose. No mutation plan is needed or allowed; do not classify intent again."
-                        : "This was pre-planning read-only context. Continue to plan_canvas_task now. New designs need only fresh task-local aliases; edits must use exact refs returned by successful inspection.",
+                    planningGuidance: readOnly()
+                      ? "Continue read-only discovery/inspection using exact refs and pageIds. Follow nextOffset for remaining matches. Once the returned frames are verified, report their names, locations and limits and finish with prose. No mutation plan is needed or allowed; do not classify intent again."
+                      : "This was pre-planning read-only context. Continue to plan_canvas_task now. New designs need only fresh task-local aliases; edits must use exact refs returned by successful inspection.",
                   }
                 : {}),
               ...(call.normalizedInspectionParameters && call.action.tool === "inspect_nodes"
@@ -4448,9 +5120,15 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           ? `Continuing saved stage ${current.title}…`
           : task.stages.length
             ? "Checking completion against Figma confirmations…"
-             : readOnly() ? "Inspecting existing canvas frames…" : "Planning bounded canvas stages…",
-       );
-      activePhase = readOnly() ? "inspection" : task.stages.length ? "native_execution" : "planning";
+            : readOnly()
+              ? "Inspecting existing canvas frames…"
+              : "Planning bounded canvas stages…",
+      );
+      activePhase = readOnly()
+        ? "inspection"
+        : task.stages.length
+          ? "native_execution"
+          : "planning";
       const input = chatTaskInput(task);
       let turn: AuthorizedChatTurn | undefined;
       let turnDurationMs = 0;
@@ -4494,7 +5172,10 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         lifecycle: task.lifecycle,
         outcome: turn.kind,
         tools: turn.kind === "tool_calls" ? turn.calls.map(({ name }) => name) : [],
-        validationCodes: turn.kind === "tool_validation" ? turn.issues.slice(0, 8).map(({ errorCode }) => errorCode) : [],
+        validationCodes:
+          turn.kind === "tool_validation"
+            ? turn.issues.slice(0, 8).map(({ errorCode }) => errorCode)
+            : [],
         durationMs: turnDurationMs,
         ...(turn.timing ? { timing: turn.timing } : {}),
         inputBytes: utf8Bytes(JSON.stringify(input)),
@@ -4619,16 +5300,21 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             evidence.uninspectedRefs.length ||
             (lastDiscovery?.complete === true && nativeInspection?.complete !== true)
           )
-            throw new Error("Read-only inspection needs complete progressive coverage and verified native evidence before reporting success.");
+            throw new Error(
+              "Read-only inspection needs complete progressive coverage and verified native evidence before reporting success.",
+            );
         }
         if (task.intent === "edit" && !task.stages.length) {
           if (task.editTarget && (task.planningContinuations ?? 0) < 1) {
             task.planningContinuations = (task.planningContinuations ?? 0) + 1;
             transition("EDIT_PLANNING");
-            task.recent = [{
-              role: "user",
-              content: "Your target is already discovered and natively inspected. Save the edit plan now by calling plan_canvas_task alone. Include targetRefs with the existing root ref and only the inspected refs you intend to modify. Keep every stage on the verified target page, preserve the root, and include actionable native mutations. Do not respond with final prose yet.",
-            }];
+            task.recent = [
+              {
+                role: "user",
+                content:
+                  "Your target is already discovered and natively inspected. Save the edit plan now by calling plan_canvas_task alone. Include targetRefs with the existing root ref and only the inspected refs you intend to modify. Keep every stage on the verified target page, preserve the root, and include actionable native mutations. Do not respond with final prose yet.",
+              },
+            ];
             await save();
             continue;
           }
@@ -4641,10 +5327,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           );
           return;
         }
-        if (
-          ["create", "edit", "continue"].includes(task.intent ?? "") &&
-          !task.stages.length
-        )
+        if (["create", "edit", "continue"].includes(task.intent ?? "") && !task.stages.length)
           throw new Error(
             `${task.intent} request has no saved canvas plan; it cannot be reported as completed. Retry the request so its native work can be planned.`,
           );
@@ -4683,11 +5366,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       delete task.failure;
       const calls = turn.calls.map((rawCall) => {
         const call = ChatFunctionCallSchema.parse(rawCall);
-        if (
-          task.targetName &&
-          call.action.tool === "get_document_context" &&
-          !call.action.query
-        )
+        if (task.targetName && call.action.tool === "get_document_context" && !call.action.query)
           return {
             ...call,
             action: { ...call.action, query: task.targetName },
@@ -4698,16 +5377,31 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         throw new Error("The model returned an invalid bounded stage.");
       const continuationStage = task.stages.findIndex((stage) => !stage.completed);
       const continuationRefs = chatTaskInspectedContinuationRefs(task, continuationStage);
-      if (continuationRefs.size && calls.some(({ action }) =>
-        (action.tool === "create_frame" || action.tool === "create_text" || action.tool === "create_rectangle") &&
-        (!task.stages[continuationStage]?.logicalRefs.includes(action.ref) ||
-          continuationRefs.has(action.ref) || action.parent.kind === "page"))) {
-        await stopEdit("invalid_required_reference",
-          "New layers in an existing design must use declared new refs and stay inside the existing screen.", "planning");
+      if (
+        continuationRefs.size &&
+        calls.some(
+          ({ action }) =>
+            (action.tool === "create_frame" ||
+              action.tool === "create_text" ||
+              action.tool === "create_rectangle") &&
+            (!task.stages[continuationStage]?.logicalRefs.includes(action.ref) ||
+              continuationRefs.has(action.ref) ||
+              action.parent.kind === "page"),
+        )
+      ) {
+        await stopEdit(
+          "invalid_required_reference",
+          "New layers in an existing design must use declared new refs and stay inside the existing screen.",
+          "planning",
+        );
         return;
       }
       const reservations: string[] = [];
-      if (task.intent === "edit" && task.stages.length && calls.some(({ action }) => isCanvasMutationTool(action.tool))) {
+      if (
+        task.intent === "edit" &&
+        task.stages.length &&
+        calls.some(({ action }) => isCanvasMutationTool(action.tool))
+      ) {
         const mutationCalls = calls.filter(({ action }) => isCanvasMutationTool(action.tool));
         const blocker = editMutationBlocker(
           task,
@@ -4731,7 +5425,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             continue;
           }
           const message = blocker.replace(/^[a-z_]+:\s*/u, "");
-          const code = blocker.startsWith("edit_plan_invalid") ? "edit_plan_invalid" : "native_execution_blocked";
+          const code = blocker.startsWith("edit_plan_invalid")
+            ? "edit_plan_invalid"
+            : "native_execution_blocked";
           task.editReferenceDiagnostic = message.slice(0, 500);
           if (code === "edit_plan_invalid" && editBatchCorrections++ < 2) {
             task.validationFeedback = `The entire batch was rejected before dispatch. ${message} Return a corrected batch in dependency order. Keep the existing frame and use the saved aliases for previously confirmed nodes.`;
@@ -4848,11 +5544,12 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           ? "checkpoint_storage"
           : isCancelled
             ? "cancelled"
-          : isTransportFailure
-            ? "transport"
-            : transportCategory === "quota_or_rate_limit" || transportCategory === "inference_busy"
-              ? "rate_limit"
-              : transportCategory === "request_timed_out" ||
+            : isTransportFailure
+              ? "transport"
+              : transportCategory === "quota_or_rate_limit" ||
+                  transportCategory === "inference_busy"
+                ? "rate_limit"
+                : transportCategory === "request_timed_out" ||
                     /timed out|timeout/iu.test(task.error)
                   ? "timeout"
                   : transportCategory === "response_invalid"
@@ -4867,10 +5564,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                             ? "inspection"
                             : "planning",
         phase,
-        code:
-          isCancelled
-            ? "request_cancelled"
-            : checkpointFailure && checkpointCode && /^[a-z_]{1,80}$/u.test(checkpointCode)
+        code: isCancelled
+          ? "request_cancelled"
+          : checkpointFailure && checkpointCode && /^[a-z_]{1,80}$/u.test(checkpointCode)
             ? checkpointCode
             : /^[a-z_]{1,80}$/u.test(transportCategory)
               ? transportCategory
@@ -4878,25 +5574,25 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 ? "native_verification_invalid"
                 : task.error.startsWith("native_verification_capacity_exceeded")
                   ? "native_verification_capacity_exceeded"
-                : task.error.startsWith("missing_creation_operation")
-                  ? "missing_creation_operation"
-                : task.error.startsWith("native_property_verification_failed")
-                  ? "native_property_verification_failed"
-                  : task.error.startsWith("missing_reference_inspection")
-                    ? "missing_reference_inspection"
-                    : task.error.startsWith("invalid_required_reference")
-                      ? "invalid_required_reference"
-                : task.error.startsWith("no_progress_repeated_error")
-                  ? "no_progress_repeated_error"
-                  : task.error.startsWith("Initial planning budget reached")
-                    ? "planning_budget_exhausted"
-                    : activePhase === "inspection"
-                      ? "inspection_failed"
-                      : activePhase === "verification"
-                        ? "verification_failed"
-                        : activePhase === "planning"
-                          ? "planning_failed"
-                          : "task_paused",
+                  : task.error.startsWith("missing_creation_operation")
+                    ? "missing_creation_operation"
+                    : task.error.startsWith("native_property_verification_failed")
+                      ? "native_property_verification_failed"
+                      : task.error.startsWith("missing_reference_inspection")
+                        ? "missing_reference_inspection"
+                        : task.error.startsWith("invalid_required_reference")
+                          ? "invalid_required_reference"
+                          : task.error.startsWith("no_progress_repeated_error")
+                            ? "no_progress_repeated_error"
+                            : task.error.startsWith("Initial planning budget reached")
+                              ? "planning_budget_exhausted"
+                              : activePhase === "inspection"
+                                ? "inspection_failed"
+                                : activePhase === "verification"
+                                  ? "verification_failed"
+                                  : activePhase === "planning"
+                                    ? "planning_failed"
+                                    : "task_paused",
         committedOperations: chatTaskCommittedOperationCount(task),
         ...(isCancelled
           ? {
