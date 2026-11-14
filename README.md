@@ -1,10 +1,10 @@
 # Figma AI Design Engine
 
-Figma AI Design Engine is a local plugin for Figma Desktop. It reads a structured JSON design and creates editable native Figma layers from it. You can start with one of the included examples or write/import your own JSON, validate it, generate the design, and keep editing it in Figma.
+A local Figma Desktop plugin for turning structured JSON into editable native Figma designs, with optional AI-assisted generation through a local companion. JSON import, validation, and rendering work offline; AI generation is an explicitly enabled, account-gated feature.
 
-The plugin can render JSON fully offline. Phase 5.5 adds incremental prompt → validate → durable section checkpoint → native editable Figma rendering through the optional companion, with optional JSON inspection. Generation stays disabled until the exact selected account-visible model passes a real Responses smoke test. Live account access and Figma Desktop acceptance remain unverified; offline JSON import does not depend on AI access.
+> **Project status:** The repository contains implementations and automated tests for the phases below. Live provider access and Figma Desktop acceptance are separate checks and remain pending where noted in the phase documentation. Passing mocked tests does not establish live or release readiness.
 
-## What the plugin can do
+## Core capabilities
 
 - Create frames, text layers, and rectangles, including nested frames.
 - Create ellipses, editable vector paths, gradients, strokes, shadows/blur, clipping, opacity and native image fills.
@@ -14,10 +14,53 @@ The plugin can render JSON fully offline. Phase 5.5 adds incremental prompt → 
 - Validate the JSON and report errors before adding layers to the Figma document.
 - Preserve existing page content and place each new design in a clear canvas area.
 - Keep Persian and other Unicode text editable in Figma text layers. Font availability and complex right-to-left shaping depend on the local Figma environment.
-- Phase 4.6/4.7.1: official browser sign-in, plan-use permission checks, model discovery, fixed smoke test, local pairing, and DPAPI-protected session restoration.
-- Phase 5.5: Persian/English multi-screen planning, bounded `identity` → `primary` → `supporting` section requests, strict validation, 44×44 touch-target checks, durable per-section resume, idempotent native append, and pause/resume/cancel controls. Every model section still requires a completed Responses event before validation; the next request waits for the current section's checkpoint and Figma acknowledgment. Live/Desktop acceptance remains pending.
+- Optional AI workflow: official browser authorization, explicit account/model checks, local companion pairing, and incremental generation with checkpoints and resume. AI generation remains gated until the selected account-visible model passes a real Responses smoke test.
 
-The **Phase 1 sample**, **Phase 2 demo**, and **Phase 3 demo** buttons are examples in the same plugin, not separate programs. Phase 1 demonstrates a coordinate-based design. Phase 2 shows nested Auto Layout and linked components. Phase 3 adds an optional design-system section to schema 1.0.0.
+The **Phase 1 sample**, **Phase 2 demo**, and **Phase 3 demo** buttons are examples in the same plugin, not separate programs. Phase 1 demonstrates coordinate-based layout, Phase 2 demonstrates nested Auto Layout and linked components, and Phase 3 adds an optional design system.
+
+## Development phases
+
+Phase status describes the implementation recorded in this repository—not a promise that every workflow has passed in Figma Desktop or against a live account.
+
+| Phase     | Focus                                                                                   | Implementation and acceptance status                                  |
+| --------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| 1         | Structured JSON to editable native Figma layers                                         | Offline workflow available.                                           |
+| 2–2.2     | Auto Layout, linked components, and safe canvas placement                               | Implemented; manual canvas acceptance is pending.                     |
+| 3         | Design tokens, native styles, and reusable components                                   | Implemented; Figma Desktop acceptance is pending.                     |
+| 4         | Multi-screen JSON generation and canvas layout                                          | Implemented; Figma Desktop acceptance is pending.                     |
+| 4.5       | Visual preflight, native styling, and safe local assets                                 | Implemented; Figma Desktop acceptance is pending.                     |
+| 4.6–4.7.1 | Optional account authorization, model discovery, local pairing, and session restoration | Implemented; live account/provider acceptance is pending.             |
+| 5–5.9.x   | AI design generation, native tools, checkpoints, and incremental resume                 | Implemented; live inference and Figma Desktop acceptance are pending. |
+| 6–6.9     | Professional visual design and bounded native verification                              | Implemented; Figma Desktop acceptance is pending.                     |
+| 7         | Workspace navigation, task visibility, and chat history                                 | Implemented; live Desktop acceptance is pending.                      |
+| 8         | Model selection, connectivity, and recovery                                             | Implemented; real account/model acceptance is pending.                |
+| 9         | Brand Kit management and task-pinned brand revisions                                    | Implemented; Figma Desktop acceptance is pending.                     |
+| 10        | Design Skills management and task-pinned guidance                                       | Implemented; Desktop/provider acceptance is pending.                  |
+
+Detailed phase notes and acceptance evidence:
+
+- [Phase 4.6 feasibility](docs/phase-4.6-feasibility.md), [local pairing](docs/phase-4.6.1-auto-pairing-design.md), and [session restoration](docs/phase-4.7.1-session-restoration.md)
+- [Phase 5 design generation](docs/phase-5-design-generation.md), [incremental canvas generation](docs/phase-5-5-live-canvas-generation.md), and [stability gate](docs/phase-5-8-stability-gate.md)
+- [Phase 6 visual design engine](docs/phase-6-professional-visual-design-engine.md) and [Phase 6.9 completion audit](docs/phase-6-9-completion-audit.md)
+- [Phase 7 UI and history](docs/phase-7-plugin-ui-ux-history.md)
+- [Phase 8 model management](docs/phase-8-model-management.md)
+- [Phase 9 Brand Kit manager](docs/phase-9-brand-kit-manager.md)
+- [Phase 10 Design Skills manager](docs/phase-10-design-skills-manager.md)
+
+## Contents
+
+- [Requirements](#requirements)
+- [Install the plugin](#install-the-plugin-in-figma)
+- [Use the plugin](#use-the-plugin)
+- [JSON format](#json-format)
+- [Phase 2.2 canvas organization](#phase-22-canvas-organization)
+- [Phase 3 design systems](#phase-3-design-systems)
+- [Phase 4 multi-screen generation](#phase-4-multi-screen-generation)
+- [Phase 4.5 visual design and quality preflight](#phase-45-visual-design-and-quality-preflight)
+- [Phase 4.6 ChatGPT connection](#phase-46-chatgpt-connection-proof-of-concept)
+- [Phase 5.5 incremental prompt-to-design](#phase-55-incremental-prompt-to-design)
+- [Limitations](#limitations)
+- [Build and development](#build-and-development)
 
 ## Requirements
 
@@ -46,7 +89,7 @@ The plugin is set up for local development and is not configured for publishing 
 1. Load **Phase 1 sample** for a small, positioned example, **Phase 2 demo** for the storefront, **Phase 3 demo** for native styles/components, or **Visual demo** for native editorial visuals and the 10-screen Persian storefront.
 2. To use your own design, click **Import JSON** to select a `.json` file, or paste/edit JSON in the editor. JSON has no application-level byte cap; actual memory and host limits still apply.
 3. Click **Validate JSON**. Fix any errors shown in the status area before continuing.
-4. Click **Generate in Figma** for Phase 1/2 documents. For JSON containing `designSystem`, inspect its dry-run summary and click **Create / Update Design System**. The plugin creates native editable layers on the current page and focuses the new design in the viewport.
+4. Click **Generate in Figma** for a single design or **Generate all screens** for a batch. For JSON containing `designSystem`, review its dry-run summary and click **Create / Update Design System**. The plugin creates native editable layers on the current page and focuses the new design in the viewport.
 5. Edit the generated layers as usual in Figma. Running Generate again adds another design; it does not replace earlier results.
 
 ## JSON format
@@ -111,7 +154,28 @@ Text supports font family/style, font size, color, alignment, line height, resiz
 
 Reusable legacy component definitions go in `document.components`; Phase 3 definitions can go in `designSystem.components` and must include a stable `key`. Add an `instance` layer with the matching `componentId` wherever the design should use that component. Generated component masters appear in a Components area beside the screen. Instances are native Figma instances and remain linked to their masters. Editing a master in Figma uses Figma's normal instance propagation. Component sets/variant properties and instance text overrides are not created by the plugin. The Phase 3 Button states are separate named masters (`primary`, `secondary`, and `disabled`) rather than a native component set.
 
-### Phase 3 design systems
+## Phase 2.2 canvas organization
+
+Each generation is placed as a cluster. If the design has components, its screen and component masters are kept together. New clusters are placed from left to right and wrap onto another row as needed, with at least 120 px of spacing. The default target row width is 6,000 px. These settings are centralized in `src/plugin/canvas-placement.ts`; an individual cluster wider than the target gets a row of its own. Row height uses the tallest actual cluster in that row, plus the gap.
+
+Before rendering, the plugin reads document-space bounds for all direct children of the current page, including unrelated frames and other scene nodes. Bounds prefer Figma's `absoluteRenderBounds`, then `absoluteBoundingBox`, and use the transformed-corner AABB fallback if needed. Rotated objects reserve their conservative axis-aligned bounds. Descendants are covered by their top-level parent, so they are not counted twice. The planner finds the first row-major slot that clears those obstacles and all previous generated clusters. It plans from intended dimensions before creating nodes, then measures and corrects the full generated cluster if its actual bounds differ. Only the new cluster root can move; existing content and internal child coordinates remain unchanged.
+
+Generated screens are added to the current Figma page; the plugin does not create a page per screen. Placement uses O(n log n) time and O(n) temporary memory for n top-level obstacles. Old vertically stacked Phase 2.1 clusters remain in place; horizontal placement applies to new generations only.
+
+### Figma Desktop acceptance
+
+Automated tests use a mocked Figma API and do not verify the real canvas. After `npm run build`, reload the development plugin in Figma Desktop and confirm:
+
+1. Generate the Phase 2 demo six times; verify the clusters appear horizontally and wrap at the configured row width.
+2. Confirm at least 120 px of clearance between cluster bounds, including component masters.
+3. Put a large unrelated frame in the next available slot and generate again; confirm the new cluster avoids it.
+4. Generate valid mobile and desktop designs with different heights; check wrapped-row height.
+5. Confirm old content is unchanged, Auto Layout remains editable, component instances stay linked, and the viewport focuses the newest design.
+6. If practical, repeat with 100+ frames and check responsiveness.
+
+Acceptance remains pending until these checks pass in Figma Desktop and results are recorded.
+
+## Phase 3 design systems
 
 The optional `designSystem` property extends schema 1.0.0; older Phase 1/2 JSON remains valid without migration. The Phase 3 demo is version-controlled at `src/samples/phase-3-design-system.json` and includes the exact requested palette, typography, numeric scales and aliases, two border tokens, three button masters, a Product Card master, nested linked instances, and editable Persian preview text. It does not add a Figma Page.
 
@@ -129,6 +193,24 @@ The **Design System** panel shows the namespace, token/component counts, validat
 Figma's [Variables guide](https://help.figma.com/hc/en-us/articles/15339657135383-Guide-to-variables-in-Figma) lists variables as available on all plans; the [plan comparison](https://help.figma.com/hc/en-us/articles/360040328273-Compare-Figma-plans-and-features) shows Starter has no variable modes, while the Plugin API typings include local collection/variable APIs. This implementation deliberately does not create variable collections or claim live numeric bindings because it has not been exercised in the target Figma Desktop/Starter account. It uses native Paint/Text Styles and resolved numeric values instead. If local variable creation is enabled after Desktop acceptance, use only Starter's single default mode; extended collections and modes are not required.
 
 The sample's primary/secondary/disabled buttons are separate native masters. Component properties and instance text overrides are not exposed, so changing product copy currently means editing the master or adding another keyed component definition.
+
+### Figma Desktop acceptance
+
+These manual checks are pending; automated tests use mocked Figma APIs and do not verify real styles, variable access, component propagation, font rendering, or RTL display. After a clean build, close and reopen/reload the development plugin, then:
+
+1. Generate the Phase 1 sample and Phase 2 demo; check existing behavior.
+2. Import or load `phase-3-design-system.json`, validate it, and review the dry-run counts before clicking **Create / Update Design System**.
+3. Confirm native Paint Styles, Text Styles, Button masters, and Product Card master appear in the current file.
+4. Confirm preview and nested component instances stay linked; edit a master and verify Figma updates its instances.
+5. Change a bound Paint/Text Style and check linked preview layers. Spacing/radius values should be described as resolved values, not variable bindings.
+6. Re-import the demo twice; check that owned styles and component masters do not multiply.
+7. Change an unrelated user style and frame, then re-import; confirm both are untouched. Also edit an owned style and confirm the default import skips it; test the explicit update checkbox only on an unmodified owned style.
+8. Generate several previews; confirm the Phase 2.2 horizontal-first 120 px placement avoids existing content.
+9. Inspect Persian text visually, confirm it is editable, and check alignment with the chosen font.
+10. Try an invalid token reference and a missing font; confirm validation/fallback is clear and existing file content remains intact.
+11. Verify the target Starter account can access the local Variables view and whether the plugin may create a single-mode local collection before enabling variable writes in a later change.
+
+Phase 3 manual acceptance remains pending until results are recorded.
 
 ## Phase 4 multi-screen generation
 
@@ -203,7 +285,7 @@ These checks are **pending**; automated tests use a mocked Figma API and do not 
 9. Cause one screen to fail with a valid but unavailable font or document issue where practical; confirm that screen's partial tree is removed and other outcomes are accurately reported.
 10. If practical, use a test file with 100+ existing frames and a 100-screen batch; inspect non-overlap and responsiveness.
 
-Phase 2.2 and Phase 3 Desktop checks have also not been confirmed with itemized results in this thread. Phase 4 is implemented, but its manual acceptance and those earlier manual gates remain pending until the user confirms them.
+Phase 4 is implemented, but its Figma Desktop acceptance and the earlier Phase 2.2/3 gates remain pending until the manual checks are recorded.
 
 ### Validation limits
 
@@ -213,27 +295,6 @@ Phase 2.2 and Phase 3 Desktop checks have also not been confirmed with itemized 
 - Text: up to 5,000 characters per text layer.
 - Layout gap/padding: 0–1,000 px; corner radii: 0–5,000 px; stroke width: 0.25–100 px.
 - JSON objects reject unsupported fields; the editor/import has no application-level byte cap.
-
-## Canvas organization
-
-Each generation is placed as a cluster. If the design has components, its screen and component masters are kept together. New clusters are placed from left to right and wrap onto another row as needed, with at least 120 px of spacing. The default target row width is 6,000 px. These settings are centralized in `src/plugin/canvas-placement.ts`; an individual cluster wider than the target gets a row of its own. Row height uses the tallest actual cluster in that row, plus the gap.
-
-Before rendering, the plugin reads document-space bounds for all direct children of the current page, including unrelated frames and other scene nodes. Bounds prefer Figma's `absoluteRenderBounds`, then `absoluteBoundingBox`, and use the transformed-corner AABB fallback if needed. Rotated objects reserve their conservative axis-aligned bounds. Descendants are covered by their top-level parent, so they are not counted twice. The planner finds the first row-major slot that clears those obstacles and all previous generated clusters. It plans from intended dimensions before creating nodes, then measures and corrects the full generated cluster if its actual bounds differ. Only the new cluster root can move; existing content and internal child coordinates remain unchanged.
-
-The plugin adds generated screens to the current Figma Page; it does not create a page per screen. Each single-cluster placement uses O(n log n) time and O(n) temporary memory for n top-level obstacles. Batch planning repeats the bounded row query per item. Old vertically stacked Phase 2.1 clusters are left in place; horizontal placement applies to new generations only.
-
-### Windows / Figma Desktop acceptance
-
-Automated tests use a mocked Figma API and do not verify the real canvas. After `npm run build`, reload the development plugin in Figma Desktop and confirm:
-
-1. Generate the Phase 2 demo six times; verify the clusters appear horizontally and wrap at the configured row width.
-2. Confirm at least 120 px of clearance between cluster bounds, including component masters.
-3. Put a large unrelated frame in the next available slot and generate again; confirm the new cluster avoids it.
-4. Generate valid mobile and desktop designs with different heights; check wrapped-row height.
-5. Confirm old content is unchanged, Auto Layout remains editable, component instances stay linked, and the viewport focuses the newest design.
-6. If practical, repeat with 100+ frames and check responsiveness.
-
-Phase 2.2 remains pending until these checks pass in Figma Desktop and the user confirms them.
 
 ## Phase 4.5 visual design and quality preflight
 
@@ -472,21 +533,3 @@ npm audit --omit=dev
 ```
 
 Runtime dependencies are React, React DOM, and Zod. Other project dependencies are used for development and building. The Figma main/controller stays offline; the companion uses only official OpenAI OAuth and API endpoints after explicit user actions. No paid dependency, separately billed API key fallback, telemetry, cloud backend, or runtime third-party service was added. The production manifest domain list remains `none`; only the local development companion is allowlisted via Figma's development-only network setting.
-
-### Phase 3 Windows / Figma Desktop acceptance
-
-These manual checks are pending; automated tests use mocked Figma APIs and do not verify real styles, variable access, component propagation, font rendering, or RTL display. After a clean build, close and reopen/reload the development plugin, then:
-
-1. Generate the Phase 1 sample and Phase 2 demo; check existing behavior.
-2. Import or load `phase-3-design-system.json`, validate it, and review the dry-run counts before clicking **Create / Update Design System**.
-3. Confirm native Paint Styles, Text Styles, Button masters, and Product Card master appear in the current file.
-4. Confirm preview and nested component instances stay linked; edit a master and verify Figma updates its instances.
-5. Change a bound Paint/Text Style and check linked preview layers. Spacing/radius values should be described as resolved values, not variable bindings.
-6. Re-import the demo twice; check that owned styles and component masters do not multiply.
-7. Change an unrelated user style and frame, then re-import; confirm both are untouched. Also edit an owned style and confirm the default import skips it; test the explicit update checkbox only on an unmodified owned style.
-8. Generate several previews; confirm the Phase 2.2 horizontal-first 120 px placement avoids existing content.
-9. Inspect Persian text visually, confirm it is editable, and check alignment with the chosen font.
-10. Try an invalid token reference and a missing font; confirm validation/fallback is clear and existing file content remains intact.
-11. Verify the target Starter account can access the local Variables view and whether the plugin may create a single-mode local collection before enabling variable writes in a later change.
-
-The user reports that Phase 2.2 manual testing was done, but the individual pass/fail results have not been stated in this thread. Phase 2.2 and Phase 3 remain pending manual acceptance until those results are confirmed.
