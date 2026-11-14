@@ -26,7 +26,7 @@ export function retainSelectedAccountModel(
   // an unavailable state and let the user choose explicitly.
   if (selectedModel) return selectedModel;
   if (verifiedModel && models.some(({ slug }) => slug === verifiedModel)) return verifiedModel;
-  return models[0]?.slug ?? "";
+  return "";
 }
 
 export function getInferenceStatusLabel(

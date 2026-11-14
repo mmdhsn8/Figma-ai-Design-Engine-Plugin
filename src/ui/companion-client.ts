@@ -36,6 +36,10 @@ const StatusSchema = z
     authLabel: z.string().max(80),
     planUseAuthorized: z.boolean(),
     modelCount: z.number().int().nonnegative().max(100),
+    sessionId: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{16,64}$/u)
+      .optional(),
     inferenceVerifiedModel: z.string().min(1).max(200).optional(),
     safeMessage: z.string().max(80).optional(),
   })

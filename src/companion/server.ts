@@ -78,6 +78,7 @@ import {
 } from "./oauth.js";
 
 const MAX_BODY_BYTES = 16 * 1_024;
+const SMOKE_VERIFICATION_TTL_MS = 8 * 60 * 60 * 1_000;
 const MAX_CHAT_BODY_BYTES = 64 * 1_024;
 const CHAT_INSTRUCTIONS = `You are a professional conversational Figma design assistant. Reply in the user's language. Never show JSON, schemas, internal tool payloads, or planning data as normal chat prose. For canvas work use only the supplied allowlisted tools; never execute code, use arbitrary APIs/URLs, claim unconfirmed changes, or silently omit requested content. Deletion is unavailable.
 
@@ -121,6 +122,7 @@ export interface CompanionStatus {
   authLabel: string;
   planUseAuthorized: boolean;
   modelCount: number;
+  sessionId?: string;
   inferenceVerifiedModel?: string;
   safeMessage?: string;
 }
@@ -145,6 +147,7 @@ export interface CompanionServerHandle {
 }
 
 interface LiveSession {
+  sessionId: string;
   accessToken: string;
   refreshToken?: string;
   clientId: string;
@@ -154,6 +157,7 @@ interface LiveSession {
   expiresAt: number;
   models: AccountModel[];
   verifiedModel?: string;
+  verifiedAt?: number;
 }
 
 export interface AccountModel {
@@ -344,15 +348,30 @@ export function createCompanionServer(options: CompanionServerOptions) {
   let servers: Server[] = [];
   let actualPort = port;
 
-  const status = (): CompanionStatus => ({
-    companion: "connected",
-    auth: authStatus,
-    authLabel: STATUS_TEXT[authStatus],
-    planUseAuthorized: Boolean(liveSession?.scopes.has(PLAN_USE_SCOPE)),
-    modelCount: liveSession?.models.length ?? 0,
-    ...(liveSession?.verifiedModel ? { inferenceVerifiedModel: liveSession.verifiedModel } : {}),
-    ...(safeMessage ? { safeMessage } : {}),
-  });
+  const status = (): CompanionStatus => {
+    expireSmokeVerification();
+    return {
+      companion: "connected",
+      auth: authStatus,
+      authLabel: STATUS_TEXT[authStatus],
+      planUseAuthorized: Boolean(liveSession?.scopes.has(PLAN_USE_SCOPE)),
+      modelCount: liveSession?.models.length ?? 0,
+      ...(liveSession ? { sessionId: liveSession.sessionId } : {}),
+      ...(liveSession?.verifiedModel ? { inferenceVerifiedModel: liveSession.verifiedModel } : {}),
+      ...(safeMessage ? { safeMessage } : {}),
+    };
+  };
+
+  function expireSmokeVerification(): void {
+    if (
+      liveSession?.verifiedAt !== undefined &&
+      now() - liveSession.verifiedAt > SMOKE_VERIFICATION_TTL_MS
+    ) {
+      liveSession.verifiedModel = undefined;
+      liveSession.verifiedAt = undefined;
+      if (authStatus === "ready") authStatus = "scope_granted";
+    }
+  }
 
   const apiBase = () => `http://${COMPANION_HOSTNAME}:${actualPort}`;
   const redirectUri = () =>
@@ -441,6 +460,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
 
   function liveSessionFromStored(saved: StoredOAuthSession): LiveSession {
     return {
+      sessionId: randomBytes(18).toString("base64url"),
       accessToken: saved.accessToken,
       ...(saved.refreshToken ? { refreshToken: saved.refreshToken } : {}),
       clientId: saved.clientId,
@@ -1315,6 +1335,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       }
       await options.installationStore.saveClientId(result.clientId, subjectHash);
       const nextSession: LiveSession = {
+        sessionId: randomBytes(18).toString("base64url"),
         accessToken: token.access_token,
         ...(typeof token.refresh_token === "string" ? { refreshToken: token.refresh_token } : {}),
         clientId: result.clientId,
@@ -1461,6 +1482,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
         return;
       }
       session.value.verifiedModel = undefined;
+      session.value.verifiedAt = undefined;
       authStatus = "scope_granted";
       safeMessage = undefined;
       const contextTool = CHAT_FUNCTION_TOOLS.find(({ name }) => name === "get_document_context");
@@ -1534,6 +1556,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
         });
       }
       session.value.verifiedModel = completed.diagnostic.model;
+      session.value.verifiedAt = now();
       authStatus = "ready";
       safeMessage = undefined;
       sendJson(response, 200, {
@@ -2621,6 +2644,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
   async function getAuthorizedSession(): Promise<
     { ok: true; value: LiveSession } | { ok: false; statusCode: number; error: string }
   > {
+    expireSmokeVerification();
     if (!liveSession) return { ok: false, statusCode: 401, error: "signed_out" };
     if (!liveSession.scopes.has(PLAN_USE_SCOPE)) {
       return { ok: false, statusCode: 403, error: "plan_use_scope_missing" };

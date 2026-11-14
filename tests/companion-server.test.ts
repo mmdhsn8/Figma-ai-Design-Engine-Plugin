@@ -298,9 +298,7 @@ describe("loopback companion", () => {
       (value) => typeof value === "object" && value !== null && "refs" in value,
     ) as { refs: Record<string, unknown[]> };
     expect(storedState.refs.store_mobile?.[8]).toBe(task.id);
-    expect(Object.values(storedState.refs).some((entry) => entry[6] === "store_mobile")).toBe(
-      true,
-    );
+    expect(Object.values(storedState.refs).some((entry) => entry[6] === "store_mobile")).toBe(true);
 
     initial = false;
     executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
@@ -1241,37 +1239,80 @@ describe("loopback companion", () => {
 
   it("serves INSPECTING through HTTP/SSE with only read-only tools and distinct availability/schema failures", async () => {
     const call = (name: string, args: unknown) => ({
-      type: "function_call", call_id: "readonly_http_call", name, arguments: JSON.stringify(args),
+      type: "function_call",
+      call_id: "readonly_http_call",
+      name,
+      arguments: JSON.stringify(args),
     });
-    const harness = await createHarness({ chatResponses: [
-      { outputItems: [call("get_document_context", { query: "Charm", offset: 8 })] },
-      { outputItems: [call("classify_canvas_intent", { intent: "inspect" })] },
-      { outputItems: [call("inspect_nodes", { refs: ["charm-home"], maxNodes: "wrong" })] },
-      { outputItems: [call("plan_canvas_task", {
-        brief: {
-          platform: "mobile", viewport: { width: 390, height: 844 },
-          brandDirection: "Charm", audience: "Shoppers", content: ["Home"], hierarchy: "Heading first",
-          typography: { family: "Arial", style: "Regular", headingSize: 28, bodySize: 14 },
-          spacingScale: [8, 16], radiusScale: [8, 16],
-          palette: { source: "curated-default", background: "#FFFFFF", surface: "#FFFFFF", primary: "#222222", accent: "#AA3366", text: "#222222", muted: "#555555" },
-          imagePolicy: "labeled-native-fallback", interactionPriorities: ["Home"], readingDirection: "RTL",
+    const harness = await createHarness({
+      chatResponses: [
+        { outputItems: [call("get_document_context", { query: "Charm", offset: 8 })] },
+        { outputItems: [call("classify_canvas_intent", { intent: "inspect" })] },
+        { outputItems: [call("inspect_nodes", { refs: ["charm-home"], maxNodes: "wrong" })] },
+        {
+          outputItems: [
+            call("plan_canvas_task", {
+              brief: {
+                platform: "mobile",
+                viewport: { width: 390, height: 844 },
+                brandDirection: "Charm",
+                audience: "Shoppers",
+                content: ["Home"],
+                hierarchy: "Heading first",
+                typography: { family: "Arial", style: "Regular", headingSize: 28, bodySize: 14 },
+                spacingScale: [8, 16],
+                radiusScale: [8, 16],
+                palette: {
+                  source: "curated-default",
+                  background: "#FFFFFF",
+                  surface: "#FFFFFF",
+                  primary: "#222222",
+                  accent: "#AA3366",
+                  text: "#222222",
+                  muted: "#555555",
+                },
+                imagePolicy: "labeled-native-fallback",
+                interactionPriorities: ["Home"],
+                readingDirection: "RTL",
+              },
+              stages: [
+                {
+                  title: "Unwanted plan",
+                  goal: "Create an unwanted frame",
+                  logicalRefs: ["charm-home"],
+                  completionCriteria: ["Frame exists"],
+                },
+              ],
+            }),
+          ],
         },
-        stages: [{ title: "Unwanted plan", goal: "Create an unwanted frame", logicalRefs: ["charm-home"], completionCriteria: ["Frame exists"] }],
-      })] },
-      { text: "Verified existing Charm frames; no mutations.", outputItems: [] },
-    ] });
+        { text: "Verified existing Charm frames; no mutations.", outputItems: [] },
+      ],
+    });
     const token = await authorizeAndDiscover(harness);
     await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
-    const send = (index: number) => request(harness.handle, "/v1/chat", {
-      token, body: {
-        requestId: `readonly-http-${index}`, model: "account-model", lifecycle: "INSPECTING",
-        input: [{ role: "user", content: "Find and inspect all existing Charm frames; no selection or changes." }],
-      },
-    });
+    const send = (index: number) =>
+      request(harness.handle, "/v1/chat", {
+        token,
+        body: {
+          requestId: `readonly-http-${index}`,
+          model: "account-model",
+          lifecycle: "INSPECTING",
+          input: [
+            {
+              role: "user",
+              content: "Find and inspect all existing Charm frames; no selection or changes.",
+            },
+          ],
+        },
+      });
     const discovery = await send(1);
     expect(await discovery.text()).toContain('"name":"get_document_context"');
     const upstream = JSON.parse(harness.responsesRequest!.body);
-    expect(upstream.tools.map(({ name }: { name: string }) => name)).toEqual(["get_document_context", "inspect_nodes"]);
+    expect(upstream.tools.map(({ name }: { name: string }) => name)).toEqual([
+      "get_document_context",
+      "inspect_nodes",
+    ]);
     expect(upstream.instructions).toContain("no mutation plan is needed or allowed");
     expect(await (await send(2)).text()).toContain("tool_not_available_for_state");
     const schema = await (await send(3)).text();
@@ -2040,6 +2081,11 @@ describe("loopback companion", () => {
     const paired = await harness.pairWithTicket();
     await request(harness.handle, "/v1/auth/start", { token: paired.sessionToken, body: {} });
     await completeLogin(harness);
+    const initialSession = (await (
+      await request(harness.handle, "/v1/status", {
+        token: paired.sessionToken,
+      })
+    ).json()) as { sessionId: string };
     const authorizationUrl = harness.openedUrl;
     await request(harness.handle, "/v1/models", { token: paired.sessionToken, body: {} });
     const smoke = await request(harness.handle, "/v1/smoke", {
@@ -2049,6 +2095,8 @@ describe("loopback companion", () => {
     expect(await smoke.json()).toMatchObject({
       status: { inferenceVerifiedModel: "account-model" },
     });
+    expect(harness.storeSnapshot()).not.toContain("sessionId");
+    expect(harness.storeSnapshot()).not.toContain("inferenceVerifiedModel");
 
     const restartedHandle = await harness.restart();
     const restored = await request(restartedHandle, "/v1/pairing/restore", {
@@ -2059,6 +2107,7 @@ describe("loopback companion", () => {
     const statusBody = await status.json();
     expect(statusBody).toMatchObject({ auth: "scope_granted", planUseAuthorized: true });
     expect(statusBody).not.toHaveProperty("inferenceVerifiedModel");
+    expect(statusBody.sessionId).not.toBe(initialSession.sessionId);
     expect(harness.openedUrl).toBe(authorizationUrl);
     expect(harness.refreshRequest).toBeUndefined();
   });
@@ -3401,6 +3450,11 @@ describe("loopback companion", () => {
     const token = await harness.pair();
     await request(harness.handle, "/v1/auth/start", { token, body: {} });
     await completeLogin(harness);
+    const originalStatus = (await (
+      await request(harness.handle, "/v1/status", { token })
+    ).json()) as {
+      sessionId: string;
+    };
     await request(harness.handle, "/v1/models", { token, body: {} });
     await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
 
@@ -3427,7 +3481,9 @@ describe("loopback companion", () => {
     callback.searchParams.set("client_id", "issued-public-client");
     await fetch(callback);
     const status = await request(harness.handle, "/v1/status", { token });
-    expect(await status.json()).toMatchObject({ auth: "scope_granted", planUseAuthorized: true });
+    const newAccountStatus = await status.json();
+    expect(newAccountStatus).toMatchObject({ auth: "scope_granted", planUseAuthorized: true });
+    expect(newAccountStatus.sessionId).not.toBe(originalStatus.sessionId);
   });
 
   it("maps a streamed plan-usage failure to a sanitized recovery category", async () => {
@@ -3467,6 +3523,30 @@ describe("loopback companion", () => {
     const statusBody = await status.json();
     expect(statusBody).toMatchObject({ auth: "scope_granted" });
     expect(statusBody).not.toHaveProperty("inferenceVerifiedModel");
+  });
+
+  it("expires a successful model verification after eight hours in the live Companion session", async () => {
+    const harness = await createHarness();
+    const paired = await harness.pairWithTicket();
+    const token = paired.sessionToken;
+    await request(harness.handle, "/v1/auth/start", { token, body: {} });
+    await completeLogin(harness);
+    await request(harness.handle, "/v1/models", { token, body: {} });
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    expect(await (await request(harness.handle, "/v1/status", { token })).json()).toMatchObject({
+      auth: "ready",
+      inferenceVerifiedModel: "account-model",
+    });
+
+    harness.advanceTime(8 * 60 * 60 * 1_000 + 1);
+    const restored = await request(harness.handle, "/v1/pairing/restore", {
+      body: { ticket: paired.restoreTicket },
+    });
+    const restoredToken = ((await restored.json()) as { sessionToken: string }).sessionToken;
+    const expired = await request(harness.handle, "/v1/status", { token: restoredToken });
+    const expiredBody = await expired.json();
+    expect(expiredBody).toMatchObject({ auth: "scope_granted" });
+    expect(expiredBody).not.toHaveProperty("inferenceVerifiedModel");
   });
 
   it("cancels the upstream stream when the paired UI aborts the smoke request", async () => {

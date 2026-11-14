@@ -90,6 +90,10 @@ describe("model-specific inference eligibility", () => {
     expect(retainSelectedAccountModel([], "gpt-6-luna")).toBe("gpt-6-luna");
   });
 
+  it("does not silently select the first account model when no preference or verification exists", () => {
+    expect(retainSelectedAccountModel(models, "")).toBe("");
+  });
+
   it("keeps a removed saved choice visible and ineligible until the user chooses another model", () => {
     expect(
       getInferenceEligibility({
