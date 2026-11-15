@@ -185,19 +185,28 @@ export function prepareGeneratedDesign(
             : { top: 32, right: 32, bottom: 32, left: 32 },
         counterAxisAlign: "stretch",
       },
-      children: (screensById.get(screen.id)?.children ?? []).map((node, index) =>
-        mapNode(
-          node,
-          plan.direction,
-          "vertical",
-          plan.language,
-          plan.request.prompt,
-          `${screen.id}.${node.sectionId ?? options.sectionId ?? "main"}.n${index}`,
-          plan.brandKit
-            ? resolveBrandKitTokens(plan.brandKit, plan.request.theme === "dark" ? "dark" : "light")
-            : undefined,
-        ),
-      ),
+      children: (() => {
+        const sectionIndexes = new Map<string, number>();
+        return (screensById.get(screen.id)?.children ?? []).map((node) => {
+          const sectionId = node.sectionId ?? options.sectionId ?? "main";
+          const sectionIndex = sectionIndexes.get(sectionId) ?? 0;
+          sectionIndexes.set(sectionId, sectionIndex + 1);
+          return mapNode(
+            node,
+            plan.direction,
+            "vertical",
+            plan.language,
+            plan.request.prompt,
+            `${screen.id}.${sectionId}.n${sectionIndex}`,
+            plan.brandKit
+              ? resolveBrandKitTokens(
+                  plan.brandKit,
+                  plan.request.theme === "dark" ? "dark" : "light",
+                )
+              : undefined,
+          );
+        });
+      })(),
     })),
     ...(resolvedAssets.length ? { assets: resolvedAssets } : {}),
   };

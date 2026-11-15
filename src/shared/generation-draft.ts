@@ -23,12 +23,17 @@ import {
 import { PinnedBrandKitSchema } from "./brand-kit.js";
 import { PinnedDesignSkillsSchema } from "./design-skill.js";
 
+const ChatTaskIdentitySchema = z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u);
+const PlanFingerprintSchema = z.string().regex(/^p12-[a-f0-9]{16}$/u);
+
 export const DraftIdentitySchema = z.string().regex(/^[a-zA-Z0-9_-]{8,100}$/u);
 export const DraftManifestSchema = z
   .object({
     version: z.literal(1),
     documentId: DraftIdentitySchema,
     generationId: DraftIdentitySchema,
+    chatTaskId: ChatTaskIdentitySchema.optional(),
+    planFingerprint: PlanFingerprintSchema.optional(),
     model: z.string().min(1).max(200),
     request: DesignGenerationRequestSchema,
     brandKit: PinnedBrandKitSchema.optional(),

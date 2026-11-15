@@ -70,6 +70,40 @@ function taskNativeRequest(message: unknown) {
 }
 
 describe("safe Figma tool executor", () => {
+  it("restores a verified Chat screen root as a stable task-owned native reference", async () => {
+    const mock = createMockApi();
+    const messages: PluginToUIMessage[] = [];
+    const executor = createFigmaToolExecutor(mock.api, (message) => messages.push(message));
+    const taskId = "chat-p12-root-0001";
+    const root = mock.api.createFrame() as unknown as MockNode;
+    root.name = "Appointments";
+    root.setPluginData("fad.tool.task-id.v1", taskId);
+    root.setPluginData("fad.generation.chat-task-id", taskId);
+    root.setPluginData("fad.tool.logical-ref.v1", "screen-p12abc123");
+    mock.api.currentPage.appendChild(root);
+
+    await executor(
+      taskNativeRequest({
+        type: "task-native-inspect",
+        requestId: "inspect-p12-generated-root",
+        documentId: "file-test-56-page_current",
+        taskId,
+        refs: ["screen-p12abc123"],
+      }),
+    );
+
+    expect(messages.at(-1)).toMatchObject({
+      type: "task-native-inspection-result",
+      success: true,
+      taskId,
+      nodes: [{ id: root.id, ref: "screen-p12abc123", name: "Appointments" }],
+      unresolvedRefs: [],
+    });
+    expect(mock.storage.get(TOOL_STATE_STORAGE_KEY)).toMatchObject({
+      refs: { "screen-p12abc123": expect.any(Array) },
+    });
+  });
+
   it("reads only task-owned native hierarchy without changing canvas or plugin data, then validates focus", async () => {
     const mock = createMockApi();
     const messages: PluginToUIMessage[] = [];

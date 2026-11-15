@@ -9,6 +9,7 @@ import { orderComponentDefinitions, parseDesignValue } from "../shared/schema";
 import type { FontSelection } from "../shared/messages";
 import type { GenerationTransaction } from "../shared/generation-transaction";
 import type { DesignPlan } from "../shared/design-generation";
+import { resolveBrandKitTokens } from "../shared/brand-kit";
 import {
   DEFAULT_MAX_ROW_WIDTH,
   DEFAULT_MIN_CANVAS_GAP,
@@ -288,6 +289,10 @@ export function createGenerationSkeletons(
     readTopLevelCanvasObstacles(api.currentPage),
   );
   const placementById = new Map(placements.map((placement) => [placement.id, placement]));
+  const skeletonBackground = plan.brandKit
+    ? resolveBrandKitTokens(plan.brandKit, plan.request.theme === "dark" ? "dark" : "light").palette
+        .background
+    : "#F7F5F0";
   const tracker = createTracker();
   const created: FrameNode[] = [];
   try {
@@ -302,7 +307,7 @@ export function createGenerationSkeletons(
       frame.resize(screen.width, screen.height);
       frame.x = position.x;
       frame.y = position.y;
-      frame.fills = [{ type: "SOLID", color: hexToRgb("#F7F5F0") }];
+      frame.fills = [{ type: "SOLID", color: hexToRgb(skeletonBackground) }];
       frame.strokes = [{ type: "SOLID", color: hexToRgb("#D8DEE6") }];
       frame.strokeWeight = 1;
       applyLayout(

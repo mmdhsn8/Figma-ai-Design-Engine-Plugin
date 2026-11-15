@@ -109,23 +109,39 @@ export const ChatDesignBriefSchema = z
     interactionPriorities: z.array(z.string().min(1).max(120)).min(1).max(8),
     readingDirection: z.enum(["LTR", "RTL"]),
     requiredPatterns: z.array(z.enum(DESIGN_PATTERN_IDS)).max(18).optional(),
-    skillSources: z.array(z.object({
-      id: z.string().regex(/^[a-z0-9][a-z0-9_-]{7,79}$/u),
-      revisionId: z.string().min(10).max(120),
-      name: z.string().trim().min(1).max(100),
-      requiredPatterns: z.array(z.enum(DESIGN_PATTERN_IDS)).max(4),
-    }).strict()).max(3).optional(),
+    skillSources: z
+      .array(
+        z
+          .object({
+            id: z.string().regex(/^[a-z0-9][a-z0-9_-]{7,79}$/u),
+            revisionId: z.string().min(10).max(120),
+            name: z.string().trim().min(1).max(100),
+            requiredPatterns: z.array(z.enum(DESIGN_PATTERN_IDS)).max(4),
+          })
+          .strict(),
+      )
+      .max(3)
+      .optional(),
   })
   .strict();
 
 export const PlannedPropertyEditSchema = FigmaToolActionSchema.options.find(
   (option) => option.shape.tool.value === "set_properties",
-)! as Extract<(typeof FigmaToolActionSchema.options)[number], { shape: { tool: z.ZodLiteral<"set_properties"> } }>;
+)! as Extract<
+  (typeof FigmaToolActionSchema.options)[number],
+  { shape: { tool: z.ZodLiteral<"set_properties"> } }
+>;
 
 export const ChatDesignStageSchema = z
   .object({
     title: z.string().min(1).max(160),
     goal: z.string().min(1).max(240),
+    purpose: z.string().trim().min(1).max(240).optional(),
+    priority: z.number().int().min(1).max(10).optional(),
+    navigation: z.array(z.string().trim().min(1).max(100)).max(8).optional(),
+    dependsOn: z.array(z.string().trim().min(1).max(100)).max(8).optional(),
+    contentPlaceholders: z.array(z.string().trim().min(1).max(120)).max(8).optional(),
+    componentOpportunities: z.array(z.string().trim().min(1).max(100)).max(8).optional(),
     pageId: z.string().min(1).max(200).optional(),
     logicalRefs: z
       .array(z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u))
@@ -138,12 +154,14 @@ export const ChatDesignStageSchema = z
   .strict();
 
 const phaseMs = z.number().int().nonnegative().max(600_000);
-export const ChatTurnTimingSchema = z.object({
-  companionHeadersMs: phaseMs.optional(),
-  upstreamHeadersMs: phaseMs.optional(),
-  upstreamFirstDeltaMs: phaseMs.optional(),
-  upstreamTotalMs: phaseMs.optional(),
-}).strict();
+export const ChatTurnTimingSchema = z
+  .object({
+    companionHeadersMs: phaseMs.optional(),
+    upstreamHeadersMs: phaseMs.optional(),
+    upstreamFirstDeltaMs: phaseMs.optional(),
+    upstreamTotalMs: phaseMs.optional(),
+  })
+  .strict();
 
 export const CHAT_PLAN_VERSION = 1;
 export const ChatPlanActionSchema = z
@@ -162,15 +180,37 @@ export const ChatPlanActionSchema = z
   .strict();
 
 export function modelPlanStages(stages: z.infer<typeof ChatDesignStageSchema>[]) {
-  return stages.map(({ title, goal, pageId, logicalRefs, completionCriteria, estimatedMutations, propertyEdit }) => ({
-    title,
-    goal,
-    ...(pageId ? { pageId } : {}),
-    logicalRefs,
-    completionCriteria,
-    ...(propertyEdit ? { propertyEdit } : {}),
-    ...(estimatedMutations ? { estimatedMutations } : {}),
-  }));
+  return stages.map(
+    ({
+      title,
+      goal,
+      purpose,
+      priority,
+      navigation,
+      dependsOn,
+      contentPlaceholders,
+      componentOpportunities,
+      pageId,
+      logicalRefs,
+      completionCriteria,
+      estimatedMutations,
+      propertyEdit,
+    }) => ({
+      title,
+      goal,
+      ...(purpose ? { purpose } : {}),
+      ...(priority !== undefined ? { priority } : {}),
+      ...(navigation ? { navigation } : {}),
+      ...(dependsOn ? { dependsOn } : {}),
+      ...(contentPlaceholders ? { contentPlaceholders } : {}),
+      ...(componentOpportunities ? { componentOpportunities } : {}),
+      ...(pageId ? { pageId } : {}),
+      logicalRefs,
+      completionCriteria,
+      ...(propertyEdit ? { propertyEdit } : {}),
+      ...(estimatedMutations ? { estimatedMutations } : {}),
+    }),
+  );
 }
 
 // Runtime metadata has no design semantics; never trust model-authored execution state.
@@ -291,7 +331,7 @@ const descriptions: Record<ChatToolName, string> = {
   classify_canvas_intent:
     "Classify a canvas-related user request before any other canvas tool unless intent is already checkpointed: create new work, edit existing nodes, inspect/report existing work, explain the observed state, or continue prior work. When the user or recent conversation identifies a project/screen, include its exact targetName. Call alone once. Never reclassify saved intent or classify an edit as create.",
   plan_canvas_task:
-    "For create/edit/continue only, call alone once after intent classification. For edit, the native controller performs discovery and inspection first; include targetRefs copied exactly from the verified target evidence, including the existing root frame, and use only those refs for existing nodes. Return an internal concise design brief and 1–12 ordered stages. Include designName when the user named a project. Each stage needs a goal, stable logicalRefs for only required acceptance nodes, measurable completionCriteria, and estimatedMutations when known. For a mobile screen stage, put its page-root viewport frame first in logicalRefs and size it exactly to brief.viewport; make content flow inside nested frames, using explicit vertical overflow only for intentional scrolling. For a new design, logicalRefs are fresh task-local aliases to create in this task, never unrelated page-history refs. For a stage that only updates properties of one existing node, include propertyEdit with tool set_properties, the exact ref, and the requested properties even if native evidence already matches. For edits, use the smallest plan that satisfies the request: a one-property change is one mutation on its existing target. Existing verified logicalRefs may be reused as acceptance evidence and do not each require a mutation. Do not add collateral refs or operations. Estimates are advisory and are not outstanding-operation requirements. Use exact inspected refs and their pageId. Do not replace or delete existing root frames. Work over 32 mutations continues in deterministic local segments; do not replan for that internal boundary. Preserve existing document styles/tokens and requested colors. No canvas edits in this call.",
+    "For create/edit/continue only, call alone once after intent classification. For edit, the native controller performs discovery and inspection first; include targetRefs copied exactly from the verified target evidence, including the existing root frame, and use only those refs for existing nodes. Return an internal concise design brief and 1–12 ordered stages. Include designName when the user named a project. Each stage needs a goal, stable logicalRefs for only required acceptance nodes, measurable completionCriteria, and estimatedMutations when known. Optional screen-planning metadata may include purpose, priority, navigation, dependsOn, contentPlaceholders, and componentOpportunities; populate it when the task requests a multi-screen design. For a mobile screen stage, put its page-root viewport frame first in logicalRefs and size it exactly to brief.viewport; make content flow inside nested frames, using explicit vertical overflow only for intentional scrolling. For a new design, logicalRefs are fresh task-local aliases to create in this task, never unrelated page-history refs. For a stage that only updates properties of one existing node, include propertyEdit with tool set_properties, the exact ref, and the requested properties even if native evidence already matches. For edits, use the smallest plan that satisfies the request: a one-property change is one mutation on its existing target. Existing verified logicalRefs may be reused as acceptance evidence and do not each require a mutation. Do not add collateral refs or operations. Estimates are advisory and are not outstanding-operation requirements. Use exact inspected refs and their pageId. Do not replace or delete existing root frames. Work over 32 mutations continues in deterministic local segments; do not replan for that internal boundary. Preserve existing document styles/tokens and requested colors. No canvas edits in this call.",
   complete_canvas_stage:
     "Finish only the current saved stage after every required logicalRef and native operation is confirmed. Call alone. Previously verified existing edit targets may satisfy a required ref without a mutation; never mutate a layer only to satisfy a ref. The local controller reconciles missing creation, missing inspection, and invalid refs, then verifies actual native property values and editable geometry before completion. For failed operations, first obtain a confirmed repair using the same tool and logical ref, then include their original operation IDs in resolvedOperationIds. Never omit failed elements or replan. The result persists completion and identifies the next stage; continue automatically until all stages finish.",
   get_document_context:
@@ -394,26 +434,31 @@ export function chatFunctionToolsForState(state: ChatLifecycleState) {
         ? ["get_document_context", "inspect_nodes"]
         : state === "EDIT_PLANNING"
           ? ["plan_canvas_task"]
-      : state === "UNPLANNED"
-      ? ["classify_canvas_intent", "get_document_context", "inspect_nodes", "plan_canvas_task"]
-      : state === "EXECUTING_STAGE"
-        ? CHAT_TOOL_NAMES.filter(
-            (name) =>
-              name !== "classify_canvas_intent" &&
-              name !== "plan_canvas_task" &&
-              name !== "get_document_context",
-          )
-      : state === "PLAN_SAVED" || state === "STAGE_COMPLETED"
-        ? CHAT_TOOL_NAMES.filter(
-            (name) =>
-              name !== "classify_canvas_intent" &&
-              name !== "plan_canvas_task" &&
-                name !== "get_document_context" &&
-                name !== "complete_canvas_stage",
-            )
-          : state === "VERIFYING_STAGE"
-            ? ["inspect_nodes", "get_operation_status", "set_auto_layout", "set_properties"]
-            : ["inspect_nodes", "get_operation_status"],
+          : state === "UNPLANNED"
+            ? [
+                "classify_canvas_intent",
+                "get_document_context",
+                "inspect_nodes",
+                "plan_canvas_task",
+              ]
+            : state === "EXECUTING_STAGE"
+              ? CHAT_TOOL_NAMES.filter(
+                  (name) =>
+                    name !== "classify_canvas_intent" &&
+                    name !== "plan_canvas_task" &&
+                    name !== "get_document_context",
+                )
+              : state === "PLAN_SAVED" || state === "STAGE_COMPLETED"
+                ? CHAT_TOOL_NAMES.filter(
+                    (name) =>
+                      name !== "classify_canvas_intent" &&
+                      name !== "plan_canvas_task" &&
+                      name !== "get_document_context" &&
+                      name !== "complete_canvas_stage",
+                  )
+                : state === "VERIFYING_STAGE"
+                  ? ["inspect_nodes", "get_operation_status", "set_auto_layout", "set_properties"]
+                  : ["inspect_nodes", "get_operation_status"],
   );
   return CHAT_FUNCTION_TOOLS.filter(({ name }) => allowed.has(name));
 }

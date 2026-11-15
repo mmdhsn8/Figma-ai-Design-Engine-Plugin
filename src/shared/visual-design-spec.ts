@@ -498,9 +498,13 @@ export function createVisualDesignSpec(input: {
     if (node.children.length && !canContain) return;
     node.children.forEach((child, index) => visit(child, `${path}/n${index}`, ref));
   };
-  input.children.forEach((node, index) =>
-    visit(node, `${node.sectionId ?? "main"}/n${index}`, rootRef),
-  );
+  const sectionIndexes = new Map<string, number>();
+  input.children.forEach((node) => {
+    const sectionId = node.sectionId ?? "main";
+    const sectionIndex = sectionIndexes.get(sectionId) ?? 0;
+    sectionIndexes.set(sectionId, sectionIndex + 1);
+    visit(node, `${sectionId}/n${sectionIndex}`, rootRef);
+  });
   const used = [...usedPatterns];
   const spec: VisualDesignSpec = {
     version: VISUAL_DESIGN_SPEC_VERSION,

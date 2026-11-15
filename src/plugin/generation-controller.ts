@@ -4,6 +4,7 @@ import {
   validateDraftScreen,
   DraftIdentitySchema,
 } from "../shared/generation-draft";
+import { createChatScreenLogicalRef } from "../shared/chat-generation";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
 import { verifyNativeDesign, type NativeDesignVerification } from "./native-design-verification";
 import { prepareGeneratedDesign } from "../ui/design-generation";
@@ -24,6 +25,10 @@ type GenerationRequest = Extract<
   }
 >;
 
+const CHAT_TASK_PLUGIN_KEY = "fad.tool.task-id.v1";
+const CHAT_REF_PLUGIN_KEY = "fad.tool.logical-ref.v1";
+const CHAT_GENERATION_TASK_KEY = "fad.generation.chat-task-id";
+
 function visualVerificationError(result: NativeDesignVerification): string | undefined {
   if (result.verified) return undefined;
   const issueRefs = result.findings
@@ -43,7 +48,14 @@ function visualVerificationError(result: NativeDesignVerification): string | und
       ].includes(finding.code),
     )
     .slice(0, 6)
-    .map((finding) => `${finding.code}${finding.ref ? `:${finding.ref}` : ""}`);
+    .map((finding) => {
+      const location = `${finding.code}${finding.ref ? `:${finding.ref}` : ""}`;
+      const evidence =
+        finding.expected !== undefined || finding.actual !== undefined
+          ? ` (${finding.expected ?? "expected evidence unavailable"} → ${finding.actual ?? "actual evidence unavailable"})`
+          : "";
+      return `${location}${evidence}`.slice(0, 220);
+    });
   const missingPatterns = result.missingPatterns.slice(0, 4).map((pattern) => `pattern:${pattern}`);
   return `Native visual verification is incomplete; saved nodes were retained. ${result.truncated ? "The native QA safety budget was exceeded. " : ""}${[...issueRefs, ...missingPatterns].join(", ") || "required evidence unavailable"}.`;
 }
@@ -253,11 +265,27 @@ export function createGenerationController(
           );
           const verificationError = visualVerificationError(verification);
           if (verificationError) throw new Error(verificationError);
+          const logicalRef = message.manifest.chatTaskId
+            ? createChatScreenLogicalRef(message.manifest.generationId, screenId)
+            : undefined;
+          if (message.manifest.chatTaskId && logicalRef) {
+            const duplicateRefs = api.currentPage.findAll(
+              (node) =>
+                node.getPluginData(CHAT_REF_PLUGIN_KEY) === logicalRef &&
+                node.id !== roots[0]!.id,
+            );
+            if (duplicateRefs.length)
+              throw new Error("Native Chat screen reference is already in use on this page.");
+            roots[0]!.setPluginData(CHAT_TASK_PLUGIN_KEY, message.manifest.chatTaskId);
+            roots[0]!.setPluginData(CHAT_REF_PLUGIN_KEY, logicalRef);
+            roots[0]!.setPluginData(CHAT_GENERATION_TASK_KEY, message.manifest.chatTaskId);
+          }
           return {
             type: "generation-result",
             requestId: message.requestId,
             success: true,
             nodeId: roots[0].id,
+            ...(logicalRef ? { logicalRef } : {}),
             generationId: message.manifest.generationId,
             warnings: [
               `Fresh full-screen native verification passed for ${verification.nodeCount} nodes.`,

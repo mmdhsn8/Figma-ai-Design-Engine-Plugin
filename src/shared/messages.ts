@@ -408,6 +408,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       documentId: z.string().optional(),
       generationId: z.string().nullable().optional(),
       nodeId: z.string().optional(),
+      logicalRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u).optional(),
       elapsedMs: z.number().nonnegative().optional(),
       error: z.string().max(500).optional(),
     })

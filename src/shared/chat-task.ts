@@ -23,6 +23,7 @@ import {
   FigmaToolAcknowledgementSchema,
   FigmaToolParentingDiagnosticSchema,
 } from "./figma-tools.js";
+import { ChatGenerationIntentSchema, ChatGenerationLinkSchema } from "./chat-generation.js";
 
 export const CHAT_TASK_MAX_MUTATIONS = 240;
 export const CHAT_EXECUTION_SEGMENT_MAX_MUTATIONS = 32;
@@ -327,18 +328,27 @@ const ReadOnlyInspectionSummarySchema = z
   .object({
     pagesScanned: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     pagesAvailable: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
-    scope: z.enum(["all_accessible_pages", "requested_page", "exact_node"]).default("all_accessible_pages"),
+    scope: z
+      .enum(["all_accessible_pages", "requested_page", "exact_node"])
+      .default("all_accessible_pages"),
     pagesRemaining: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
     framesDiscovered: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     matchingFrames: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     framesInspected: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     uninspectedFrames: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
     inaccessiblePages: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
-    inaccessiblePageSamples: z.array(z.object({
-      id: z.string().max(200),
-      name: z.string().max(100),
-      reason: z.string().max(100).optional(),
-    }).strict()).max(24).default([]),
+    inaccessiblePageSamples: z
+      .array(
+        z
+          .object({
+            id: z.string().max(200),
+            name: z.string().max(100),
+            reason: z.string().max(100).optional(),
+          })
+          .strict(),
+      )
+      .max(24)
+      .default([]),
     complete: z.boolean().default(false),
     continuationAvailable: z.boolean().default(false),
     truncationReason: z.string().max(160).optional(),
@@ -369,7 +379,12 @@ const ReadOnlyInspectionSummarySchema = z
         cacheHit: z.boolean().default(false),
         revalidatedAfterRestart: z.boolean().default(false),
         discoveryCacheHits: z.number().int().min(0).max(CHAT_TASK_MAX_READ_ONLY_OPERATIONS),
-        discoveryCacheLookups: z.number().int().min(0).max(CHAT_TASK_MAX_READ_ONLY_OPERATIONS).default(0),
+        discoveryCacheLookups: z
+          .number()
+          .int()
+          .min(0)
+          .max(CHAT_TASK_MAX_READ_ONLY_OPERATIONS)
+          .default(0),
         discoveryCacheHitRate: z.number().min(0).max(1).default(0),
         nativeExecutionMs: z.number().int().min(0).max(86_400_000),
         resultSerializationMs: z.number().int().min(0).max(86_400_000),
@@ -431,8 +446,13 @@ export const ChatTaskSchema = z
   .object({
     version: z.literal(1),
     id: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
-    chatId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u).optional(),
+    chatId: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{8,60}$/u)
+      .optional(),
     intent: z.enum(["create", "edit", "inspect", "explain", "continue"]).optional(),
+    generationIntent: ChatGenerationIntentSchema.optional(),
+    generationLink: ChatGenerationLinkSchema.optional(),
     targetName: z.string().trim().min(1).max(100).optional(),
     editTarget: ChatEditTargetSchema.optional(),
     planningContinuations: z.number().int().min(0).max(1).optional(),
@@ -462,6 +482,12 @@ export const ChatTaskSchema = z
           .object({
             title: z.string().min(1).max(160),
             goal: z.string().min(1).max(240).default("Complete the requested section."),
+            purpose: z.string().trim().min(1).max(240).optional(),
+            priority: z.number().int().min(1).max(10).optional(),
+            navigation: z.array(z.string().trim().min(1).max(100)).max(8).optional(),
+            dependsOn: z.array(z.string().trim().min(1).max(100)).max(8).optional(),
+            contentPlaceholders: z.array(z.string().trim().min(1).max(120)).max(8).optional(),
+            componentOpportunities: z.array(z.string().trim().min(1).max(100)).max(8).optional(),
             pageId: z.string().min(1).max(200).optional(),
             logicalRefs: z
               .array(z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u))
@@ -617,16 +643,28 @@ export const ChatTaskSchema = z
     recent: z.array(ChatInputItemSchema).max(20),
     starts: z.array(z.number().int().nonnegative()).max(40),
     rounds: z.number().int().min(0).max(100),
-    modelRoundTrace: z.array(z.object({
-      round: z.number().int().min(1).max(100),
-      lifecycle: ChatLifecycleStateSchema,
-      outcome: z.enum(["done", "tool_calls", "tool_validation"]),
-      tools: z.array(z.enum(CHAT_TOOL_NAMES)).max(10),
-      validationCodes: z.array(z.string().regex(/^[A-Za-z0-9_]{1,80}$/u)).max(8),
-      durationMs: z.number().int().min(0).max(600_000).optional(),
-      inputBytes: z.number().int().min(0).max(64 * 1024).optional(),
-      timing: ChatTurnTimingSchema.optional(),
-    }).strict()).max(100).default([]),
+    modelRoundTrace: z
+      .array(
+        z
+          .object({
+            round: z.number().int().min(1).max(100),
+            lifecycle: ChatLifecycleStateSchema,
+            outcome: z.enum(["done", "tool_calls", "tool_validation"]),
+            tools: z.array(z.enum(CHAT_TOOL_NAMES)).max(10),
+            validationCodes: z.array(z.string().regex(/^[A-Za-z0-9_]{1,80}$/u)).max(8),
+            durationMs: z.number().int().min(0).max(600_000).optional(),
+            inputBytes: z
+              .number()
+              .int()
+              .min(0)
+              .max(64 * 1024)
+              .optional(),
+            timing: ChatTurnTimingSchema.optional(),
+          })
+          .strict(),
+      )
+      .max(100)
+      .default([]),
     roundBreakdown: ChatRoundBreakdownSchema.default(emptyRoundBreakdown),
     batches: z.number().int().min(0).max(1_000).default(0),
     lifecycleTransitions: z.number().int().min(0).max(100).default(0),
@@ -660,7 +698,9 @@ export const ChatTaskSchema = z
         ]),
         code: z.string().max(80),
         phase: ChatTaskFailurePhaseSchema.optional(),
-        cancellationSource: z.enum(["ui_abort", "native_batch_cancelled", "unspecified"]).optional(),
+        cancellationSource: z
+          .enum(["ui_abort", "native_batch_cancelled", "unspecified"])
+          .optional(),
         committedOperations: z.number().int().nonnegative(),
         operationId: z.string().max(100).optional(),
         toolStateDiagnostic: FigmaToolStateDiagnosticSchema.optional(),
@@ -771,7 +811,10 @@ export function chatTaskInspectedContinuationRefs(task: ChatTask, stageIndex: nu
     if (entry.status !== "completed" || entry.acknowledgementStatus !== "read_only") continue;
     try {
       const data = JSON.parse(entry.output ?? "{}").data;
-      if (entry.call.action.tool === "get_document_context" && data?.discovery?.matchStatus === "unique") {
+      if (
+        entry.call.action.tool === "get_document_context" &&
+        data?.discovery?.matchStatus === "unique"
+      ) {
         for (const frame of data.frames ?? [])
           if (frame.pageId === pageId && frame.type === "FRAME" && typeof frame.ref === "string")
             roots.add(frame.ref);
@@ -779,10 +822,10 @@ export function chatTaskInspectedContinuationRefs(task: ChatTask, stageIndex: nu
       if (entry.call.action.tool !== "inspect_nodes" || data?.pageId !== pageId) continue;
       const visit = (node: { ref?: string; children?: unknown[] }) => {
         if (typeof node.ref === "string") inspected.add(node.ref);
-        for (const child of node.children ?? []) if (child && typeof child === "object") visit(child);
+        for (const child of node.children ?? [])
+          if (child && typeof child === "object") visit(child);
       };
-      for (const node of data.nodes ?? [])
-        if (roots.size === 1 && roots.has(node.ref)) visit(node);
+      for (const node of data.nodes ?? []) if (roots.size === 1 && roots.has(node.ref)) visit(node);
     } catch {
       // An unreadable result cannot establish identity.
     }
@@ -817,7 +860,10 @@ export function chatTaskStageSatisfiedRefs(task: ChatTask, stageIndex: number): 
       nativeMutationRefs.delete(logicalRef);
       deletedRefs.add(action.ref);
       deletedRefs.add(logicalRef);
-    } else if (task.intent !== "continue" || ["create_frame", "create_rectangle", "create_text"].includes(action.tool)) {
+    } else if (
+      task.intent !== "continue" ||
+      ["create_frame", "create_rectangle", "create_text"].includes(action.tool)
+    ) {
       nativeMutationRefs.add(action.ref);
       nativeMutationRefs.add(logicalRef);
       deletedRefs.delete(action.ref);
@@ -1082,7 +1128,9 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
       consistent: chatTaskCommittedOperationCount(task) === confirmedSegmentTotal,
     },
     completionReason,
-    ...(task.editReferenceDiagnostic ? { editReferenceDiagnostic: task.editReferenceDiagnostic } : {}),
+    ...(task.editReferenceDiagnostic
+      ? { editReferenceDiagnostic: task.editReferenceDiagnostic }
+      : {}),
     stageCapacity,
     modelRounds: task.rounds,
     modelRoundTrace: task.modelRoundTrace,

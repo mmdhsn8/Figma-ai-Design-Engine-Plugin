@@ -59,6 +59,15 @@ import {
   planNativeQualityRepairs,
   type NativeRepairDecision,
 } from "../shared/native-quality-repair";
+import {
+  createChatScreenLogicalRef,
+  createMultiScreenDesignRequest,
+  ChatGenerationLinkSchema,
+  MultiScreenGenerationOutcomeSchema,
+  MultiScreenProgressEventSchema,
+  type MultiScreenDesignRequest,
+  type MultiScreenProgressEvent,
+} from "../shared/chat-generation";
 
 type Result = Extract<PluginToUIMessage, { type: "tool-result" }>;
 
@@ -137,6 +146,10 @@ type Dependencies = {
   execute(operations: FigmaToolOperation[]): Promise<Result>;
   save(task: ChatTask): Promise<void>;
   progress(message: string): void;
+  generateMultiScreen?(
+    request: MultiScreenDesignRequest,
+    progress: (event: MultiScreenProgressEvent) => Promise<void>,
+  ): Promise<unknown>;
   signal: AbortSignal;
   now?: () => number;
   wait?: (ms: number, signal: AbortSignal) => Promise<void>;
@@ -2612,6 +2625,191 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       );
     await deps.save(parsed.data);
   };
+  const runMultiScreenHandoff = async (): Promise<void> => {
+    if (!task.generationIntent || task.intent !== "create")
+      throw new Error(
+        "multi_screen_handoff_not_authorized: Only a planned create intent can enter structured generation.",
+      );
+    if (!task.brief || !task.model)
+      throw new Error(
+        "multi_screen_plan_incomplete: The saved Chat plan is missing its brief or pinned model.",
+      );
+    const generationId = task.generationLink?.generationId ?? `generation-${task.id}`;
+    const planned = createMultiScreenDesignRequest({
+      taskId: task.id,
+      generationId,
+      documentId: task.documentId,
+      model: task.model,
+      prompt: task.prompt,
+      intent: task.generationIntent,
+      brief: task.brief,
+      stages: task.stages,
+      ...(task.brandKit ? { brandKit: task.brandKit } : {}),
+      ...(task.designSkills ? { designSkills: task.designSkills } : {}),
+    });
+    if (!planned.success) throw new Error(`multi_screen_plan_invalid: ${planned.errors.join(" ")}`);
+    const request = planned.data;
+    const screenIds = request.screens.map(({ id }) => id);
+    const existingLink = task.generationLink;
+    if (existingLink) {
+      const sameIds = JSON.stringify(existingLink.screenIds) === JSON.stringify(screenIds);
+      if (
+        existingLink.generationId !== request.generationId ||
+        existingLink.planFingerprint !== request.planFingerprint ||
+        !sameIds
+      )
+        throw new Error(
+          "multi_screen_plan_conflict: The saved generation plan changed. Start a new Chat task to create a new revision.",
+        );
+      if (existingLink.status === "completed") {
+        task.status = "completed";
+        transition("TASK_COMPLETED");
+        return;
+      }
+    } else {
+      task.generationLink = ChatGenerationLinkSchema.parse({
+        schemaVersion: 1,
+        generationId: request.generationId,
+        planFingerprint: request.planFingerprint,
+        screenIds,
+        completedScreenIds: [],
+        nativeRoots: [],
+        completedSections: 0,
+        status: "prepared",
+      });
+    }
+    if (!deps.generateMultiScreen)
+      throw new Error(
+        "multi_screen_adapter_unavailable: The structured generation adapter is unavailable.",
+      );
+    const link = task.generationLink!;
+    link.status = "running";
+    delete link.errorCode;
+    transition("PLAN_SAVED");
+    await save();
+    const names = new Map(
+      request.screens.map((screen, index) => [
+        screen.id,
+        `${index + 1}/${request.screens.length} ${screen.name}`,
+      ]),
+    );
+    const report = async (eventValue: MultiScreenProgressEvent) => {
+      const event = MultiScreenProgressEventSchema.parse(eventValue);
+      if (
+        event.totalScreens !== request.screens.length ||
+        event.completedSections > request.screens.length * 3
+      )
+        throw new Error(
+          "multi_screen_progress_invalid: Progress did not match the saved screen plan.",
+        );
+      if (event.screenId && !link.screenIds.includes(event.screenId))
+        throw new Error(
+          "multi_screen_progress_invalid: Progress referenced a screen outside this task.",
+        );
+      link.completedSections = Math.max(link.completedSections, event.completedSections);
+      if (event.phase === "screen-verified" && event.screenId) {
+        const nativeRoot = event.nativeRoot;
+        if (
+          !nativeRoot ||
+          nativeRoot.logicalRef !== createChatScreenLogicalRef(request.generationId, event.screenId)
+        )
+          throw new Error(
+            "multi_screen_progress_invalid: Verified screen did not include its task-owned native identity.",
+          );
+        if (!link.completedScreenIds.includes(event.screenId))
+          link.completedScreenIds.push(event.screenId);
+        const existingRoot = link.nativeRoots.find(({ screenId }) => screenId === event.screenId);
+        if (
+          existingRoot &&
+          (existingRoot.nodeId !== nativeRoot.nodeId || existingRoot.logicalRef !== nativeRoot.logicalRef)
+        )
+          throw new Error(
+            "multi_screen_identity_conflict: A verified screen changed its saved native identity.",
+          );
+        if (!existingRoot) link.nativeRoots.push(nativeRoot);
+        const stage = task.stages[event.screenIndex ?? -1];
+        if (!stage || request.screens[event.screenIndex ?? -1]?.id !== event.screenId)
+          throw new Error(
+            "multi_screen_progress_invalid: Verified screen order did not match the saved task.",
+          );
+        stage.completed = true;
+        stage.verified = true;
+      }
+      link.currentScreenId = event.screenId;
+      link.currentSectionId = event.sectionId;
+      await save();
+      if (event.phase === "planning") deps.progress(`Planning ${event.totalScreens} screens…`);
+      else if (event.phase === "screen-start" && event.screenId)
+        deps.progress(
+          `Screen ${names.get(event.screenId) ?? event.screenId} · planning native sections…`,
+        );
+      else if (event.phase === "section-start" && event.screenId && event.sectionId)
+        deps.progress(
+          `Screen ${names.get(event.screenId) ?? event.screenId} · ${event.sectionId} section…`,
+        );
+      else if (event.phase === "section-saved" && event.screenId && event.sectionId)
+        deps.progress(
+          `Screen ${names.get(event.screenId) ?? event.screenId} · ${event.sectionId} saved durably.`,
+        );
+      else if (event.phase === "native-render" && event.screenId && event.sectionId)
+        deps.progress(
+          `Rendering ${event.sectionId} on screen ${names.get(event.screenId) ?? event.screenId}…`,
+        );
+      else if (event.phase === "screen-verified" && event.screenId)
+        deps.progress(`Verified screen ${names.get(event.screenId) ?? event.screenId}.`);
+      else if (event.phase === "complete")
+        deps.progress("All planned native screens passed generation verification.");
+    };
+    try {
+      const outcome = MultiScreenGenerationOutcomeSchema.parse(
+        await deps.generateMultiScreen(request, report),
+      );
+      const nativeRoots = outcome.nativeRoots ?? [];
+      if (
+        outcome.generationId !== request.generationId ||
+        JSON.stringify(outcome.screenIds) !== JSON.stringify(screenIds) ||
+        JSON.stringify(outcome.verifiedScreenIds) !== JSON.stringify(screenIds) ||
+        nativeRoots.length !== screenIds.length ||
+        JSON.stringify(nativeRoots) !== JSON.stringify(link.nativeRoots) ||
+        nativeRoots.some(
+          ({ screenId, logicalRef }) =>
+            logicalRef !== createChatScreenLogicalRef(request.generationId, screenId),
+        )
+      )
+        throw new Error(
+          "multi_screen_verification_incomplete: Native screen confirmations did not match the saved plan.",
+        );
+      link.completedScreenIds = [...screenIds];
+      link.nativeRoots = [...nativeRoots];
+      link.completedSections = screenIds.length * 3;
+      link.status = "completed";
+      delete link.currentScreenId;
+      delete link.currentSectionId;
+      delete link.errorCode;
+      task.stages.forEach((stage, index) => {
+        stage.completed = true;
+        stage.verified = true;
+        const root = nativeRoots[index];
+        if (root) stage.logicalRefs = [root.logicalRef];
+      });
+      task.text =
+        request.locale === "fa-IR"
+          ? `${screenIds.length} صفحهٔ قابل‌ویرایش در فیگما ساخته و بررسی شد (${outcome.nodeCount} لایهٔ بومی).`
+          : `Created and verified ${screenIds.length} editable Figma screens (${outcome.nodeCount} native layers).`;
+      task.pending = [];
+      task.recent = [];
+      task.status = "completed";
+      delete task.error;
+      delete task.failure;
+      transition("TASK_COMPLETED");
+      await save();
+    } catch (error) {
+      link.status = deps.signal.aborted ? "paused" : "failed";
+      link.errorCode = deps.signal.aborted ? "request_cancelled" : "generation_failed";
+      await save();
+      throw error;
+    }
+  };
   const stopEdit = async (
     code: string,
     reason: string,
@@ -3576,6 +3774,10 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     }
     while (true) {
       check();
+      if (task.generationIntent && task.intent === "create" && task.stages.length > 0) {
+        await runMultiScreenHandoff();
+        return;
+      }
       if (task.intent === "edit" && task.stages.length === 0) {
         const controllerPending = task.pending.some((call) =>
           call.callId.startsWith(EDIT_TARGET_CALL_PREFIX),
@@ -3862,6 +4064,27 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           continue;
         }
         const calls = task.pending;
+        if (
+          task.generationIntent &&
+          (task.intent === undefined || task.intent === "create") &&
+          calls.some(
+            ({ action }) =>
+              action.tool !== "classify_canvas_intent" && action.tool !== "plan_canvas_task",
+          )
+        ) {
+          task.recent.push(
+            ...calls.map((call) =>
+              output(call.callId, {
+                success: false,
+                error:
+                  "This request is routed through the structured screen-generation workflow. Do not inspect document content or call native tools; classify the request, then save one ordered screen plan.",
+              }),
+            ),
+          );
+          task.pending = [];
+          await save();
+          continue;
+        }
         const intentCalls = calls.filter((call) => call.action.tool === "classify_canvas_intent");
         if (intentCalls.length) {
           if (calls.length !== 1 || intentCalls.length !== 1)
@@ -4134,7 +4357,10 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                     ? {
                         completionCriteria: [
                           ...planned.completionCriteria.slice(0, 4),
-                          `Include required patterns: ${task.brief.requiredPatterns.slice(0, 6).join(", ")}`.slice(0, 180),
+                          `Include required patterns: ${task.brief.requiredPatterns.slice(0, 6).join(", ")}`.slice(
+                            0,
+                            180,
+                          ),
                         ],
                       }
                     : {}),
@@ -4169,7 +4395,11 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                 }));
                 task.context = task.context.filter(
                   (item) =>
-                    !("role" in item && item.role === "user" && item.content.startsWith(DESIGN_SKILL_CONTEXT_MARKER)),
+                    !(
+                      "role" in item &&
+                      item.role === "user" &&
+                      item.content.startsWith(DESIGN_SKILL_CONTEXT_MARKER)
+                    ),
                 );
                 transition("PLAN_SAVED");
               }
@@ -5854,6 +6084,17 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       (error instanceof Error &&
         /^(?:Stopped|Stopped between native operations)/u.test(error.message));
     task.status = isCancelled ? "stopped" : "failed";
+    if (task.generationLink) {
+      task.generationLink.status = isCancelled ? "paused" : "failed";
+      task.generationLink.errorCode = isCancelled
+        ? "request_cancelled"
+        : transportCategory === "checkpoint_storage"
+          ? "checkpoint_storage"
+          : "generation_failed";
+      task.text = isCancelled
+        ? "Structured generation paused. Saved section transactions and confirmed native screens are retained; resume this Chat task to continue."
+        : `Structured generation failed safely: ${(error instanceof Error ? error.message : "The saved generation could not continue.").slice(0, 500)}. Confirmed work is retained; no completion was reported.`;
+    }
     task.error = isCancelled
       ? task.intent === "edit"
         ? "Edit cancelled. Verified target evidence and any confirmed native changes are retained."

@@ -31,7 +31,7 @@ export const GENERATED_NODE_ROLES = [
 
 export const DesignGenerationRequestSchema = z
   .object({
-    prompt: z.string().trim().min(10),
+    prompt: z.string().trim().min(10).max(12_000),
     target: z.enum(["mobile", "desktop", "both"]),
     screenCount: z
       .number()

@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   ChatTaskSchema,
   chatTaskCommittedOperationCount,
@@ -21,6 +24,31 @@ import type { FigmaToolOperation } from "../src/shared/figma-tools";
 import type { PluginToUIMessage } from "../src/shared/messages";
 import { MAX_NATIVE_QUALITY_SCAN_NODES } from "../src/shared/native-visual-quality";
 import { BrandKitRevisionSchema, pinBrandKit } from "../src/shared/brand-kit";
+import {
+  createChatScreenLogicalRef,
+  ChatGenerationIntentSchema,
+  type MultiScreenDesignRequest,
+  type MultiScreenProgressEvent,
+} from "../src/shared/chat-generation";
+import { createDraftStore } from "../src/companion/draft-store";
+import { createGenerationController } from "../src/plugin/generation-controller";
+import { createGenerationTransaction } from "../src/shared/generation-transaction";
+import {
+  createDesignPlan,
+  createDesignSections,
+  normalizeGeneratedDesignResponse,
+  type GeneratedDesign,
+} from "../src/shared/design-generation";
+import { validateDraftSection, type DraftManifest } from "../src/shared/generation-draft";
+import { prepareGeneratedDesign } from "../src/ui/design-generation";
+import { sectionDesignFixture } from "./generation-fixture";
+import { createMockApi, type MockNode } from "./figma-mock";
+import {
+  DesignSkillRevisionSchema,
+  parseSkillMarkdown,
+  pinDesignSkill,
+  skillContentHash,
+} from "../src/shared/design-skill";
 
 type Result = Extract<PluginToUIMessage, { type: "tool-result" }>;
 let callNumber = 0;
@@ -147,6 +175,38 @@ function chatBrandKit(themePrimary?: string) {
     }),
   );
 }
+
+function chatDesignSkill() {
+  const sourceMarkdown = "# Clear care flows\n\nUse clear headings and calm appointment cards.\n";
+  const parsed = parseSkillMarkdown(sourceMarkdown);
+  const revision = DesignSkillRevisionSchema.parse({
+    schemaVersion: 1,
+    id: "skill-chat-care",
+    revision: 3,
+    revisionId: "skill-chat-care.r3",
+    name: "Clear care flows",
+    description: "Patient-facing multi-screen layouts",
+    category: "general",
+    domains: ["general"],
+    supportedTasks: ["new-design", "chat-planning"],
+    screenTypes: ["all"],
+    locale: "multi",
+    version: "1.0.0",
+    tags: ["care"],
+    priority: 0,
+    incompatibilityGroups: [],
+    requiredPatterns: ["form"],
+    source: "user-authored",
+    trust: "first-party",
+    createdAt: 1,
+    updatedAt: 1,
+    contentHash: skillContentHash(sourceMarkdown),
+    sourceMarkdown: parsed.sourceMarkdown,
+    guidanceText: parsed.guidanceText,
+    derivedNotes: parsed.derivedNotes,
+  });
+  return pinDesignSkill(revision, "default");
+}
 function success(ops: FigmaToolOperation[]): Result {
   return {
     type: "tool-result",
@@ -189,7 +249,10 @@ function success(ops: FigmaToolOperation[]): Result {
         ? {
             data: {
               page: { id: "page:current", name: "Current" },
-              pages: [{ id: "page:current", name: "Current", current: true }, { id: "page:charm", name: "Charm", current: false }],
+              pages: [
+                { id: "page:current", name: "Current", current: true },
+                { id: "page:charm", name: "Charm", current: false },
+              ],
               discovery: {
                 matchStatus: op.action.query ? "unique" : "not_queried",
                 matchCount: op.action.query ? 1 : 0,
@@ -201,7 +264,21 @@ function success(ops: FigmaToolOperation[]): Result {
                 pagesRemaining: 0,
               },
               frames: op.action.query
-                ? [{ ref: "charm-home", nodeId: "node-charm-home", pageId: "page:charm", pageName: "Charm", type: "FRAME", name: "Charm Home", x: 0, y: 0, width: 390, height: 844, editable: true }]
+                ? [
+                    {
+                      ref: "charm-home",
+                      nodeId: "node-charm-home",
+                      pageId: "page:charm",
+                      pageName: "Charm",
+                      type: "FRAME",
+                      name: "Charm Home",
+                      x: 0,
+                      y: 0,
+                      width: 390,
+                      height: 844,
+                      editable: true,
+                    },
+                  ]
                 : [],
             },
           }
@@ -217,7 +294,14 @@ function markVerifiedStructure(data: Record<string, unknown>, nodeCount: number)
     qualityCoverage: { complete: true, nodeCount, findingCount: 0 },
   });
 }
-function harness(turns: Array<AuthorizedChatTurn | Error>, autoReadContext = true) {
+function harness(
+  turns: Array<AuthorizedChatTurn | Error>,
+  autoReadContext = true,
+  generateMultiScreen?: (
+    request: MultiScreenDesignRequest,
+    progress: (event: MultiScreenProgressEvent) => Promise<void>,
+  ) => Promise<unknown>,
+) {
   let clock = 100_000;
   const checkpoints: ChatTask[] = [];
   const batches: FigmaToolOperation[][] = [];
@@ -260,7 +344,8 @@ function harness(turns: Array<AuthorizedChatTurn | Error>, autoReadContext = tru
         if (operation.action.tool !== "set_properties") continue;
         const values = nativeProperties.get(operation.action.ref) ?? {};
         for (const [key, value] of Object.entries(operation.action.properties)) {
-          const evidenceKey = key === "color" ? "textColor" : key === "align" ? "textAlignHorizontal" : key;
+          const evidenceKey =
+            key === "color" ? "textColor" : key === "align" ? "textAlignHorizontal" : key;
           values[evidenceKey] = value;
         }
         nativeProperties.set(operation.action.ref, values);
@@ -268,7 +353,9 @@ function harness(turns: Array<AuthorizedChatTurn | Error>, autoReadContext = tru
       const result = success(operations);
       for (const operation of operations) {
         if (operation.action.tool !== "inspect_nodes") continue;
-        const item = result.results.find(({ operationId }) => operationId === operation.operationId);
+        const item = result.results.find(
+          ({ operationId }) => operationId === operation.operationId,
+        );
         const nodes = item?.data?.nodes;
         if (!Array.isArray(nodes)) continue;
         for (const value of nodes) {
@@ -283,6 +370,7 @@ function harness(turns: Array<AuthorizedChatTurn | Error>, autoReadContext = tru
       checkpoints.push(structuredClone(ChatTaskSchema.parse(checkpoint)));
     }),
     progress: vi.fn(),
+    ...(generateMultiScreen ? { generateMultiScreen: vi.fn(generateMultiScreen) } : {}),
     now: () => clock,
     wait: vi.fn(async (ms: number) => {
       clock += ms;
@@ -330,6 +418,28 @@ const plan = (
       goal: `Complete ${title}`,
       logicalRefs: [refs[index] ?? "product-0"],
       completionCriteria: [`${title} exists as editable native layers`],
+    })),
+  });
+const multiScreenPlan = (names: string[], readingDirection: "LTR" | "RTL" = "RTL") =>
+  turn("plan_canvas_task", {
+    brief: {
+      ...defaultBrief,
+      brandDirection: "Calm and trustworthy care",
+      audience: "Patients and caregivers",
+      content: ["Page title", "Patient status", "Next action"],
+      hierarchy: "Title, status, one primary action, then support details",
+      readingDirection,
+    },
+    stages: names.map((title, index) => ({
+      title,
+      goal: `Complete the ${title} screen for the patient portal.`,
+      purpose: `Help a patient complete the ${title.toLocaleLowerCase()} task.`,
+      priority: index + 1,
+      ...(index ? { navigation: [names[index - 1]!], dependsOn: [names[index - 1]!] } : {}),
+      contentPlaceholders: ["Patient name", "Status", "Next action"],
+      componentOpportunities: ["Consistent appointment card"],
+      logicalRefs: [`screen-${index + 1}`],
+      completionCriteria: [`${title} is an editable native screen`],
     })),
   });
 const finish = (resolvedOperationIds: string[] = []) =>
@@ -425,7 +535,8 @@ function reportedPartialEditTask() {
   current.id = "chat-1794304545560-ythoff";
   current.chatId = "chat-1794304485267-qarld7";
   current.documentId = "doc-mw1xggge-dwqwh8bw2b-0_1";
-  current.prompt = "فقط پس‌زمینه فریم موجود خانه | Charm را به #FFF0F5 تغییر بده و سایر لایه‌ها را حفظ کن.";
+  current.prompt =
+    "فقط پس‌زمینه فریم موجود خانه | Charm را به #FFF0F5 تغییر بده و سایر لایه‌ها را حفظ کن.";
   current.intent = "edit";
   current.targetName = "خانه | Charm";
   current.lifecycle = "EXECUTING_STAGE";
@@ -491,7 +602,10 @@ function reportedPartialEditTask() {
       status: "completed",
       category: "read_only",
       acknowledgementStatus: "read_only",
-      output: JSON.stringify({ success: true, data: { page: { id: "0:1", name: "Phase 1 — Storefront" } } }),
+      output: JSON.stringify({
+        success: true,
+        data: { page: { id: "0:1", name: "Phase 1 — Storefront" } },
+      }),
     },
     {
       call: callAt(targetInspectionCall),
@@ -509,7 +623,11 @@ function reportedPartialEditTask() {
       status: "completed",
       category: "mutation",
       acknowledgementStatus: "confirmed_mutation",
-      output: JSON.stringify({ success: true, logicalRef: rootRef, summary: "Updated only the requested properties on the existing frame." }),
+      output: JSON.stringify({
+        success: true,
+        logicalRef: rootRef,
+        summary: "Updated only the requested properties on the existing frame.",
+      }),
     },
     {
       call: callAt(priorQualityCall),
@@ -518,7 +636,11 @@ function reportedPartialEditTask() {
       status: "completed",
       category: "read_only",
       acknowledgementStatus: "read_only",
-      output: JSON.stringify({ success: true, summary: "Verified 3 native layers; 0 structural finding(s).", data: { pageId: "0:1", nodes: [] } }),
+      output: JSON.stringify({
+        success: true,
+        summary: "Verified 3 native layers; 0 structural finding(s).",
+        data: { pageId: "0:1", nodes: [] },
+      }),
     },
     {
       call: callAt(priorInspectionCall),
@@ -534,14 +656,660 @@ function reportedPartialEditTask() {
 }
 
 describe("progressive conversational canvas tasks", () => {
+  it("hands one Chat message through durable sections to the existing native renderer and verifier", async () => {
+    const names = ["Appointments", "Care plan", "Messages"];
+    let observedRequest: MultiScreenDesignRequest | undefined;
+    const executionOrder: string[] = [];
+    const providerCalls: Array<{ model: string; screenId: string; sectionId: string }> = [];
+    const generateMultiScreen = async (
+      request: MultiScreenDesignRequest,
+      progress: (event: MultiScreenProgressEvent) => Promise<void>,
+    ) => {
+      observedRequest = request;
+      const directory = await mkdtemp(join(tmpdir(), "fad-chat-generation-"));
+      try {
+        const mock = createMockApi();
+        const documentId = "file-test-56-page_current";
+        expect(request.documentId).toBe(documentId);
+        const paintStyles: PaintStyle[] = [];
+        const textStyles: TextStyle[] = [];
+        let nextStyleId = 0;
+        const createStyle = (type: "PAINT" | "TEXT") => {
+          const metadata = new Map<string, string>();
+          const style = {
+            id: `chat-style-${++nextStyleId}`,
+            type,
+            name: "",
+            getPluginData: (key: string) => metadata.get(key) ?? "",
+            setPluginData: (key: string, value: string) => metadata.set(key, value),
+            remove: () => {
+              const styles = type === "PAINT" ? paintStyles : textStyles;
+              const index = styles.indexOf(style as never);
+              if (index >= 0) styles.splice(index, 1);
+            },
+            ...(type === "PAINT"
+              ? { paints: [] as Paint[] }
+              : {
+                  fontName: { family: "Inter", style: "Regular" },
+                  fontSize: 12,
+                  lineHeight: { unit: "AUTO" },
+                  letterSpacing: { unit: "PIXELS", value: 0 },
+                  textDecoration: "NONE",
+                }),
+          } as unknown as PaintStyle | TextStyle;
+          (type === "PAINT" ? paintStyles : textStyles).push(style as never);
+          return style;
+        };
+        const api = Object.assign(mock.api, {
+          getLocalPaintStylesAsync: async () => paintStyles,
+          getLocalTextStylesAsync: async () => textStyles,
+          createPaintStyle: () => createStyle("PAINT") as PaintStyle,
+          createTextStyle: () => createStyle("TEXT") as TextStyle,
+        }) as PluginAPI;
+        const manifest = {
+          version: 1 as const,
+          documentId,
+          generationId: request.generationId,
+          chatTaskId: request.taskId,
+          planFingerprint: request.planFingerprint,
+          createdAt: 1,
+          model: request.model,
+          request: request.request,
+          ...(request.brandKit ? { brandKit: request.brandKit } : {}),
+          ...(request.designSkills?.length ? { designSkills: request.designSkills } : {}),
+        };
+        const store = createDraftStore(directory);
+        await store.start("mock-account", manifest);
+        let activeStore = store;
+        const native = createGenerationController(api);
+        const nativeResult = async (message: Parameters<typeof native>[0]) => {
+          const result = await native(message);
+          if (result.type !== "generation-result" || !result.success)
+            throw new Error(
+              result.type === "generation-result"
+                ? result.error
+                : "Unexpected generation response.",
+            );
+          return result;
+        };
+        const planResult = createDesignPlan(
+          request.request,
+          request.brandKit,
+          request.designSkills,
+        );
+        if (!planResult.success) throw new Error(planResult.errors.join(" "));
+        await progress({
+          phase: "planning",
+          completedScreens: 0,
+          completedSections: 0,
+          totalScreens: 3,
+        });
+        await nativeResult({
+          type: "generation-prepare",
+          requestId: "chat-generation-prepare",
+          manifest,
+          screenIds: request.screens.map(({ id }) => id),
+          focusInitial: true,
+        });
+        const sections = createDesignSections(planResult.data);
+        const screenIds = request.screens.map(({ id }) => id);
+        const verifiedScreenIds: string[] = [];
+        const nativeRoots: Array<{ screenId: string; nodeId: string; logicalRef: string }> = [];
+        for (const [screenIndex, screen] of request.screens.entries()) {
+          await progress({
+            phase: "screen-start",
+            screenId: screen.id,
+            screenIndex,
+            completedScreens: screenIndex,
+            completedSections: screenIndex * 3,
+            totalScreens: 3,
+          });
+          const savedChildren = [];
+          for (const section of sections) {
+            await progress({
+              phase: "section-start",
+              screenId: screen.id,
+              screenIndex,
+              sectionId: section.id,
+              completedScreens: screenIndex,
+              completedSections:
+                screenIndex * 3 +
+                sections.filter(({ sequence }) => sequence < section.sequence).length,
+              totalScreens: 3,
+            });
+            // The mocked provider returns one bounded section for the exact pinned model.
+            providerCalls.push({
+              model: request.model,
+              screenId: screen.id,
+              sectionId: section.id,
+            });
+            executionOrder.push(`provider:${screen.id}:${section.id}`);
+            const raw = sectionDesignFixture(screen.id, section.title);
+            const normalized = normalizeGeneratedDesignResponse(JSON.stringify(raw), {
+              ...planResult.data,
+              screens: planResult.data.screens.filter(({ id }) => id === screen.id),
+            });
+            if (!normalized.success) throw new Error(normalized.errors.join(" "));
+            const design: GeneratedDesign = normalized.data.design;
+            design.screens[0]!.children[0]!.sectionId = section.id;
+            if (section.id === "primary") design.screens[0]!.children[0]!.pattern = "form";
+            design.screens[0]!.children[0]!.children.push({
+              type: "rectangle",
+              name: "Status visualization",
+              text: null,
+              palette: "accent",
+              width: 334,
+              height: 40,
+              fontSize: 16,
+              fontStyle: "Regular",
+              textAlign: "right",
+              cornerRadius: 8,
+              elevation: "none",
+              layout: "none",
+              gap: 0,
+              padding: 0,
+              qualityRole: "decorative",
+              children: [],
+            });
+            const transaction = createGenerationTransaction({
+              generationId: request.generationId,
+              documentScope: request.documentId,
+              screenId: screen.id,
+              sectionId: section.id,
+              transactionId: `${request.taskId}-${screen.id}-${section.id}`,
+              design,
+            });
+            validateDraftSection(manifest, transaction, design);
+            executionOrder.push(`save:${screen.id}:${section.id}`);
+            await activeStore.saveSection(
+              "mock-account",
+              documentId,
+              request.generationId,
+              transaction,
+              design,
+            );
+            if (screenIndex === 0 && section.sequence === 0) {
+              activeStore = createDraftStore(directory);
+              executionOrder.push("reload-after-save-before-render");
+            }
+            const checkpoint = await activeStore.load("mock-account", documentId);
+            const saved = checkpoint?.transactions.find(
+              ({ transaction: stored }) => stored.idempotency_key === transaction.idempotency_key,
+            );
+            expect(saved?.rendered).toBe(false);
+            expect(saved?.transaction.sequence).toBe(section.sequence);
+            await progress({
+              phase: "section-saved",
+              screenId: screen.id,
+              screenIndex,
+              sectionId: section.id,
+              completedScreens: screenIndex,
+              completedSections: screenIndex * 3 + section.sequence + 1,
+              totalScreens: 3,
+            });
+            await progress({
+              phase: "native-render",
+              screenId: screen.id,
+              screenIndex,
+              sectionId: section.id,
+              completedScreens: screenIndex,
+              completedSections: screenIndex * 3 + section.sequence + 1,
+              totalScreens: 3,
+            });
+            executionOrder.push(`native-render:${screen.id}:${section.id}`);
+            const applyMessage = {
+              type: "generation-apply-section",
+              requestId: `chat-generation-${screen.id}-${section.id}`,
+              manifest,
+              transaction,
+              design,
+            } as const;
+            let rendered = await nativeResult(applyMessage);
+            if (screenIndex === 0 && section.sequence === 0) {
+              const nodesAfterPossibleCommit = mock.nodes.length;
+              executionOrder.push("native-timeout-after-possible-commit");
+              // Simulate losing the acknowledgement after the native controller committed.
+              rendered = await nativeResult({
+                ...applyMessage,
+                requestId: "chat-generation-reconcile",
+              });
+              expect(mock.nodes).toHaveLength(nodesAfterPossibleCommit);
+            }
+            if (!rendered.nodeId)
+              throw new Error("The existing Figma renderer did not return a section root.");
+            await activeStore.markSectionApplied(
+              "mock-account",
+              documentId,
+              request.generationId,
+              transaction,
+              rendered.nodeId,
+            );
+            savedChildren.push(...design.screens[0]!.children);
+          }
+          const completeScreen: GeneratedDesign = {
+            projectName: sectionDesignFixture(screen.id).projectName,
+            palette: sectionDesignFixture(screen.id).palette,
+            screens: [{ id: screen.id, children: savedChildren }],
+          };
+          const normalizedComplete = normalizeGeneratedDesignResponse(
+            JSON.stringify(completeScreen),
+            {
+              ...planResult.data,
+              screens: planResult.data.screens.filter(({ id }) => id === screen.id),
+            },
+          );
+          if (!normalizedComplete.success) throw new Error(normalizedComplete.errors.join(" "));
+          const composed = prepareGeneratedDesign(JSON.stringify(completeScreen), {
+            ...planResult.data,
+            screens: planResult.data.screens.filter(({ id }) => id === screen.id),
+          });
+          if (!composed.success) throw new Error(composed.errors.join(" "));
+          expect(composed.success).toBe(true);
+          expect(savedChildren.map(({ sectionId }) => sectionId)).toEqual(
+            sections.map(({ id }) => id),
+          );
+          expect(composed.data.visualSpecs[0]?.nodes.map(({ logicalRef }) => logicalRef)).toContain(
+            `${screen.id}.primary.n0`,
+          );
+          expect(
+            mock.page.findAll(
+              (node) => node.getPluginData("fad.design.logical-ref") === `${screen.id}.primary.n0`,
+            ),
+          ).toHaveLength(1);
+          const verified = await nativeResult({
+            type: "generation-verify",
+            requestId: `chat-verify-${screen.id}`,
+            manifest,
+            design: completeScreen,
+          });
+          if (!verified.nodeId)
+            throw new Error("The existing Figma verifier did not return a screen identity.");
+          const logicalRef = createChatScreenLogicalRef(request.generationId, screen.id);
+          expect(verified.logicalRef).toBe(logicalRef);
+          const nativeRoot = { screenId: screen.id, nodeId: verified.nodeId, logicalRef };
+          nativeRoots.push(nativeRoot);
+          const verifiedRoot = mock.page.findAll((node) => node.id === verified.nodeId)[0];
+          expect(
+            mock.page.findAll(
+              (node) => node.getPluginData("fad.tool.task-id.v1") === request.taskId,
+            ),
+          ).toContain(verifiedRoot);
+          expect(verifiedRoot?.getPluginData("fad.tool.logical-ref.v1")).toBe(logicalRef);
+          executionOrder.push(`verified:${screen.id}`);
+          verifiedScreenIds.push(screen.id);
+          await progress({
+            phase: "screen-verified",
+            screenId: screen.id,
+            screenIndex,
+            nativeRoot,
+            completedScreens: screenIndex + 1,
+            completedSections: (screenIndex + 1) * 3,
+            totalScreens: 3,
+          });
+        }
+        const saved = await activeStore.load("mock-account", documentId);
+        expect(saved?.transactions).toHaveLength(9);
+        expect(saved?.transactions.every(({ rendered }) => rendered)).toBe(true);
+        const roots = mock.page.findAll(
+          (node) => node.getPluginData("fad.multi-screen.batch-id") === request.generationId,
+        );
+        expect(
+          roots
+            .filter(
+              (node) => node.type === "FRAME" && node.getPluginData("fad.multi-screen.screen-id"),
+            )
+            .map((node) => node.getPluginData("fad.multi-screen.screen-id")),
+        ).toEqual(screenIds);
+        const nativeNodeCount = roots.reduce((sum, root) => {
+          const visit = (node: MockNode): number =>
+            1 + node.children.reduce((count, child) => count + visit(child), 0);
+          return sum + visit(root as MockNode);
+        }, 0);
+        await progress({
+          phase: "complete",
+          completedScreens: 3,
+          completedSections: 9,
+          totalScreens: 3,
+        });
+        return {
+          generationId: request.generationId,
+          screenIds,
+          verifiedScreenIds,
+          nativeRoots,
+          nodeCount: nativeNodeCount,
+        };
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    };
+    const h = harness(
+      [turn("classify_canvas_intent", { intent: "create" }), multiScreenPlan(names)],
+      false,
+      generateMultiScreen,
+    );
+    const current = task();
+    current.id = "chat-generation-001";
+    current.documentId = "file-test-56-page_current";
+    current.prompt = "برای پرتال سلامت من سه صفحه فارسی طراحی کن";
+    current.model = "provider/model-exact";
+    current.generationIntent = ChatGenerationIntentSchema.parse({
+      schemaVersion: 1,
+      screenCount: 3,
+      target: "mobile",
+      locale: "fa-IR",
+    });
+    current.brandKit = chatBrandKit();
+    current.designSkills = [chatDesignSkill()];
+    delete current.intent;
+
+    await runChatTask(current, h.deps);
+
+    expect(observedRequest?.request.screenNames).toEqual(names);
+    expect(observedRequest?.model).toBe("provider/model-exact");
+    expect(observedRequest?.brandKit?.revision).toBe(4);
+    expect(observedRequest?.designSkills?.[0]?.revisionId).toBe("skill-chat-care.r3");
+    expect(current.generationLink).toMatchObject({
+      status: "completed",
+      completedScreenIds: observedRequest?.screens.map(({ id }) => id),
+      completedSections: 9,
+    });
+    expect(current.status).toBe("completed");
+    expect(current.text).toContain("3 صفحه");
+    expect(h.batches).toHaveLength(0);
+    expect(providerCalls).toHaveLength(9);
+    expect(providerCalls.every(({ model }) => model === "provider/model-exact")).toBe(true);
+    expect(executionOrder.filter((item) => item.startsWith("native-render:"))).toHaveLength(9);
+    expect(executionOrder.filter((item) => item.startsWith("verified:")).length).toBe(3);
+    expect(executionOrder).toContain("native-timeout-after-possible-commit");
+    const reloadIndex = executionOrder.indexOf("reload-after-save-before-render");
+    expect(executionOrder[reloadIndex - 1]).toBe(
+      `save:${observedRequest?.screens[0]?.id}:identity`,
+    );
+    expect(reloadIndex).toBeLessThan(executionOrder.findIndex((item) => item.startsWith("native-render:")));
+    for (const [index, item] of executionOrder.entries()) {
+      if (!item.startsWith("native-render:")) continue;
+      const [, screenId, sectionId] = item.split(":");
+      expect(executionOrder.slice(0, index)).toContain(`save:${screenId}:${sectionId}`);
+    }
+    expect(h.checkpoints.some(({ generationLink }) => generationLink?.status === "running")).toBe(
+      true,
+    );
+    const restored = ChatTaskSchema.parse(JSON.parse(JSON.stringify(current)));
+    expect(restored.generationLink?.generationId).toBe(current.generationLink?.generationId);
+    expect(restored.brandKit?.revision).toBe(4);
+    expect(restored.designSkills?.[0]?.revisionId).toBe("skill-chat-care.r3");
+    await runChatTask(current, h.deps);
+    expect(providerCalls).toHaveLength(9);
+    expect(executionOrder.filter((item) => item.startsWith("native-render:"))).toHaveLength(9);
+  }, 15_000);
+
+  it("keeps a generation handoff failed after provider timeouts or malformed sections", async () => {
+    const failures = [
+      {
+        error: new CompanionClientError("request_timed_out"),
+        run: async () => {
+          throw new CompanionClientError("request_timed_out");
+        },
+      },
+      {
+        error: new Error("section_validation_failed: malformed provider section"),
+        run: async (
+          request: MultiScreenDesignRequest,
+          report: (event: MultiScreenProgressEvent) => Promise<void>,
+        ) => {
+          await report({
+            phase: "section-start",
+            screenId: request.screens[0]!.id,
+            screenIndex: 0,
+            sectionId: "identity",
+            completedScreens: 0,
+            completedSections: 0,
+            totalScreens: request.screens.length,
+          });
+          throw new Error("section_validation_failed: malformed provider section");
+        },
+      },
+      {
+        error: new Error("section_persistence_failed: simulated durable storage failure"),
+        run: async (
+          request: MultiScreenDesignRequest,
+          report: (event: MultiScreenProgressEvent) => Promise<void>,
+        ) => {
+          const directory = await mkdtemp(join(tmpdir(), "fad-chat-persistence-fault-"));
+          try {
+            const manifest: DraftManifest = {
+              version: 1,
+              documentId: request.documentId,
+              generationId: request.generationId,
+              chatTaskId: request.taskId,
+              planFingerprint: request.planFingerprint,
+              createdAt: 1,
+              model: request.model,
+              request: request.request,
+            };
+            const store = createDraftStore(directory);
+            await store.start("mock-account", manifest);
+            await report({
+              phase: "section-start",
+              screenId: request.screens[0]!.id,
+              screenIndex: 0,
+              sectionId: "identity",
+              completedScreens: 0,
+              completedSections: 0,
+              totalScreens: request.screens.length,
+            });
+            const saveSection = store.saveSection.bind(store);
+            store.saveSection = async (...args) => {
+              if (args[0] === "mock-account")
+                throw new Error("section_persistence_failed: simulated durable storage failure");
+              return saveSection(...args);
+            };
+            const design = sectionDesignFixture(request.screens[0]!.id);
+            const transaction = createGenerationTransaction({
+              generationId: request.generationId,
+              documentScope: request.documentId,
+              screenId: request.screens[0]!.id,
+              sectionId: "identity",
+              transactionId: "persistence-fault-001",
+              design,
+            });
+            await store.saveSection(
+              "mock-account",
+              request.documentId,
+              request.generationId,
+              transaction,
+              design,
+            );
+          } finally {
+            await rm(directory, { recursive: true, force: true });
+          }
+        },
+      },
+    ];
+    for (const [index, failure] of failures.entries()) {
+      const h = harness(
+        [
+          turn("classify_canvas_intent", { intent: "create" }),
+          multiScreenPlan(["Home", "Settings"], "LTR"),
+        ],
+        false,
+        failure.run,
+      );
+      const current = task();
+      current.id = `chat-generation-failure-${index + 1}`;
+      current.prompt = "Create 2 mobile healthcare screens";
+      current.model = "provider/model-exact";
+      current.generationIntent = {
+        schemaVersion: 1,
+        screenCount: 2,
+        target: "mobile",
+        locale: "en-US",
+      };
+      delete current.intent;
+
+      await expect(runChatTask(current, h.deps)).rejects.toThrow(failure.error.message);
+      expect(current.status).toBe("failed");
+      expect(current.generationLink?.status).toBe("failed");
+      expect(current.text).not.toContain("2 native screens are completed");
+      expect(h.batches).toHaveLength(0);
+    }
+  });
+
+  it("does not complete a handoff when native verification omits a planned screen", async () => {
+    const h = harness(
+      [
+        turn("classify_canvas_intent", { intent: "create" }),
+        multiScreenPlan(["Home", "Settings"], "LTR"),
+      ],
+      false,
+      async (request) => {
+        const screenIds = request.screens.map(({ id }) => id);
+        const firstScreenId = screenIds[0]!;
+        return {
+          generationId: request.generationId,
+          screenIds,
+          verifiedScreenIds: [firstScreenId],
+          nativeRoots: [
+            {
+              screenId: firstScreenId,
+              nodeId: "native-root-home-001",
+              logicalRef: createChatScreenLogicalRef(request.generationId, firstScreenId),
+            },
+          ],
+          nodeCount: 12,
+        };
+      },
+    );
+    const current = task();
+    current.id = "chat-generation-incomplete-qa";
+    current.prompt = "Create 2 mobile healthcare screens";
+    current.model = "provider/model-exact";
+    current.generationIntent = {
+      schemaVersion: 1,
+      screenCount: 2,
+      target: "mobile",
+      locale: "en-US",
+    };
+    delete current.intent;
+
+    await expect(runChatTask(current, h.deps)).rejects.toThrow();
+    expect(current.status).toBe("failed");
+    expect(current.generationLink?.status).toBe("failed");
+    expect(current.generationLink?.completedScreenIds).toEqual([]);
+    expect(current.text).not.toContain("Created and verified");
+  });
+
+  it("pauses after a durable section, reloads the same IDs, and resumes without another Chat plan", async () => {
+    const names = ["Appointments", "Care plan", "Messages"];
+    const first = harness(
+      [turn("classify_canvas_intent", { intent: "create" }), multiScreenPlan(names, "LTR")],
+      false,
+      async (request, progress) => {
+        await progress({
+          phase: "section-saved",
+          screenId: request.screens[0]!.id,
+          screenIndex: 0,
+          sectionId: "identity",
+          completedScreens: 0,
+          completedSections: 1,
+          totalScreens: 3,
+        });
+        throw new CompanionClientError("request_cancelled");
+      },
+    );
+    const current = task();
+    current.id = "chat-generation-002";
+    current.prompt = "Create 3 mobile healthcare screens";
+    current.model = "provider/model-exact";
+    current.generationIntent = {
+      schemaVersion: 1,
+      screenCount: 3,
+      target: "mobile",
+      locale: "en-US",
+    };
+    delete current.intent;
+    await expect(runChatTask(current, first.deps)).rejects.toThrow("request_cancelled");
+    const saved = ChatTaskSchema.parse(JSON.parse(JSON.stringify(current)));
+    const savedGenerationId = saved.generationLink?.generationId;
+    const savedFingerprint = saved.generationLink?.planFingerprint;
+    expect(saved.generationLink).toMatchObject({ status: "paused", completedSections: 1 });
+
+    let resumedRequest: MultiScreenDesignRequest | undefined;
+    const resume = harness([], false, async (request, progress) => {
+      resumedRequest = request;
+      const screenIds = request.screens.map(({ id }) => id);
+      const nativeRoots = request.screens.map(({ id: screenId }, index) => ({
+        screenId,
+        nodeId: `native-root-${index + 1}`,
+        logicalRef: createChatScreenLogicalRef(request.generationId, screenId),
+      }));
+      for (const [screenIndex, nativeRoot] of nativeRoots.entries())
+        await progress({
+          phase: "screen-verified",
+          screenId: nativeRoot.screenId,
+          screenIndex,
+          nativeRoot,
+          completedScreens: screenIndex + 1,
+          completedSections: (screenIndex + 1) * 3,
+          totalScreens: screenIds.length,
+        });
+      return {
+        generationId: request.generationId,
+        screenIds,
+        verifiedScreenIds: screenIds,
+        nativeRoots,
+        nodeCount: 40,
+      };
+    });
+    await runChatTask(saved, resume.deps);
+    expect(resume.inputs).toHaveLength(0);
+    expect(resumedRequest?.generationId).toBe(savedGenerationId);
+    expect(resumedRequest?.planFingerprint).toBe(savedFingerprint);
+    expect(saved.generationLink?.status).toBe("completed");
+  });
+
+  it("blocks resume when the saved screen plan changes under an existing generation identity", async () => {
+    const names = ["Appointments", "Care plan"];
+    const first = harness(
+      [turn("classify_canvas_intent", { intent: "create" }), multiScreenPlan(names, "LTR")],
+      false,
+      async () => {
+        throw new CompanionClientError("request_cancelled");
+      },
+    );
+    const current = task();
+    current.id = "chat-generation-003";
+    current.prompt = "Create 2 healthcare screens";
+    current.model = "provider/model-exact";
+    current.generationIntent = {
+      schemaVersion: 1,
+      screenCount: 2,
+      target: "mobile",
+      locale: "en-US",
+    };
+    delete current.intent;
+    await expect(runChatTask(current, first.deps)).rejects.toThrow("request_cancelled");
+    const restored = ChatTaskSchema.parse(JSON.parse(JSON.stringify(current)));
+    restored.stages[0]!.purpose = "Changed after the saved plan";
+    let generationCalls = 0;
+    const blocked = harness([], false, async () => {
+      generationCalls++;
+      return {};
+    });
+    await expect(runChatTask(restored, blocked.deps)).rejects.toThrow("multi_screen_plan_conflict");
+    expect(generationCalls).toBe(0);
+    expect(restored.generationLink?.status).toBe("failed");
+    expect(restored.text).toContain("multi_screen_plan_conflict");
+  });
+
   it("accepts legacy task checkpoints and preserves a pinned model in new snapshots", () => {
     const legacy = task();
     expect(legacy.model).toBeUndefined();
     const pinned = ChatTaskSchema.parse({ ...legacy, model: "provider/model-exact" });
     expect(pinned.model).toBe("provider/model-exact");
-    expect(ChatTaskSchema.safeParse({ ...legacy, model: "provider/model with spaces" }).success).toBe(
-      false,
-    );
+    expect(
+      ChatTaskSchema.safeParse({ ...legacy, model: "provider/model with spaces" }).success,
+    ).toBe(false);
   });
 
   it("keeps version 1 native-repair checkpoints readable after the repair upgrade", () => {
@@ -566,7 +1334,8 @@ describe("progressive conversational canvas tasks", () => {
   });
 
   it("closes the reported 11-round repeated-context failure with one model request and bounded inspection", async () => {
-    const classification = () => turn("classify_canvas_intent", { intent: "inspect", targetName: "Charm" });
+    const classification = () =>
+      turn("classify_canvas_intent", { intent: "inspect", targetName: "Charm" });
     const reportedCallSequence = [
       classification(),
       ...Array.from({ length: 5 }, (_, index) =>
@@ -583,7 +1352,8 @@ describe("progressive conversational canvas tasks", () => {
     const h = harness(reportedCallSequence, false);
     const current = task();
     current.id = "chat-1794288205407-wiwkb8";
-    current.prompt = "Find and inspect all existing Charm frames without selecting any frame or changing the canvas.";
+    current.prompt =
+      "Find and inspect all existing Charm frames without selecting any frame or changing the canvas.";
     delete current.intent;
 
     await runChatTask(current, h.deps);
@@ -592,7 +1362,10 @@ describe("progressive conversational canvas tasks", () => {
     expect(h.deps.model).toHaveBeenCalledTimes(1);
     expect(current).toMatchObject({ status: "completed", lifecycle: "TASK_COMPLETED", stages: [] });
     expect(chatTaskCommittedOperationCount(current)).toBe(0);
-    expect(h.batches.flat().map(({ action }) => action.tool)).toEqual(["get_document_context", "inspect_nodes"]);
+    expect(h.batches.flat().map(({ action }) => action.tool)).toEqual([
+      "get_document_context",
+      "inspect_nodes",
+    ]);
     expect(h.inputs).toHaveLength(1);
     // Discovery and verified geometry must survive the intervening classifier and reload.
     const restored = ChatTaskSchema.parse(structuredClone(current));
@@ -601,13 +1374,15 @@ describe("progressive conversational canvas tasks", () => {
     expect(input).toContain("page:charm");
     expect(input).toContain("844");
     expect(chatTaskSafeDiagnostic(current)).toMatchObject({
-      intent: "inspect", inspectionOutcome: "COMPLETED",
+      intent: "inspect",
+      inspectionOutcome: "COMPLETED",
       inspectionSummary: {
         nativeOperations: 2,
         canvasMutations: 0,
         nativePerformance: { modelRequests: 1, modelInputBytes: expect.any(Number) },
       },
-      completionReason: "read_only_inspection_confirmed", modelRequests: 1,
+      completionReason: "read_only_inspection_confirmed",
+      modelRequests: 1,
       modelRoundTrace: [
         { round: 1, tools: ["classify_canvas_intent"], outcome: "tool_calls", validationCodes: [] },
       ],
@@ -615,11 +1390,14 @@ describe("progressive conversational canvas tasks", () => {
   });
 
   it("resumes the saved live fourth-round classifier without changing intent or replaying native calls", async () => {
-    const h = harness([
-      turn("get_document_context", {}),
-      turn("inspect_nodes", { pageId: "page:charm", refs: ["charm-home"] }),
-      new Error("controlled interruption"),
-    ], false);
+    const h = harness(
+      [
+        turn("get_document_context", {}),
+        turn("inspect_nodes", { pageId: "page:charm", refs: ["charm-home"] }),
+        new Error("controlled interruption"),
+      ],
+      false,
+    );
     const current = task();
     current.intent = "inspect";
     current.targetName = "Charm";
@@ -662,9 +1440,14 @@ describe("progressive conversational canvas tasks", () => {
         pages: [{ id: "page:current", name: "Current", current: true }],
         frames: [],
         discovery: {
-          query: "Charm", matchStatus: "no_match", matchCount: 0,
-          pagesVisited: 1, pagesAvailable: 1, pagesRemaining: 0,
-          complete: true, truncated: false,
+          query: "Charm",
+          matchStatus: "no_match",
+          matchCount: 0,
+          pagesVisited: 1,
+          pagesAvailable: 1,
+          pagesRemaining: 0,
+          complete: true,
+          truncated: false,
           nativeInspection: { complete: true, framesInspected: 0, framesExpected: 0 },
         },
       };
@@ -678,54 +1461,70 @@ describe("progressive conversational canvas tasks", () => {
     expect(current.text).toContain("Canvas mutations: 0.");
   });
 
-  it.each(["inspect", "explain"] as const)("keeps %s read-only even if a model returns a plan or mutation", async (intent) => {
-    for (const response of [plan(), creates(1)]) {
-      const h = harness([response], false);
-      const current = task();
-      current.intent = intent;
-      current.targetName = "Charm";
-      await runChatTask(current, h.deps);
-      expect(current.stages).toEqual([]);
-      expect(h.deps.model).not.toHaveBeenCalled();
-      expect(h.batches.flat().every((operation) =>
-        operation.action.tool === "get_document_context" ||
-        operation.action.tool === "inspect_nodes",
-      )).toBe(true);
-      expect(current.inspectionOutcome).toBe("COMPLETED");
-      expect(chatTaskCommittedOperationCount(current)).toBe(0);
-    }
-  });
+  it.each(["inspect", "explain"] as const)(
+    "keeps %s read-only even if a model returns a plan or mutation",
+    async (intent) => {
+      for (const response of [plan(), creates(1)]) {
+        const h = harness([response], false);
+        const current = task();
+        current.intent = intent;
+        current.targetName = "Charm";
+        await runChatTask(current, h.deps);
+        expect(current.stages).toEqual([]);
+        expect(h.deps.model).not.toHaveBeenCalled();
+        expect(
+          h.batches
+            .flat()
+            .every(
+              (operation) =>
+                operation.action.tool === "get_document_context" ||
+                operation.action.tool === "inspect_nodes",
+            ),
+        ).toBe(true);
+        expect(current.inspectionOutcome).toBe("COMPLETED");
+        expect(chatTaskCommittedOperationCount(current)).toBe(0);
+      }
+    },
+  );
 
   it.each([
     { matchStatus: "no_match", truncated: false, outcome: "NO_MATCH", status: "completed" },
     { matchStatus: "no_match_truncated", truncated: true, outcome: "BLOCKED", status: "failed" },
-  ] as const)("records the bounded $matchStatus result without a mutation plan", async ({ matchStatus, truncated, outcome, status }) => {
-    const h = harness([], false);
-    h.deps.execute.mockImplementationOnce(async (operations) => {
-      h.batches.push(operations);
-      const result = success(operations);
-      result.results[0]!.data = {
-        page: { id: "page:current", name: "Current" },
-        pages: [{ id: "page:current", name: "Current", current: true }],
-        frames: [],
-        discovery: {
-          matchStatus, matchCount: 0, truncated, pagesVisited: 1, pagesAvailable: 1,
-          complete: !truncated, pagesRemaining: 0,
-          nativeInspection: { complete: !truncated, framesInspected: 0, framesExpected: 0 },
-        },
-      };
-      return result;
-    });
-    const current = task();
-    current.intent = "inspect";
-    current.targetName = "Charm";
-    await runChatTask(current, h.deps);
-    expect(current.status).toBe(status);
-    expect(current.inspectionOutcome).toBe(outcome);
-    expect(chatTaskCommittedOperationCount(current)).toBe(0);
-    expect(current.text).toContain(matchStatus === "no_match" ? "no matching frames" : "Blocked");
-    expect(current.text).toContain("Canvas mutations: 0.");
-  });
+  ] as const)(
+    "records the bounded $matchStatus result without a mutation plan",
+    async ({ matchStatus, truncated, outcome, status }) => {
+      const h = harness([], false);
+      h.deps.execute.mockImplementationOnce(async (operations) => {
+        h.batches.push(operations);
+        const result = success(operations);
+        result.results[0]!.data = {
+          page: { id: "page:current", name: "Current" },
+          pages: [{ id: "page:current", name: "Current", current: true }],
+          frames: [],
+          discovery: {
+            matchStatus,
+            matchCount: 0,
+            truncated,
+            pagesVisited: 1,
+            pagesAvailable: 1,
+            complete: !truncated,
+            pagesRemaining: 0,
+            nativeInspection: { complete: !truncated, framesInspected: 0, framesExpected: 0 },
+          },
+        };
+        return result;
+      });
+      const current = task();
+      current.intent = "inspect";
+      current.targetName = "Charm";
+      await runChatTask(current, h.deps);
+      expect(current.status).toBe(status);
+      expect(current.inspectionOutcome).toBe(outcome);
+      expect(chatTaskCommittedOperationCount(current)).toBe(0);
+      expect(current.text).toContain(matchStatus === "no_match" ? "no matching frames" : "Blocked");
+      expect(current.text).toContain("Canvas mutations: 0.");
+    },
+  );
 
   it("replaces stale model inspection requests with the exact discovered page and ref", async () => {
     for (const wrongPage of [false, true]) {
@@ -748,7 +1547,9 @@ describe("progressive conversational canvas tasks", () => {
         "get_document_context",
         "inspect_nodes",
       ]);
-      expect(h.batches.flat().find(({ action }) => action.tool === "inspect_nodes")?.action).toMatchObject({
+      expect(
+        h.batches.flat().find(({ action }) => action.tool === "inspect_nodes")?.action,
+      ).toMatchObject({
         pageId: "page:charm",
         refs: ["charm-home"],
         selection: false,
@@ -835,7 +1636,7 @@ describe("progressive conversational canvas tasks", () => {
       h.batches
         .flat()
         .filter(({ action }) => action.tool === "get_document_context")
-        .map(({ action }) => (action.tool === "get_document_context" ? action.offset ?? 0 : -1)),
+        .map(({ action }) => (action.tool === "get_document_context" ? (action.offset ?? 0) : -1)),
     ).toEqual([0, 8]);
     expect(
       h.batches
@@ -886,8 +1687,28 @@ describe("progressive conversational canvas tasks", () => {
         result.results[0]!.data = {
           page: { id: "page:current", name: "Current" },
           pages: [{ id: "page:current", name: "Current", current: true }],
-          frames: [{ ref: "charm-home", pageId: "page:charm", pageName: "Charm", name: "Charm Home", type: "FRAME", x: 0, y: 0, width: 390, height: 844 }],
-          discovery: { query: "Charm", matchStatus: "unique", matchCount: 1, pagesVisited: 1, pagesAvailable: 1, framesDiscovered: 1, truncated: false },
+          frames: [
+            {
+              ref: "charm-home",
+              pageId: "page:charm",
+              pageName: "Charm",
+              name: "Charm Home",
+              type: "FRAME",
+              x: 0,
+              y: 0,
+              width: 390,
+              height: 844,
+            },
+          ],
+          discovery: {
+            query: "Charm",
+            matchStatus: "unique",
+            matchCount: 1,
+            pagesVisited: 1,
+            pagesAvailable: 1,
+            framesDiscovered: 1,
+            truncated: false,
+          },
         };
       else {
         result.success = false;
@@ -904,7 +1725,11 @@ describe("progressive conversational canvas tasks", () => {
 
     expect(current.status).toBe("failed");
     expect(current.inspectionOutcome).toBe("FAILED");
-    expect(current.inspectionSummary).toMatchObject({ framesDiscovered: 1, framesInspected: 0, uninspectedFrames: 1 });
+    expect(current.inspectionSummary).toMatchObject({
+      framesDiscovered: 1,
+      framesInspected: 0,
+      uninspectedFrames: 1,
+    });
     expect(current.text).toContain("Failed; native inspection could not be completed");
     expect(chatTaskCommittedOperationCount(current)).toBe(0);
   });
@@ -961,26 +1786,33 @@ describe("progressive conversational canvas tasks", () => {
   });
 
   it("deterministically discovers and inspects an edit target before refusing a replacement root", async () => {
-    const h = harness([
-      turn("classify_canvas_intent", { intent: "edit", targetName: "Charm Home" }),
-      turn("plan_canvas_task", {
-        designName: "Charm",
-        targetRefs: ["charm-home"],
-        brief: defaultBrief,
-        stages: [{
-          title: "Improve Charm Home",
-          goal: "Improve the verified existing Home frame.",
-          logicalRefs: ["charm-home"],
-          completionCriteria: ["The existing Home frame has the requested visual improvements."],
-        }],
-      }),
-      turn("create_frame", {
-        ref: "replacement-home",
-        name: "Replacement Home",
-        parent: { kind: "page" },
-        size: { width: 390, height: 844 },
-      }),
-    ], false);
+    const h = harness(
+      [
+        turn("classify_canvas_intent", { intent: "edit", targetName: "Charm Home" }),
+        turn("plan_canvas_task", {
+          designName: "Charm",
+          targetRefs: ["charm-home"],
+          brief: defaultBrief,
+          stages: [
+            {
+              title: "Improve Charm Home",
+              goal: "Improve the verified existing Home frame.",
+              logicalRefs: ["charm-home"],
+              completionCriteria: [
+                "The existing Home frame has the requested visual improvements.",
+              ],
+            },
+          ],
+        }),
+        turn("create_frame", {
+          ref: "replacement-home",
+          name: "Replacement Home",
+          parent: { kind: "page" },
+          size: { width: 390, height: 844 },
+        }),
+      ],
+      false,
+    );
     const current = task();
     delete current.intent;
 
@@ -991,7 +1823,11 @@ describe("progressive conversational canvas tasks", () => {
       "get_document_context",
       "inspect_nodes",
     ]);
-    expect(current.editTarget).toMatchObject({ ref: "charm-home", pageId: "page:charm", nodeId: "node-charm-home" });
+    expect(current.editTarget).toMatchObject({
+      ref: "charm-home",
+      pageId: "page:charm",
+      nodeId: "node-charm-home",
+    });
     expect(h.lifecycles).toEqual(["UNPLANNED", "EDIT_PLANNING", "PLAN_SAVED"]);
     expect(current.failure?.code).toBe("native_execution_blocked");
     expect(current.ledger.some(({ call }) => call.action.tool === "create_frame")).toBe(false);
@@ -1011,41 +1847,49 @@ describe("progressive conversational canvas tasks", () => {
   });
 
   it("plans and verifies a cross-page edit against the inspected existing frame", async () => {
-    const h = harness([
-      turn("classify_canvas_intent", { intent: "edit", targetName: "Charm" }),
-      turn("plan_canvas_task", {
-        designName: "Charm",
-        targetRefs: ["charm-home"],
-        brief: defaultBrief,
-        stages: [{
-          title: "Improve Home",
-          goal: "Improve the inspected existing Home frame.",
+    const h = harness(
+      [
+        turn("classify_canvas_intent", { intent: "edit", targetName: "Charm" }),
+        turn("plan_canvas_task", {
+          designName: "Charm",
+          targetRefs: ["charm-home"],
+          brief: defaultBrief,
+          stages: [
+            {
+              title: "Improve Home",
+              goal: "Improve the inspected existing Home frame.",
+              pageId: "page:charm",
+              logicalRefs: ["charm-home"],
+              completionCriteria: ["Home remains native and meets the requested visual changes."],
+            },
+          ],
+        }),
+        turn("set_properties", {
           pageId: "page:charm",
-          logicalRefs: ["charm-home"],
-          completionCriteria: ["Home remains native and meets the requested visual changes."],
-        }],
-      }),
-      turn("set_properties", {
-        pageId: "page:charm",
-        ref: "charm-home",
-        properties: { fill: "#9B3F62" },
-      }),
-      finish(),
-      done,
-    ], false);
+          ref: "charm-home",
+          properties: { fill: "#9B3F62" },
+        }),
+        finish(),
+        done,
+      ],
+      false,
+    );
     const current = task();
     delete current.intent;
 
     await runChatTask(current, h.deps);
-    const verification = h.batches.flat().find(
-      ({ action }) =>
-        action.tool === "inspect_nodes" && action.purpose === "structural_verification",
-    );
+    const verification = h.batches
+      .flat()
+      .find(
+        ({ action }) =>
+          action.tool === "inspect_nodes" && action.purpose === "structural_verification",
+      );
     expect(current.status).toBe("completed");
     expect(current.targetName).toBe("Charm");
     expect(current.stages[0]?.pageId).toBe("page:charm");
-    expect(h.batches.flat().find(({ action }) => action.tool === "get_document_context")?.action)
-      .toMatchObject({ query: "Charm" });
+    expect(
+      h.batches.flat().find(({ action }) => action.tool === "get_document_context")?.action,
+    ).toMatchObject({ query: "Charm" });
     expect(verification?.action).toMatchObject({ pageId: "page:charm" });
     expect(verification?.action).toMatchObject({ refs: ["charm-home"] });
     expect(current.text).toContain("Confirmed canvas mutations: 1");
@@ -1071,22 +1915,43 @@ describe("progressive conversational canvas tasks", () => {
     target.plannedRefs = [target.ref];
     stage.logicalRefs = [target.ref];
     stage.goal = "Confirm native root fill exactly equals #FFF0F5 without mutations.";
-    stage.completionCriteria = ["Native fill of existing root frame is #FFF0F5; no mutation performed."];
+    stage.completionCriteria = [
+      "Native fill of existing root frame is #FFF0F5; no mutation performed.",
+    ];
     stage.completionReason = "native_verification_pending";
     stage.estimatedMutations = 1;
     if (kind !== "legacy") {
       stage.goal = "Set the existing root fill";
-      stage.propertyEdit = { tool: "set_properties", ref: target.ref, properties: { fill: "#FFF0F5" } };
+      stage.propertyEdit = {
+        tool: "set_properties",
+        ref: target.ref,
+        properties: { fill: "#FFF0F5" },
+      };
     }
     const priorMutation = current.ledger.find((entry) => entry.category === "mutation")!;
     current.ledger = current.ledger.filter((entry) => entry.category !== "mutation");
     if (kind === "resumed") current.ledger.push(priorMutation);
-    const historical = ["classify_canvas_intent", "plan_canvas_task", "inspect_nodes", "done",
-      "inspect_nodes", "done", "inspect_nodes", "done", "inspect_nodes", "get_operation_status", "done"] as const;
+    const historical = [
+      "classify_canvas_intent",
+      "plan_canvas_task",
+      "inspect_nodes",
+      "done",
+      "inspect_nodes",
+      "done",
+      "inspect_nodes",
+      "done",
+      "inspect_nodes",
+      "get_operation_status",
+      "done",
+    ] as const;
     current.modelRoundTrace = historical.map((tool, index) => ({
-      round: index + 1, lifecycle: index === 0 ? "UNPLANNED" : index === 1 ? "EDIT_PLANNING" : "PLAN_SAVED",
-      outcome: tool === "done" ? "done" : "tool_calls", tools: tool === "done" ? [] : [tool],
-      validationCodes: [], durationMs: 0, inputBytes: 0,
+      round: index + 1,
+      lifecycle: index === 0 ? "UNPLANNED" : index === 1 ? "EDIT_PLANNING" : "PLAN_SAVED",
+      outcome: tool === "done" ? "done" : "tool_calls",
+      tools: tool === "done" ? [] : [tool],
+      validationCodes: [],
+      durationMs: 0,
+      inputBytes: 0,
     }));
     const h = harness([done, done], false);
     let fill: string = initialFill;
@@ -1097,12 +1962,35 @@ describe("progressive conversational canvas tasks", () => {
         if (op.action.tool === "set_properties") fill = op.action.properties.fill!;
         if (op.action.tool !== "inspect_nodes") continue;
         const data = result.results.find((item) => item.operationId === op.operationId)!.data!;
-        data.nodes = [{ ref: target.ref, type: "FRAME", name: target.name, visible: true,
-          x: target.x, y: target.y, width: target.width, height: target.height, fill: kind === "covered" ? "#FFF0F5" : fill }];
+        data.nodes = [
+          {
+            ref: target.ref,
+            type: "FRAME",
+            name: target.name,
+            visible: true,
+            x: target.x,
+            y: target.y,
+            width: target.width,
+            height: target.height,
+            fill: kind === "covered" ? "#FFF0F5" : fill,
+          },
+        ];
         const ref = kind === "covered" ? "visible-background" : target.ref;
-        if (kind === "covered") (data.nodes as object[]).push({ ...(data.nodes as object[])[0], ref, type: "RECTANGLE", fill });
-        if (kind !== "blocked") data.visualBackground = { rootRef: target.ref, rootNodeId: target.nodeId, ref,
-          nodeId: kind === "covered" ? "68:134" : target.nodeId, fill };
+        if (kind === "covered")
+          (data.nodes as object[]).push({
+            ...(data.nodes as object[])[0],
+            ref,
+            type: "RECTANGLE",
+            fill,
+          });
+        if (kind !== "blocked")
+          data.visualBackground = {
+            rootRef: target.ref,
+            rootNodeId: target.nodeId,
+            ref,
+            nodeId: kind === "covered" ? "68:134" : target.nodeId,
+            fill,
+          };
       }
       return result;
     });
@@ -1117,8 +2005,13 @@ describe("progressive conversational canvas tasks", () => {
       writes ? ["inspect_nodes", "set_properties", "inspect_nodes"] : ["inspect_nodes"],
     );
     expect(current.status).toBe("completed");
-    if (kind === "covered" && writes) expect(h.batches[1]?.[0]?.action).toMatchObject({ ref: "visible-background" });
-    expect(stage.completionReason).toBe(writes || kind === "resumed" ? "required_refs_and_native_verification_confirmed" : "verified_no_op");
+    if (kind === "covered" && writes)
+      expect(h.batches[1]?.[0]?.action).toMatchObject({ ref: "visible-background" });
+    expect(stage.completionReason).toBe(
+      writes || kind === "resumed"
+        ? "required_refs_and_native_verification_confirmed"
+        : "verified_no_op",
+    );
     expect(chatTaskCommittedOperationCount(current)).toBe(writes || kind === "resumed" ? 1 : 0);
     expect(target.nodeId).toBe("68:133");
   });
@@ -1137,22 +2030,53 @@ describe("progressive conversational canvas tasks", () => {
     const add = (tool: string, args: unknown, data: unknown, mutation = false) => {
       const response = turn(tool, args);
       if (response.kind !== "tool_calls") throw new Error("Expected call");
-      current.ledger.push({ call: response.calls[0]!, operationId: `${current.id}-op-${current.ledger.length + 1}`,
-        status: "completed", stage: 0, category: mutation ? "mutation" : "read_only",
+      current.ledger.push({
+        call: response.calls[0]!,
+        operationId: `${current.id}-op-${current.ledger.length + 1}`,
+        status: "completed",
+        stage: 0,
+        category: mutation ? "mutation" : "read_only",
         acknowledgementStatus: mutation ? "confirmed_mutation" : "read_only",
-        output: JSON.stringify({ success: true, data }) });
+        output: JSON.stringify({ success: true, data }),
+      });
     };
-    add("get_document_context", {}, { discovery: { matchStatus: "unique" },
-      frames: [{ ref: root, pageId: "0:1", type: "FRAME" }] });
-    add("inspect_nodes", { pageId: "0:1", refs: [root] }, { pageId: "0:1",
-      nodes: [{ ref: root, children: [{ ref: background }, { ref: intro }] }] });
-    for (const [tool, ref] of [["create_frame", "polishHero"], ["create_text", "heroCopy"],
-      ["create_rectangle", "heroBand"], ["create_text", "heroSubcopy"]]) {
-      add(tool!, { ref, pageId: "0:1", name: ref, parent: { kind: "node", ref: ref === "polishHero" ? root : "polishHero" },
-        size: { width: 100, height: 40 }, ...(tool === "create_text" ? { text: "Charm" } : {}) }, {}, true);
+    add(
+      "get_document_context",
+      {},
+      {
+        discovery: { matchStatus: "unique" },
+        frames: [{ ref: root, pageId: "0:1", type: "FRAME" }],
+      },
+    );
+    add(
+      "inspect_nodes",
+      { pageId: "0:1", refs: [root] },
+      { pageId: "0:1", nodes: [{ ref: root, children: [{ ref: background }, { ref: intro }] }] },
+    );
+    for (const [tool, ref] of [
+      ["create_frame", "polishHero"],
+      ["create_text", "heroCopy"],
+      ["create_rectangle", "heroBand"],
+      ["create_text", "heroSubcopy"],
+    ]) {
+      add(
+        tool!,
+        {
+          ref,
+          pageId: "0:1",
+          name: ref,
+          parent: { kind: "node", ref: ref === "polishHero" ? root : "polishHero" },
+          size: { width: 100, height: 40 },
+          ...(tool === "create_text" ? { text: "Charm" } : {}),
+        },
+        {},
+        true,
+      );
     }
     const h = harness([], false);
-    await expect(runChatTask(current, h.deps)).rejects.toThrow("outside the saved enhancement specification");
+    await expect(runChatTask(current, h.deps)).rejects.toThrow(
+      "outside the saved enhancement specification",
+    );
     expect(h.deps.model).not.toHaveBeenCalled();
     expect(h.batches.flat().map(({ action }) => action.tool)).toEqual(["inspect_nodes"]);
     expect(chatTaskCommittedOperationCount(current)).toBe(4);
@@ -1166,42 +2090,80 @@ describe("progressive conversational canvas tasks", () => {
     current.lifecycle = "PLAN_SAVED";
     const target = current.editTarget!;
     const stage = current.stages[0]!;
-    const existing = [...target.verifiedRefs, "task-d12ddc8f99ff0679add2b5179a612d21",
-      "task-d0baefe3ceaf3bc57cfa598b4e5dd7ed", "task-074450a5446e70e7cbc3817d6211027f",
-      "task-63d52d619508b0474b9dce59716c115f"];
+    const existing = [
+      ...target.verifiedRefs,
+      "task-d12ddc8f99ff0679add2b5179a612d21",
+      "task-d0baefe3ceaf3bc57cfa598b4e5dd7ed",
+      "task-074450a5446e70e7cbc3817d6211027f",
+      "task-63d52d619508b0474b9dce59716c115f",
+    ];
     target.plannedRefs = [...existing];
     target.verifiedRefs = [...existing];
     stage.logicalRefs = [...existing];
     current.ledger = current.ledger.filter((entry) => entry.category !== "mutation");
     const calls = (...turns: AuthorizedChatTurn[]): AuthorizedChatTurn => {
-      const items = turns.flatMap((item) => item.kind === "tool_calls" ? item.calls : []);
-      return { kind: "tool_calls", calls: items, functionCallItems: items.map((item) => item.functionCall), text: "" };
+      const items = turns.flatMap((item) => (item.kind === "tool_calls" ? item.calls : []));
+      return {
+        kind: "tool_calls",
+        calls: items,
+        functionCallItems: items.map((item) => item.functionCall),
+        text: "",
+      };
     };
-    const create = (tool: string, ref: string, parentRef = target.ref) => turn(tool, {
-      ref, name: ref, pageId: target.pageId, size: { width: 160, height: 40 },
-      parent: { kind: "node", ref: parentRef }, ...(tool === "create_text" ? { text: "Charm" } : {}),
-    });
-    const set = (ref: string) => turn("set_properties", { ref, pageId: target.pageId, properties: { visible: true } });
-    const first = (header: string) => calls(set(existing[1]!), set(existing[2]!),
-      create("create_frame", header), create("create_frame", "banner"),
-      create("create_frame", "categories"), create("create_frame", "products"),
-      create("create_rectangle", "bannerSurface", "banner"),
-      create("create_text", "logo", header), create("create_text", "bannerTitle", "banner"),
-      create("create_text", "categoryLabel", "categories"));
-    const second = calls(set(existing[3]!), set(existing[4]!), set(existing[5]!),
+    const create = (tool: string, ref: string, parentRef = target.ref) =>
+      turn(tool, {
+        ref,
+        name: ref,
+        pageId: target.pageId,
+        size: { width: 160, height: 40 },
+        parent: { kind: "node", ref: parentRef },
+        ...(tool === "create_text" ? { text: "Charm" } : {}),
+      });
+    const set = (ref: string) =>
+      turn("set_properties", { ref, pageId: target.pageId, properties: { visible: true } });
+    const first = (header: string) =>
+      calls(
+        set(existing[1]!),
+        set(existing[2]!),
+        create("create_frame", header),
+        create("create_frame", "banner"),
+        create("create_frame", "categories"),
+        create("create_frame", "products"),
+        create("create_rectangle", "bannerSurface", "banner"),
+        create("create_text", "logo", header),
+        create("create_text", "bannerTitle", "banner"),
+        create("create_text", "categoryLabel", "categories"),
+      );
+    const second = calls(
+      set(existing[3]!),
+      set(existing[4]!),
+      set(existing[5]!),
       create("create_frame", "productCard", "products"),
-      create("create_text", "productName", "productCard"), create("create_text", "price", "productCard"));
+      create("create_text", "productName", "productCard"),
+      create("create_text", "price", "productCard"),
+    );
     const h = harness([first(existing[3]!), first("header"), second, finish()], false);
     await runChatTask(current, h.deps);
-    expect(h.inputs[1]?.some((item) => "content" in item && JSON.stringify(item).includes(existing[3]!))).toBe(true);
+    expect(
+      h.inputs[1]?.some((item) => "content" in item && JSON.stringify(item).includes(existing[3]!)),
+    ).toBe(true);
     expect(current.editReferenceDiagnostic).toContain(existing[3]);
-    expect(h.batches.flat().filter(({ action }) => isCanvasMutationTool(action.tool))).toHaveLength(16);
+    expect(h.batches.flat().filter(({ action }) => isCanvasMutationTool(action.tool))).toHaveLength(
+      16,
+    );
     const creations = h.batches.flat().filter(({ action }) => action.tool.startsWith("create_"));
     expect(creations).toHaveLength(11);
     expect(new Set(stage.logicalRefs).size).toBe(18);
-    expect(h.checkpoints.some((checkpoint) => checkpoint.pending.length === 10 &&
-      checkpoint.stages[0]?.logicalRefs.includes("header"))).toBe(true);
-    expect(h.batches.at(-1)?.[0]?.action).toMatchObject({ tool: "inspect_nodes", refs: stage.logicalRefs });
+    expect(
+      h.checkpoints.some(
+        (checkpoint) =>
+          checkpoint.pending.length === 10 && checkpoint.stages[0]?.logicalRefs.includes("header"),
+      ),
+    ).toBe(true);
+    expect(h.batches.at(-1)?.[0]?.action).toMatchObject({
+      tool: "inspect_nodes",
+      refs: stage.logicalRefs,
+    });
     expect(target.nodeId).toBe("68:133");
     expect(current.status).toBe("completed");
   });
@@ -1226,9 +2188,14 @@ describe("progressive conversational canvas tasks", () => {
       h.batches.push(operations);
       const result = success(operations);
       for (const operation of operations) {
-        if (operation.action.tool !== "inspect_nodes" || operation.action.purpose !== "structural_verification")
+        if (
+          operation.action.tool !== "inspect_nodes" ||
+          operation.action.purpose !== "structural_verification"
+        )
           continue;
-        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        const item = result.results.find(
+          ({ operationId }) => operationId === operation.operationId,
+        )!;
         item.data!.nodes = operation.action.refs.map((ref) => ({
           ref,
           type: ref.endsWith("144") ? "FRAME" : "RECTANGLE",
@@ -1292,7 +2259,9 @@ describe("progressive conversational canvas tasks", () => {
       const result = success(operations);
       for (const operation of operations) {
         if (operation.action.tool !== "inspect_nodes") continue;
-        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        const item = result.results.find(
+          ({ operationId }) => operationId === operation.operationId,
+        )!;
         item.data!.nodes = operation.action.refs.map((ref) => ({
           ref,
           type: ref === current.editTarget!.ref ? "FRAME" : "RECTANGLE",
@@ -1336,7 +2305,9 @@ describe("progressive conversational canvas tasks", () => {
       nodeCount: MAX_NATIVE_QUALITY_SCAN_NODES,
     });
     expect(h.deps.model).not.toHaveBeenCalled();
-    expect(h.batches.flat().filter(({ action }) => isCanvasMutationTool(action.tool))).toHaveLength(0);
+    expect(h.batches.flat().filter(({ action }) => isCanvasMutationTool(action.tool))).toHaveLength(
+      0,
+    );
   });
 
   it("reconciles a resumed edit before rejecting a model replay of the confirmed property update", async () => {
@@ -1356,9 +2327,14 @@ describe("progressive conversational canvas tasks", () => {
       h.batches.push(operations);
       const result = success(operations);
       for (const operation of operations) {
-        if (operation.action.tool !== "inspect_nodes" || operation.action.purpose !== "structural_verification")
+        if (
+          operation.action.tool !== "inspect_nodes" ||
+          operation.action.purpose !== "structural_verification"
+        )
           continue;
-        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        const item = result.results.find(
+          ({ operationId }) => operationId === operation.operationId,
+        )!;
         item.data!.nodes = operation.action.refs.map((ref) => ({
           ref,
           type: "FRAME",
@@ -1425,9 +2401,14 @@ describe("progressive conversational canvas tasks", () => {
       h.batches.push(operations);
       const result = success(operations);
       for (const operation of operations) {
-        if (operation.action.tool !== "inspect_nodes" || operation.action.purpose !== "structural_verification")
+        if (
+          operation.action.tool !== "inspect_nodes" ||
+          operation.action.purpose !== "structural_verification"
+        )
           continue;
-        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        const item = result.results.find(
+          ({ operationId }) => operationId === operation.operationId,
+        )!;
         item.data!.nodes = operation.action.refs.map((ref) => ({
           ref,
           type: ref === "new-charm-label" ? "TEXT" : "FRAME",
@@ -1455,7 +2436,11 @@ describe("progressive conversational canvas tasks", () => {
     expect(
       h.batches.flat().filter((operation) => operation.action.tool === "set_properties"),
     ).toHaveLength(0);
-    expect(current.stages[0]).toMatchObject({ completed: true, operations: 2, verificationOperations: 1 });
+    expect(current.stages[0]).toMatchObject({
+      completed: true,
+      operations: 2,
+      verificationOperations: 1,
+    });
   });
 
   it("uses bounded native verification to fill a missing inspection checkpoint for a planned target ref", async () => {
@@ -1466,9 +2451,14 @@ describe("progressive conversational canvas tasks", () => {
       h.batches.push(operations);
       const result = success(operations);
       for (const operation of operations) {
-        if (operation.action.tool !== "inspect_nodes" || operation.action.purpose !== "structural_verification")
+        if (
+          operation.action.tool !== "inspect_nodes" ||
+          operation.action.purpose !== "structural_verification"
+        )
           continue;
-        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        const item = result.results.find(
+          ({ operationId }) => operationId === operation.operationId,
+        )!;
         item.data!.nodes = operation.action.refs.map((ref) => ({
           ref,
           type: ref.endsWith("144") ? "FRAME" : "RECTANGLE",
@@ -1489,7 +2479,9 @@ describe("progressive conversational canvas tasks", () => {
 
     expect(current.status).toBe("completed");
     expect(current.editTarget?.verifiedRefs).toContain("task-71c74e09c3a188e7a94c9eb1b1e6550f");
-    expect(h.batches.flat().filter((operation) => isCanvasMutationTool(operation.action.tool))).toHaveLength(0);
+    expect(
+      h.batches.flat().filter((operation) => isCanvasMutationTool(operation.action.tool)),
+    ).toHaveLength(0);
     expect(current.stages[0]?.verificationOperations).toBe(1);
   });
 
@@ -1500,9 +2492,14 @@ describe("progressive conversational canvas tasks", () => {
       h.batches.push(operations);
       const result = success(operations);
       for (const operation of operations) {
-        if (operation.action.tool !== "inspect_nodes" || operation.action.purpose !== "structural_verification")
+        if (
+          operation.action.tool !== "inspect_nodes" ||
+          operation.action.purpose !== "structural_verification"
+        )
           continue;
-        const item = result.results.find(({ operationId }) => operationId === operation.operationId)!;
+        const item = result.results.find(
+          ({ operationId }) => operationId === operation.operationId,
+        )!;
         item.data!.nodes = operation.action.refs.map((ref) => ({
           ref,
           type: "FRAME",
@@ -1524,35 +2521,45 @@ describe("progressive conversational canvas tasks", () => {
     );
 
     expect(current.status).toBe("failed");
-    expect(current.failure).toMatchObject({ category: "verification", code: "native_property_verification_failed" });
+    expect(current.failure).toMatchObject({
+      category: "verification",
+      code: "native_property_verification_failed",
+    });
     expect(current.stages[0]?.completed).toBe(false);
     expect(current.ledger.filter((entry) => entry.category === "mutation")).toHaveLength(1);
     expect(current.ledger.filter((entry) => entry.category === "verification")).toHaveLength(1);
-    expect(h.batches.flat().filter((operation) => isCanvasMutationTool(operation.action.tool))).toHaveLength(0);
+    expect(
+      h.batches.flat().filter((operation) => isCanvasMutationTool(operation.action.tool)),
+    ).toHaveLength(0);
   });
 
   it("recovers the reported three-round edit failure when the model returns done after discovery", async () => {
-    const h = harness([
-      turn("classify_canvas_intent", { intent: "edit" }),
-      done,
-      turn("plan_canvas_task", {
-        targetRefs: ["charm-home"],
-        brief: defaultBrief,
-        stages: [{
-          title: "Improve Charm Home",
-          goal: "Improve the verified existing Charm Home frame.",
-          logicalRefs: ["charm-home"],
-          completionCriteria: ["The native Home frame receives the requested edit."],
-        }],
-      }),
-      turn("set_properties", {
-        pageId: "page:charm",
-        ref: "charm-home",
-        properties: { fill: "#9B3F62" },
-      }),
-      finish(),
-      done,
-    ], false);
+    const h = harness(
+      [
+        turn("classify_canvas_intent", { intent: "edit" }),
+        done,
+        turn("plan_canvas_task", {
+          targetRefs: ["charm-home"],
+          brief: defaultBrief,
+          stages: [
+            {
+              title: "Improve Charm Home",
+              goal: "Improve the verified existing Charm Home frame.",
+              logicalRefs: ["charm-home"],
+              completionCriteria: ["The native Home frame receives the requested edit."],
+            },
+          ],
+        }),
+        turn("set_properties", {
+          pageId: "page:charm",
+          ref: "charm-home",
+          properties: { fill: "#9B3F62" },
+        }),
+        finish(),
+        done,
+      ],
+      false,
+    );
     const current = task();
     current.prompt = "design safhe home charm ro behtar kon";
     delete current.intent;
@@ -1561,7 +2568,9 @@ describe("progressive conversational canvas tasks", () => {
 
     expect(h.deps.model).toHaveBeenCalledTimes(5);
     expect(h.lifecycles.slice(0, 3)).toEqual(["UNPLANNED", "EDIT_PLANNING", "EDIT_PLANNING"]);
-    expect(current.modelRoundTrace.slice(0, 3).map(({ outcome, tools }) => ({ outcome, tools }))).toEqual([
+    expect(
+      current.modelRoundTrace.slice(0, 3).map(({ outcome, tools }) => ({ outcome, tools })),
+    ).toEqual([
       { outcome: "tool_calls", tools: ["classify_canvas_intent"] },
       { outcome: "done", tools: [] },
       { outcome: "tool_calls", tools: ["plan_canvas_task"] },
@@ -1570,22 +2579,31 @@ describe("progressive conversational canvas tasks", () => {
     expect(current.failure).toBeUndefined();
     expect(current.stages).toHaveLength(1);
     expect(current.editTarget?.query).toBe("home charm");
-    expect(current.ledger.filter((entry) => isCanvasMutationTool(entry.call.action.tool))).toHaveLength(1);
+    expect(
+      current.ledger.filter((entry) => isCanvasMutationTool(entry.call.action.tool)),
+    ).toHaveLength(1);
     expect(chatTaskCommittedOperationCount(current)).toBe(1);
     expect(current.text).toContain("Charm Home");
   });
 
   it("blocks a named edit when discovery is ambiguous", async () => {
-    const h = harness([
-      turn("classify_canvas_intent", { intent: "edit", targetName: "Charm" }),
-      done,
-    ], false);
+    const h = harness(
+      [turn("classify_canvas_intent", { intent: "edit", targetName: "Charm" }), done],
+      false,
+    );
     h.deps.execute.mockImplementationOnce(async (operations) => {
       h.batches.push(operations);
       const result = success(operations);
       result.results[0]!.data = {
         page: { id: "page:current", name: "Current" },
-        discovery: { matchStatus: "ambiguous", matchCount: 2, complete: true, truncated: false, paused: false, pagesRemaining: 0 },
+        discovery: {
+          matchStatus: "ambiguous",
+          matchCount: 2,
+          complete: true,
+          truncated: false,
+          paused: false,
+          pagesRemaining: 0,
+        },
         frames: [
           { ref: "charm-home", pageId: "page:one", name: "Charm Home" },
           { ref: "charm-home-copy", pageId: "page:two", name: "Charm Home" },
@@ -1597,9 +2615,7 @@ describe("progressive conversational canvas tasks", () => {
     delete current.intent;
 
     await runChatTask(current, h.deps);
-    expect(h.batches.flat().map(({ action }) => action.tool)).toEqual([
-      "get_document_context",
-    ]);
+    expect(h.batches.flat().map(({ action }) => action.tool)).toEqual(["get_document_context"]);
     expect(current.stages).toHaveLength(0);
     expect(current.failure).toMatchObject({ code: "target_ambiguous", committedOperations: 0 });
     expect(h.deps.model).toHaveBeenCalledTimes(1);
@@ -3631,19 +4647,19 @@ describe("progressive conversational canvas tasks", () => {
         return {
           ...result,
           data: {
-              nodes: [
-                {
-                  ref: "product-0",
-                  type: "FRAME",
-                  name: "product-0",
-                  x: 0,
-                  y: 0,
-                  width: 390,
-                  height: 844,
-                  visible: true,
-                  bounds: { x: 0, y: 0, width: 390, height: 844 },
-                },
-              ],
+            nodes: [
+              {
+                ref: "product-0",
+                type: "FRAME",
+                name: "product-0",
+                x: 0,
+                y: 0,
+                width: 390,
+                height: 844,
+                visible: true,
+                bounds: { x: 0, y: 0, width: 390, height: 844 },
+              },
+            ],
           },
         };
       });

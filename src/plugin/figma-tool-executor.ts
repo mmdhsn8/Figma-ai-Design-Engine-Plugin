@@ -39,6 +39,7 @@ const TASK_PLUGIN_KEY = "fad.tool.task-id.v1";
 const DESIGN_NAME_PLUGIN_KEY = "fad.design.name.v1";
 const DESIGN_CHAT_PLUGIN_KEY = "fad.design.chat-id.v1";
 const DESIGN_TASK_PLUGIN_KEY = "fad.design.task-id.v1";
+const CHAT_GENERATION_TASK_KEY = "fad.generation.chat-task-id";
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 48 * 1024;
 const OPERATION_TIMEOUT_MS = 10_000;
@@ -1200,6 +1201,33 @@ export function createFigmaToolExecutor(
       (node) => node.getPluginData(TASK_PLUGIN_KEY) === message.taskId,
     );
     const visibleNodes = owned.slice(0, 500);
+    let registeredGenerationRoots = false;
+    for (const node of visibleNodes) {
+      if (node.getPluginData(CHAT_GENERATION_TASK_KEY) !== message.taskId) continue;
+      const ref = node.getPluginData(REF_PLUGIN_KEY);
+      if (!ref || !/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u.test(ref)) continue;
+      const existing = state.refs[ref];
+      if (existing) {
+        if (existing.nodeId === node.id && existing.pageId === pageId && !existing.taskId) {
+          existing.taskId = message.taskId;
+          registeredGenerationRoots = true;
+        }
+        continue;
+      }
+      const matchingNodes = api.currentPage.findAll(
+        (candidate) => candidate.getPluginData(REF_PLUGIN_KEY) === ref,
+      );
+      if (matchingNodes.length !== 1 || matchingNodes[0]?.id !== node.id) continue;
+      state.refs[ref] = {
+        nodeId: node.id,
+        pageId,
+        parentId: node.parent?.id,
+        nodeType: node.type,
+        taskId: message.taskId,
+      };
+      registeredGenerationRoots = true;
+    }
+    if (registeredGenerationRoots) await saveState(state, pageId);
     const ownedIds = new Set(visibleNodes.map(({ id }) => id));
     const nodes = visibleNodes.map((node) => {
       const savedRef = node.getPluginData(REF_PLUGIN_KEY);

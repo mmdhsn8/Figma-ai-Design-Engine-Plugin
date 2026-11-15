@@ -105,9 +105,16 @@ import {
   DESIGN_SKILL_CONTEXT_MARKER,
   pinnedSkillGuidance,
   type DesignSkillStoreSnapshot,
-  type PinnedDesignSkill,
 } from "../shared/design-skill";
 import { inferDesignDomain } from "../shared/visual-design-spec";
+import {
+  createChatScreenLogicalRef,
+  parseChatGenerationIntent,
+  type MultiScreenNativeRoot,
+  type MultiScreenDesignRequest,
+  type MultiScreenGenerationOutcome,
+  type MultiScreenProgressEvent,
+} from "../shared/chat-generation";
 import {
   CompanionClientError,
   cancelLocalPairing,
@@ -374,6 +381,7 @@ function createPairingVerifier(): string {
 
 const TOOL_RESPONSE_TIMEOUT_MS = 45_000;
 
+/* eslint-disable react-hooks/purity -- App's async event handlers pass a deferred generation callback into runChatTask. The rule follows that callback into event-only helpers and treats their Date/performance reads as render work; the suppression is limited to this component. */
 export default function App({ initialView = "home" }: { initialView?: PluginView } = {}) {
   const [navigation, dispatchNavigation] = useReducer(navigationReducer, {
     activeView: initialView,
@@ -1892,6 +1900,32 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     if (!retry && chatTask.current && chatTask.current.status !== "completed") return;
     const text = chatInput.trim();
     if (!retry && !text) return;
+    const generationIntent = !retry ? parseChatGenerationIntent(text) : undefined;
+    if (
+      generationIntent?.kind === "out_of_range" ||
+      generationIntent?.kind === "unsupported_target"
+    ) {
+      if (!activeChatIdRef.current) await createNewChat();
+      const assistantMessage =
+        generationIntent.kind === "unsupported_target"
+          ? "Chat generation currently plans one device family per task. Choose mobile or desktop, then retry. No provider request or canvas change was started."
+          : generationIntent.screenCount > 10
+            ? "Chat screen generation supports 1–10 screens per task. Shorten the request or split it into separate tasks. No provider request or canvas change was started."
+            : "Choose at least one screen for a Chat generation task. No provider request or canvas change was started.";
+      setChatMessages((messages) => [
+        ...messages,
+        { id: `user-${nextRequestId()}`, role: "user", content: text },
+        {
+          id: `assistant-${nextRequestId()}`,
+          role: "assistant",
+          content: assistantMessage,
+        },
+      ]);
+      setChatInput("");
+      return;
+    }
+    const boundedGenerationIntent =
+      generationIntent?.kind === "ready" ? generationIntent.intent : undefined;
     if (!activeChatIdRef.current) await createNewChat();
     const taskChatId = activeChatIdRef.current;
     if (!taskChatId) return;
@@ -1972,8 +2006,23 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             ]
           : [];
         const taskContext = [
-          ...priorContext.slice(skillContext.length ? -27 : -28),
+          ...priorContext.slice(
+            -(28 - (skillContext.length ? 1 : 0) - (boundedGenerationIntent ? 1 : 0)),
+          ),
           ...skillContext,
+          ...(boundedGenerationIntent
+            ? [
+                {
+                  role: "user" as const,
+                  content: [
+                    "MULTI_SCREEN_GENERATION_HANDOFF_V1",
+                    `Plan exactly ${boundedGenerationIntent.screenCount} new ${boundedGenerationIntent.target} screens in ${boundedGenerationIntent.locale}.`,
+                    "Use classify_canvas_intent first. Only a create intent may use this handoff. Then call plan_canvas_task once with exactly one ordered stage per screen; no document inspection or native operations are needed for a new design.",
+                    "For each stage provide a distinct title, concise purpose and goal, priority, optional navigation targets and dependencies using exact planned screen titles, bounded contentPlaceholders, and componentOpportunities. Keep the requested app domain and user-named screen roles. A mobile viewport must be exactly 390×844; desktop must be exactly 1440×900. Keep visual tone, typography, spacing, content, and RTL/LTR direction coherent across all screens.",
+                  ].join("\n"),
+                },
+              ]
+            : []),
         ];
         assistantId = id;
         chatTask.current = {
@@ -1985,6 +2034,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           accountScope: session.accountScope,
           prompt: text,
           model: selectedCompanionModel,
+          ...(boundedGenerationIntent ? { generationIntent: boundedGenerationIntent } : {}),
           ...(selectedBrand ? { brandKit: pinBrandKit(selectedBrand) } : {}),
           ...(skillSelection.skills.length ? { designSkills: skillSelection.skills } : {}),
           lifecycle: "UNPLANNED",
@@ -2040,6 +2090,33 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       );
       await runChatTask(task, {
         signal: controller.signal,
+        generateMultiScreen: async (
+          request: MultiScreenDesignRequest,
+          report: (event: MultiScreenProgressEvent) => Promise<void>,
+        ) => {
+          if (request.model !== executionModel)
+            throw new Error(
+              "model_pin_conflict: The selected model no longer matches this saved Chat task.",
+            );
+          return generateDesignFromBrief({
+            request,
+            signal: controller.signal,
+            report,
+            assertAuthorized: async () => {
+              checkChatSession();
+              const latest = await getCompanionStatus(companionToken);
+              checkChatSession();
+              if (
+                latest.sessionId !== session.sessionId ||
+                latest.accountScope !== session.accountScope ||
+                !latest.planUseAuthorized
+              )
+                throw new Error(
+                  "Stopped because the Companion account changed during screen generation.",
+                );
+            },
+          });
+        },
         save: async (checkpoint) => {
           await chatTaskBridge({
             type: "chat-task-save",
@@ -2825,82 +2902,116 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     dispatchNavigation({ type: "navigate", view: "json" });
   };
 
-  const generateDesignFromBrief = async () => {
-    if (generationRequest.current) return;
-    let brandStore: BrandKitStoreSnapshot;
-    try {
-      brandStore = await ensureBrandKitLoaded();
-    } catch (error) {
-      setGenerationState("failed");
-      setGenerationErrors([
-        error instanceof Error ? error.message : "Brand Kit storage is unavailable.",
-      ]);
+  const generateDesignFromBrief = async (handoff?: {
+    request: MultiScreenDesignRequest;
+    signal: AbortSignal;
+    report: (event: MultiScreenProgressEvent) => Promise<void>;
+    assertAuthorized: () => Promise<void>;
+  }): Promise<MultiScreenGenerationOutcome | undefined> => {
+    if (generationRequest.current) {
+      if (handoff)
+        throw new Error("generation_busy: Another structured generation task is already active.");
       return;
     }
-    const selectedBrand = brandStore.brands.find(
-      ({ id, status }) => id === brandStore.defaultBrandId && status === "active",
-    );
-    let pinnedBrand = selectedBrand ? pinBrandKit(selectedBrand) : undefined;
-    let skillStore: DesignSkillStoreSnapshot;
-    try {
-      skillStore = await ensureDesignSkillsLoaded();
-    } catch (cause) {
-      setGenerationState("failed");
-      setGenerationErrors([
-        cause instanceof Error ? cause.message : "Design Skills storage is unavailable.",
-      ]);
-      return;
+    const generationInput = handoff?.request.request ?? designGenerationInput;
+    const generationModel = handoff?.request.model ?? selectedCompanionModel;
+    let pinnedBrand = handoff?.request.brandKit;
+    let pinnedSkills = handoff?.request.designSkills;
+    if (!handoff) {
+      let brandStore: BrandKitStoreSnapshot;
+      try {
+        brandStore = await ensureBrandKitLoaded();
+      } catch (error) {
+        setGenerationState("failed");
+        const message =
+          error instanceof Error ? error.message : "Brand Kit storage is unavailable.";
+        setGenerationErrors([message]);
+        if (handoff) throw error;
+        return;
+      }
+      const selectedBrand = brandStore.brands.find(
+        ({ id, status }) => id === brandStore.defaultBrandId && status === "active",
+      );
+      pinnedBrand = selectedBrand ? pinBrandKit(selectedBrand) : undefined;
     }
     let brandVisualAssets: Awaited<ReturnType<typeof resolvePinnedBrandAssets>>;
-    const preliminaryPlan = createDesignPlan(designGenerationInput, pinnedBrand);
+    const preliminaryPlan = createDesignPlan(generationInput, pinnedBrand, pinnedSkills);
     if (!preliminaryPlan.success) {
       setGenerationState("failed");
       setGenerationErrors(preliminaryPlan.errors);
+      if (handoff) throw new Error(preliminaryPlan.errors.join(" "));
       return;
     }
-    const skillSelection = selectDesignSkills({
-      skills: skillStore.skills,
-      enabledIds: skillStore.entries
-        .filter((entry) => entry.enabled && !entry.archived && !entry.removed)
-        .map(({ id: skillId }) => skillId),
-      defaultIds: skillStore.defaultSkillIds,
-      prompt: preliminaryPlan.data.request.prompt,
-      domain: preliminaryPlan.data.domain,
-      task: preliminaryPlan.data.request.screenCount > 1 ? "multi-screen" : "new-design",
-      locale: preliminaryPlan.data.language,
-      screen:
-        preliminaryPlan.data.request.target === "both"
-          ? "responsive"
-          : preliminaryPlan.data.request.target,
-    });
-    if (skillSelection.conflicts.length) {
-      setGenerationState("failed");
-      setGenerationErrors(skillSelection.conflicts);
-      return;
+    if (!handoff) {
+      let skillStore: DesignSkillStoreSnapshot;
+      try {
+        skillStore = await ensureDesignSkillsLoaded();
+      } catch (cause) {
+        setGenerationState("failed");
+        const message =
+          cause instanceof Error ? cause.message : "Design Skills storage is unavailable.";
+        setGenerationErrors([message]);
+        if (handoff) throw cause;
+        return;
+      }
+      const skillSelection = selectDesignSkills({
+        skills: skillStore.skills,
+        enabledIds: skillStore.entries
+          .filter((entry) => entry.enabled && !entry.archived && !entry.removed)
+          .map(({ id: skillId }) => skillId),
+        defaultIds: skillStore.defaultSkillIds,
+        prompt: preliminaryPlan.data.request.prompt,
+        domain: preliminaryPlan.data.domain,
+        task: preliminaryPlan.data.request.screenCount > 1 ? "multi-screen" : "new-design",
+        locale: preliminaryPlan.data.language,
+        screen:
+          preliminaryPlan.data.request.target === "both"
+            ? "responsive"
+            : preliminaryPlan.data.request.target,
+      });
+      if (skillSelection.conflicts.length) {
+        setGenerationState("failed");
+        setGenerationErrors(skillSelection.conflicts);
+        if (handoff) throw new Error(skillSelection.conflicts.join(" "));
+        return;
+      }
+      pinnedSkills = skillSelection.skills.length ? skillSelection.skills : undefined;
     }
-    let pinnedSkills: PinnedDesignSkill[] | undefined = skillSelection.skills.length
-      ? skillSelection.skills
-      : undefined;
-    const planResult = createDesignPlan(designGenerationInput, pinnedBrand, pinnedSkills);
+    const planResult = createDesignPlan(generationInput, pinnedBrand, pinnedSkills);
     if (!planResult.success) {
       setGenerationState("failed");
       setGenerationErrors(planResult.errors);
+      if (handoff) throw new Error(planResult.errors.join(" "));
       return;
     }
     let planData: DesignPlan = planResult.data;
-    if (generationBlockReason || !companionToken || !selectedCompanionModel) {
+    if (handoff) {
+      const planIds = planData.screens.map(({ id }) => id);
+      const handoffIds = handoff.request.screens.map(({ id }) => id);
+      if (JSON.stringify(planIds) !== JSON.stringify(handoffIds))
+        throw new Error(
+          "multi_screen_plan_conflict: The generation renderer plan differs from the saved Chat plan.",
+        );
+    }
+    if (generationBlockReason || !companionToken || !generationModel) {
       setGenerationState("failed");
-      setGenerationErrors([generationBlockReason ?? "Connect the authorized companion first."]);
+      const message = generationBlockReason ?? "Connect the authorized companion first.";
+      setGenerationErrors([message]);
+      if (handoff) throw new Error(message);
       return;
     }
     if (!documentId) {
       setGenerationErrors(["Wait for document identity before generating."]);
       setGenerationState("failed");
+      if (handoff) throw new Error("Wait for document identity before generating.");
       return;
     }
 
     const requestId = nextRequestId();
     const controller = new AbortController();
+    const cancelFromChat = () => controller.abort();
+    if (handoff?.signal.aborted) controller.abort();
+    else handoff?.signal.addEventListener("abort", cancelFromChat, { once: true });
     const totalStartedAt = performance.now();
     generationRequest.current = requestId;
     generationAbort.current = controller;
@@ -2925,11 +3036,12 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       setGenerationErrors([
         "Generation was cancelled. No model-generated Figma content was created.",
       ]);
+      if (handoff) throw new CompanionClientError("request_cancelled");
       return;
     }
 
     const draftKey = JSON.stringify({
-      model: selectedCompanionModel,
+      model: generationModel,
       request: planData.request,
     });
     let draft: GenerationDraft = {
@@ -2938,8 +3050,14 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       manifest: {
         version: 1,
         documentId,
-        generationId: `generation-${nextRequestId()}`,
-        model: selectedCompanionModel,
+        generationId: handoff?.request.generationId ?? `generation-${nextRequestId()}`,
+        ...(handoff
+          ? {
+              chatTaskId: handoff.request.taskId,
+              planFingerprint: handoff.request.planFingerprint,
+            }
+          : {}),
+        model: generationModel,
         request: planData.request,
         ...(pinnedBrand ? { brandKit: pinnedBrand } : {}),
         ...(pinnedSkills?.length ? { designSkills: pinnedSkills } : {}),
@@ -2957,8 +3075,34 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     let firstSectionRecorded = false;
     let firstNativeNodeRecorded = false;
     let repairAttempts = 0;
+    let completedOutcome: MultiScreenGenerationOutcome | undefined;
 
     const sectionKey = (screenId: string, sectionId: string) => `${screenId}:${sectionId}`;
+    const emitHandoffProgress = async (
+      phase: MultiScreenProgressEvent["phase"],
+      screen?: { id: string; order: number },
+      sectionId?: MultiScreenProgressEvent["sectionId"],
+      nativeRoot?: MultiScreenNativeRoot,
+    ) => {
+      if (!handoff) return;
+      const completedSections = new Set(
+        draft.transactions.map(({ transaction }) => transaction.idempotency_key),
+      ).size;
+      const completedScreens = new Set(
+        draft.transactions
+          .filter(({ transaction }) => transaction.screen_completed)
+          .map(({ transaction }) => transaction.screen_id),
+      ).size;
+      await handoff.report({
+        phase,
+        ...(screen ? { screenId: screen.id, screenIndex: screen.order } : {}),
+        ...(sectionId ? { sectionId } : {}),
+        ...(nativeRoot ? { nativeRoot } : {}),
+        completedScreens,
+        completedSections: Math.min(planData.screens.length * 3, completedSections),
+        totalScreens: planData.screens.length,
+      });
+    };
     const markSection = (screenId: string, sectionId: string, stage: SectionStage) => {
       setSectionStages((current) => ({ ...current, [sectionKey(screenId, sectionId)]: stage }));
       setLastProgressAt(Date.now());
@@ -3040,6 +3184,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       const key = sectionKey(transaction.screen_id, transaction.section_id);
       markSection(transaction.screen_id, transaction.section_id, "applying");
       setGenerationState("rendering");
+      const renderScreen = planData.screens.find(({ id }) => id === transaction.screen_id);
+      if (renderScreen)
+        await emitHandoffProgress("native-render", renderScreen, transaction.section_id);
       const started = performance.now();
       const rendered = await generationBridge(
         {
@@ -3089,8 +3236,21 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         throw new Error(
           "Figma page changed; reopen the plugin in the intended page before resuming.",
         );
+      if (handoff && handoff.request.documentId !== activeContext.documentId)
+        throw new Error(
+          "multi_screen_document_conflict: The saved Chat task belongs to a different Figma document or page.",
+        );
       const recovered = await loadSavedDraft(companionToken, documentId);
       if (recovered) {
+        if (
+          handoff &&
+          (recovered.manifest.generationId !== handoff.request.generationId ||
+            recovered.manifest.chatTaskId !== handoff.request.taskId ||
+            recovered.manifest.planFingerprint !== handoff.request.planFingerprint)
+        )
+          throw new Error(
+            "multi_screen_draft_conflict: The saved document draft belongs to another Chat generation.",
+          );
         if (
           JSON.stringify({
             model: recovered.manifest.model,
@@ -3134,6 +3294,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         generationId: draft.manifest.generationId,
       });
       setActiveGenerationId(draft.manifest.generationId);
+      await emitHandoffProgress("planning");
 
       const transactionScreenIds = new Set(
         draft.transactions.map(({ transaction }) => transaction.screen_id),
@@ -3194,6 +3355,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
       for (const screen of planData.screens) {
         if (legacyScreenIds.has(screen.id)) continue;
+        await emitHandoffProgress("screen-start", screen);
         const screenPlan = { ...planData, screens: [screen] };
         const sections = createDesignSections(planData);
         setScreenStages((stages) => ({ ...stages, [screen.id]: "generating sections" }));
@@ -3207,6 +3369,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           );
           await waitForResume(screen.id, section.id);
           if (persisted) {
+            await emitHandoffProgress("section-saved", screen, section.id);
             await renderSection(persisted);
             continue;
           }
@@ -3223,11 +3386,13 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           for (let attempt = 0; attempt <= 1; attempt++) {
             markSection(screen.id, section.id, attempt ? "needs-repair" : "generating");
             setGenerationState(attempt ? "repairing" : "generating");
+            await handoff?.assertAuthorized();
+            await emitHandoffProgress("section-start", screen, section.id);
             const inferenceStarted = performance.now();
             const raw = await generateAuthorizedDesign(
               companionToken,
               screenRequestId,
-              selectedCompanionModel,
+              generationModel,
               planData.request,
               repairIssues,
               fetch,
@@ -3389,6 +3554,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             ),
           }));
           markSection(screen.id, section.id, "saved");
+          await emitHandoffProgress("section-saved", screen, section.id);
           if (controller.signal.aborted) throw new CompanionClientError("request_cancelled");
           await renderSection(draft.transactions[draft.transactions.length - 1]!);
           updateScreenProgress();
@@ -3417,6 +3583,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         );
       nativeWarnings.push(...prepared.data.brandConflicts);
       setGenerationState("validating");
+      const nativeRoots: MultiScreenNativeRoot[] = [];
       for (const screen of completeScreens) {
         const verificationStarted = performance.now();
         const verified = await generationBridge({
@@ -3432,6 +3599,16 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         if (!verified.nodeId)
           throw new Error(`Figma did not return a native identity for ${screen.id} verification.`);
         nativeWarnings.push(...(verified.warnings ?? []));
+        const screenPlan = planData.screens.find(({ id }) => id === screen.id);
+        if (handoff) {
+          const logicalRef = createChatScreenLogicalRef(draft.manifest.generationId, screen.id);
+          if (verified.logicalRef !== logicalRef)
+            throw new Error(`Figma did not confirm the task-owned reference for ${screen.id}.`);
+          const nativeRoot = { screenId: screen.id, nodeId: verified.nodeId, logicalRef };
+          nativeRoots.push(nativeRoot);
+          if (screenPlan)
+            await emitHandoffProgress("screen-verified", screenPlan, undefined, nativeRoot);
+        } else if (screenPlan) await emitHandoffProgress("screen-verified", screenPlan);
         setStageMetrics((metrics) => ({
           ...metrics,
           [`${screen.id}.nativeVerificationMs`]: Math.round(
@@ -3439,6 +3616,14 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           ),
         }));
       }
+      completedOutcome = {
+        generationId: draft.manifest.generationId,
+        screenIds: planData.screens.map(({ id }) => id),
+        verifiedScreenIds: planData.screens.map(({ id }) => id),
+        ...(handoff ? { nativeRoots } : {}),
+        nodeCount: prepared.data.nodeCount,
+      };
+      await emitHandoffProgress("complete");
       const audit = auditVisualQuality(prepared.data.batch);
       const warnings = [
         ...nativeWarnings,
@@ -3504,6 +3689,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           }
         }
       }
+      if (handoff) throw error;
     } finally {
       if (generationRequest.current === requestId)
         setStageMetrics((metrics) => ({
@@ -3514,8 +3700,16 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       if (generationAbort.current === controller) generationAbort.current = null;
       generationPauseRequested.current = false;
       generationResume.current = null;
+      handoff?.signal.removeEventListener("abort", cancelFromChat);
       setPauseRequested(false);
       setGenerationPaused(false);
+    }
+    if (handoff) {
+      if (!completedOutcome)
+        throw new Error(
+          "multi_screen_verification_incomplete: No confirmed native completion was returned.",
+        );
+      return completedOutcome;
     }
   };
 
@@ -5998,6 +6192,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     </main>
   );
 }
+/* eslint-enable react-hooks/purity */
 
 function companionErrorText(error: unknown): string {
   const category =
