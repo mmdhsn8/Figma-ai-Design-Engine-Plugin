@@ -259,7 +259,7 @@ export type NativeGenerationAdoption = z.infer<typeof NativeGenerationAdoptionSc
 export type FigmaToolExecutor = ((message: Extract<UIToPluginMessage, {
   type: "tool-execute" | "tool-cancel" | "tool-pause" | "tool-delete-consent" | "task-native-inspect" | "task-native-focus";
 }>) => Promise<void>) & {
-  registerRenderedGeneration(request: NativeGenerationAdoption): Promise<{ registeredRefs: number; persistenceMs: number }>;
+  registerRenderedGeneration(request: NativeGenerationAdoption): Promise<{ registeredRefs: number; persistenceMs: number; operationIds: string[] }>;
 };
 
 class ToolStateError extends Error {
@@ -1255,6 +1255,8 @@ export function createFigmaToolExecutor(
       const refEntry = savedRef ? state.refs[savedRef] : undefined;
       const frame = node as SceneNode & {
         layoutMode?: string;
+        clipsContent?: boolean;
+        overflowDirection?: "NONE" | "HORIZONTAL" | "VERTICAL" | "BOTH";
         itemSpacing?: number;
         paddingTop?: number;
         paddingRight?: number;
@@ -1283,6 +1285,8 @@ export function createFigmaToolExecutor(
         ...(hasLayout
           ? {
               layoutMode: frame.layoutMode,
+              ...(typeof frame.clipsContent === "boolean" ? { clipsContent: frame.clipsContent } : {}),
+              ...(frame.overflowDirection ? { overflowDirection: frame.overflowDirection } : {}),
               ...(typeof frame.itemSpacing === "number" ? { itemSpacing: frame.itemSpacing } : {}),
               ...(typeof frame.paddingTop === "number" &&
               typeof frame.paddingRight === "number" &&
@@ -3812,12 +3816,13 @@ export function createFigmaToolExecutor(
 
   const registerRenderedGeneration = async (
     request: NativeGenerationAdoption,
-  ): Promise<{ registeredRefs: number; persistenceMs: number }> => {
+  ): Promise<{ registeredRefs: number; persistenceMs: number; operationIds: string[] }> => {
     const parsed = NativeGenerationAdoptionSchema.parse(request);
     await queue;
     assertTaskPageScope(parsed.documentId, parsed.pageId);
     const rootsSeen = new Set<string>();
     const refsSeen = new Set<string>();
+    const operationIds: string[] = [];
     const claims: Array<{ node: SceneNode; screenId: string; ref: string; semanticRole: string }> = [];
     for (const expected of parsed.roots) {
       if (rootsSeen.has(expected.screenId)) throw new Error("A generated screen identity was supplied more than once.");
@@ -3875,6 +3880,7 @@ export function createFigmaToolExecutor(
     try {
       for (const { node, screenId, ref, semanticRole } of claims) {
         const operationId = `adopt-${fingerprint(`${parsed.taskId}:${parsed.batchId}:${screenId}:${ref}`).slice(0, 24)}`;
+        operationIds.push(operationId);
         const creationFingerprint = fingerprint(JSON.stringify(["native-render-adoption-v1", parsed.taskId, parsed.batchId, screenId, node.id, ref, node.type]));
         const existing = state.refs[ref];
         if (existing) {
@@ -3930,7 +3936,7 @@ export function createFigmaToolExecutor(
       for (const ref of changedRefs) delete state.refs[ref];
       throw error;
     }
-    return { registeredRefs: claims.length, persistenceMs };
+    return { registeredRefs: claims.length, persistenceMs, operationIds };
   };
 
   return Object.assign(execute, { registerRenderedGeneration });

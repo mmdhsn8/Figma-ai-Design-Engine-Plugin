@@ -12,6 +12,7 @@ import { renderDesign, renderMultiScreenDesign } from "./renderer";
 import { collectFontRequirements, unavailableFontWarnings } from "./font-preflight";
 import { createGenerationController } from "./generation-controller";
 import { createFigmaToolExecutor } from "./figma-tool-executor";
+import { renderDesignProgramLocal } from "./design-program-spike";
 import { handleChatTaskStorage } from "./chat-task-storage";
 import { handleChatHistoryStorage } from "./chat-history-storage";
 import { handleModelPreferenceStorage } from "./model-preference-storage";
@@ -145,6 +146,69 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     message.data.type === "chat-history-delete"
   ) {
     send(await handleChatHistoryStorage(figma, message.data));
+    return;
+  }
+  if (message.data.type === "design-program-render") {
+    const request = message.data;
+    const pageId = figma.currentPage.id;
+    const activeDocumentId = () => {
+      const localId = figma.root.getPluginData("fad.document-id");
+      const fileId = figma.fileKey ?? localId;
+      return fileId ? `${fileId}-${figma.currentPage.id.replaceAll(":", "_")}` : undefined;
+    };
+    const assertCurrentScope = () => {
+      if (figma.currentPage.id !== pageId || activeDocumentId() !== request.documentId)
+        throw new Error("stale_document_scope");
+    };
+    try {
+      assertCurrentScope();
+      const result = await renderDesignProgramLocal(figma, request.program, {
+        taskId: request.taskId,
+        documentId: request.documentId,
+        pageId,
+        executor: figmaToolExecutor,
+        assertCurrentScope,
+      });
+      if (!result.success) {
+        send({
+          type: "design-program-render-result",
+          requestId: request.requestId,
+          taskId: request.taskId,
+          success: false,
+          errorCode: result.code,
+          findings: result.findings.slice(0, 20),
+        });
+        return;
+      }
+      const root = result.roots.find(({ screenId }) => screenId === request.program.screens[0]?.id);
+      if (!root) throw new Error("rendered_root_missing");
+      send({
+        type: "design-program-render-result",
+        requestId: request.requestId,
+        taskId: request.taskId,
+        success: true,
+        screenId: root.screenId,
+        rootRef: root.ref,
+        nativeBatchId: result.batchId,
+        adoptionOperationIds: result.operationIds,
+        programFingerprint: result.fingerprint,
+        nativeNodeCount: result.registeredRefs,
+      });
+    } catch (error) {
+      send({
+        type: "design-program-render-result",
+        requestId: request.requestId,
+        taskId: request.taskId,
+        success: false,
+        errorCode: error instanceof Error && error.message === "stale_document_scope" ? "stale_document_scope" : "native_render_error",
+        findings: [{
+          code: error instanceof Error && error.message === "stale_document_scope" ? "stale_document_scope" : "native_render_error",
+          path: "renderer",
+          message: error instanceof Error && error.message === "stale_document_scope" ? "The active Figma document or page changed; no screen was adopted." : "The local native renderer could not confirm this screen.",
+          severity: "error",
+        }],
+      });
+    }
     return;
   }
   if (

@@ -68,6 +68,10 @@ import {
   type MultiScreenDesignRequest,
   type MultiScreenProgressEvent,
 } from "../shared/chat-generation";
+import { runUniversalDesignTask } from "./universal-design-task";
+import type { DesignProgramV1 } from "../shared/design-program";
+import type { DesignProgramRenderResponse } from "./design-program-bridge";
+import type { UIToPluginMessage } from "../shared/messages";
 
 type Result = Extract<PluginToUIMessage, { type: "tool-result" }>;
 
@@ -150,6 +154,12 @@ type Dependencies = {
     request: MultiScreenDesignRequest,
     progress: (event: MultiScreenProgressEvent) => Promise<void>,
   ): Promise<unknown>;
+  assertAuthorized?(): Promise<void>;
+  renderProgram?(program: DesignProgramV1, requestId: string): Promise<DesignProgramRenderResponse>;
+  inspectProgram?(
+    request: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
+  ): Promise<Extract<PluginToUIMessage, { type: "task-native-inspection-result" }>>;
+  timingEvidence?: "live" | "mock";
   signal: AbortSignal;
   now?: () => number;
   wait?: (ms: number, signal: AbortSignal) => Promise<void>;
@@ -3701,7 +3711,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       ? "native_execution"
       : "planning";
   syncCapacityAccounting(task);
-  if (readOnly()) transition("INSPECTING");
+  if (task.executionRoute === "universal-design-v1" && !task.intent && !task.stages.length)
+    transition("UNIVERSAL_CLASSIFY");
+  else if (readOnly()) transition("INSPECTING");
   else if (!task.stages.length)
     transition(
       task.intent === "edit"
@@ -3793,6 +3805,23 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     }
     while (true) {
       check();
+      if (task.executionRoute === "universal-design-v1" && task.intent === "create") {
+        if (!deps.assertAuthorized || !deps.renderProgram || !deps.inspectProgram)
+          throw new Error("universal_route_dependencies_missing: The authenticated provider and native renderer bridges are required.");
+        await runUniversalDesignTask(task, {
+          model: deps.model,
+          save: deps.save,
+          progress: deps.progress,
+          assertAuthorized: deps.assertAuthorized,
+          renderProgram: deps.renderProgram,
+          inspectProgram: deps.inspectProgram,
+          signal: deps.signal,
+          now,
+          onPhase: (phase) => { activePhase = phase; },
+          timingEvidence: deps.timingEvidence ?? "live",
+        });
+        return;
+      }
       if (task.generationIntent && task.intent === "create" && task.stages.length > 0) {
         await runMultiScreenHandoff();
         return;
@@ -4115,6 +4144,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             throw new Error(
               "Structured screen creation could not be confirmed. Start a new task with the screen count, names, and device family.",
             );
+          if (task.executionRoute === "universal-design-v1" && call.action.intent !== "create")
+            throw new Error("universal_route_intent_conflict: This saved create route cannot be reinterpreted as an edit or inspection.");
           const replayed =
             task.intent === call.action.intent &&
             (!call.action.targetName || call.action.targetName === task.targetName);
@@ -4125,6 +4156,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           if (readOnly()) {
             transition("INSPECTING");
             activePhase = "inspection";
+          } else if (task.executionRoute === "universal-design-v1") {
+            transition("UNIVERSAL_PLANNING");
+            activePhase = "planning";
           } else if (task.intent === "edit") {
             transition("EDIT_TARGETING");
             activePhase = "inspection";

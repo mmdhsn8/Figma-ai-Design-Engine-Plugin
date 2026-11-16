@@ -5,6 +5,8 @@ import {
   type FigmaToolAction,
 } from "./figma-tools.js";
 import { DESIGN_PATTERN_IDS } from "./design-patterns.js";
+import { DesignProgramV1Schema } from "./design-program.js";
+import { ProjectPlanDraftSchema } from "./universal-design.js";
 
 export const CHAT_TOOL_NAMES = [
   "classify_canvas_intent",
@@ -20,6 +22,9 @@ export const CHAT_TOOL_NAMES = [
   "get_operation_status",
   "plan_canvas_task",
   "complete_canvas_stage",
+  "plan_universal_project",
+  "compose_design_program",
+  "repair_design_program",
 ] as const;
 
 export const CHAT_LIFECYCLE_STATES = [
@@ -32,6 +37,10 @@ export const CHAT_LIFECYCLE_STATES = [
   "VERIFYING_STAGE",
   "STAGE_COMPLETED",
   "TASK_COMPLETED",
+  "UNIVERSAL_PLANNING",
+  "UNIVERSAL_COMPOSING",
+  "UNIVERSAL_REPAIR",
+  "UNIVERSAL_CLASSIFY",
 ] as const;
 export const ChatLifecycleStateSchema = z.enum(CHAT_LIFECYCLE_STATES);
 export type ChatLifecycleState = z.infer<typeof ChatLifecycleStateSchema>;
@@ -274,6 +283,38 @@ export const ChatStageActionSchema = z
   })
   .strict();
 
+export const PlanUniversalProjectActionSchema = ProjectPlanDraftSchema.extend({
+  tool: z.literal("plan_universal_project"),
+});
+
+const universalProgramActionFields = {
+  screenId: z.string().regex(/^screen-(?:0[1-9]|10)$/u),
+  program: DesignProgramV1Schema,
+};
+export const ComposeDesignProgramActionSchema = z
+  .object({ tool: z.literal("compose_design_program"), ...universalProgramActionFields })
+  .strict()
+  .superRefine((action, context) => {
+    if (action.program.screens.length !== 1 || action.program.screens[0]?.id !== action.screenId)
+      context.addIssue({ code: "custom", path: ["program", "screens"], message: "Compose exactly the requested planned screen." });
+  });
+
+export const RepairDesignProgramActionSchema = z
+  .object({
+    tool: z.literal("repair_design_program"),
+    ...universalProgramActionFields,
+    findings: z.array(z.object({
+      code: z.string().regex(/^[a-z0-9_-]{1,80}$/u),
+      path: z.string().max(200),
+      message: z.string().max(180),
+    }).strict()).min(1).max(12),
+  })
+  .strict()
+  .superRefine((action, context) => {
+    if (action.program.screens.length !== 1 || action.program.screens[0]?.id !== action.screenId)
+      context.addIssue({ code: "custom", path: ["program", "screens"], message: "Repair only the requested planned screen." });
+  });
+
 export const ChatFunctionCallSchema = z
   .object({
     callId: CallIdSchema,
@@ -283,6 +324,9 @@ export const ChatFunctionCallSchema = z
       ChatCanvasIntentActionSchema,
       ChatPlanActionSchema,
       ChatStageActionSchema,
+      PlanUniversalProjectActionSchema,
+      ComposeDesignProgramActionSchema,
+      RepairDesignProgramActionSchema,
     ]),
     normalizedPlanningMetadata: z.boolean().optional(),
     normalizedInspectionParameters: z.boolean().optional(),
@@ -352,12 +396,21 @@ const descriptions: Record<ChatToolName, string> = {
   reparent_node:
     "Explicitly move an inspected or current-task native node to a frame/component using logical refs when the requested task calls for that move. The executor rejects stale parent identity and cycles; it does not infer authorization from append_child.",
   get_operation_status: "Read the saved status of a prior operation by operation ID.",
+  plan_universal_project:
+    "Create one open-domain ProjectPlanV1 for the already checkpointed new design request. Use free-form product purpose, entities, roles and domain tags; return the exact requested screen count when one was given, otherwise choose 1–10 distinct useful screens. Each screen needs one purpose, 3–6 content regions, user task, entry/exit, relationships, density and scroll intent. Distinguish requested from inferred screens, facts from assumptions, and never invent real records. No document inspection or canvas mutation.",
+  compose_design_program:
+    "Compose exactly one planned screen as a complete DesignProgramV1 value. Match the supplied stable screen ID, viewport, language, direction and pinned revisions. Use generic native frames, text, shapes and layout; use only labeled placeholders for unavailable assets. No URLs, code, unrequested screens or guessed document refs.",
+  repair_design_program:
+    "Repair only the supplied one-screen DesignProgramV1 fields identified by the bounded findings. Preserve valid content, stable IDs, screen identity, scope and visual intent. Return one complete corrected program; do not add screens, tools, external assets or executable content.",
 };
 
 function actionSchema(name: ChatToolName): z.ZodType {
   if (name === "classify_canvas_intent") return ChatCanvasIntentActionSchema;
   if (name === "plan_canvas_task") return ChatPlanActionSchema;
   if (name === "complete_canvas_stage") return ChatStageActionSchema;
+  if (name === "plan_universal_project") return PlanUniversalProjectActionSchema;
+  if (name === "compose_design_program") return ComposeDesignProgramActionSchema;
+  if (name === "repair_design_program") return RepairDesignProgramActionSchema;
   const schema = FigmaToolActionSchema.options.find((option) => option.shape.tool.value === name);
   if (!schema) throw new Error(`Missing action schema for ${name}.`);
   return schema;
@@ -441,12 +494,23 @@ export function chatFunctionToolsForState(state: ChatLifecycleState) {
                 "inspect_nodes",
                 "plan_canvas_task",
               ]
+            : state === "UNIVERSAL_PLANNING"
+              ? ["plan_universal_project"]
+              : state === "UNIVERSAL_COMPOSING"
+                ? ["compose_design_program"]
+                : state === "UNIVERSAL_REPAIR"
+                  ? ["repair_design_program"]
+                  : state === "UNIVERSAL_CLASSIFY"
+                    ? ["classify_canvas_intent"]
             : state === "EXECUTING_STAGE"
               ? CHAT_TOOL_NAMES.filter(
                   (name) =>
                     name !== "classify_canvas_intent" &&
                     name !== "plan_canvas_task" &&
-                    name !== "get_document_context",
+                    name !== "get_document_context" &&
+                    name !== "plan_universal_project" &&
+                    name !== "compose_design_program" &&
+                    name !== "repair_design_program",
                 )
               : state === "PLAN_SAVED" || state === "STAGE_COMPLETED"
                 ? CHAT_TOOL_NAMES.filter(
@@ -454,7 +518,10 @@ export function chatFunctionToolsForState(state: ChatLifecycleState) {
                       name !== "classify_canvas_intent" &&
                       name !== "plan_canvas_task" &&
                       name !== "get_document_context" &&
-                      name !== "complete_canvas_stage",
+                      name !== "complete_canvas_stage" &&
+                      name !== "plan_universal_project" &&
+                      name !== "compose_design_program" &&
+                      name !== "repair_design_program",
                   )
                 : state === "VERIFYING_STAGE"
                   ? ["inspect_nodes", "get_operation_status", "set_auto_layout", "set_properties"]

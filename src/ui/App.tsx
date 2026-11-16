@@ -35,6 +35,9 @@ import {
 } from "../shared/chat-task";
 import { runChatTask, chatTaskInput } from "./chat-task";
 import { chatHistoryBridge, chatTaskBridge } from "./chat-task-bridge";
+import { renderDesignProgramBridge } from "./design-program-bridge";
+import { selectChatExecutionRoute, universalDesignRouteEnabled } from "./universal-design-route";
+import { taskNativeBridge } from "./task-native-bridge";
 import { ChatHistoryView } from "./chat-history-view";
 import { ChatDeleteDialog } from "./chat-delete-dialog";
 import { HomeDashboard } from "./home-dashboard";
@@ -1099,7 +1102,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         message.type === "chat-task-result" ||
         message.type === "chat-history-result" ||
         message.type === "task-native-inspection-result" ||
-        message.type === "task-native-focus-result"
+        message.type === "task-native-focus-result" ||
+        message.type === "design-program-render-result"
       )
         return;
       if (message.type === "tool-progress") {
@@ -1908,6 +1912,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     const text = chatInput.trim();
     if (!retry && !text) return;
     const generationIntent = !retry ? parseChatGenerationIntent(text) : undefined;
+    const selectedRoute = !retry
+      ? selectChatExecutionRoute(text, universalDesignRouteEnabled())
+      : undefined;
     if (
       generationIntent?.kind === "out_of_range" ||
       generationIntent?.kind === "unsupported_target"
@@ -2017,7 +2024,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             -(28 - (skillContext.length ? 1 : 0) - (boundedGenerationIntent ? 1 : 0)),
           ),
           ...skillContext,
-          ...(boundedGenerationIntent
+          ...(boundedGenerationIntent && selectedRoute !== "universal-design-v1"
             ? [
                 {
                   role: "user" as const,
@@ -2041,6 +2048,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           accountScope: session.accountScope,
           prompt: text,
           model: selectedCompanionModel,
+          executionRoute: selectedRoute ?? "legacy",
           ...(boundedGenerationIntent ? { generationIntent: boundedGenerationIntent } : {}),
           ...(selectedBrand ? { brandKit: pinBrandKit(selectedBrand) } : {}),
           ...(skillSelection.skills.length ? { designSkills: skillSelection.skills } : {}),
@@ -2135,6 +2143,37 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           setChatTaskSnapshot(structuredClone(checkpoint));
         },
         progress: setChatActivity,
+        assertAuthorized: async () => {
+          checkChatSession();
+          const latest = await getCompanionStatus(companionToken);
+          checkChatSession();
+          if (
+            latest.sessionId !== session.sessionId ||
+            latest.accountScope !== session.accountScope ||
+            !latest.planUseAuthorized
+          )
+            throw new Error("Stopped because the Companion account changed during universal screen planning.");
+        },
+        renderProgram: async (program, requestId) => {
+          checkChatSession();
+          const response = await renderDesignProgramBridge({
+            type: "design-program-render",
+            requestId,
+            taskId: task.id,
+            documentId: task.documentId,
+            program,
+          });
+          checkChatSession();
+          return response;
+        },
+        inspectProgram: async (request) => {
+          checkChatSession();
+          const response = await taskNativeBridge(request);
+          checkChatSession();
+          if (response.type !== "task-native-inspection-result")
+            throw new Error("Figma returned an unexpected response for the universal screen readback.");
+          return response;
+        },
         model: (input, lifecycle) =>
           streamAuthorizedChat(
             companionToken,

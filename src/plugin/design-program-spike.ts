@@ -7,8 +7,12 @@ const TASK_KEY = "fad.tool.task-id.v1";
 const TOOL_REF_KEY = "fad.tool.logical-ref.v1";
 const DESIGN_REF_KEY = "fad.design.logical-ref";
 
+function activePageId(api: RendererFigmaApi): string {
+  return (api.currentPage as RendererFigmaApi["currentPage"] & { id: string }).id;
+}
+
 export type LocalProgramRenderResult =
-  | { success: true; batchId: string; roots: Array<{ screenId: string; nodeId: string; ref: string }>; nodeCount: number; fingerprint: string; timingsMs: { parse: number; compile: number; render: number; registration: number; persistence: number } }
+  | { success: true; batchId: string; roots: Array<{ screenId: string; nodeId: string; ref: string }>; nodeCount: number; registeredRefs: number; operationIds: string[]; fingerprint: string; timingsMs: { parse: number; compile: number; render: number; registration: number; persistence: number } }
   | { success: false; code: string; findings: Array<{ code: string; path: string; message: string; severity: "error" | "warning" }> };
 
 function stableToolRef(logicalRef: string): string {
@@ -22,19 +26,24 @@ function stableToolRef(logicalRef: string): string {
 }
 
 /**
- * Local-only bridge for the Phase 2 proof: the existing native renderer creates
- * the declarative trees; the existing task-native inspection/tool path can then
- * claim the newly generated nodes by stable, verified refs. This is not wired
- * into the production Chat route.
+ * Chat adoption seam for the Phase 2 declarative renderer. It creates one
+ * bounded program through the existing native renderer and registers the
+ * verified editable subtree with the existing task-scoped executor.
  */
 export async function renderDesignProgramLocal(
   api: RendererFigmaApi,
   value: unknown,
-  scope: { taskId: string; documentId: string; pageId: string; executor: Pick<FigmaToolExecutor, "registerRenderedGeneration"> },
+  scope: { taskId: string; documentId: string; pageId: string; executor: Pick<FigmaToolExecutor, "registerRenderedGeneration">; assertCurrentScope?: () => void },
 ): Promise<LocalProgramRenderResult> {
-  const { taskId, documentId, pageId, executor } = scope;
+  const { taskId, documentId, pageId, executor, assertCurrentScope } = scope;
   if (!/^[A-Za-z0-9_-]{8,60}$/u.test(taskId))
     return { success: false, code: "invalid_task_scope", findings: [{ code: "invalid_task_scope", path: "taskId", message: "A stable task id is required for local ownership tagging.", severity: "error" }] };
+  try {
+    assertCurrentScope?.();
+    if (activePageId(api) !== pageId) throw new Error("page_scope_changed");
+  } catch {
+    return { success: false, code: "stale_document_scope", findings: [{ code: "stale_document_scope", path: "documentId", message: "The active Figma document or page changed before native rendering.", severity: "error" }] };
+  }
   const parseStarted = performance.now();
   const parsedProgram = parseDesignProgram(value);
   const parseMs = Math.max(0, performance.now() - parseStarted);
@@ -47,7 +56,7 @@ export async function renderDesignProgramLocal(
 
   try {
     const renderStarted = performance.now();
-    const rendered = await renderMultiScreenDesign(api, compiled.batch, { resume: true, verifyTouchTargets: true });
+    const rendered = await renderMultiScreenDesign(api, compiled.batch, { resume: true, verifyTouchTargets: true, beforeScreen: () => { assertCurrentScope?.(); if (activePageId(api) !== pageId) throw new Error("page_scope_changed"); } });
     const renderMs = Math.max(0, performance.now() - renderStarted);
     if (rendered.failedScreens > 0 || rendered.screens.some((screen) => screen.status !== "generated"))
       return { success: false, code: "native_render_incomplete", findings: [{ code: "native_render_incomplete", path: "screens", message: `${rendered.failedScreens} of ${rendered.totalScreens} screens did not render. ${rendered.screens.flatMap((screen) => screen.error ? [`${screen.id}: ${screen.error}`] : []).join(" ")}`.slice(0, 500), severity: "error" }] };
@@ -103,6 +112,8 @@ export async function renderDesignProgramLocal(
       }
     }
     const registrationStarted = performance.now();
+    assertCurrentScope?.();
+    if (activePageId(api) !== pageId) throw new Error("page_scope_changed");
     const registration = await executor.registerRenderedGeneration({
       taskId,
       documentId,
@@ -113,7 +124,7 @@ export async function renderDesignProgramLocal(
     const registrationMs = Math.max(0, performance.now() - registrationStarted);
     if (registration.registeredRefs !== adoptionRoots.reduce((count, root) => count + root.nodes.length, 0))
       return { success: false, code: "incomplete_ownership_registration", findings: [{ code: "incomplete_ownership_registration", path: "screens", message: "The scoped tool executor did not register every verified renderer node.", severity: "error" }] };
-    return { success: true, batchId: rendered.batchId, roots, nodeCount: compiled.nodeCount, fingerprint: compiled.fingerprint, timingsMs: { parse: parseMs, compile: compileMs, render: renderMs, registration: registrationMs, persistence: registration.persistenceMs } };
+    return { success: true, batchId: rendered.batchId, roots, nodeCount: compiled.nodeCount, registeredRefs: registration.registeredRefs, operationIds: registration.operationIds, fingerprint: compiled.fingerprint, timingsMs: { parse: parseMs, compile: compileMs, render: renderMs, registration: registrationMs, persistence: registration.persistenceMs } };
   } catch (error) {
     return { success: false, code: "native_render_error", findings: [{ code: "native_render_error", path: "renderer", message: error instanceof Error ? error.message.slice(0, 500) : "Native renderer failed.", severity: "error" }] };
   }

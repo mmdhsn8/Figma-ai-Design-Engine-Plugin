@@ -745,31 +745,45 @@ export type ParsedChatGenerationIntent =
   | { kind: "out_of_range"; screenCount: number }
   | { kind: "unsupported_target" };
 
+const CREATE_VERB =
+  /(?:\b(?:create|design|build|make|generate)\b|(?:طراحی|بساز|ایجاد|طراحى|بسازید))/iu;
+const TOP_LEVEL_EDIT =
+  /^(?:please\s+)?(?:edit|change|update|modify|fix|restyle)\b|^(?:لطفا[ً\s‌-]*)?(?:(?:صفحه|اسکرین)(?:\s+\d+)?\s*(?:را|رو)?\s*)?(?:ویرایش|تغییر|اصلاح|بهبود)(?:\s+کن|\s+بده|\s+بدید)?/iu;
+const EXISTING_EDIT_COMMAND =
+  /\b(?:edit|change|update|modify|fix|restyle)\s+(?:(?:the|existing|current|selected)\s+)?(?:screen|page|frame|canvas|design)\b|\b(?:edit|change|update|modify)\s+(?:screen|page)\s+\d+\b|(?:صفحه|اسکرین)(?:\s+\d+)?\s*(?:را|رو)\s*(?:ویرایش|تغییر|اصلاح|بهبود)(?:\s+کن|\s+بده|\s+بدید)|(?:ویرایش|تغییر|اصلاح|بهبود)\s*(?:صفحه|اسکرین)(?:\s+\d+)?/iu;
+
+export function isClearCreateRequest(prompt: string): boolean {
+  const normalized = prompt.trim().toLocaleLowerCase();
+  return Boolean(
+    normalized &&
+      CREATE_VERB.test(normalized) &&
+      !TOP_LEVEL_EDIT.test(normalized) &&
+      !EXISTING_EDIT_COMMAND.test(normalized),
+  );
+}
+
 export function parseChatGenerationIntent(prompt: string): ParsedChatGenerationIntent {
   const normalized = prompt.trim().toLocaleLowerCase();
-  const intentText = normalized.replace(/قابل[\s‌-]*ویرایش/gu, "");
-  const createVerb =
-    /(?:\b(?:create|design|build|make|generate)\b|(?:طراحی|بساز|ایجاد|طراحى|بسازید))/iu.test(
-      normalized,
-    );
-  if (
-    !createVerb ||
-    /\b(?:edit|change|update|modify|fix|restyle)\b|(?:ویرایش|تغییر|اصلاح|بهبود)/iu.test(intentText)
-  )
-    return { kind: "not_a_handoff" };
+  if (!isClearCreateRequest(normalized)) return { kind: "not_a_handoff" };
   const screenTerm =
     /(?:\b(?:screens?|pages?|views?)\b|(?:صفحه(?:‌ها|ها|ی|های)?|اسکرین(?:‌ها|ها)?))/iu;
   if (!screenTerm.test(normalized)) return { kind: "not_a_handoff" };
-  const numericMatch =
-    /([0-9۰-۹٠-٩]{1,3})\s*(?:screens?|pages?|views?|صفحه(?:‌ها|ها|ی|های)?|اسکرین(?:‌ها|ها)?)/iu.exec(
-      normalized,
-    );
-  const wordMatch =
-    /\b(one|two|three|four|five|six|seven|eight|nine|ten)\b|(?:یک|دو|سه|چهار|پنج|شش|هفت|هشت|نه|ده)\s*(?:صفحه|اسکرین)/iu.exec(
-      normalized,
-    );
+  const screenAdjective =
+    /(?:(?:new|editable|mobile|desktop|web|phone|responsive|جدید|قابل‌ویرایش|موبایل|دسکتاپ)\s+){0,3}/iu;
+  const screenNoun =
+    /(?:screens?|pages?|views?|صفحه(?:‌ها|ها|ی|های)?|اسکرین(?:‌ها|ها)?)/iu;
+  const numericMatch = new RegExp(
+    `([0-9۰-۹٠-٩]{1,3})\\s*${screenAdjective.source}${screenNoun.source}`,
+    "iu",
+  ).exec(normalized);
+  const englishWordMatch = new RegExp(
+    `\\b(one|two|three|four|five|six|seven|eight|nine|ten)\\b\\s*${screenAdjective.source}${screenNoun.source}`,
+    "iu",
+  ).exec(normalized);
+  const persianWordMatch =
+    /(یک|دو|سه|چهار|پنج|شش|هفت|هشت|نه|ده)\s*(?:صفحه|اسکرین)/iu.exec(normalized);
   const rawCount = numericMatch?.[1];
-  const word = wordMatch?.[1] ?? wordMatch?.[0]?.split(/\s/u)[0];
+  const word = englishWordMatch?.[1] ?? persianWordMatch?.[1];
   const count = rawCount ? Number(asciiDigits(rawCount)) : word ? countWords[word] : undefined;
   if (!count) return { kind: "not_a_handoff" };
   if (count < 1 || count > 10) return { kind: "out_of_range", screenCount: count };

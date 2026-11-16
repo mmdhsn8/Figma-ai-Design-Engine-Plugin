@@ -24,6 +24,11 @@ import {
   FigmaToolParentingDiagnosticSchema,
 } from "./figma-tools.js";
 import { ChatGenerationIntentSchema, ChatGenerationLinkSchema } from "./chat-generation.js";
+import {
+  ProjectPlanV1Schema,
+  UniversalDesignMetricsSchema,
+  UniversalScreenCheckpointSchema,
+} from "./universal-design.js";
 
 export const CHAT_TASK_MAX_MUTATIONS = 240;
 export const CHAT_EXECUTION_SEGMENT_MAX_MUTATIONS = 32;
@@ -451,8 +456,13 @@ export const ChatTaskSchema = z
       .regex(/^[A-Za-z0-9_-]{8,60}$/u)
       .optional(),
     intent: z.enum(["create", "edit", "inspect", "explain", "continue"]).optional(),
+    executionRoute: z.enum(["legacy", "universal-design-v1"]).optional(),
     generationIntent: ChatGenerationIntentSchema.optional(),
     generationLink: ChatGenerationLinkSchema.optional(),
+    projectPlan: ProjectPlanV1Schema.optional(),
+    projectPlanFingerprint: z.string().regex(/^ppv1-[a-f0-9]{16}$/u).optional(),
+    universalScreens: z.array(UniversalScreenCheckpointSchema).max(10).optional(),
+    universalMetrics: UniversalDesignMetricsSchema.optional(),
     targetName: z.string().trim().min(1).max(100).optional(),
     editTarget: ChatEditTargetSchema.optional(),
     planningContinuations: z.number().int().min(0).max(1).optional(),
@@ -1088,11 +1098,42 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
       ? { lastNativeRepairPipelineVersion: stage.nativeRepairPipelineVersion }
       : {}),
     taskId: task.id,
-    generationRoute: task.generationLink
-      ? "structured_route_selected"
-      : task.generationIntent
-        ? "structured_multiscreen_eligible"
-        : "legacy_chat_checkpoint_without_structured_intent",
+    executionRoute: task.executionRoute ?? "legacy",
+    generationRoute: task.executionRoute === "universal-design-v1"
+      ? "universal_design_v1"
+      : task.generationLink
+        ? "structured_route_selected"
+        : task.generationIntent
+          ? "structured_multiscreen_eligible"
+          : "legacy_chat_checkpoint_without_structured_intent",
+    ...(task.projectPlanFingerprint ? { projectPlanFingerprint: task.projectPlanFingerprint } : {}),
+    ...(task.universalMetrics
+      ? {
+          universalDesign: {
+            version: task.universalMetrics.version,
+            planRequests: task.universalMetrics.planRequests,
+            programRequests: task.universalMetrics.programRequests,
+            repairRequests: task.universalMetrics.repairRequests,
+            providerRounds: task.universalMetrics.providerRounds,
+            providerInputBytes: task.universalMetrics.providerInputBytes,
+            providerLatencyMs: task.universalMetrics.providerLatencyMs,
+            nativeBatches: task.universalMetrics.nativeBatches,
+            nativeDurationMs: task.universalMetrics.nativeDurationMs,
+            firstNativeProgressMs: task.universalMetrics.firstNativeProgressMs,
+            totalElapsedMs: task.universalMetrics.totalElapsedMs,
+            acceptedScreenTimesMs: task.universalMetrics.acceptedScreenTimesMs,
+            timingEvidence: task.universalMetrics.timingEvidence,
+            benchmarkComparableTiming: task.universalMetrics.benchmarkComparableTiming,
+            screenStatus: (task.universalScreens ?? []).map(({ screenId, status, nativeNodeCount, verifiedNodeCount, errorCode }) => ({
+              screenId,
+              status,
+              ...(nativeNodeCount !== undefined ? { nativeNodeCount } : {}),
+              ...(verifiedNodeCount !== undefined ? { verifiedNodeCount } : {}),
+              ...(errorCode ? { errorCode } : {}),
+            })),
+          },
+        }
+      : {}),
     ...(task.intent ? { intent: task.intent } : {}),
     ...(task.inspectionOutcome ? { inspectionOutcome: task.inspectionOutcome } : {}),
     ...(task.inspectionSummary ? { inspectionSummary: task.inspectionSummary } : {}),
@@ -1141,7 +1182,9 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
     modelRoundTrace: task.modelRoundTrace,
     modelRequests: task.rounds + task.roundBreakdown.modelRetries,
     roundBreakdown: task.roundBreakdown,
-    nativeBatches: task.batches,
+    nativeBatches: task.executionRoute === "universal-design-v1"
+      ? (task.universalMetrics?.nativeBatches ?? 0)
+      : task.batches,
     ...(stage
       ? {
           activeStageProgress: {

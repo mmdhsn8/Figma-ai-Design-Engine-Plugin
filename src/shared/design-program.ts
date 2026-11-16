@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DesignSystemTokensSchema } from "./design-system-schema";
+import { DesignSystemTokensSchema } from "./design-system-schema.js";
 
 export const DESIGN_PROGRAM_VERSION = 1 as const;
 export const DESIGN_PROGRAM_LIMITS = {
@@ -183,9 +183,13 @@ export function parseDesignProgram(value: unknown): DesignProgramParseResult {
       for (const value of node.type === "container" ? [node.background] : node.type === "text" ? [node.color] : node.type === "image" ? [] : [node.fill]) {
         if (typeof value === "string" && value.startsWith("token:") && !(value.slice(6) in program.tokens.colors)) findings.push({ code: "missing_token", path: `screens.${screen.id}.root.${node.id}`, message: `Color token “${value.slice(6)}” is not defined.`, severity: "error" });
       }
-      if (node.type === "image" && node.asset.source !== "placeholder") {
-        if (!node.asset.verified || !node.asset.authorized || !node.asset.assetRef) findings.push({ code: "asset_provenance_unverified", path: `screens.${screen.id}.root.${node.id}.asset`, message: "Non-placeholder assets require a verified, authorized asset reference.", severity: "error" });
-        findings.push({ code: "unsupported_asset_source", path: `screens.${screen.id}.root.${node.id}.asset`, message: "This local spike renders labeled placeholders only.", severity: "error" });
+      if (node.type === "image") {
+        if (/(?:https?:\/\/|www\.)/iu.test(node.asset.label) || node.asset.assetRef)
+          findings.push({ code: "asset_url_forbidden", path: `screens.${screen.id}.root.${node.id}.asset`, message: "Image placeholders cannot contain remote URLs or unverified asset references.", severity: "error" });
+        if (node.asset.source !== "placeholder") {
+          if (!node.asset.verified || !node.asset.authorized || !node.asset.assetRef) findings.push({ code: "asset_provenance_unverified", path: `screens.${screen.id}.root.${node.id}.asset`, message: "Non-placeholder assets require a verified, authorized asset reference.", severity: "error" });
+          findings.push({ code: "unsupported_asset_source", path: `screens.${screen.id}.root.${node.id}.asset`, message: "This local spike renders labeled placeholders only.", severity: "error" });
+        }
       }
     });
     if (screen.scroll === "horizontal") findings.push({ code: "unsupported_horizontal_scroll", path: `screens.${screen.id}.scroll`, message: "Horizontal scrolling is unsupported by this adapter.", severity: "error" });

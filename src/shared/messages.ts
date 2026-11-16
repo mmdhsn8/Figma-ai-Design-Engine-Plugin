@@ -20,6 +20,7 @@ import {
 import { ModelIdSchema } from "./model-preference";
 import { BrandKitStorageCommandSchema, BrandKitStorageResultSchema } from "./brand-kit";
 import { DesignSkillStorageCommandSchema, DesignSkillStorageResultSchema } from "./design-skill";
+import { DesignProgramV1Schema } from "./design-program";
 
 const RequestSchema = z.object({
   requestId: z.string().min(1).max(100),
@@ -195,6 +196,19 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       task: ChatTaskSchema.nullable(),
     })
     .strict(),
+  z
+    .object({
+      type: z.literal("design-program-render"),
+      requestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+      taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+      documentId: z.string().min(1).max(300),
+      program: DesignProgramV1Schema,
+    })
+    .strict()
+    .superRefine((request, context) => {
+      if (request.program.screens.length !== 1)
+        context.addIssue({ code: "custom", path: ["program", "screens"], message: "Chat renders one checkpointed screen per native request." });
+    }),
   z
     .object({
       type: z.literal("task-native-inspect"),
@@ -374,6 +388,28 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       error: z.string().max(500).optional(),
     })
     .strict(),
+  z
+    .object({
+      type: z.literal("design-program-render-result"),
+      requestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+      taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+      success: z.boolean(),
+      screenId: z.string().regex(/^screen-(?:0[1-9]|10)$/u).optional(),
+      rootRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u).optional(),
+      nativeBatchId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
+      adoptionOperationIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u)).max(200).optional(),
+      programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u).optional(),
+      nativeNodeCount: z.number().int().nonnegative().max(300).optional(),
+      errorCode: z.string().regex(/^[a-z_]{1,80}$/u).optional(),
+      findings: z.array(z.object({ code: z.string().regex(/^[a-z0-9_-]{1,80}$/u), path: z.string().max(200), message: z.string().max(240), severity: z.enum(["error", "warning"]) }).strict()).max(20).optional(),
+    })
+    .strict()
+    .superRefine((result, context) => {
+      if (result.success && (!result.screenId || !result.rootRef || !result.nativeBatchId || !result.adoptionOperationIds?.length || !result.programFingerprint || result.nativeNodeCount === undefined))
+        context.addIssue({ code: "custom", path: [], message: "A successful render result needs complete native ownership evidence." });
+      if (!result.success && !result.errorCode)
+        context.addIssue({ code: "custom", path: ["errorCode"], message: "A failed render result needs a safe failure code." });
+    }),
   z
     .object({
       type: z.literal("task-native-inspection-result"),
