@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DESIGN_PROGRAM_VERSION, DesignProgramV1Schema } from "./design-program.js";
+import { createDefaultVisualLanguage, ProjectVisualLanguageV1Schema } from "./design-composition.js";
 
 const text = (maximum: number, minimum = 1) => z.string().trim().min(minimum).max(maximum);
 const orderRef = z.number().int().min(0).max(9);
@@ -21,6 +22,7 @@ export const ProjectPlanDraftSchema = z
     direction: z.enum(["rtl", "ltr"]),
     screenCount: z.number().int().min(1).max(10),
     styleDirection: text(500),
+    visualLanguageV1: ProjectVisualLanguageV1Schema.optional(),
     contentDensity: z.enum(["low", "medium", "high"]),
     contentSamplePolicy: z.enum(["user-provided-only", "clearly-illustrative", "no-sample-data"]),
     accessibilityMinimums: z.array(text(180)).max(10),
@@ -49,7 +51,7 @@ export const ProjectPlanDraftSchema = z
                   })
                   .strict(),
               )
-              .min(3)
+              .min(1)
               .max(6),
             dataRelationships: z.array(text(140)).max(8),
             responsiveConstraints: z.array(text(140)).max(8),
@@ -87,7 +89,7 @@ const PlannedScreenSchema = z
     primaryTask: text(180),
     entryState: text(120),
     exitState: text(120),
-    regions: z.array(PlannedRegionSchema).min(3).max(6),
+    regions: z.array(PlannedRegionSchema).min(1).max(6),
     dataRelationships: z.array(text(140)).max(8),
     responsiveConstraints: z.array(text(140)).max(8),
     accessibilityNotes: z.array(text(140)).max(8),
@@ -127,6 +129,7 @@ export const ProjectPlanV1Schema = z
     ]),
     screenCount: z.number().int().min(1).max(10),
     styleDirection: text(500),
+    visualLanguageV1: ProjectVisualLanguageV1Schema.optional(),
     contentDensity: z.enum(["low", "medium", "high"]),
     contentSamplePolicy: z.enum(["user-provided-only", "clearly-illustrative", "no-sample-data"]),
     accessibilityMinimums: z.array(text(180)).max(10),
@@ -138,7 +141,7 @@ export const ProjectPlanV1Schema = z
     nonGoals: z.array(text(180)).max(12),
     pinnedBrandKit: z.object({ id: text(80), revision: z.number().int().positive(), tokenHash: z.string().regex(/^[a-f0-9]{8}$/u) }).strict().optional(),
     pinnedSkills: z.array(z.object({ id: text(80), revisionId: text(120) }).strict()).max(3),
-    capabilityFlags: z.array(z.enum(["native-frame", "native-text", "native-shape", "auto-layout", "vertical-scroll", "local-placeholder-only", "task-scoped-readback"])).max(12),
+    capabilityFlags: z.array(z.enum(["native-frame", "native-text", "native-shape", "auto-layout", "vertical-scroll", "local-placeholder-only", "pinned-brand-assets", "task-scoped-readback"])).max(12),
   })
   .strict()
   .superRefine((plan, context) => {
@@ -211,7 +214,8 @@ export function parseProjectPlanDraft(
     requestedScreenCount?: number;
     requestedTarget?: "mobile" | "desktop";
     requestedLocale?: string;
-    brandKit?: { id: string; revision: number; tokenHash: string };
+    visualLanguageFallback?: z.infer<typeof ProjectVisualLanguageV1Schema>;
+    brandKit?: { id: string; revision: number; tokenHash: string; assetIds?: string[] };
     skills?: Array<{ id: string; revisionId: string }>;
   },
 ): ProjectPlanResult {
@@ -270,6 +274,7 @@ export function parseProjectPlanDraft(
     viewport,
     screenCount: draft.screenCount,
     styleDirection: draft.styleDirection,
+    visualLanguageV1: draft.visualLanguageV1 ?? context.visualLanguageFallback ?? createDefaultVisualLanguage({ styleDirection: draft.styleDirection, density: draft.contentDensity, locale: draft.locale }),
     contentDensity: draft.contentDensity,
     contentSamplePolicy: draft.contentSamplePolicy,
     accessibilityMinimums: draft.accessibilityMinimums,
@@ -279,9 +284,9 @@ export function parseProjectPlanDraft(
     knownFacts: draft.knownFacts,
     assumptions: draft.assumptions,
     nonGoals: draft.nonGoals,
-    ...(context.brandKit ? { pinnedBrandKit: context.brandKit } : {}),
+    ...(context.brandKit ? { pinnedBrandKit: { id: context.brandKit.id, revision: context.brandKit.revision, tokenHash: context.brandKit.tokenHash } } : {}),
     pinnedSkills: context.skills ?? [],
-    capabilityFlags: ["native-frame", "native-text", "native-shape", "auto-layout", "vertical-scroll", "local-placeholder-only", "task-scoped-readback"] as const,
+    capabilityFlags: ["native-frame", "native-text", "native-shape", "auto-layout", "vertical-scroll", "local-placeholder-only", ...(context.brandKit?.assetIds?.length ? ["pinned-brand-assets" as const] : []), "task-scoped-readback"] as const,
   };
   const checked = ProjectPlanV1Schema.safeParse(candidate);
   if (!checked.success)

@@ -17,7 +17,7 @@ import {
   type BrandKitStoreSnapshot,
   type PinnedBrandKit,
 } from "../shared/brand-kit";
-import type { VisualAsset } from "../shared/visual-schema";
+import { visualAssetSize, type VisualAsset } from "../shared/visual-schema";
 import { embeddedImageBytes } from "../shared/visual-assets";
 import { utf8Bytes } from "../shared/generation-limits";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
@@ -33,6 +33,12 @@ export type BrandKitStorageApi = Pick<
   PluginAPI["clientStorage"],
   "getAsync" | "setAsync" | "keysAsync"
 >;
+export class PinnedBrandAssetResolutionError extends Error {
+  constructor(readonly code: "asset_outside_pinned_revision" | "asset_missing_or_changed" | "asset_bytes_invalid" | "asset_bundle_too_large") {
+    super(code);
+    this.name = "PinnedBrandAssetResolutionError";
+  }
+}
 type PreservedSidecar = { version: 1; entries: Array<{ key: string; value: unknown }> };
 type Recovered = {
   index: BrandKitIndex;
@@ -445,16 +451,31 @@ function bytesToBase64(bytes: Uint8Array): string {
 export async function resolvePinnedBrandVisualAssets(
   storage: BrandKitStorageApi,
   pinned: PinnedBrandKit | undefined,
+  requestedAssetIds?: readonly string[],
 ): Promise<VisualAsset[]> {
-  if (!pinned) return [];
+  if (!pinned) {
+    if (requestedAssetIds?.length) throw new PinnedBrandAssetResolutionError("asset_outside_pinned_revision");
+    return [];
+  }
   const visual: VisualAsset[] = [];
-  for (const asset of pinned.assets) {
+  const requested = requestedAssetIds === undefined ? pinned.assets.map(({ assetId }) => assetId) : [...new Set(requestedAssetIds)];
+  const assetById = new Map(pinned.assets.map((asset) => [asset.assetId, asset]));
+  let visualBytes = 0;
+  for (const assetId of requested) {
+    const asset = assetById.get(assetId);
+    if (!asset) throw new PinnedBrandAssetResolutionError("asset_outside_pinned_revision");
     const value = await storage.getAsync(`${ASSET_PREFIX}${asset.assetId}`);
     if (!(value instanceof Uint8Array) || contentHash(value) !== asset.contentHash)
-      throw new Error(
-        `Pinned Brand Kit asset “${asset.name}” is missing or changed; resume is blocked without mutation.`,
-      );
-    visual.push(createBrandVisualAsset(asset, bytesToBase64(value)));
+      throw new PinnedBrandAssetResolutionError("asset_missing_or_changed");
+    try {
+      const resolved = createBrandVisualAsset(asset, bytesToBase64(value));
+      visualBytes += visualAssetSize(resolved);
+      if (visualBytes > 700 * 1_024) throw new PinnedBrandAssetResolutionError("asset_bundle_too_large");
+      visual.push(resolved);
+    } catch (error) {
+      if (error instanceof PinnedBrandAssetResolutionError) throw error;
+      throw new PinnedBrandAssetResolutionError("asset_bytes_invalid");
+    }
   }
   return visual;
 }

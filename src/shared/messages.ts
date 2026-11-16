@@ -18,7 +18,7 @@ import {
   FigmaToolStateDiagnosticSchema,
 } from "./figma-tools";
 import { ModelIdSchema } from "./model-preference";
-import { BrandKitStorageCommandSchema, BrandKitStorageResultSchema } from "./brand-kit";
+import { BrandKitStorageCommandSchema, BrandKitStorageResultSchema, PinnedBrandKitSchema } from "./brand-kit";
 import { DesignSkillStorageCommandSchema, DesignSkillStorageResultSchema } from "./design-skill";
 import { DesignProgramV1Schema } from "./design-program";
 import { DesignEngineSchema } from "./design-engine-preference";
@@ -203,6 +203,7 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       requestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
       taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
       documentId: z.string().min(1).max(300),
+      brandKit: PinnedBrandKitSchema.optional(),
       program: DesignProgramV1Schema,
     })
     .strict()

@@ -8,6 +8,7 @@ import {
   type MultiScreenSpec,
 } from "./multi-screen-schema";
 import { auditVisualQuality } from "./visual-quality";
+import type { VisualAsset } from "./visual-schema";
 import {
   designProgramTokens,
   parseDesignProgram,
@@ -25,6 +26,16 @@ function resolveColor(color: string, program: DesignProgramV1): string {
   return program.tokens.colors[color.slice(6)] ?? color;
 }
 
+function semanticRadius(semanticRole: string, program: DesignProgramV1): number | undefined {
+  const radii = program.visualLanguageV1?.radii;
+  if (!radii) return undefined;
+  const role = semanticRole.toLocaleLowerCase();
+  if (/^(?:screen|page|root|layout)(?:[-_ ]|$)/u.test(role)) return 0;
+  if (/(?:button|action|input|control|tab|navigation)/u.test(role)) return radii.control;
+  if (/(?:card|surface|summary|panel|section|region|content|sheet)/u.test(role)) return radii.surface;
+  return radii.compact;
+}
+
 function sizing(mode: SizingMode): SizingMode {
   return mode;
 }
@@ -35,11 +46,11 @@ function safeCounterAlign(
   axis: "row" | "column",
 ): "start" | "center" | "end" | "stretch" | "baseline" {
   const crossAxis = axis === "row" ? "height" : "width";
-  if (children.some((child) => child[crossAxis].mode === "fill")) return "stretch";
+  if (children.length > 0 && children.every((child) => child[crossAxis].mode === "fill")) return "stretch";
   return declared === "stretch" ? "start" : declared;
 }
 
-function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenId: string, direction: "ltr" | "rtl"): DesignNode {
+function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenId: string, direction: "ltr" | "rtl", availableAssetIds: ReadonlySet<string>): DesignNode {
   const common = {
     name: node.name,
     width: node.width.value,
@@ -49,12 +60,13 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
     ...(node.interaction === "button" || node.interaction === "navigation" ? { qualityRole: "button" as const } : node.interaction === "input" ? { qualityRole: "input" as const } : {}),
   };
   if (node.type === "container") {
-    const children = node.children.map((child) => nodeToNative(child, program, screenId, direction));
+    const children = node.children.map((child) => nodeToNative(child, program, screenId, direction, availableAssetIds));
     if (direction === "rtl" && node.layout.axis === "row") children.reverse();
     return {
       ...common,
       type: "frame",
       background: node.background ? resolveColor(node.background, program) : undefined,
+      ...(node.background ? { cornerRadius: semanticRadius(node.semanticRole, program) } : {}),
       children,
       layout: {
         mode: node.layout.axis === "row" ? "horizontal" : "vertical",
@@ -65,16 +77,28 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
       },
     };
   }
-  if (node.type === "text") return {
-    ...common, type: "text", text: node.text, fontSize: node.fontSize, color: resolveColor(node.color, program),
-    fontFamily: node.weight === "bold" || node.weight === "semibold" ? program.tokens.headingFont : program.tokens.bodyFont,
+  if (node.type === "text") {
+    const language = program.visualLanguageV1?.typography;
+    const roleSize = node.textRole === "display" ? language?.displaySize
+      : node.textRole === "title" || node.textRole === "heading" ? language?.titleSize
+        : node.textRole === "caption" || node.textRole === "label" ? language?.captionSize
+          : node.textRole === "body" || node.textRole === "action" ? language?.bodySize : undefined;
+    const headingRole = node.textRole === "display" || node.textRole === "title" || node.textRole === "heading";
+    return {
+    ...common, type: "text", text: node.text, fontSize: roleSize ?? node.fontSize, color: resolveColor(node.color, program),
+    fontFamily: headingRole || node.weight === "bold" || node.weight === "semibold" ? program.tokens.headingFont : program.tokens.bodyFont,
     fontStyle: node.weight === "bold" ? "Bold" : node.weight === "semibold" ? "Semi Bold" : node.weight === "medium" ? "Medium" : "Regular",
     textAlign: node.align ?? (direction === "rtl" ? "right" : "left"), textAutoResize: "height",
-  };
-  if (node.type === "rectangle") return { ...common, type: "rectangle", fill: resolveColor(node.fill, program), cornerRadius: node.cornerRadius };
+    };
+  }
+  if (node.type === "rectangle") return { ...common, type: "rectangle", fill: resolveColor(node.fill, program), cornerRadius: node.cornerRadius ?? semanticRadius(node.semanticRole, program) ?? 0 };
   if (node.type === "ellipse") return { ...common, type: "ellipse", fill: resolveColor(node.fill, program) };
   if (node.type === "vector") return { ...common, type: "vector", pathData: node.pathData, fill: resolveColor(node.fill, program) };
-  const placeholderLabel = `Placeholder · ${node.asset.label}`;
+  if (node.asset.source === "user-approved-brand-kit" && node.asset.assetRef && availableAssetIds.has(node.asset.assetRef))
+    return { ...common, type: "image", assetId: node.asset.assetRef, fit: "crop", alt: node.asset.label, qualityRole: "image" };
+  const placeholderLabel = node.asset.source === "user-approved-brand-kit"
+    ? `Pinned asset · ${node.asset.label}`
+    : `Placeholder · ${node.asset.label}`;
   return {
     ...common, type: "frame", background: "#EEF1F5", layout: { mode: "vertical", primaryAxisAlign: "center", counterAxisAlign: "center" },
     children: [{ type: "text", name: "Placeholder disclosure", text: placeholderLabel, width: Math.min(node.width.value, 300), height: 32, sizing: { width: "fixed", height: "fixed" }, fontSize: 14, color: "#475569", textAlign: "center", textAutoResize: "height", logicalRef: `${program.id}.${screenId}.${node.id}.label`.slice(0, 120) }],
@@ -85,8 +109,10 @@ function nativeDisplayName(value: string): boolean {
   return !/[\\/]/u.test(value) && !Array.from(value).some((character) => character.charCodeAt(0) <= 0x1f || character.charCodeAt(0) === 0x7f);
 }
 
-export function compileDesignProgram(value: unknown): DesignProgramCompileResult {
-  const parsed = parseDesignProgram(value);
+export function compileDesignProgram(value: unknown, options: { assets?: VisualAsset[]; allowedBrandAssetIds?: ReadonlySet<string> } = {}): DesignProgramCompileResult {
+  const assets = options.assets ?? [];
+  const allowedBrandAssetIds = options.allowedBrandAssetIds ?? new Set(assets.map(({ id }) => id));
+  const parsed = parseDesignProgram(value, { allowedBrandAssetIds });
   if (!parsed.success) return { success: false, findings: parsed.findings };
   const program = parsed.data;
   const findings: DesignProgramFinding[] = [];
@@ -99,6 +125,7 @@ export function compileDesignProgram(value: unknown): DesignProgramCompileResult
     if (!nativeDisplayName(screen.title)) findings.push({ code: "unsupported_display_name", path: `screens.${screen.id}.title`, message: "Screen title contains a slash or control character.", severity: "error" });
   }
   if (findings.length) return { success: false, findings };
+  const pageColor = program.visualLanguageV1?.colorRoles.page ?? program.tokens.colors.page ?? "#FFFFFF";
   const screens = [...program.screens].sort((a, b) => a.order - b.order).map((screen) => {
     const contentHeight = screen.scroll === "vertical"
       ? Math.max(screen.viewport.height, screen.root.height.value + 48)
@@ -106,9 +133,10 @@ export function compileDesignProgram(value: unknown): DesignProgramCompileResult
     const root: FrameNodeSpec = {
       type: "frame", name: `${screen.id} content`, width: screen.viewport.width, height: contentHeight,
       sizing: { width: "fixed", height: "fixed" },
+      background: pageColor,
       layout: { mode: "vertical", padding: { top: 24, right: 24, bottom: 24, left: 24 }, counterAxisAlign: "start" },
-      children: [nodeToNative(screen.root, program, screen.id, program.locale.direction)],
-      logicalRef: `${screen.id}.content`,
+      children: [nodeToNative(screen.root, program, screen.id, program.locale.direction, new Set(assets.map(({ id }) => id)))],
+      logicalRef: `${program.id}.${screen.id}.content`.slice(0, 120),
     };
     return {
       id: screen.id,
@@ -117,7 +145,7 @@ export function compileDesignProgram(value: unknown): DesignProgramCompileResult
       devicePreset: screen.viewport.preset,
       width: screen.viewport.width,
       height: screen.viewport.height,
-      background: "#FFFFFF",
+      background: pageColor,
       layout: { mode: "vertical", counterAxisAlign: "start" },
       children: [root],
       metadata: {
@@ -126,6 +154,8 @@ export function compileDesignProgram(value: unknown): DesignProgramCompileResult
         purpose: screen.purpose,
         language: program.locale.language,
         direction: program.locale.direction,
+        ...(program.visualLanguageV1 ? { visualLanguage: program.visualLanguageV1.identity } : {}),
+        ...(screen.compositionV1 ? { compositionArchetype: screen.compositionV1.archetype, compositionReason: screen.compositionV1.decisionTrace } : {}),
         scroll: screen.scroll,
         ...(screen.dependsOn.length ? { dependsOn: screen.dependsOn.join(",") } : {}),
       },
@@ -135,6 +165,7 @@ export function compileDesignProgram(value: unknown): DesignProgramCompileResult
     schemaVersion: "1.0.0",
     id: program.id,
     name: program.id,
+    ...(assets.length ? { assets } : {}),
     designSystem: designProgramTokens(program),
     screens,
   };

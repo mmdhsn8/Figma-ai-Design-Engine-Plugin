@@ -2,6 +2,7 @@ import { parseDesignProgram } from "../shared/design-program";
 import { compileDesignProgram } from "../shared/design-program-adapter";
 import type { FigmaToolExecutor, NativeGenerationAdoption } from "./figma-tool-executor";
 import { renderMultiScreenDesign, type RendererFigmaApi } from "./renderer";
+import type { VisualAsset } from "../shared/visual-schema";
 
 const TASK_KEY = "fad.tool.task-id.v1";
 const TOOL_REF_KEY = "fad.tool.logical-ref.v1";
@@ -33,7 +34,7 @@ function stableToolRef(logicalRef: string): string {
 export async function renderDesignProgramLocal(
   api: RendererFigmaApi,
   value: unknown,
-  scope: { taskId: string; documentId: string; pageId: string; executor: Pick<FigmaToolExecutor, "registerRenderedGeneration">; assertCurrentScope?: () => void },
+  scope: { taskId: string; documentId: string; pageId: string; executor: Pick<FigmaToolExecutor, "registerRenderedGeneration">; assets?: VisualAsset[]; assertCurrentScope?: () => void },
 ): Promise<LocalProgramRenderResult> {
   const { taskId, documentId, pageId, executor, assertCurrentScope } = scope;
   if (!/^[A-Za-z0-9_-]{8,60}$/u.test(taskId))
@@ -45,11 +46,13 @@ export async function renderDesignProgramLocal(
     return { success: false, code: "stale_document_scope", findings: [{ code: "stale_document_scope", path: "documentId", message: "The active Figma document or page changed before native rendering.", severity: "error" }] };
   }
   const parseStarted = performance.now();
-  const parsedProgram = parseDesignProgram(value);
+  const assets = scope.assets ?? [];
+  const allowedBrandAssetIds = new Set(assets.map(({ id }) => id));
+  const parsedProgram = parseDesignProgram(value, { allowedBrandAssetIds });
   const parseMs = Math.max(0, performance.now() - parseStarted);
   if (!parsedProgram.success) return { success: false, code: "invalid_program", findings: parsedProgram.findings };
   const compileStarted = performance.now();
-  const compiled = compileDesignProgram(value);
+  const compiled = compileDesignProgram(value, { assets, allowedBrandAssetIds });
   const compileMs = Math.max(0, performance.now() - compileStarted);
   if (!compiled.success) return { success: false, code: "compile_rejected", findings: compiled.findings };
   const semanticRoles = new Map(compiled.semanticRoles.map(({ logicalRef, role }) => [logicalRef, role]));

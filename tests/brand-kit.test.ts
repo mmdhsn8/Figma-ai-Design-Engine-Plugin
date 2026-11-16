@@ -12,7 +12,7 @@ import {
   type BrandKitRevision,
   type BrandKitStorageCommand,
 } from "../src/shared/brand-kit";
-import { handleBrandKitStorage, type BrandKitStorageApi } from "../src/plugin/brand-kit-storage";
+import { handleBrandKitStorage, PinnedBrandAssetResolutionError, resolvePinnedBrandVisualAssets, type BrandKitStorageApi } from "../src/plugin/brand-kit-storage";
 import type { UIToPluginMessage } from "../src/shared/messages";
 import { ONE_PIXEL_PNG } from "./visual-fixtures";
 import {
@@ -353,6 +353,17 @@ describe("durable local Brand Kit storage", () => {
     );
     const resolved = await send(storage, { action: "load-asset", assetId });
     expect(resolved).toMatchObject({ success: true, assetBase64: ONE_PIXEL_PNG });
+    const pinned = pinBrandKit(kit);
+    await expect(resolvePinnedBrandVisualAssets(storage, pinned, [assetId])).resolves.toMatchObject([
+      { id: assetId, kind: "raster", license: "Provided by the brand team" },
+    ]);
+    await expect(resolvePinnedBrandVisualAssets(storage, pinned, [])).resolves.toEqual([]);
+    await expect(resolvePinnedBrandVisualAssets(storage, pinned, ["asset_outside_01"]))
+      .rejects.toMatchObject({ code: "asset_outside_pinned_revision" });
+    await expect(resolvePinnedBrandVisualAssets(storage, undefined, [assetId]))
+      .rejects.toBeInstanceOf(PinnedBrandAssetResolutionError);
+    await expect(resolvePinnedBrandVisualAssets(new MemoryStorage(), pinned, [assetId]))
+      .rejects.toMatchObject({ code: "asset_missing_or_changed" });
     expect(BRAND_KIT_MAX_TOTAL_ASSET_BYTES).toBe(1024 * 1024);
     const corrupt = await send(storage, {
       action: "import",

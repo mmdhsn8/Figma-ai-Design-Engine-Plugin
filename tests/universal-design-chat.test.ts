@@ -2,13 +2,16 @@ import { describe, expect, it, vi } from "vitest";
 import { ChatTaskSchema, chatTaskSafeDiagnostic, type ChatTask } from "../src/shared/chat-task";
 import { parseResponsesFunctionCalls, type ChatInputItem } from "../src/shared/chat-tools";
 import { parseChatGenerationIntent, isClearCreateRequest } from "../src/shared/chat-generation";
-import { DesignProgramV1Schema, parseDesignProgram, type DesignProgramV1 } from "../src/shared/design-program";
+import { UniversalDesignProgramV1Schema, parseDesignProgram, type DesignProgramNode, type DesignProgramV1 } from "../src/shared/design-program";
+import { compositionVariationSeed, createDefaultVisualLanguage, type ProjectVisualLanguageV1 } from "../src/shared/design-composition";
 import { ProjectPlanDraftSchema, parseProjectPlanDraft } from "../src/shared/universal-design";
 import { compileDesignProgram } from "../src/shared/design-program-adapter";
 import { runChatTask } from "../src/ui/chat-task";
 import { renderDesignProgramLocal } from "../src/plugin/design-program-spike";
 import { createFigmaToolExecutor } from "../src/plugin/figma-tool-executor";
 import { createMockApi } from "./figma-mock";
+import { brandAssetContentHash, BrandKitRevisionSchema, createBrandVisualAsset, pinBrandKit, type PinnedBrandKit } from "../src/shared/brand-kit";
+import { ONE_PIXEL_PNG } from "./visual-fixtures";
 import type { AuthorizedChatTurn } from "../src/ui/companion-client";
 import type { PluginToUIMessage } from "../src/shared/messages";
 import { selectChatExecutionRoute } from "../src/ui/universal-design-route";
@@ -115,7 +118,7 @@ const cases: Case[] = [
   },
 ];
 
-function draftFor(input: Case) {
+function draftFor(input: Case, regionCount = 3, visualLanguageV1?: ProjectVisualLanguageV1) {
   return ProjectPlanDraftSchema.parse({
     productPurpose: input.purpose,
     projectNarrative: `${input.purpose} The screens share a stable task and entity vocabulary.`,
@@ -129,6 +132,7 @@ function draftFor(input: Case) {
     direction: input.locale === "fa-IR" ? "rtl" : "ltr",
     screenCount: input.screens.length,
     styleDirection: "Calm editorial hierarchy, clear card grouping, readable native text and a focused primary action.",
+    visualLanguageV1: visualLanguageV1 ?? createDefaultVisualLanguage({ styleDirection: "Calm editorial hierarchy with varied native compositions.", density: "medium", locale: input.locale }),
     contentDensity: "medium",
     contentSamplePolicy: "clearly-illustrative",
     accessibilityMinimums: ["Readable text size", "High contrast", "Clear focus and action hierarchy"],
@@ -145,7 +149,7 @@ function draftFor(input: Case) {
         { name: "Page heading", semanticRole: "heading", content: screen.name, priority: 1 },
         { name: "Primary information", semanticRole: input.entities[0] ?? "primary-content", content: screen.purpose, priority: 2 },
         { name: "Next action", semanticRole: "primary-action", content: input.goals[order % input.goals.length], priority: 3 },
-      ],
+      ].slice(0, regionCount),
       dataRelationships: [`${input.entities[0]} links to ${input.entities[1] ?? input.entities[0]}`],
       responsiveConstraints: [input.platform === "mobile" ? "Vertical scroll within a 390px mobile frame" : "Keep primary data and controls aligned on a 1440px desktop frame"],
       accessibilityNotes: ["Use labeled actions and preserve the project's reading direction"],
@@ -162,13 +166,13 @@ function draftFor(input: Case) {
   });
 }
 
-function programFor(input: Case, screenIndex: number): DesignProgramV1 {
+function programFor(input: Case, screenIndex: number, regionCount = 3): DesignProgramV1 {
   const screen = input.screens[screenIndex]!;
   const viewport = input.platform === "mobile"
     ? { preset: "mobile" as const, width: 390 as const, height: 844 as const }
     : { preset: "desktop" as const, width: 1440 as const, height: 900 as const };
   const width = viewport.width - 48;
-  const content = [screen.name, screen.purpose, `${input.entities[screenIndex % input.entities.length]} · ${input.goals[screenIndex % input.goals.length]}`];
+  const content = [screen.name, screen.purpose, `${input.entities[screenIndex % input.entities.length]} · ${input.goals[screenIndex % input.goals.length]}`].slice(0, regionCount);
   const textNode = (index: number) => ({
     type: "text" as const,
     id: `copy-${index + 1}`,
@@ -180,10 +184,45 @@ function programFor(input: Case, screenIndex: number): DesignProgramV1 {
     text: content[index]!,
     color: index === 0 ? "token:text" : "token:muted",
     fontSize: index === 0 ? 24 : 16,
+    textRole: index === 0 ? "heading" as const : index === 2 ? "action" as const : "body" as const,
     weight: index === 0 ? "bold" as const : "regular" as const,
     align: input.locale === "fa-IR" ? "right" as const : "left" as const,
   });
-  return DesignProgramV1Schema.parse({
+  const draft = draftFor(input, regionCount);
+  const planned = draft.screens[screenIndex]!;
+  const archetypes = ["editorial", "multi-panel", "task-focused"] as const;
+  type ContainerNode = Extract<DesignProgramNode, { type: "container" }>;
+  const children: ContainerNode[] = content.map((_, index) => ({
+    type: "container" as const,
+    id: `region-${index + 1}`,
+    name: planned.regions[index]?.name ?? `Content region ${index + 1}`,
+    semanticRole: planned.regions[index]?.semanticRole ?? `content-${index + 1}`,
+    interaction: index === 2 ? "button" as const : "none" as const,
+    width: screenIndex === 1 ? { mode: "fixed" as const, value: [92, 136, 80][index]! } : { mode: "fill" as const, value: width },
+    height: { mode: "fixed" as const, value: index === 2 ? 88 : screenIndex === 2 && index === 0 ? 160 : 148 },
+    background: index === 0 ? "token:surface" : index === 2 ? "token:raised-surface" : "token:surface",
+    layout: { axis: (screenIndex === 1 && index === 0 ? "row" : "column") as "row" | "column", gap: index === 0 ? 12 : 8, padding: { top: 12, right: 12, bottom: 12, left: 12 }, align: "start" as const, crossAlign: "stretch" as const },
+    children: [textNode(index)],
+  }));
+  if (regionCount > 1 && screenIndex === 0) {
+    children[1]!.children.push({ ...textNode(2), id: "copy-metric-detail", text: `${input.entities[0]} · ${input.goals[1 % input.goals.length]}`, semanticRole: "supporting-data" });
+  } else if (regionCount > 1 && screenIndex === 1) {
+    children[0]!.children.push({ ...textNode(2), id: "copy-detail-meta", text: `Selected ${input.entities[0]}`, semanticRole: "record-metadata" });
+  } else if (regionCount > 1) {
+    children[1]!.children.push({ ...textNode(2), id: "copy-status-detail", text: `Next: ${input.goals[0]}`, semanticRole: "status-detail" });
+    children[0]!.children.push({
+      type: "container",
+      id: "progress-steps",
+      name: "Progress sequence",
+      semanticRole: "progress-sequence",
+      interaction: "none",
+      width: { mode: "fill", value: width - 24 },
+      height: { mode: "fixed", value: 52 },
+      layout: { axis: "row", gap: 8, padding: { top: 0, right: 0, bottom: 0, left: 0 }, align: "start", crossAlign: "center" },
+      children: [{ ...textNode(1), id: "progress-current", text: "Step 1 · In progress", semanticRole: "progress-current" }],
+    });
+  }
+  return UniversalDesignProgramV1Schema.parse({
     programVersion: 1,
     id: "model-generated-project",
     revision: 7,
@@ -191,10 +230,11 @@ function programFor(input: Case, screenIndex: number): DesignProgramV1 {
     audience: input.audience,
     locale: { language: input.locale, direction: input.locale === "fa-IR" ? "rtl" : "ltr" },
     visualIntent: "An editable, coherent screen with grouped project-specific information and a clear next action.",
+    visualLanguageV1: draft.visualLanguageV1,
     contentProvenance: "synthetic-fixture",
     requiredCapabilities: ["native-text", "auto-layout", ...(input.locale === "fa-IR" ? ["rtl" as const] : []), "vertical-scroll"],
     tokens: {
-      colors: { background: "#F7F8FA", surface: "#FFFFFF", primary: "#315E75", accent: "#E4AA55", text: "#17232A", muted: "#5D6A70" },
+      colors: { background: draft.visualLanguageV1!.colorRoles.page, surface: draft.visualLanguageV1!.colorRoles.surface, "raised-surface": draft.visualLanguageV1!.colorRoles.raisedSurface, primary: draft.visualLanguageV1!.colorRoles.primary, accent: draft.visualLanguageV1!.colorRoles.accent, text: draft.visualLanguageV1!.colorRoles.text, muted: draft.visualLanguageV1!.colorRoles.mutedText, border: draft.visualLanguageV1!.colorRoles.border },
       spacing: [8, 12, 16, 24],
       headingFont: "Inter",
       bodyFont: "Inter",
@@ -207,6 +247,17 @@ function programFor(input: Case, screenIndex: number): DesignProgramV1 {
       order: screenIndex,
       viewport,
       scroll: "vertical",
+      compositionV1: {
+        version: 1,
+        archetype: archetypes[screenIndex % archetypes.length],
+        decisionTrace: `The ${planned.role} prioritizes its main content and next action with a distinct hierarchy.`,
+        variationSeed: compositionVariationSeed("chat-universal-0001", `screen-${String(screenIndex + 1).padStart(2, "0")}`),
+        focusNodeId: `region-${Math.min(3, regionCount)}`,
+        responsiveIntent: input.platform === "mobile" ? "Single-column content with local horizontal pairing only for compact metrics." : "Use a broader split to keep primary content and supporting details visible together.",
+        regions: planned.regions.map((region, index) => ({ nodeId: `region-${index + 1}`, semanticRole: region.semanticRole, priority: region.priority, visualWeight: region.priority === 1 ? 6 : region.priority === 2 ? 4 : 2, contentKind: index === 2 ? "action" as const : index === 1 ? "data" as const : "text" as const })),
+        entityRefs: planned.entityRefs,
+        approvedAssetsUsed: [],
+      },
       dependsOn: screenIndex > 0 ? [`screen-${String(screenIndex).padStart(2, "0")}`] : [],
       root: {
         type: "container",
@@ -217,22 +268,18 @@ function programFor(input: Case, screenIndex: number): DesignProgramV1 {
         width: { mode: "fixed", value: width },
         height: { mode: "fixed", value: viewport.height + 120 },
         background: "token:background",
-        layout: { axis: "column", gap: 20, padding: { top: 8, right: 0, bottom: 8, left: 0 }, align: "start", crossAlign: "stretch" },
-        children: content.map((_, index) => ({
-          type: "container" as const,
-          id: `region-${index + 1}`,
-          name: `Content region ${index + 1}`,
-          semanticRole: ["primary-summary", "supporting-details", "next-step"][index]!,
-          interaction: "none" as const,
-          width: { mode: "fill" as const, value: width },
-          height: { mode: "fixed" as const, value: 96 },
-          background: index === 2 ? "#E9F0F2" : "token:surface",
-          layout: { axis: "column" as const, gap: 8, padding: { top: 16, right: 16, bottom: 16, left: 16 }, align: "start" as const, crossAlign: "stretch" as const },
-          children: [textNode(index)],
-        })),
+        layout: { axis: screenIndex === 1 ? "row" : "column", gap: screenIndex === 1 ? 12 : 20, padding: { top: 8, right: 0, bottom: 8, left: 0 }, align: screenIndex === 2 ? "center" : "start", crossAlign: "stretch" },
+        children,
       },
     }],
   });
+}
+
+function compositionTopology(root: DesignProgramV1["screens"][number]["root"]): string {
+  if (root.type !== "container") return root.type;
+  return JSON.stringify([root.layout.axis, root.children.map((node) => node.type === "container"
+    ? [node.layout.axis, node.children.map((child) => child.type === "container" ? [child.layout.axis, child.children.length] : child.type)]
+    : node.type)]);
 }
 
 function modelTurn(name: string, argumentsValue: unknown, index: number): AuthorizedChatTurn {
@@ -267,12 +314,37 @@ function taskFor(input: Case): ChatTask {
   });
 }
 
+function pinnedBrandFixture(): PinnedBrandKit {
+  const typography = Object.fromEntries(["display", "heading1", "heading2", "heading3", "body", "caption", "button"].map((role) => [role, {
+    requestedFamily: "Brand Display", fallbackFamily: "Inter", style: "Regular", weight: 400,
+    size: role === "display" ? 40 : role.startsWith("heading") ? 28 : role === "caption" ? 12 : 16,
+    lineHeight: 24, letterSpacing: 0, alignment: "left", direction: "ltr",
+  }]));
+  return pinBrandKit(BrandKitRevisionSchema.parse({
+    schemaVersion: 1, id: "brand_universal_01", revision: 1, name: "Universal Test Brand", locale: "en", direction: "ltr",
+    createdAt: 1, updatedAt: 1, status: "active",
+    tokens: {
+      palette: { primary: "#2463EB", secondary: "#1E3A8A", accent: "#F97316", background: "#F8FAFC", surface: "#FFFFFF", text: "#0F172A", mutedText: "#64748B", border: "#CBD5E1", success: "#15803D", warning: "#B45309", error: "#B91C1C", custom: {} },
+      typography,
+      spacing: [4, 8, 12, 16], radii: [4, 8, 12], stroke: 1,
+      shadow: { color: "#0F172A", opacity: 0.12, offsetX: 0, offsetY: 6, radius: 18 },
+      grid: { mobileColumns: 4, desktopColumns: 12, mobileGutter: 12, desktopGutter: 24, desktopBreakpoint: 900 },
+      density: "comfortable", components: { buttonRadius: 12, cardRadius: 16, inputRadius: 10, buttonHeight: 48 }, themes: [],
+    },
+    assets: [],
+  }));
+}
+
 function makeHarness(input: Case, options: {
   firstPlanMalformed?: boolean;
   firstProgramViewportMismatch?: boolean;
   repairViewportMismatch?: boolean;
+  sparseConfirmation?: boolean;
+  brandKit?: PinnedBrandKit;
+  planLanguage?: ProjectVisualLanguageV1;
 } = {}) {
   const task = taskFor(input);
+  if (options.brandKit) task.brandKit = options.brandKit;
   const mock = createMockApi();
   const sent: PluginToUIMessage[] = [];
   const executor = createFigmaToolExecutor(mock.api, (message) => sent.push(message));
@@ -293,11 +365,11 @@ function makeHarness(input: Case, options: {
           kind: "tool_validation" as const,
           issues: [{ toolName: "plan_universal_project", callId: "universal-call-0002", stage: "arguments_schema" as const, errorCode: "too_small", fieldPaths: ["productPurpose"] }],
         };
-      return modelTurn("plan_universal_project", draftFor(input), index);
+      return modelTurn("plan_universal_project", draftFor(input, options.sparseConfirmation ? 1 : 3, options.planLanguage), index);
     }
     if (lifecycle === "UNIVERSAL_COMPOSING") {
       const screenIndex = composed++;
-      const program = programFor(input, screenIndex);
+      const program = programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
       if (options.firstProgramViewportMismatch && screenIndex === 0) {
         program.screens[0]!.viewport = input.platform === "mobile"
           ? { preset: "desktop", width: 1440, height: 900 }
@@ -312,7 +384,7 @@ function makeHarness(input: Case, options: {
       const repair = checkpoints.at(-1)?.universalScreens?.find(({ status }) => status === "repair_pending");
       if (!repair) throw new Error("The repair request has no persisted finding scope.");
       const screenIndex = Number(repair.screenId.slice("screen-".length)) - 1;
-      const program = programFor(input, screenIndex);
+      const program = programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
       if (options.repairViewportMismatch) {
         program.screens[0]!.viewport = input.platform === "mobile"
           ? { preset: "desktop", width: 1440, height: 900 }
@@ -451,6 +523,12 @@ describe("universal design Chat route", () => {
     expect(h.task.universalScreens?.every(({ status, program, rootRef, nativeNodeCount, verifiedNodeCount }) => status === "verified" && Boolean(program) && Boolean(rootRef) && Boolean(nativeNodeCount) && verifiedNodeCount === nativeNodeCount)).toBe(true);
     expect(h.task.projectPlan?.screens.map(({ name }) => name)).toEqual(input.screens.map(({ name }) => name));
     expect(h.task.projectPlan?.direction).toBe(input.locale === "fa-IR" ? "rtl" : "ltr");
+    const composedPrograms = h.task.universalScreens!.map(({ program }) => program!);
+    expect(new Set(composedPrograms.map(({ visualLanguageV1 }) => JSON.stringify(visualLanguageV1))).size).toBe(1);
+    expect(composedPrograms.every(({ screens }) => Boolean(screens[0]?.compositionV1?.decisionTrace && screens[0]?.compositionV1?.regions.length === 3))).toBe(true);
+    expect(composedPrograms.every(({ screens }) => screens[0]?.compositionV1?.variationSeed === compositionVariationSeed(h.task.id, screens[0]!.id))).toBe(true);
+    if (composedPrograms.length >= 3)
+      expect(new Set(composedPrograms.slice(0, 3).map(({ screens }) => compositionTopology(screens[0]!.root))).size).toBe(3);
     expect(h.task.universalMetrics).toMatchObject({
       planRequests: 1,
       programRequests: input.screens.length,
@@ -513,6 +591,48 @@ describe("universal design Chat route", () => {
     const modelText = h.mock.nodes.filter((node) => node.type === "TEXT").map((node) => String(node.characters)).join(" ");
     expect(modelText).toMatch(/specimen|provenance|conservation|loan/iu);
     expect(modelText).not.toMatch(/cart|checkout|apparel|clothing|clothes/iu);
+  });
+
+  it("accepts a genuinely sparse confirmation screen without a node-count floor", async () => {
+    const confirmation: Case = {
+      name: "sparse appointment confirmation",
+      brief: "Create one mobile appointment confirmation screen in English.",
+      purpose: "Confirm the booking and explain the next step.",
+      audience: "A person who just booked an appointment",
+      platform: "mobile",
+      locale: "en-US",
+      tags: ["appointment-confirmation"],
+      entities: ["appointment"],
+      goals: ["Review the booking"],
+      screens: [{ name: "Booking confirmed", role: "confirmation", purpose: "Confirm the booked appointment and show the next step." }],
+    };
+    const h = makeHarness(confirmation, { sparseConfirmation: true });
+    await runChatTask(h.task, h.deps);
+    const program = h.task.universalScreens?.[0]?.program;
+    expect(h.task.status).toBe("completed");
+    expect(program?.screens[0]?.compositionV1?.regions).toHaveLength(1);
+    expect(parseDesignProgram(program).success).toBe(true);
+    expect(h.task.universalScreens?.[0]?.verifiedNodeCount).toBeGreaterThan(0);
+  });
+
+  it("applies the task-pinned Brand Kit while preserving an explicit user palette override", async () => {
+    const brandKit = pinnedBrandFixture();
+    const base = cases[2]!;
+    const brandRun = makeHarness(base, { brandKit });
+    await runChatTask(brandRun.task, brandRun.deps);
+    expect(brandRun.task.projectPlan?.visualLanguageV1?.colorRoles.primary).toBe("#2463EB");
+    expect(brandRun.task.projectPlan?.visualLanguageV1?.typography.headingFont).toBe("Brand Display");
+    expect(brandRun.task.projectPlan?.visualLanguageV1?.spacingScale).toEqual([4, 8, 12, 16]);
+    expect(brandRun.task.universalScreens?.every(({ program }) => program?.tokens.colors.primary === "#2463EB")).toBe(true);
+
+    const override = createDefaultVisualLanguage({ styleDirection: "Use a calm teal product identity", density: "medium", locale: base.locale });
+    override.colorRoles.primary = "#117A65";
+    const explicit: Case = { ...base, brief: `${base.brief} Use #117A65 as the project primary color instead of the Brand Kit color.` };
+    const explicitRun = makeHarness(explicit, { brandKit, planLanguage: override });
+    await runChatTask(explicitRun.task, explicitRun.deps);
+    expect(explicitRun.task.projectPlan?.visualLanguageV1?.colorRoles.primary).toBe("#117A65");
+    expect(explicitRun.task.projectPlan?.visualLanguageV1?.typography.headingFont).toBe("Brand Display");
+    expect(explicitRun.task.universalScreens?.every(({ program }) => program?.tokens.colors.primary === "#117A65")).toBe(true);
   });
 
   it("corrects an invalid structured plan with one bounded schema retry", async () => {
@@ -583,6 +703,17 @@ describe("universal design Chat route", () => {
     const program = programFor(input, 0);
     expect(parseDesignProgram(program).success).toBe(true);
     expect(compileDesignProgram(program).success).toBe(true);
+    const phase3Checkpoint = structuredClone(program);
+    Reflect.deleteProperty(phase3Checkpoint, "visualLanguageV1");
+    Reflect.deleteProperty(phase3Checkpoint.screens[0]!, "compositionV1");
+    const removeTextRoles = (node: DesignProgramNode) => {
+      if (node.type === "text") Reflect.deleteProperty(node, "textRole");
+      if (node.type === "container") node.children.forEach(removeTextRoles);
+    };
+    removeTextRoles(phase3Checkpoint.screens[0]!.root);
+    expect(parseDesignProgram(phase3Checkpoint).success).toBe(true);
+    expect(compileDesignProgram(phase3Checkpoint).success).toBe(true);
+    expect(UniversalDesignProgramV1Schema.safeParse(phase3Checkpoint).success).toBe(false);
     expect(parseDesignProgram({ ...program, programVersion: 2 }).success).toBe(false);
     const external = structuredClone(program);
     const externalRoot = external.screens[0]!.root;
@@ -618,5 +749,94 @@ describe("universal design Chat route", () => {
       asset: { source: "authorized-existing-file", label: "private image", assetRef: "node:guessed", verified: false, authorized: false },
     });
     expect(parseDesignProgram(unauthorized).success).toBe(false);
+  });
+
+  it("preflights fixed-axis overflow, touch targets and text contrast without guessing an aesthetic score", () => {
+    const overflowing = programFor(cases[2]!, 1);
+    const horizontal = overflowing.screens[0]!.root;
+    if (horizontal.type !== "container") throw new Error("Program fixture root must be a container.");
+    const fixedRegion = horizontal.children[0];
+    if (fixedRegion?.type !== "container") throw new Error("Program fixture region must be a container.");
+    fixedRegion.width.value = horizontal.width.value + 80;
+    expect(parseDesignProgram(overflowing).success).toBe(false);
+    expect(parseDesignProgram(overflowing).findings.some(({ code }) => code === "layout_axis_overflow")).toBe(true);
+
+    const tinyTarget = programFor(cases[0]!, 0);
+    const tinyRoot = tinyTarget.screens[0]!.root;
+    if (tinyRoot.type !== "container") throw new Error("Program fixture root must be a container.");
+    const action = tinyRoot.children[2];
+    if (action?.type !== "container") throw new Error("Program fixture action region must be a container.");
+    action.width.value = 40;
+    expect(parseDesignProgram(tinyTarget).findings.some(({ code }) => code === "touch_target_below_minimum")).toBe(true);
+
+    const lowContrast = programFor(cases[0]!, 0);
+    const replaceTextColors = (node: DesignProgramNode) => {
+      if (node.type === "text") node.color = "#FFFFFF";
+      if (node.type === "container") node.children.forEach(replaceTextColors);
+    };
+    replaceTextColors(lowContrast.screens[0]!.root);
+    const audit = compileDesignProgram(lowContrast);
+    expect(audit.success).toBe(true);
+    if (audit.success) expect(audit.findings.some(({ code }) => code === "quality_low-contrast")).toBe(true);
+  });
+
+  it("renders a hash-verified pinned Brand Kit image as an editable native image fill", async () => {
+    const input = cases[0]!;
+    const assetId = "asset_universal_01";
+    const asset = createBrandVisualAsset({
+      assetId,
+      kind: "raster",
+      variant: "primary",
+      name: "User-provided field image",
+      mimeType: "image/png",
+      width: 1,
+      height: 1,
+      contentHash: brandAssetContentHash(ONE_PIXEL_PNG),
+      provenance: "user-provided",
+      rightsNote: "Provided for a local regression test",
+      createdAt: 1,
+    }, ONE_PIXEL_PNG);
+    const program = programFor(input, 0);
+    const root = program.screens[0]!.root;
+    if (root.type !== "container") throw new Error("Program fixture root must be a container.");
+    root.children.push({
+      type: "image",
+      id: "brand-image",
+      name: "Pinned field image",
+      semanticRole: "approved-brand-media",
+      interaction: "none",
+      width: { mode: "fixed", value: 80 },
+      height: { mode: "fixed", value: 80 },
+      asset: { source: "user-approved-brand-kit", label: asset.name, assetRef: assetId, verified: true, authorized: true },
+    });
+    program.screens[0]!.compositionV1!.approvedAssetsUsed = [assetId];
+    program.requiredCapabilities.push("image");
+    expect(parseDesignProgram(program).success).toBe(false);
+    expect(parseDesignProgram(program, { allowedBrandAssetIds: new Set([assetId]) }).success).toBe(true);
+    const preflight = compileDesignProgram(program, { allowedBrandAssetIds: new Set([assetId]) });
+    expect(preflight.success, JSON.stringify(preflight)).toBe(true);
+
+    const mock = createMockApi();
+    const executor = createFigmaToolExecutor(mock.api, () => {});
+    const rendered = await renderDesignProgramLocal(mock.api, program, {
+      taskId: "chat-asset-test-0001",
+      documentId: "file-test-56-page_current",
+      pageId: "page:current",
+      executor,
+      assets: [asset],
+    });
+    expect(rendered.success, JSON.stringify(rendered)).toBe(true);
+    expect(mock.nodes.some((node) => node.type === "RECTANGLE" && node.getPluginData("fad.design.asset-id") === assetId)).toBe(true);
+    const replayProgram = structuredClone(program);
+    replayProgram.id = "project-asset-reuse";
+    const replay = await renderDesignProgramLocal(mock.api, replayProgram, {
+      taskId: "chat-asset-test-0002",
+      documentId: "file-test-56-page_current",
+      pageId: "page:current",
+      executor,
+      assets: [asset],
+    });
+    expect(replay.success, JSON.stringify(replay)).toBe(true);
+    expect(mock.getImageImportCalls()).toBe(1);
   });
 });

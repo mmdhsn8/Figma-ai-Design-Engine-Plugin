@@ -119,6 +119,9 @@ export interface MultiScreenResult {
   warnings: string[];
 }
 
+const MAX_CACHED_IMAGE_HASHES_PER_API = 16;
+const imageHashesByApi = new WeakMap<object, Map<string, string>>();
+
 export interface MultiScreenRenderResult {
   batchId: string;
   batchName: string;
@@ -375,7 +378,8 @@ function prepareVisualAssets(
   const assetMap = new Map((assets ?? []).map((asset) => [asset.id, asset]));
   const references = new Set<string>();
   nodeTrees.forEach((nodes) => collectImageReferences(nodes, references));
-  const hashesByBytes = new Map<string, string>();
+  const hashesByBytes = imageHashesByApi.get(api) ?? new Map<string, string>();
+  imageHashesByApi.set(api, hashesByBytes);
   const imageHashes = new Map<string, string>();
   for (const assetId of references) {
     const asset = assetMap.get(assetId);
@@ -391,6 +395,10 @@ function prepareVisualAssets(
         );
       }
       hashesByBytes.set(asset.base64, hash);
+      if (hashesByBytes.size > MAX_CACHED_IMAGE_HASHES_PER_API) {
+        const oldest = hashesByBytes.keys().next().value as string | undefined;
+        if (oldest !== undefined && oldest !== asset.base64) hashesByBytes.delete(oldest);
+      }
     }
     imageHashes.set(assetId, hash);
   }

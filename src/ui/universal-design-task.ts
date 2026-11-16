@@ -5,6 +5,7 @@ import { parseChatGenerationIntent } from "../shared/chat-generation";
 import { resolveBrandKitTokens } from "../shared/brand-kit";
 import { CHAT_TASK_MAX_VALIDATION_CORRECTIONS, ChatTaskSchema, type ChatTask } from "../shared/chat-task";
 import { utf8Bytes } from "../shared/generation-limits";
+import { compositionVariationSeed, createDefaultVisualLanguage, ProjectVisualLanguageV1Schema, type ProjectVisualLanguageV1 } from "../shared/design-composition";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
 import {
   parseProjectPlanDraft,
@@ -70,6 +71,7 @@ function pinnedContext(task: ChatTask): Record<string, unknown> {
           direction: task.brandKit.direction,
           tokenHash: task.brandKit.tokenHash,
           tokens: task.brandKit.tokens,
+          assetCatalog: task.brandKit.assets.map(({ assetId, kind, variant, name, mimeType, width, height, provenance, rightsNote, contentHash }) => ({ assetId, kind, variant, name, mimeType, width, height, provenance, rightsNote, contentHash })),
         }
       : null,
     designSkills: (task.designSkills ?? []).map((skill) => ({
@@ -105,7 +107,8 @@ function planRequestContext(task: ChatTask): Record<string, unknown> {
       "editable native Figma frames, text and vector shapes",
       "mobile viewport 390×844 or desktop viewport 1440×900",
       "RTL or LTR layout; vertical scroll",
-      "native-placeholder assets only; no remote URLs or arbitrary code",
+      "editable native text, frames and vector shapes; pinned Brand Kit images may be reused by asset ID",
+      "clearly labeled native placeholders when no authorized local asset fits; no remote URLs or arbitrary code",
       "maximum 10 screens and 200 adopted native nodes per task",
     ],
     readScope: "No existing document content has been inspected; plan from the brief and pinned local design context only.",
@@ -123,6 +126,7 @@ function planSummary(plan: ProjectPlanV1, screen: ProjectPlanV1["screens"][numbe
     keyEntities: plan.keyEntities,
     domainTags: plan.domainTags,
     styleDirection: plan.styleDirection,
+    visualLanguageV1: plan.visualLanguageV1,
     contentDensity: plan.contentDensity,
     contentSamplePolicy: plan.contentSamplePolicy,
     accessibilityMinimums: plan.accessibilityMinimums,
@@ -149,6 +153,59 @@ function taskBrandSummary(plan: ProjectPlanV1): unknown {
   return plan.pinnedBrandKit ?? null;
 }
 
+function pinBrandLanguage(language: ProjectVisualLanguageV1, task: ChatTask): ProjectVisualLanguageV1 {
+  const kit = task.brandKit;
+  if (!kit) return language;
+  const prompt = task.prompt;
+  const explicitColor = /#[0-9a-f]{6}/iu.test(prompt)
+    || /\b(?:black|white|red|orange|yellow|green|blue|purple|violet|teal|cyan|pink|brown|gray|grey|beige|navy|indigo|mint|coral)\b/iu.test(prompt)
+    || /(?:رنگ\s*(?:آبی|سبز|قرمز|بنفش|نارنجی|زرد|صورتی|قهوه‌ای|مشکی|سفید)|از\s+.{1,30}\s+رنگ\s+استفاده)/iu.test(prompt);
+  const explicitFont = /\b(?:font|typeface|typography family)\b|(?:فونت|قلم)/iu.test(prompt);
+  const explicitSpacing = /\b(?:spacing|compact|spacious|dense layout)\b|(?:فاصله|تراکم)/iu.test(prompt);
+  const brand = resolveBrandKitTokens(kit, language.colorMode);
+  const brandSpacing = [...new Set(kit.tokens.spacing.filter((value) => value >= 2).sort((a, b) => a - b))].slice(0, 8);
+  const clamp = (value: number, minimum: number, maximum: number) => Math.max(minimum, Math.min(maximum, Math.round(value)));
+  return ProjectVisualLanguageV1Schema.parse({
+    ...language,
+    colorRoles: explicitColor ? language.colorRoles : {
+      ...language.colorRoles,
+      page: brand.palette.background,
+      surface: brand.palette.surface,
+      raisedSurface: brand.palette.surface,
+      text: brand.palette.text,
+      mutedText: brand.palette.mutedText,
+      primary: brand.palette.primary,
+      accent: brand.palette.accent,
+      border: brand.palette.border,
+    },
+    typography: explicitFont ? language.typography : {
+      ...language.typography,
+      headingFont: kit.tokens.typography.heading1.requestedFamily,
+      bodyFont: kit.tokens.typography.body.requestedFamily,
+      displaySize: clamp(kit.tokens.typography.display.size, 24, 72),
+      titleSize: clamp(kit.tokens.typography.heading1.size, 20, 48),
+      bodySize: clamp(kit.tokens.typography.body.size, 12, 24),
+      captionSize: clamp(kit.tokens.typography.caption.size, 10, 18),
+    },
+    spacingScale: explicitSpacing || brandSpacing.length < 3 ? language.spacingScale : brandSpacing,
+    radii: {
+      compact: Math.min(32, kit.tokens.radii[0] ?? language.radii.compact),
+      control: Math.min(40, kit.tokens.components.inputRadius),
+      surface: Math.min(48, kit.tokens.components.cardRadius),
+    },
+  });
+}
+
+function pinPlanLanguage(plan: ProjectPlanV1, task: ChatTask): ProjectPlanV1 {
+  const visualLanguageV1 = pinBrandLanguage(visualLanguageForPlan(plan), task);
+  return ProjectPlanV1Schema.parse({ ...plan, visualLanguageV1 });
+}
+
+function finalizePlan(plan: ProjectPlanV1, task: ChatTask): { plan: ProjectPlanV1; fingerprint: string } {
+  const pinnedPlan = pinPlanLanguage(plan, task);
+  return { plan: pinnedPlan, fingerprint: projectPlanFingerprint(pinnedPlan) };
+}
+
 function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", screen?: UniversalScreenCheckpoint): ChatInputItem[] {
   const plan = task.projectPlan;
   const screenPlan = screen && plan?.screens.find(({ screenId }) => screenId === screen.screenId);
@@ -169,7 +226,7 @@ function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", sc
   const routeInstruction = purpose === "plan"
     ? "Return only one plan_universal_project tool call. Respect the exact count/device/language constraints in this context. Choose useful distinct screens if the brief did not provide a count. Do not guess private document data."
     : purpose === "compose"
-      ? "Return only one compose_design_program tool call for the single currentScreen. Use the shared project language and visual system, meaningful domain semantics, readable content, at least three planned regions, editable native elements and only clearly illustrative synthetic content when necessary. Use placeholder assets only. Do not include other screens."
+      ? `Return only one compose_design_program tool call for the single currentScreen. Reuse the exact shared visualLanguageV1; choose a useful general archetype from the allowed vocabulary and explain the choice in decisionTrace. Give each planned region a real container nodeId in the editable tree, prioritize the user goal, and use the stable variation seed ${compositionVariationSeed(task.id, screen!.screenId)}. Use semantic textRole values so typography tokens apply. Follow contentSamplePolicy exactly and label fictional sample data as illustrative. Only use an image assetRef if its ID is in the pinned Brand Kit assetCatalog; otherwise make a visibly labeled native placeholder or editable vector. Do not force card grids, add at least three nodes, or include other screens.`
       : "Return only one repair_design_program tool call. Modify only the supplied invalid fields/findings in this saved one-screen program and preserve all other valid content.";
   const payload = {
     contract: purpose === "plan" ? "ProjectPlanDraftV1" : "DesignProgramV1",
@@ -237,7 +294,18 @@ function initialMetrics(now: number, timingEvidence: "live" | "mock") {
   });
 }
 
-function findingsForProgram(program: DesignProgramV1, expectedScreenId: string, plan: ProjectPlanV1, planScreen: ProjectPlanV1["screens"][number]): Array<{ code: string; path: string; message: string }> {
+function pinnedBrandAssetIds(task: ChatTask): Set<string> {
+  return new Set(task.brandKit?.assets.map(({ assetId }) => assetId) ?? []);
+}
+
+function layoutTopology(root: DesignProgramV1["screens"][number]["root"]): string {
+  if (root.type !== "container") return root.type;
+  return JSON.stringify([root.layout.axis, root.children.map((child) => child.type === "container"
+    ? [child.layout.axis, child.children.map((grandchild) => grandchild.type === "container" ? [grandchild.layout.axis, grandchild.children.length] : grandchild.type)]
+    : child.type)]);
+}
+
+function findingsForProgram(program: DesignProgramV1, expectedScreenId: string, plan: ProjectPlanV1, planScreen: ProjectPlanV1["screens"][number], task: ChatTask): Array<{ code: string; path: string; message: string }> {
   const findings: Array<{ code: string; path: string; message: string }> = [];
   const screen = program.screens[0];
   if (!screen || program.screens.length !== 1)
@@ -250,27 +318,58 @@ function findingsForProgram(program: DesignProgramV1, expectedScreenId: string, 
   }
   if (program.locale.direction !== plan.direction || program.locale.language.toLocaleLowerCase() !== plan.locale.toLocaleLowerCase())
     findings.push({ code: "locale_mismatch", path: "locale", message: "The program language or reading direction differs from the saved project plan." });
-  const parsed = parseDesignProgram(program);
+  const allowedBrandAssetIds = pinnedBrandAssetIds(task);
+  const parsed = parseDesignProgram(program, { allowedBrandAssetIds });
   if (!parsed.success)
     findings.push(...parsed.findings.filter((finding) => finding.severity === "error").slice(0, 10).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })));
-  const compiled = compileDesignProgram(program);
+  const compiled = compileDesignProgram(program, { allowedBrandAssetIds });
   if (!compiled.success)
     findings.push(...compiled.findings.slice(0, 10).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })));
   if (parsed.success && screen) {
-    const roles = new Set<string>();
-    let textNodes = 0;
+    const textContent: string[] = [];
     const visit = (node: DesignProgramV1["screens"][number]["root"]) => {
-      roles.add(node.semanticRole.toLocaleLowerCase());
-      if (node.type === "text") textNodes++;
+      if (node.type === "text") textContent.push(node.text.trim());
       if (node.type === "container") node.children.forEach(visit);
     };
     visit(screen.root);
-    if (parsed.nodeCount < 6 || roles.size < 3 || textNodes < 3)
-      findings.push({ code: "screen_semantics_too_sparse", path: "screens.0.root", message: "The screen needs at least six native nodes, three distinct semantic roles and three editable text nodes to represent its planned regions." });
     if (screen.root.type !== "container")
       findings.push({ code: "screen_root_not_container", path: "screens.0.root", message: "The screen root must be an editable layout container." });
+    if (!textContent.some((value) => value.length > 1 && !/^(?:placeholder|lorem ipsum|sample text)$/iu.test(value)))
+      findings.push({ code: "meaningful_content_missing", path: "screens.0.root", message: "The screen has no meaningful editable text for its planned purpose." });
+    if (!screen.compositionV1)
+      findings.push({ code: "composition_intent_missing", path: "screens.0.compositionV1", message: "The screen must record its archetype, visual rationale and semantic region mapping." });
+    else if (plan.visualLanguageV1) {
+      if (screen.compositionV1.regions.length !== planScreen.regions.length)
+        findings.push({ code: "planned_region_coverage_mismatch", path: "screens.0.compositionV1.regions", message: "Map each planned semantic region to a distinct editable container." });
+      else if (screen.compositionV1.regions.some((region, index) => region.semanticRole.toLocaleLowerCase() !== planScreen.regions[index]?.semanticRole.toLocaleLowerCase()))
+        findings.push({ code: "planned_region_role_mismatch", path: "screens.0.compositionV1.regions", message: "Keep each composition region aligned with the matching planned semantic role." });
+      const unknownEntities = screen.compositionV1.entityRefs.filter((ref) => !planScreen.entityRefs.includes(ref));
+      if (unknownEntities.length)
+        findings.push({ code: "unplanned_entity_reference", path: "screens.0.compositionV1.entityRefs", message: "Composition entity references must come from the saved screen plan." });
+    }
+    if (program.visualLanguageV1 && plan.visualLanguageV1 && JSON.stringify(program.visualLanguageV1) !== JSON.stringify(plan.visualLanguageV1))
+      findings.push({ code: "visual_language_drift", path: "visualLanguageV1", message: "Every screen must retain the exact visual language saved for its project." });
+    if (plan.visualLanguageV1 && planScreen.order < 3) {
+      const topology = layoutTopology(screen.root);
+      const repeatedEarlierRole = task.universalScreens?.some((saved) => {
+        if (saved.screenId === planScreen.screenId || !saved.program) return false;
+        const priorPlan = plan.screens.find(({ screenId }) => screenId === saved.screenId);
+        const priorScreen = saved.program.screens[0];
+        return Boolean(priorPlan && priorScreen && priorPlan.role.toLocaleLowerCase() !== planScreen.role.toLocaleLowerCase() && layoutTopology(priorScreen.root) === topology);
+      });
+      if (repeatedEarlierRole)
+        findings.push({ code: "repeated_screen_topology", path: "screens.0.root", message: "Use a distinct editable layout structure when this screen has a different role from an earlier planned screen." });
+    }
+    if (compiled.success) {
+      const actionable = compiled.findings.filter(({ code }) => code === "quality_low-contrast" || code === "quality_overflow-risk" || code === "quality_small-touch-target");
+      findings.push(...actionable.slice(0, 4).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })));
+    }
   }
   return [...new Map(findings.map((finding) => [`${finding.code}:${finding.path}`, finding])).values()].slice(0, 12);
+}
+
+function visualLanguageForPlan(plan: ProjectPlanV1): ProjectVisualLanguageV1 {
+  return plan.visualLanguageV1 ?? createDefaultVisualLanguage({ styleDirection: plan.styleDirection, density: plan.contentDensity, locale: plan.locale });
 }
 
 function normalizedProgram(value: DesignProgramV1, plan: ProjectPlanV1, screenPlan: ProjectPlanV1["screens"][number]): DesignProgramV1 {
@@ -282,13 +381,62 @@ function normalizedProgram(value: DesignProgramV1, plan: ProjectPlanV1, screenPl
   required.add("auto-layout");
   if (plan.direction === "rtl") required.add("rtl");
   if (screenPlan.scroll === "vertical") required.add("vertical-scroll");
+  if (screen.root.type === "container") {
+    const visit = (node: DesignProgramV1["screens"][number]["root"]) => {
+      if (node.type === "vector") required.add("vector");
+      if (node.type === "image" && node.asset.source === "user-approved-brand-kit") required.add("image");
+      if (node.type === "container") node.children.forEach(visit);
+    };
+    visit(screen.root);
+  }
+  const visualLanguageV1 = visualLanguageForPlan(plan);
+  const existingComposition = screen.compositionV1;
+  const childRegions = screen.root.type === "container" ? screen.root.children.filter((node) => node.type === "container").slice(0, 6) : [];
+  const assetRefs: string[] = [];
+  const collectAssets = (node: DesignProgramV1["screens"][number]["root"]) => {
+    if (node.type === "image" && node.asset.source === "user-approved-brand-kit" && node.asset.assetRef) assetRefs.push(node.asset.assetRef);
+    if (node.type === "container") node.children.forEach(collectAssets);
+  };
+  collectAssets(screen.root);
+  const compositionV1 = {
+    ...(existingComposition ?? {
+      version: 1 as const,
+      archetype: "custom" as const,
+      decisionTrace: "Recovered from the saved editable container hierarchy.",
+      focusNodeId: childRegions[0]?.id ?? screen.root.id,
+      responsiveIntent: `${plan.platform} viewport with ${screenPlan.scroll === "vertical" ? "vertical scroll" : "contained content"}.`,
+      regions: (childRegions.length ? childRegions : [screen.root]).map((node, index) => ({ nodeId: node.id, semanticRole: node.semanticRole, priority: Math.min(index + 1, 6), visualWeight: Math.max(1, 6 - index), contentKind: "text" as const })),
+      entityRefs: screenPlan.entityRefs,
+      approvedAssetsUsed: [...new Set(assetRefs)],
+    }),
+    variationSeed: compositionVariationSeed(plan.taskId, screenPlan.screenId),
+  };
+  const languageColors = visualLanguageV1.colorRoles;
   return DesignProgramV1Schema.parse({
     ...value,
     id: plan.projectId,
     revision: 1,
-    contentProvenance: "synthetic-fixture",
+    contentProvenance: plan.contentSamplePolicy === "clearly-illustrative" ? "synthetic-illustrative" : value.contentProvenance,
     requiredCapabilities: [...required],
-    tokens: value.tokens,
+    visualLanguageV1,
+    tokens: {
+      ...value.tokens,
+      colors: {
+        ...value.tokens.colors,
+        page: languageColors.page,
+        background: languageColors.page,
+        surface: languageColors.surface,
+        "raised-surface": languageColors.raisedSurface,
+        primary: languageColors.primary,
+        accent: languageColors.accent,
+        text: languageColors.text,
+        muted: languageColors.mutedText,
+        border: languageColors.border,
+      },
+      spacing: visualLanguageV1.spacingScale,
+      headingFont: visualLanguageV1.typography.headingFont,
+      bodyFont: visualLanguageV1.typography.bodyFont,
+    },
     locale: value.locale,
     screens: [{
       ...screen,
@@ -298,6 +446,7 @@ function normalizedProgram(value: DesignProgramV1, plan: ProjectPlanV1, screenPl
       order: screenPlan.order,
       viewport: screen.viewport,
       scroll: screenPlan.scroll,
+      compositionV1,
       // Inter-screen dependencies live in ProjectPlanV1. This isolated program
       // is rendered and validated as one screen, so it cannot reference sibling IDs.
       dependsOn: [],
@@ -305,38 +454,22 @@ function normalizedProgram(value: DesignProgramV1, plan: ProjectPlanV1, screenPl
   });
 }
 
-function applyPinnedBrand(program: DesignProgramV1, task: ChatTask): DesignProgramV1 {
-  if (!task.brandKit) return program;
-  const palette = resolveBrandKitTokens(task.brandKit).palette;
-  return DesignProgramV1Schema.parse({
-    ...program,
-    tokens: {
-      ...program.tokens,
-      colors: {
-        ...program.tokens.colors,
-        background: palette.background,
-        surface: palette.surface,
-        primary: palette.primary,
-        accent: palette.accent,
-        text: palette.text,
-        muted: palette.mutedText,
-      },
-      headingFont: task.brandKit.tokens.typography.heading1.requestedFamily,
-      bodyFont: task.brandKit.tokens.typography.body.requestedFamily,
-      spacing: task.brandKit.tokens.spacing.slice(0, 24),
-    },
-  });
-}
-
-function estimateNativeNodes(program: DesignProgramV1): number {
-  let images = 0;
+function estimateNativeNodes(program: DesignProgramV1, task: ChatTask): number {
+  let extraImageNodes = 0;
   const visit = (node: DesignProgramV1["screens"][number]["root"]) => {
-    if (node.type === "image") images++;
+    if (node.type === "image") {
+      if (node.asset.source === "placeholder") extraImageNodes++;
+      else if (node.asset.source === "user-approved-brand-kit" && node.asset.assetRef) {
+        const pinned = task.brandKit?.assets.find(({ assetId }) => assetId === node.asset.assetRef);
+        // Safe SVGs may expand to one editable frame plus at most 32 vector paths.
+        if (pinned?.kind === "svg-paths") extraImageNodes += 32;
+      } else extraImageNodes += 32;
+    }
     if (node.type === "container") node.children.forEach(visit);
   };
   visit(program.screens[0]!.root);
-  const parsed = parseDesignProgram(program);
-  return parsed.success ? parsed.nodeCount + images + 2 : Number.MAX_SAFE_INTEGER;
+  const parsed = parseDesignProgram(program, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+  return parsed.success ? parsed.nodeCount + extraImageNodes + 2 : Number.MAX_SAFE_INTEGER;
 }
 
 function nativeSubtree(nodes: NonNullable<NativeInspection["nodes"]>, rootId: string) {
@@ -542,7 +675,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       ...(intent ? { requestedScreenCount: intent.screenCount } : {}),
       ...(requestedTarget ? { requestedTarget } : {}),
       requestedLocale: intent?.locale ?? (isPersian ? "fa-IR" : "en-US"),
-      ...(task.brandKit ? { brandKit: { id: task.brandKit.id, revision: task.brandKit.revision, tokenHash: task.brandKit.tokenHash } } : {}),
+      visualLanguageFallback: createDefaultVisualLanguage({ styleDirection: "Clear project hierarchy", density: "medium", locale: intent?.locale ?? (isPersian ? "fa-IR" : "en-US") }),
+      ...(task.brandKit ? { brandKit: { id: task.brandKit.id, revision: task.brandKit.revision, tokenHash: task.brandKit.tokenHash, assetIds: task.brandKit.assets.map(({ assetId }) => assetId) } } : {}),
       skills: (task.designSkills ?? []).map(({ id, revisionId }) => ({ id, revisionId })),
     });
     if (!planResult.success) {
@@ -562,15 +696,18 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         ...(intent ? { requestedScreenCount: intent.screenCount } : {}),
         ...(requestedTarget ? { requestedTarget } : {}),
         requestedLocale: intent?.locale ?? (isPersian ? "fa-IR" : "en-US"),
-        ...(task.brandKit ? { brandKit: { id: task.brandKit.id, revision: task.brandKit.revision, tokenHash: task.brandKit.tokenHash } } : {}),
+        visualLanguageFallback: createDefaultVisualLanguage({ styleDirection: "Clear project hierarchy", density: "medium", locale: intent?.locale ?? (isPersian ? "fa-IR" : "en-US") }),
+        ...(task.brandKit ? { brandKit: { id: task.brandKit.id, revision: task.brandKit.revision, tokenHash: task.brandKit.tokenHash, assetIds: task.brandKit.assets.map(({ assetId }) => assetId) } } : {}),
         skills: (task.designSkills ?? []).map(({ id, revisionId }) => ({ id, revisionId })),
       });
       if (!retryResult.success) fail("project_plan_invalid", `The bounded plan correction failed (${retryResult.findings.map(({ code }) => code).join(", ")}).`);
-      task.projectPlan = retryResult.plan;
-      task.projectPlanFingerprint = retryResult.fingerprint;
+      const finalized = finalizePlan(retryResult.plan, task);
+      task.projectPlan = finalized.plan;
+      task.projectPlanFingerprint = finalized.fingerprint;
     } else {
-      task.projectPlan = planResult.plan;
-      task.projectPlanFingerprint = planResult.fingerprint;
+      const finalized = finalizePlan(planResult.plan, task);
+      task.projectPlan = finalized.plan;
+      task.projectPlanFingerprint = finalized.fingerprint;
     }
     const plan = task.projectPlan!;
     task.pending = [];
@@ -614,8 +751,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       const call = await requestTool("compose", screen);
       if (call.action.tool !== "compose_design_program")
         fail("provider_tool_contract_invalid", "The provider returned a non-composition action during screen generation.");
-      const normalized = applyPinnedBrand(normalizedProgram(call.action.program, plan, screenPlan), task);
-      const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan);
+      const normalized = normalizedProgram(call.action.program, plan, screenPlan);
+      const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
       if (findings.length) {
         screen.program = normalized;
         screen.findings = findings;
@@ -627,11 +764,12 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         await save();
       } else {
         screen.program = normalized;
-        const parsed = parseDesignProgram(normalized);
+        const allowedBrandAssetIds = pinnedBrandAssetIds(task);
+        const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds });
         if (!parsed.success) fail("program_validation_failed", "The one-screen program did not pass its strict shared validator.");
         screen.fingerprint = parsed.fingerprint;
-        screen.findings = compileDesignProgram(normalized).success
-          ? compileDesignProgram(normalized).findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }))
+        screen.findings = compileDesignProgram(normalized, { allowedBrandAssetIds }).success
+          ? compileDesignProgram(normalized, { allowedBrandAssetIds }).findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }))
           : undefined;
         screen.status = "program_saved";
         delete screen.errorCode;
@@ -658,12 +796,13 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         fail("repair_scope_mismatch", "The repair referenced findings outside the locally measured preflight report.");
       if (JSON.stringify(call.action.program) === JSON.stringify(screen.program))
         fail("program_repair_no_progress", "The bounded repair returned an unchanged program; further repair was stopped.");
-      const normalized = applyPinnedBrand(normalizedProgram(call.action.program, plan, screenPlan), task);
+      const normalized = normalizedProgram(call.action.program, plan, screenPlan);
       screen.repairAttempts++;
-      const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan);
+      const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
       screen.program = normalized;
-      screen.findings = findings.length ? findings : compileDesignProgram(normalized).success
-        ? compileDesignProgram(normalized).findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }))
+      const allowedBrandAssetIds = pinnedBrandAssetIds(task);
+      screen.findings = findings.length ? findings : compileDesignProgram(normalized, { allowedBrandAssetIds }).success
+        ? compileDesignProgram(normalized, { allowedBrandAssetIds }).findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }))
         : [];
       if (findings.length) {
         screen.status = "repair_pending";
@@ -671,7 +810,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         await save();
         fail("program_repair_exhausted", `The bounded repair left ${findings.map(({ code }) => code).join(", ")}; no native render was dispatched.`);
       }
-      const parsed = parseDesignProgram(normalized);
+      const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds });
       if (!parsed.success) fail("program_validation_failed", "The repaired one-screen program did not pass its strict shared validator.");
       screen.fingerprint = parsed.fingerprint;
       screen.status = "program_saved";
@@ -687,7 +826,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     if (screen.status === "program_saved" || screen.status === "rendering") {
       deps.onPhase?.("native_execution");
       const alreadyVerifiedNodes = screens.filter((item) => item.status === "verified").reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0);
-      const estimated = estimateNativeNodes(screen.program);
+      const estimated = estimateNativeNodes(screen.program, task);
       if (alreadyVerifiedNodes + estimated > MAX_TASK_NATIVE_NODES)
         fail("native_capacity_exceeded", `This route allows at most ${MAX_TASK_NATIVE_NODES} adopted native nodes per task; the saved screen would exceed that bound. Earlier verified screens are retained.`);
       transition("UNIVERSAL_COMPOSING");

@@ -17,7 +17,7 @@ import { handleChatTaskStorage } from "./chat-task-storage";
 import { handleChatHistoryStorage } from "./chat-history-storage";
 import { handleModelPreferenceStorage } from "./model-preference-storage";
 import { handleDesignEnginePreferenceStorage } from "./design-engine-preference-storage";
-import { handleBrandKitStorage } from "./brand-kit-storage";
+import { handleBrandKitStorage, PinnedBrandAssetResolutionError, resolvePinnedBrandVisualAssets } from "./brand-kit-storage";
 import { handleDesignSkillStorage } from "./design-skill-storage";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
@@ -163,11 +163,20 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     };
     try {
       assertCurrentScope();
+      const referencedAssets = new Set<string>();
+      const collectAssets = (node: typeof request.program.screens[number]["root"]) => {
+        if (node.type === "image" && node.asset.source === "user-approved-brand-kit" && node.asset.assetRef)
+          referencedAssets.add(node.asset.assetRef);
+        if (node.type === "container") node.children.forEach(collectAssets);
+      };
+      request.program.screens.forEach(({ root }) => collectAssets(root));
+      const assets = await resolvePinnedBrandVisualAssets(figma.clientStorage, request.brandKit, [...referencedAssets]);
       const result = await renderDesignProgramLocal(figma, request.program, {
         taskId: request.taskId,
         documentId: request.documentId,
         pageId,
         executor: figmaToolExecutor,
+        assets,
         assertCurrentScope,
       });
       if (!result.success) {
@@ -196,16 +205,30 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         nativeNodeCount: result.registeredRefs,
       });
     } catch (error) {
+      const staleScope = error instanceof Error && error.message === "stale_document_scope";
+      const assetFailure = error instanceof PinnedBrandAssetResolutionError;
+      const failureCode = staleScope ? "stale_document_scope" : assetFailure ? "pinned_brand_asset_unavailable" : "native_render_error";
+      const failureMessage = staleScope
+        ? "The active Figma document or page changed; no screen was adopted."
+        : assetFailure
+          ? error.code === "asset_outside_pinned_revision"
+            ? "The composition references an asset outside this task's pinned Brand Kit revision; no screen was adopted."
+            : error.code === "asset_missing_or_changed"
+              ? "A pinned Brand Kit asset is missing or changed. Restore the pinned asset or remove its reference, then resume; no screen was adopted."
+              : error.code === "asset_bundle_too_large"
+                ? "The referenced pinned assets exceed the local renderer's safe bundle limit. Use fewer or smaller assets, then resume; no screen was adopted."
+                : "A pinned Brand Kit asset failed local format or provenance validation; no screen was adopted."
+          : "The local native renderer could not confirm this screen.";
       send({
         type: "design-program-render-result",
         requestId: request.requestId,
         taskId: request.taskId,
         success: false,
-        errorCode: error instanceof Error && error.message === "stale_document_scope" ? "stale_document_scope" : "native_render_error",
+        errorCode: failureCode,
         findings: [{
-          code: error instanceof Error && error.message === "stale_document_scope" ? "stale_document_scope" : "native_render_error",
+          code: failureCode,
           path: "renderer",
-          message: error instanceof Error && error.message === "stale_document_scope" ? "The active Figma document or page changed; no screen was adopted." : "The local native renderer could not confirm this screen.",
+          message: failureMessage,
           severity: "error",
         }],
       });

@@ -17,6 +17,7 @@ export function createMockApi() {
   const viewportFocusCalls: string[][] = [];
   const pageChangeListeners = new Map<string, Set<(event: NodeChangeEvent) => void>>();
   const documentChangeListeners = new Set<(event: DocumentChangeEvent) => void>();
+  let imageImportCalls = 0;
   const emitDocumentChange = () => {
     const event = { documentChanges: [] } as unknown as DocumentChangeEvent;
     for (const listener of documentChangeListeners) listener(event);
@@ -362,6 +363,10 @@ export function createMockApi() {
     createFrame: () => makeNode("FRAME") as unknown as FrameNode,
     createComponent: () => makeNode("COMPONENT") as unknown as ComponentNode,
     createRectangle: () => makeNode("RECTANGLE") as unknown as RectangleNode,
+    createImage: (bytes: Uint8Array) => {
+      imageImportCalls++;
+      return { hash: `mock-image-${bytes.length}-${bytes[0] ?? 0}` } as Image;
+    },
     createText: () => makeNode("TEXT") as unknown as TextNode,
     createPaintStyle: () => {
       const style = {
@@ -411,6 +416,7 @@ export function createMockApi() {
       (api as unknown as { currentPage: PageNode }).currentPage = otherPage as unknown as PageNode;
     },
     find: (name: string) => page.findAll((node) => node.name === name)[0] as MockNode | undefined,
+    getImageImportCalls: () => imageImportCalls,
     otherPage,
   };
 }

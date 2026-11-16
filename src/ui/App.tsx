@@ -2284,6 +2284,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             requestId,
             taskId: task.id,
             documentId: task.documentId,
+            brandKit: task.brandKit,
             program,
           });
           checkChatSession();
