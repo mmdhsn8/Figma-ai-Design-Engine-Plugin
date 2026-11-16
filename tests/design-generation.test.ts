@@ -411,6 +411,51 @@ describe("brief planner and constrained design generation", () => {
     if (root?.type === "frame") expect(root.children[1]).toMatchObject({ type: "frame", name: "Wellness illustration slot" });
   });
 
+  it("maps Phase 14 apparel imagery to editable vectors in both expected and prepared trees", () => {
+    const plan = planFor(request({
+      prompt: "صفحه جزئیات فروشگاه پوشاک فارسی ماه‌پوش را طراحی کن.",
+      screenCount: 1,
+      screenNames: ["جزئیات محصول"],
+      language: "fa",
+      fidelity: "high_fidelity",
+      professionalVisualVersion: 1,
+    }));
+    const design = generatedResponse([plan.screens[0]!.id]);
+    const root = design.screens[0]!.children[0]!;
+    root.children.push({
+      ...textNode(""),
+      type: "image",
+      name: "مانتوی لینن آبان",
+      text: null,
+      qualityRole: "image",
+      palette: "surface",
+      height: 132,
+      width: 150,
+      placeholder: true,
+    });
+    const prepared = prepareGeneratedDesign(JSON.stringify(design), plan, {
+      scope: "section",
+      sectionId: "supporting",
+    });
+    if (!prepared.success) throw new Error(prepared.errors.join(" "));
+    const art = prepared.data.visualSpecs[0]!.nodes.find(({ logicalRef }) =>
+      logicalRef.endsWith(".illustration"),
+    );
+    const mappedRoot = prepared.data.batch.screens[0]!.children[0];
+    const image = mappedRoot?.type === "frame" ? mappedRoot.children[1] : undefined;
+    expect(art).toMatchObject({ nativeType: "VECTOR", iconName: "coat" });
+    expect(image?.type === "frame" && image.children[0]).toMatchObject({
+      type: "vector",
+      logicalRef: art?.logicalRef,
+      width: art?.width,
+      height: art?.height,
+    });
+    expect(image?.type === "frame" && image.children[1]).toMatchObject({
+      type: "text",
+      text: "طرح نمونه",
+    });
+  });
+
   it("preflights semantic commerce sections before they can be saved", () => {
     const plan = planFor(request({
       prompt: "یک فروشگاه لباس با صفحه جزئیات محصول فارسی و خرید آسان طراحی کن.",

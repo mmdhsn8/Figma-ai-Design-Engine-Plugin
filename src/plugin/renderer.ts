@@ -1523,7 +1523,16 @@ function markSectionNodeIds(
     for (let index = 0; index < spec.children.length; index++) {
       const child = actual.children[index];
       if (!child) throw new DesignRenderError("A rendered section child is missing.");
-      markSectionNodeIds(child, spec.children[index]!, ids, cursor);
+      const childSpec = spec.children[index]!;
+      const synthetic = spec.logicalRef && childSpec.logicalRef &&
+        ["illustration", "disclosure", "label"].find(
+          (suffix) => childSpec.logicalRef === `${spec.logicalRef}.${suffix}`,
+        );
+      if (synthetic) {
+        child.setPluginData(SEMANTIC_NODE_ID_KEY, `${id}:${synthetic}`);
+      } else {
+        markSectionNodeIds(child, childSpec, ids, cursor);
+      }
     }
   }
 }

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { fashionArtwork, FASHION_ART_PATHS, PROFESSIONAL_VISUAL_VERSION } from "./professional-visual.js";
 import { MAX_GENERATED_NODES } from "./generation-limits.js";
 import {
   PinnedBrandKitSchema,
@@ -51,6 +52,7 @@ export type DesignDomain = z.infer<typeof DesignDomainSchema>;
 export const DesignBriefSchema = z
   .object({
     version: z.literal(DESIGN_BRIEF_VERSION),
+    professionalVisualVersion: z.literal(PROFESSIONAL_VISUAL_VERSION).optional(),
     prompt: z.string().trim().min(10).max(8_000),
     fidelity: DesignFidelitySchema,
     domain: DesignDomainSchema,
@@ -87,7 +89,8 @@ const VisualNodeSchema = z
     parentRef: logicalRef.optional(),
     sourcePath: z.string().max(240),
     nodeType: z.enum(["frame", "rectangle", "ellipse", "text", "icon", "image"]),
-    nativeType: z.enum(["FRAME", "RECTANGLE", "ELLIPSE", "TEXT", "VECTOR"]),
+    nativeType: z.enum(["FRAME", "RECTANGLE", "ELLIPSE", "TEXT", "VECTOR", "INSTANCE"]),
+    componentOwner: z.string().max(240).optional(),
     name: z.string().trim().min(1).max(200),
     qualityRole: z.enum(["button", "input", "image", "heading", "body", "decorative"]),
     pattern: z.enum(DESIGN_PATTERN_IDS).optional(),
@@ -263,6 +266,7 @@ export function createVisualDesignSpec(input: {
   };
   projectScreenCount: number;
   requiredPatterns?: readonly DesignPatternId[];
+  authoritativePatterns?: boolean;
   compositionVersion?: 1;
   sectionId?: DesignSectionRole;
   requireHighFidelityStructure?: boolean;
@@ -396,7 +400,7 @@ export function createVisualDesignSpec(input: {
                 : {}),
               ...(typographyToken
                 ? { fallbackFamily: typographyToken.fallbackFamily, fallbackStyle: "Regular" }
-                : {}),
+                : node.fontFamily ? { fallbackFamily: "Inter", fallbackStyle: "Regular" } : {}),
               style: typographyToken?.style ?? node.fontStyle,
               size: typographyToken?.size ?? node.fontSize,
               ...((typographyToken?.lineHeight ?? node.lineHeight)
@@ -459,25 +463,31 @@ export function createVisualDesignSpec(input: {
     }
     if (node.type === "image" && !node.assetId) {
       const illustrationRef = `${ref}.illustration`;
-      const illustrationSize = Math.min(36, Math.max(20, node.width - 16));
+      const artwork = input.brief.professionalVisualVersion && fashionArtwork({
+        ...node,
+        padding: spacing ? nearestToken(node.padding, spacing) : node.padding,
+        gap: spacing ? nearestToken(node.gap, spacing) : node.gap,
+      });
+      const illustrationSize = artwork ? artwork.size : Math.min(36, Math.max(20, node.width - 16));
       nodes.push({
         logicalRef: illustrationRef,
         parentRef: ref,
         sourcePath: `${path}.placeholder-illustration`,
-        nodeType: "ellipse",
-        nativeType: "ELLIPSE",
-        name: "Editable illustration placeholder",
+        nodeType: artwork ? "icon" : "ellipse",
+        nativeType: artwork ? "VECTOR" : "ELLIPSE",
+        name: artwork ? `Fashion illustration · ${artwork.iconName}` : "Editable illustration placeholder",
+        ...(artwork ? { iconName: artwork.iconName } : {}),
         qualityRole: "decorative",
         width: illustrationSize,
         height: illustrationSize,
         layout: "none",
         padding: 0,
         gap: 0,
-        paletteRole: "accent",
+        paletteRole: artwork ? artwork.palette : "accent",
       });
       const disclosure =
         input.brief.locale === "fa"
-          ? "جایگاه تصویر · عکس واقعی نیست"
+          ? artwork ? "طرح نمونه" : "جایگاه تصویر · عکس واقعی نیست"
           : "Image placeholder · not a real photo";
       const disclosureRef = `${ref}.disclosure`;
       nodes.push({
@@ -539,19 +549,20 @@ export function createVisualDesignSpec(input: {
   if (input.compositionVersion === 1) {
     const compositionPatterns = [
       ...new Set([
-        ...inferPatternsForScreen(
+        ...(input.authoritativePatterns ? [] : inferPatternsForScreen(
           input.brief.prompt,
           input.brief.domain,
           input.screen.familyName,
           input.projectScreenCount,
           input.brief.fidelity === "high_fidelity",
-        ),
+        )),
         ...fullPatterns,
       ]),
     ];
     const baseComposition = createVisualCompositionContract({
       domain: input.brief.domain,
       role: screenRole,
+      professionalVisualVersion: input.brief.professionalVisualVersion,
       locale: input.brief.locale,
       ...(input.sectionId ? { sectionId: input.sectionId } : {}),
       mood: input.brief.brandDirection,
@@ -701,6 +712,7 @@ export function createDesignBrief(input: {
   locale: "fa" | "en";
   direction: "rtl" | "ltr";
   brandDirection?: string;
+  professionalVisualVersion?: typeof PROFESSIONAL_VISUAL_VERSION;
   brandKit?: PinnedBrandKit;
   designSkills?: readonly DesignSkillPrompt[];
 }): DesignBrief {
@@ -715,6 +727,7 @@ export function createDesignBrief(input: {
   return DesignBriefSchema.parse({
     version: DESIGN_BRIEF_VERSION,
     prompt: input.prompt,
+    ...(input.professionalVisualVersion ? { professionalVisualVersion: input.professionalVisualVersion } : {}),
     fidelity: input.fidelity,
     domain: input.domain,
     audience: "Not specified in the user's brief; preserve this as an open design assumption.",
@@ -781,7 +794,7 @@ export function validateVisualDesignSpec(
     }
     if (node.nodeType === "text" && (!node.text?.trim() || !node.typography))
       errors.push(`nodes[${index}] text requires non-empty copy and typography evidence.`);
-    if (node.nodeType === "icon" && (!node.iconName || !(node.iconName in DESIGN_ICON_PATHS)))
+    if (node.nodeType === "icon" && (!node.iconName || !(node.iconName in DESIGN_ICON_PATHS || node.iconName in FASHION_ART_PATHS)))
       errors.push(`nodes[${index}] icon must use a bundled, allowlisted vector name.`);
     if (node.nodeType === "image" && (!node.placeholder || node.qualityRole !== "image"))
       errors.push(

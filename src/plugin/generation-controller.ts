@@ -192,7 +192,7 @@ export function createGenerationController(
               "Section exceeds the 250-node transaction budget; saved data is retained.",
             );
           prepared.data.batch.id = message.manifest.generationId;
-          if (prepared.data.batch.designSystem) {
+          if (prepared.data.batch.designSystem && !plan.data.request.storefrontLayoutVersion) {
             prepared.data.batch.designSystem.id = message.manifest.generationId;
             prepared.data.batch.designSystem.namespace = message.manifest.generationId;
           }

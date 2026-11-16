@@ -20,11 +20,14 @@ import { boundsIntersectWithGap, DEFAULT_MIN_CANVAS_GAP } from "../src/plugin/ca
 import { parseDesignValue, type DesignSpec } from "../src/shared/schema";
 import {
   createDesignPlan,
+  createDesignSections,
   normalizeGeneratedDesignResponse,
   type GeneratedDesign,
 } from "../src/shared/design-generation";
 import { pinBrandKit } from "../src/shared/brand-kit";
-import { prepareGeneratedDesign } from "../src/ui/design-generation";
+import { storefrontPlan } from "./storefront-fixture";
+import { composeStorefrontSection } from "../src/shared/storefront-layout";
+import { normalizeGeneratedSectionContrast, prepareGeneratedDesign } from "../src/ui/design-generation";
 import { newBrandKit } from "../src/ui/brand-kit-manager";
 import { createGenerationController } from "../src/plugin/generation-controller";
 import { verifyNativeDesign } from "../src/plugin/native-design-verification";
@@ -60,6 +63,7 @@ interface MockNode {
   appendChild(node: MockNode): void;
   remove(): void;
   createInstance(): MockNode;
+  getMainComponentAsync(): Promise<MockNode | undefined>;
   getPluginData(key: string): string;
   setPluginData(key: string, value: string): void;
   setFillStyleIdAsync(id: string): Promise<void>;
@@ -193,8 +197,18 @@ function createMockFigma(options: { failLoadFamily?: string } = {}) {
         instance.width = node.width;
         instance.height = node.height;
         instance.mainComponent = node;
+        if (node.name.includes("/art-")) {
+          for (const source of node.children) {
+            const child = makeNode(source.type);
+            child.name = source.name;
+            child.fills = source.fills;
+            child.resize(source.width, source.height);
+            instance.appendChild(child);
+          }
+        }
         return instance;
       },
+      async getMainComponentAsync() { return node.mainComponent; },
     };
     roots.push(node);
     allCreated.push(node);
@@ -1389,6 +1403,89 @@ describe("renderDesign", () => {
     });
     expect(mock.api.currentPage.selection).toHaveLength(2);
     expect(mock.raw.viewport.scrollAndZoomIntoView).toHaveBeenCalled();
+  });
+
+  it("renders the deterministic storefront as nine durable native transactions and reuses artwork masters", async () => {
+    const plan = storefrontPlan;
+    const { manifest } = draftFixture();
+    manifest.request = plan.request;
+    manifest.visualCompositionVersion = 1;
+    const ids = plan.screens.map(({ id }) => id);
+    const roots = createGenerationSkeletons(mock.api, manifest.generationId, plan, ids, false, true);
+    const verificationApi = mock.raw as unknown as Pick<PluginAPI, "getNodeByIdAsync" | "currentPage">;
+    const instances = new Map<string, MockNode>();
+    const counts: Array<{ role: string; nodes: number; art: number; interactive: number; height: number }> = [];
+
+    for (const screen of plan.screens) {
+      const screenPlan = { ...plan, screens: [screen] };
+      let nodes = 1;
+      let art = 0;
+      let interactive = 0;
+      let height = 72;
+      for (const { id } of createDesignSections(plan)) {
+        const content = composeStorefrontSection(screenPlan, id);
+        content.screens[0]!.children[0]!.sectionId = id;
+        const { design, findings } = normalizeGeneratedSectionContrast(content, screenPlan);
+        expect(findings).toEqual([]);
+        const checked = prepareGeneratedDesign(JSON.stringify(design), screenPlan, {
+          scope: "section", sectionId: id, visualCompositionVersion: 1,
+        });
+        if (!checked.success) throw new Error(checked.errors.join(" "));
+        const spec = checked.data.visualSpecs[0]!;
+        const transaction = createGenerationTransaction({
+          generationId: manifest.generationId,
+          documentScope: manifest.documentId,
+          screenId: screen.id, sectionId: id, transactionId: `${screen.id}-${id}`, design,
+        });
+        checked.data.batch.id = manifest.generationId;
+        const options = { resume: true, scrollMobileSections: true, verifyTouchTargets: true, transaction };
+        const first = await renderMultiScreenDesign(mock.api, checked.data.batch, options);
+        expect(first.screens[0]?.error).toBeUndefined();
+        expect(first.screens[0]?.nodeId).toBe(roots[screen.order]);
+        const beforeRetry = mock.allCreated.length;
+        const replay = await renderMultiScreenDesign(mock.api, checked.data.batch, options);
+        expect(replay.screens[0]?.nodeId).toBe(first.screens[0]?.nodeId);
+        expect(mock.allCreated).toHaveLength(beforeRetry);
+
+        nodes += spec.nodes.length - 1;
+        art += spec.nodes.filter(({ nativeType }) => nativeType === "INSTANCE").length;
+        interactive += spec.nodes.filter(({ qualityRole }) => qualityRole === "button" || qualityRole === "input").length;
+        height += design.screens[0]!.children[0]!.height;
+        const pageId = verificationApi.currentPage.id;
+        const verification = await verifyNativeDesign(verificationApi, roots[screen.order]!, pageId, spec, true);
+        for (const expected of spec.nodes.filter(({ componentOwner }) => componentOwner)) {
+          expect(verification.findings.filter(({ ref, code }) =>
+            ref === expected.logicalRef && ["type-mismatch", "value-mismatch"].includes(code),
+          )).toEqual([]);
+          const found = mock.allCreated.find((node) => node.getPluginData("fad.design.logical-ref") === expected.logicalRef);
+          expect(found?.type).toBe("INSTANCE");
+          const master = found?.mainComponent;
+          expect(master?.getPluginData("fad.design-system.component")).toBe(expected.componentOwner);
+          if (instances.has(expected.componentOwner!))
+            expect(master).toBe(instances.get(expected.componentOwner!));
+          else if (master) instances.set(expected.componentOwner!, master);
+          if (screen.order === 0 && found && master) {
+            found.mainComponent = undefined;
+            const broken = await verifyNativeDesign(verificationApi, roots[screen.order]!, pageId, spec, true);
+            expect(broken.findings).toContainEqual(expect.objectContaining({
+              ref: expected.logicalRef, code: "value-mismatch", actual: "missing component owner",
+            }));
+            found.mainComponent = master;
+          }
+        }
+      }
+      const root = mock.roots.find((node) => node.id === roots[screen.order])!;
+      expect(root.children).toHaveLength(3);
+      expect(root).toMatchObject({ width: 390, height: 844, clipsContent: true, overflowDirection: "VERTICAL" });
+      expect(root.getPluginData("fad.generation.commit")).toBe("complete");
+      counts.push({ role: screen.screenRole, nodes, art, interactive, height });
+    }
+    expect(mock.raw.createComponentFromNode).toHaveBeenCalledTimes(instances.size);
+    expect(instances.size).toBeLessThan(counts.reduce((sum, info) => sum + info.art, 0));
+    expect(mock.allCreated.some((node) => node.type === "TEXT" &&
+      node.textAlignHorizontal === "RIGHT" && node.name === "مانتوی لینن آبان")).toBe(true);
+    expect(counts.every(({ height }) => height > 844)).toBe(true);
+    console.info("STOREFRONT_PREPARED_METRICS", JSON.stringify(counts));
   });
 
   it("applies completed Persian sections in order and makes native retries idempotent", async () => {

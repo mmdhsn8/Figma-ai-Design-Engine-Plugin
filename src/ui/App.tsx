@@ -1,3 +1,5 @@
+import { composeStorefrontSection, isSampleStorefront } from "../shared/storefront-layout";
+import { PROFESSIONAL_VISUAL_VERSION } from "../shared/professional-visual";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import phase1Sample from "../samples/sample-design.json?raw";
 import phase2Sample from "../samples/phase-2-storefront.json?raw";
@@ -3047,10 +3049,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       return;
     }
 
-    const draftKey = JSON.stringify({
-      model: generationModel,
-      request: planData.request,
-    });
+    const draftRequestKey = (request: DesignPlan["request"]) =>
+      JSON.stringify({ ...request, professionalVisualVersion: undefined, storefrontLayoutVersion: undefined });
+    const draftKey = draftRequestKey(planData.request);
     let draft: GenerationDraft = {
       screens: [],
       transactions: [],
@@ -3260,10 +3261,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             "multi_screen_draft_conflict: The saved document draft belongs to another Chat generation.",
           );
         if (
-          JSON.stringify({
-            model: recovered.manifest.model,
-            request: recovered.manifest.request,
-          }) !== draftKey
+          recovered.manifest.model !== generationModel ||
+          draftRequestKey(recovered.manifest.request) !== draftKey
         )
           throw new Error(
             "A different saved draft exists for this document/page. Resume it or explicitly clear its checkpoint before starting another project.",
@@ -3287,6 +3286,18 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           palette: recovered.screens[0]?.design.palette,
         };
       } else {
+        if (handoff) {
+          const professionalPlan = createDesignPlan(
+            { ...planData.request, professionalVisualVersion: PROFESSIONAL_VISUAL_VERSION },
+            pinnedBrand, pinnedSkills,
+          );
+          if (professionalPlan.success && professionalPlan.data.brief.professionalVisualVersion) {
+            planData = professionalPlan.data;
+            if (isSampleStorefront(planData))
+              planData = { ...planData, request: { ...planData.request, storefrontLayoutVersion: 1 } };
+            draft.manifest.request = planData.request;
+          }
+        }
         brandVisualAssets = await resolvePinnedBrandAssets(pinnedBrand);
         await draftRequest(
           companionToken,
@@ -3391,13 +3402,20 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                 transaction: ReturnType<typeof createGenerationTransaction>;
               }
             | undefined;
-          for (let attempt = 0; attempt <= 1; attempt++) {
+          const localSection = planData.request.storefrontLayoutVersion === 1;
+          for (let attempt = 0; attempt <= (localSection ? 0 : 1); attempt++) {
             markSection(screen.id, section.id, attempt ? "needs-repair" : "generating");
             setGenerationState(attempt ? "repairing" : "generating");
             await handoff?.assertAuthorized();
             await emitHandoffProgress("section-start", screen, section.id);
             const inferenceStarted = performance.now();
-            const raw = await generateAuthorizedDesign(
+            if (!localSection) setStageMetrics((metrics) => ({
+              ...metrics,
+              sectionRequests: (metrics.sectionRequests ?? 0) + 1,
+            }));
+            const raw = localSection
+              ? JSON.stringify(composeStorefrontSection(screenPlan, section.id))
+              : await generateAuthorizedDesign(
               companionToken,
               screenRequestId,
               generationModel,
@@ -3517,6 +3535,10 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                       );
                     }
                   }
+                  setStageMetrics((metrics) => ({
+                    ...metrics,
+                    [`${screen.id}.${section.id}.preparedNodes`]: compositionPreflight.data.nodeCount,
+                  }));
                   if (compositionPreflight.data.nodeCount > 250)
                     throw new Error("The section exceeds 250 native layers after preparation. Simplify the section.");
                   const transaction = createGenerationTransaction({
@@ -3552,7 +3574,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               ),
             }));
             if (!completed) {
-              if (attempt === 0) {
+              if (attempt === 0 && !localSection) {
                 repairIssues = issues.slice(0, 8);
                 // A section retry requests the complete bounded section, not an untyped subtree patch.
                 repairAttempts++;
@@ -3561,7 +3583,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                 continue;
               }
               throw new Error(
-                `Section ${section.title} failed validation after one bounded repair: ${issues.join(" ")}`,
+                `Section ${section.title} failed validation${localSection ? "" : " after one bounded repair"}: ${issues.join(" ")}`,
               );
             }
             break;
@@ -3683,7 +3705,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       const audit = auditVisualQuality(prepared.data.batch);
       const warnings = [
         ...nativeWarnings,
-        "Sections are independent completed Responses requests; actual provider latency depends on account/model availability.",
+        planData.request.storefrontLayoutVersion === 1
+          ? "Storefront layout v1 composed the nine sections locally after Chat planning."
+          : "Sections use independent completed Responses requests. Provider latency varies by account and model.",
         "No image assets were generated or downloaded. Import licensed local assets or keep editable placeholders.",
         "Check font availability, Persian shaping, text wrapping, and visual balance in Figma Desktop.",
         ...audit.diagnostics.slice(0, 6).map((item) => `${item.code}: ${item.message}`),
@@ -3751,6 +3775,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         setStageMetrics((metrics) => ({
           ...metrics,
           totalMs: Math.round(performance.now() - totalStartedAt),
+          ...(planData.request.storefrontLayoutVersion === 1 ? { storefrontLayoutVersion: 1 } : {}),
         }));
       if (generationRequest.current === requestId) generationRequest.current = null;
       if (generationAbort.current === controller) generationAbort.current = null;

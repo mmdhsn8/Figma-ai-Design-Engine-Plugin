@@ -1,4 +1,6 @@
-import { DESIGN_SCHEMA_VERSION } from "../shared/schema";
+import { storefrontPatterns } from "../shared/storefront-layout.js";
+import { fashionArtwork, FASHION_ART_PATHS } from "../shared/professional-visual.js";
+import { DESIGN_SCHEMA_VERSION, type ComponentDefinitionSpec, type DesignNode } from "../shared/schema";
 import { parseMultiScreenText, type MultiScreenSpec } from "../shared/multi-screen-schema";
 import {
   DESIGN_GENERATION_COLOR_TOKENS,
@@ -131,7 +133,8 @@ export function prepareGeneratedDesign(
       );
       if (!logoResult.success) return { success: false, errors: [logoResult.error] };
     }
-    const inferredPatterns = (
+    const localStorefront = plan.request.storefrontLayoutVersion === 1;
+    const inferredPatterns = localStorefront ? storefrontPatterns(screen.screenRole) : (
       options.visualCompositionVersion === 1 ? inferPatternsForScreen : inferLegacyPatternsForScreen
     )(
       plan.request.prompt,
@@ -148,7 +151,8 @@ export function prepareGeneratedDesign(
       brief: plan.brief,
       screen,
       projectScreenCount: plan.request.screenCount * (plan.request.target === "both" ? 2 : 1),
-      requiredPatterns: requestedPatterns,
+      requiredPatterns: localStorefront ? inferredPatterns : requestedPatterns,
+      authoritativePatterns: localStorefront,
       ...(options.visualCompositionVersion === 1
         ? { compositionVersion: options.visualCompositionVersion }
         : {}),
@@ -227,12 +231,17 @@ export function prepareGeneratedDesign(
                   plan.request.theme === "dark" ? "dark" : "light",
                 )
               : undefined,
+            undefined,
+            Boolean(plan.brief.professionalVisualVersion),
           );
         });
       })(),
     })),
     ...(resolvedAssets.length ? { assets: resolvedAssets } : {}),
   };
+  if (plan.request.storefrontLayoutVersion === 1) {
+    applyStorefrontDesignSystem(batch, visualSpecs, plan);
+  }
   const json = JSON.stringify(batch, null, 2);
   const validated = parseMultiScreenText(json);
   if (!validated.success) return { success: false, errors: validated.errors.slice(0, 12) };
@@ -255,6 +264,63 @@ export function prepareGeneratedDesign(
       assetCoverage,
     },
   };
+}
+
+function applyStorefrontDesignSystem(
+  batch: MultiScreenSpec,
+  specs: VisualDesignSpec[],
+  plan: DesignPlan,
+): void {
+  const system = batch.designSystem!;
+  const brand = plan.brandKit
+    ? `-${plan.brandKit.tokenHash.slice(-8)}-${plan.request.theme === "dark" ? "dark" : "light"}`
+    : "";
+  const namespace = `storefront-v1${brand}`;
+  system.id = namespace;
+  system.namespace = namespace;
+  system.name = "Storefront";
+  const masters = new Map<string, ComponentDefinitionSpec>();
+  for (const [index, screen] of batch.screens.entries()) {
+    const byRef = new Map(specs[index]!.nodes.map((node) => [node.logicalRef, node]));
+    const visit = (node: DesignNode): DesignNode => {
+      if (node.type === "frame") return {
+        ...node,
+        ...(node.layout && (node.qualityRole === "button" || node.qualityRole === "input")
+          ? { layout: { ...node.layout, primaryAxisAlign: "center" } }
+          : {}),
+        children: node.children.map(visit),
+      };
+      const expected = node.logicalRef ? byRef.get(node.logicalRef) : undefined;
+      if (node.type === "vector" && expected?.iconName && node.logicalRef?.endsWith(".illustration")) {
+        const id = `art-${expected.iconName}-${node.width}`;
+        if (!masters.has(id))
+          masters.set(id, {
+            type: "component", id, key: id, name: node.name,
+            width: node.width, height: node.height,
+            children: [{ ...node, logicalRef: undefined, x: 0, y: 0 }],
+          });
+        expected.nativeType = "INSTANCE";
+        expected.componentOwner = `design-system:${system.id}:component:${id}`;
+        return { type: "instance", componentId: id, name: node.name, logicalRef: node.logicalRef };
+      }
+      if (node.type === "text" && expected?.typography) {
+        const type = expected.typography;
+        const token = `typography.${type.style.toLowerCase().replace(/[^a-z0-9]+/gu, "-")}-${type.size.toString().replace(".", "-")}-${type.alignment}`;
+        system.typography[token] = {
+          fontFamily: type.family ?? "Inter",
+          fontStyle: type.style,
+          fontSize: type.size,
+          lineHeight: type.lineHeight,
+          letterSpacing: type.letterSpacing,
+          textAlign: type.alignment,
+        };
+        return { ...node, textStyle: { token } };
+      }
+      return node;
+    };
+    screen.children = screen.children.map(visit);
+  }
+  system.components = [...masters.values()];
 }
 
 function hasUnapprovedAssetReference(
@@ -449,6 +515,7 @@ function mapNode(
   logicalRef: string,
   brandTokens?: BrandKitTokens,
   forcedTypographyRole?: keyof BrandKitTokens["typography"],
+  professionalVisual = false,
 ): MultiScreenSpec["screens"][number]["children"][number] {
   const typographyRole =
     forcedTypographyRole ??
@@ -592,6 +659,8 @@ function mapNode(
           prompt,
           `${logicalRef}.n${index}`,
           brandTokens,
+          undefined,
+          professionalVisual,
         ),
       ),
       ...touchSizing,
@@ -656,8 +725,9 @@ function mapNode(
         qualityRole: "image",
         logicalRef,
       };
+    const artwork = professionalVisual && fashionArtwork({ ...node, padding, gap });
     const disclosure =
-      language === "fa" ? "جایگاه تصویر · عکس واقعی نیست" : "Image placeholder · not a real photo";
+      language === "fa" ? artwork ? "طرح نمونه" : "جایگاه تصویر · عکس واقعی نیست" : "Image placeholder · not a real photo";
     return {
       type: "frame",
       name: node.name,
@@ -671,7 +741,16 @@ function mapNode(
         counterAxisAlign: "center",
       },
       children: [
-        {
+        artwork ? {
+          type: "vector",
+          name: `Fashion illustration · ${artwork.iconName}`,
+          width: artwork.size,
+          height: artwork.size,
+          pathData: FASHION_ART_PATHS[artwork.iconName],
+          fill: { token: DESIGN_GENERATION_COLOR_TOKENS[artwork.palette] },
+          qualityRole: "decorative",
+          logicalRef: `${logicalRef}.illustration`,
+        } : {
           type: "ellipse",
           name: "Editable illustration placeholder",
           width: Math.min(36, Math.max(20, node.width - 16)),

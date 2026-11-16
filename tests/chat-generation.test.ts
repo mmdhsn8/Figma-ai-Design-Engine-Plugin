@@ -1,3 +1,6 @@
+import { createDesignPlan } from "../src/shared/design-generation";
+import { isSampleStorefront } from "../src/shared/storefront-layout";
+import { brief as storefrontBrief } from "./storefront-fixture";
 import { describe, expect, it } from "vitest";
 import {
   createMultiScreenDesignRequest,
@@ -67,6 +70,22 @@ describe("Chat to structured generation contract", () => {
       kind: "ready",
       intent: { screenCount: count },
     });
+  });
+
+  it("routes the Persian acceptance brief from Chat to the deterministic storefront profile", () => {
+    const parsed = parseChatGenerationIntent(storefrontBrief);
+    if (parsed.kind !== "ready") throw new Error(parsed.kind);
+    const task = createMultiScreenDesignRequest({
+      ...input(3, ["خانه فروشگاه", "جزئیات محصول", "سبد خرید"]),
+      prompt: storefrontBrief,
+      intent: parsed.intent,
+      brief: { ...sharedBrief, audience: "خریداران پوشاک", brandDirection: "زرشکی و کرم" },
+    });
+    if (!task.success) throw new Error(task.errors.join(" "));
+    const plan = createDesignPlan({ ...task.data.request, professionalVisualVersion: 1 });
+    if (!plan.success) throw new Error(plan.errors.join(" "));
+    expect(isSampleStorefront(plan.data)).toBe(true);
+    expect(plan.data.screens.map(({ id }) => id)).toEqual(task.data.screens.map(({ id }) => id));
   });
 
   it("does not route edits or multi-device requests into the generation handoff", () => {

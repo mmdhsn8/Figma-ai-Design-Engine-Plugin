@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { PROFESSIONAL_VISUAL_VERSION, professionalStorefrontRequirements } from "./professional-visual.js";
 import {
   DESIGN_PATTERN_IDS,
   DESIGN_SCREEN_ROLES,
@@ -39,6 +40,7 @@ const VisualCompositionPatternCountSchema = z
 export const VisualCompositionContractSchema = z
   .object({
     version: z.literal(VISUAL_COMPOSITION_VERSION),
+    professionalVisualVersion: z.literal(PROFESSIONAL_VISUAL_VERSION).optional(),
     domain: z.string().trim().min(1).max(80),
     screenRole: z.enum(DESIGN_SCREEN_ROLES),
     sectionId: z.enum(["identity", "primary", "supporting"]).optional(),
@@ -112,6 +114,7 @@ const roleEmphasis: Readonly<Record<DesignScreenRole, readonly string[]>> = {
 export function createVisualCompositionContract(input: {
   domain: string;
   role: DesignScreenRole;
+  professionalVisualVersion?: typeof PROFESSIONAL_VISUAL_VERSION;
   locale?: "fa" | "en";
   sectionId?: DesignSectionRole;
   mood: string;
@@ -187,6 +190,17 @@ export function createVisualCompositionContract(input: {
     addMinimum("primary", "price-summary", 1);
     addMinimum("primary", "cta-group", 1);
   }
+  const professional = input.professionalVisualVersion
+    ? professionalStorefrontRequirements(input.role) : undefined;
+  if (professional && relevantSections.includes("primary")) {
+    patternsBySection.primary = [...new Set([...patternsBySection.primary, ...professional.patterns])];
+    if (professional.items) {
+      const { pattern, minimum } = professional.items;
+      const existing = minimumPatternCounts.find((item) => item.pattern === pattern);
+      if (existing) existing.minimum = minimum;
+      else addMinimum("primary", pattern, minimum);
+    }
+  }
   const mobile = input.viewport.width === 390;
   const imageRoles: DesignScreenRole[] = ["home", "listing", "detail", "cart"];
   const roleMinimumImages =
@@ -196,21 +210,22 @@ export function createVisualCompositionContract(input: {
         : 1
       : 0;
   const minimumImageSlots =
-    input.sectionId && input.sectionId !== "primary" ? 0 : roleMinimumImages;
+    input.sectionId && input.sectionId !== "primary" ? 0 : professional?.images ?? roleMinimumImages;
   const minimumPriceCount =
     input.domain !== "commerce" ||
     input.sectionId === "identity" ||
     input.sectionId === "supporting"
       ? 0
-      : input.role === "home" || input.role === "listing"
+      : professional?.prices ?? (input.role === "home" || input.role === "listing"
         ? 2
         : ["detail", "cart", "checkout"].includes(input.role)
           ? 1
-          : 0;
+          : 0);
   const priceFormat =
     /تومان|toman/iu.test(input.prompt) || /fa/iu.test(input.locale ?? "") ? "toman" : "numeric";
   return VisualCompositionContractSchema.parse({
     version: VISUAL_COMPOSITION_VERSION,
+    ...(input.professionalVisualVersion ? { professionalVisualVersion: input.professionalVisualVersion } : {}),
     domain: input.domain,
     screenRole: input.role,
     ...(input.sectionId ? { sectionId: input.sectionId } : {}),
@@ -394,14 +409,45 @@ export function validateVisualCompositionCoverage(
       `visual_composition.price_count_below_minimum:${contract.screenRole}:${prices.length}/${contract.quality.minimumPriceCount}:${contract.quality.priceFormat}`,
     );
   for (const { section, nodes: sectionNodes } of checks) {
+    const merchandise = new Set<string>();
     for (const root of sectionNodes.filter((node) => node.pattern)) {
       const descendants = descendantsFor(root.logicalRef, childrenByParent);
       const images = descendants.filter((node) => node.nodeType === "image");
-      const texts = descendants.filter((node) => node.nodeType === "text" && node.text?.trim());
-      const buttons = descendants.filter((node) => node.qualityRole === "button");
+      const texts = descendants.filter((node) => node.nodeType === "text" && node.text?.trim() &&
+        (!contract.professionalVisualVersion || !node.logicalRef.endsWith(".disclosure")));
       const controls = descendants.filter(
         (node) => node.qualityRole === "button" || node.qualityRole === "input",
       );
+      if (contract.professionalVisualVersion) {
+        const requiredImages =
+          root.pattern === "image-gallery" && contract.screenRole === "detail" ? 3 :
+          root.pattern === "hero-banner" && contract.screenRole === "home" ? 1 : 0;
+        if (images.length < requiredImages)
+          errors.push(
+            `visual_composition.pattern_image_count_below_minimum:${contract.screenRole}:${section}:${root.logicalRef}:${images.length}/${requiredImages}`,
+          );
+        if (root.pattern === "product-card" || root.pattern === "cart-item") {
+          const title = texts.find(({ qualityRole }) => qualityRole === "heading");
+          const name = title?.text?.normalize("NFKC").replace(/[يى]/gu, "ی")
+            .replace(/ك/gu, "ک").replace(/[\s\u200c]+/gu, "").trim();
+          if (!name || name.length < 3 || pricePattern.test(title?.text ?? "") || merchandise.has(name))
+            errors.push(
+              `visual_composition.distinct_product_title_required:${contract.screenRole}:${section}:${root.logicalRef}`,
+            );
+          else merchandise.add(name);
+        }
+        if (root.pattern === "variant-selector" && contract.screenRole === "detail" &&
+          (!texts.some(({ text }) => /سایز|اندازه/u.test(text ?? "")) ||
+           !texts.some(({ text }) => /رنگ/u.test(text ?? "")) || controls.length < 4))
+          errors.push(
+            `visual_composition.size_and_color_choices_required:${contract.screenRole}:${section}:${root.logicalRef}`,
+          );
+        if (root.pattern === "cart-item" && !descendants.some((node) => node.pattern === "quantity-control"))
+          errors.push(
+            `visual_composition.cart_item_quantity_missing:${contract.screenRole}:${section}:${root.logicalRef}`,
+          );
+      }
+      const buttons = descendants.filter((node) => node.qualityRole === "button");
       if (root.pattern === "app-bar" && !texts.length && !images.length)
         errors.push(
           `visual_composition.app_bar_identity_missing:${contract.screenRole}:${section}:${root.logicalRef}`,

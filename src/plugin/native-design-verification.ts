@@ -5,6 +5,7 @@ import {
   type NativeVisualFinding,
   type NativeVisualNode,
 } from "../shared/native-visual-quality";
+import { COMPONENT_OWNER_KEY } from "./design-system/component-registry";
 import type { VisualDesignSpec } from "../shared/visual-design-spec";
 
 export const MAX_NATIVE_DESIGN_QA_NODES = MAX_NATIVE_QUALITY_SCAN_NODES;
@@ -252,6 +253,7 @@ export async function verifyNativeDesign(
     ELLIPSE: "ELLIPSE",
     TEXT: "TEXT",
     VECTOR: "VECTOR",
+    INSTANCE: "INSTANCE",
   };
   for (const expected of spec.nodes) {
     const node = actualNodes.get(expected.logicalRef);
@@ -267,6 +269,18 @@ export async function verifyNativeDesign(
         expected: expectedNativeType,
         actual: node.type,
       });
+    if (node.type === "INSTANCE" && expected.componentOwner) {
+      const master = await node.getMainComponentAsync();
+      const owner = master?.getPluginData(COMPONENT_OWNER_KEY);
+      if (owner !== expected.componentOwner || node.children.length !== 1 || node.children[0]?.type !== "VECTOR")
+        nativeFindings.push({
+          code: "value-mismatch",
+          ref: expected.logicalRef,
+          message: "Artwork instance has no verified owned vector master.",
+          expected: expected.componentOwner,
+          actual: owner || "missing component owner",
+        });
+    }
     if (expected.parentRef) {
       const actualParentRef = node.parent?.getPluginData("fad.design.logical-ref") ?? "";
       if (actualParentRef !== expected.parentRef)
@@ -376,7 +390,11 @@ export async function verifyNativeDesign(
       });
     if (actual && expected.paletteRole !== "none" && !expected.assetId) {
       const expectedFill = spec.tokens[expected.paletteRole].toUpperCase();
-      const actualFill = (node.type === "TEXT" ? actual.textColor : actual.fill)?.toUpperCase();
+      const actualFill = (node.type === "TEXT"
+        ? actual.textColor
+        : expected.componentOwner
+          ? actual.children?.[0]?.fill
+          : actual.fill)?.toUpperCase();
       if (actualFill !== expectedFill)
         nativeFindings.push({
           code: "value-mismatch",
