@@ -3086,6 +3086,50 @@ describe("loopback companion", () => {
     expect(harness.responsesRequest).toBe(completedRequest);
   });
 
+  it.each([false, true])("uses a forced design-data function when text.format is unsupported (invalid output: %s)", async (invalid) => {
+    const generatedOutput = JSON.stringify({ projectName: "فروشگاه", screens: [] });
+    const harness = await createHarness({
+      generatedOutput,
+      unsupportedDesignFormat: true,
+      ...(invalid ? { designFunctionOutputItems: [] } : {}),
+    });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const response = await request(harness.handle, "/v1/design", { token, body: {
+      requestId: "req-section-function-output",
+      model: "account-model",
+      request: {
+        prompt: "Create a storefront with a home page and product detail.",
+        target: "mobile", screenCount: 2, screenNames: ["Home", "Detail"],
+        language: "fa", style: "",
+      },
+      screenIds: ["home"], section: { id: "identity", sequence: 0 },
+    } });
+    const payload = JSON.parse(harness.responsesRequest!.body);
+    expect(payload).not.toHaveProperty("text");
+    expect(payload).toMatchObject({
+      tool_choice: { type: "function", name: "return_figma_design" },
+      parallel_tool_calls: false,
+      tools: [{ type: "function", name: "return_figma_design", parameters: {
+        required: ["projectName", "palette", "screens"],
+      } }],
+    });
+    if (invalid) {
+      expect(response.status).toBe(502);
+      const error = await response.json();
+      expect(error).toMatchObject({
+        error: "response_invalid",
+        diagnostic: { errorCode: "invalid_design_function_output" },
+      });
+      expect(JSON.stringify(error)).not.toContain(generatedOutput);
+    } else {
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe(generatedOutput);
+      expect(response.headers.get("x-fad-response-bytes")).toBe(String(Buffer.byteLength(generatedOutput)));
+      expect(response.headers.get("x-fad-completed")).toBe("response.completed");
+    }
+  });
+
   it("accepts a long Persian brief for two mobile screens and explains validation failures", async () => {
     const design = {
       projectName: "فروشگاه فارسی",
@@ -3731,6 +3775,8 @@ async function createHarness(
     stallDesignHeaders?: boolean;
     incompleteGeneratedStreams?: number;
     generatedOutput?: string;
+    unsupportedDesignFormat?: boolean;
+    designFunctionOutputItems?: unknown[];
     chatResponses?: Array<{
       text?: string;
       outputItems?: unknown[];
@@ -3914,6 +3960,11 @@ async function createHarness(
           { status: 200, headers: { "Content-Type": "text/event-stream" } },
         );
       }
+      if (options.unsupportedDesignFormat && responsePayload.text) {
+        return Response.json({ error: {
+          code: "subscription_sharing_unsupported_capability", param: "text.format",
+        } }, { status: 400 });
+      }
       if (options.responsesHttpError) {
         return Response.json(options.responsesHttpError.body, {
           status: options.responsesHttpError.status,
@@ -3948,16 +3999,17 @@ async function createHarness(
           typeof responsePayload.tool_choice === "object" &&
           responsePayload.tool_choice !== null
         ) {
+          const name = (responsePayload.tool_choice as { name?: string }).name;
           const call = {
             type: "function_call",
             call_id: "smoke_call_123456",
-            name: "get_document_context",
-            arguments: "{}",
+            name,
+            arguments: name === "return_figma_design" ? (options.generatedOutput ?? "{}") : "{}",
           };
           return new Response(
-            `data: ${JSON.stringify({
+            `${name === "return_figma_design" ? `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Do not treat this explanatory text as JSON." })}\n\n` : ""}data: ${JSON.stringify({
               type: "response.completed",
-              response: { status: "completed", output: [call] },
+              response: { status: "completed", output: name === "return_figma_design" ? (options.designFunctionOutputItems ?? [call]) : [call] },
             })}\n\n`,
             { status: 200, headers: { "Content-Type": "text/event-stream" } },
           );

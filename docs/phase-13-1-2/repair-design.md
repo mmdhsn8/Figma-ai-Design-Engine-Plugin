@@ -1,0 +1,5 @@
+# Repair design
+
+Apply existing target expansion, then compact the gap when feasible. If a versioned horizontal row with semantic controls still does not fit, greedily pack consecutive children into native horizontal Auto Layout frames. Retain the original parent pattern and child order, and recompute height with the new row count. The wrapper padding uses the lowest pinned spacing token when applicable. If a child cannot fit a row, retain the existing stack fallback and reject when no bounded candidate fits. The diagnostic reports the reflowed section-root demand and available space, without raw text.
+
+Original nodes keep their semantic roles and editable contents. Row wrappers are created before the first durable save, and a normalized result is idempotent. There is no automatic cross-section relocation: the current section protocol does not encode which actions a later independently generated section can safely take over. Required controls are neither dropped nor replaced by an unverified menu.

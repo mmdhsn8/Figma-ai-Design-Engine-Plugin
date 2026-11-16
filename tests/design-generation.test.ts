@@ -3,6 +3,9 @@ import dashboardSample from "../src/samples/phase-5-english-dashboard.json?raw";
 import { parseMultiScreenText } from "../src/shared/multi-screen-schema";
 import {
   createDesignPlan,
+  generatedSectionLayoutFits,
+  createDesignSections,
+  createDesignSectionInstructions,
   createDesignInstructions,
   normalizeGeneratedDesignResponse,
   generationRepairTargets,
@@ -13,6 +16,7 @@ import {
   type GeneratedDesignNode,
 } from "../src/shared/design-generation";
 import {
+  normalizeGeneratedSectionContrast,
   pendingGenerationScreens,
   prepareGeneratedDesign,
   retainGeneratedScreen,
@@ -98,7 +102,158 @@ function generatedResponse(ids: string[]): GeneratedDesign {
   };
 }
 
+function commerceDetailSection(screenId: string, sparse = false): GeneratedDesign {
+  const frame = (
+    name: string,
+    width: number,
+    height: number,
+    children: GeneratedDesignNode[],
+    pattern?: GeneratedDesignNode["pattern"],
+    layout: GeneratedDesignNode["layout"] = "vertical",
+  ): GeneratedDesignNode => ({
+    type: "frame",
+    name,
+    text: null,
+    palette: "surface",
+    width,
+    height,
+    fontSize: 16,
+    fontStyle: "Regular",
+    textAlign: "right",
+    cornerRadius: 8,
+    elevation: "none",
+    layout,
+    gap: 8,
+    padding: 8,
+    qualityRole: "decorative",
+    ...(pattern ? { pattern } : {}),
+    children,
+  });
+  const gallery = frame("Product gallery", 334, 120, [
+    {
+      ...frame("Product image slot", 318, 88, []),
+      type: "image",
+      layout: "none",
+      padding: 0,
+      qualityRole: "image",
+      placeholder: true,
+    },
+  ], "image-gallery");
+  const sizes = ["S", ...(sparse ? [] : ["M"])].map((label) => ({
+    ...textNode(label),
+    name: `Size ${label}`,
+    width: 44,
+    height: 44,
+    qualityRole: "button" as const,
+  }));
+  const variants = frame("Size selector", 334, 64, sizes, "variant-selector", "horizontal");
+  const actions = frame("Purchase actions", 334, 60, [
+    {
+      ...textNode("افزودن به سبد"),
+      name: "Add to cart",
+      width: 318,
+      height: 44,
+      qualityRole: "button",
+    },
+  ], "cta-group");
+  const design = generatedResponse([screenId]);
+  design.screens[0]!.children = [
+    frame("محتوای جزئیات محصول", 350, 320, [
+      gallery,
+      variants,
+      actions,
+      { ...textNode("مانتو لینن"), width: 334, height: 32 },
+      { ...textNode("۱٬۲۹۰٬۰۰۰ تومان"), name: "Product price", width: 334, height: 24, qualityRole: "body" },
+    ]),
+  ];
+  return design;
+}
+
 describe("brief planner and constrained design generation", () => {
+  it("repairs a synthetic 4.06:1 Persian label before native preparation and is idempotent", () => {
+    const plan = planFor(request({ screenCount: 1, screenNames: ["Home"], language: "fa" }));
+    const design = generatedResponse([plan.screens[0]!.id]);
+    Object.assign(design.palette, { page: "#FAF8F5", muted: "#7B7B69", text: "#202020" });
+    const frame = design.screens[0]!.children[0]!;
+    frame.palette = "none";
+    frame.children = [{ ...textNode("۱۲۰٬۰۰۰ تومان"), palette: "muted", textAlign: "right" }];
+    const original = JSON.stringify(design);
+    const result = normalizeGeneratedSectionContrast(design, plan);
+    expect(result.findings).toEqual([]);
+    expect(result.repairs).toEqual([expect.objectContaining({
+      path: "screens.0.children.0.0", from: "muted", to: "text", surface: "#FAF8F5",
+    })]);
+    expect(result.repairs[0]?.before.toFixed(2)).toBe("4.06");
+    expect(result.repairs[0]?.after).toBeGreaterThanOrEqual(4.5);
+    expect(prepareGeneratedDesign(JSON.stringify(result.design), plan, { scope: "section", sectionId: "identity" }).success).toBe(true);
+    expect(normalizeGeneratedSectionContrast(result.design, plan)).toMatchObject({
+      design: result.design, repairs: [], findings: [],
+    });
+    expect(JSON.stringify(design)).toBe(original);
+    const label = frame.children[0]!;
+    label.opacity = 0.1;
+    expect(normalizeGeneratedSectionContrast(design, plan).findings[0]).toContain("contrast_unresolved");
+    frame.opacity = 0.8;
+    expect(normalizeGeneratedSectionContrast(design, plan).findings[0]).toContain("solid, measurable");
+  });
+
+  it("keeps a versioned Persian toolbar horizontal when tap targets fit with a smaller gap", () => {
+    const plan = planFor(request({ screenCount: 1, screenNames: ["Home"], language: "fa" }));
+    const design = generatedResponse([plan.screens[0]!.id]);
+    const root = design.screens[0]!.children[0]!;
+    const sizes = [32, 36, 40, 43.9, 44, 48, 32];
+    Object.assign(root, { width: 350, height: 80, padding: 0, layout: "vertical" });
+    root.children = [{
+      ...root,
+      name: "Toolbar",
+      layout: "horizontal",
+      gap: 8,
+      height: 48,
+      padding: 4,
+      children: sizes.map((size, index) => ({
+        ...textNode("سبد"),
+        ...(index === 0 ? { type: "icon" as const, iconName: "bag" as const, text: null } : {}),
+        width: size,
+        height: size,
+        textAlign: "right",
+        qualityRole: "button",
+      })),
+    }];
+    const raw = JSON.stringify(design);
+    expect(normalizeGeneratedDesignResponse(raw, plan, "identity").success).toBe(false);
+    const result = normalizeGeneratedDesignResponse(raw, plan, "identity", 1);
+    if (!result.success) throw new Error(result.errors.join("\n"));
+    const toolbar = result.data.design.screens[0]!.children[0]!.children[0]!;
+    expect(toolbar).toMatchObject({ layout: "horizontal", gap: 4 });
+    expect(toolbar.children.map(({ width, height }) => [width, height])).toEqual(
+      sizes.map((size) => [Math.max(44, size), Math.max(44, size)]),
+    );
+    expect(result.data.tapTargetRepairs).toHaveLength(5);
+    expect(result.data.tapTargetRepairs?.every(({ parentReflowed }) => parentReflowed)).toBe(true);
+    expect(normalizeGeneratedDesignResponse(JSON.stringify(result.data.design), plan, "identity", 1))
+      .toMatchObject({ success: true, data: { design: result.data.design } });
+  });
+
+  it("normalizes undersized font metrics and omitted padding before section validation", () => {
+    const plan = planFor(request({ screenCount: 1, screenNames: ["Home"] }));
+    const design = generatedResponse([plan.screens[0]!.id]);
+    const root = design.screens[0]!.children[0]!;
+    root.fontSize = 0;
+    root.children = [{ ...textNode("فروشگاه"), fontSize: 6 }];
+    const { padding: _padding, ...label } = root.children[0]!;
+    expect(_padding).toBeDefined();
+    const raw = JSON.stringify({
+      ...design,
+      screens: [{ ...design.screens[0], children: [{ ...root, children: [label] }] }],
+    });
+    expect(validateGeneratedDesignResponse(raw, plan).success).toBe(false);
+    const normalized = normalizeGeneratedDesignResponse(raw, plan, "identity");
+    expect(normalized).toMatchObject({
+      success: true,
+      data: { design: { screens: [{ children: [{ fontSize: 16, children: [{ fontSize: 12, padding: 0 }] }] }] } },
+    });
+  });
+
   it("defaults to high fidelity, preserves explicit wireframe mode, and covers non-commerce domains", () => {
     const defaultPlan = createDesignPlan(
       request({
@@ -254,6 +409,104 @@ describe("brief planner and constrained design generation", () => {
     const root = prepared.data.batch.screens[0]!.children[0];
     expect(root?.type).toBe("frame");
     if (root?.type === "frame") expect(root.children[1]).toMatchObject({ type: "frame", name: "Wellness illustration slot" });
+  });
+
+  it("preflights semantic commerce sections before they can be saved", () => {
+    const plan = planFor(request({
+      prompt: "یک فروشگاه لباس با صفحه جزئیات محصول فارسی و خرید آسان طراحی کن.",
+      screenCount: 1,
+      screenNames: ["جزئیات محصول"],
+      fidelity: "high_fidelity",
+      projectType: "storefront",
+    }));
+    const screenId = plan.screens[0]!.id;
+    expect(plan.screens[0]?.screenRole).toBe("detail");
+    const complete = prepareGeneratedDesign(JSON.stringify(commerceDetailSection(screenId)), plan, {
+      scope: "section",
+      sectionId: "primary",
+      visualCompositionVersion: 1,
+    });
+    expect(complete.success).toBe(true);
+    if (!complete.success) throw new Error(complete.errors.join("\n"));
+    expect(complete.data.visualSpecs[0]?.composition).toMatchObject({
+      screenRole: "detail",
+      sectionId: "primary",
+      assets: { status: "placeholder-backed", requiredSlots: 1, placeholders: 1 },
+    });
+    expect(complete.data.visualSpecs[0]?.nodes.filter(({ pattern }) => pattern)
+      .every(({ sectionId }) => sectionId === "primary")).toBe(true);
+
+    const sparse = prepareGeneratedDesign(JSON.stringify(commerceDetailSection(screenId, true)), plan, {
+      scope: "section",
+      sectionId: "primary",
+      visualCompositionVersion: 1,
+    });
+    expect(sparse.success).toBe(false);
+    if (!sparse.success) expect(sparse.errors.join(" ")).toContain("variant_choices_missing");
+
+    const assembled = commerceDetailSection(screenId);
+    const primary = assembled.screens[0]!.children[0]!;
+    primary.sectionId = "primary";
+    primary.height += 650;
+    const gallery = primary.children[0]!;
+    gallery.height += 650;
+    gallery.children[0]!.height += 650;
+    assembled.screens[0]!.children = [
+      {
+        ...primary,
+        name: "Store header",
+        sectionId: "identity",
+        pattern: "app-bar",
+        height: 144,
+        children: [{
+          ...primary,
+          name: "Navigation",
+          sectionId: undefined,
+          pattern: "navigation",
+          width: 334,
+          height: 120,
+          children: [textNode("فروشگاه"), textNode("بازگشت به محصولات")],
+        }],
+      },
+      primary,
+      {
+        ...primary,
+        name: "Delivery details",
+        sectionId: "supporting",
+        pattern: "trust-row",
+        height: 64,
+        children: [textNode("ارسال و امکان مرجوعی")],
+      },
+    ];
+    const full = prepareGeneratedDesign(JSON.stringify(assembled), plan, {
+      visualCompositionVersion: 1,
+    });
+    if (!full.success) throw new Error(full.errors.join("\n"));
+    expect(full.data.batch.screens[0]).toMatchObject({ width: 390, height: 844 });
+    expect(full.data.visualSpecs[0]?.nodes).toContainEqual(
+      expect.objectContaining({ pattern: "image-gallery", sectionId: "primary" }),
+    );
+  });
+
+  it("plans the Persian storefront roles and assigns role-specific primary guidance", () => {
+    const plan = planFor(request({
+      prompt: "برای فروشگاه لباس، صفحه اصلی، جزئیات محصول و سبد خرید فارسی بساز.",
+      screenCount: 3,
+      screenNames: ["صفحه اصلی", "جزئیات محصول", "سبد خرید"],
+      fidelity: "high_fidelity",
+      projectType: "storefront",
+    }));
+    const primary = createDesignSections(plan).find(({ id }) => id === "primary");
+    if (!primary) throw new Error("Primary section is missing.");
+    const instructions = plan.screens.map((screen) =>
+      createDesignSectionInstructions(plan, screen, primary),
+    );
+
+    expect(plan.screens.map(({ screenRole }) => screenRole)).toEqual(["home", "detail", "cart"]);
+    expect(instructions[0]).toContain("at least two distinct side-by-side product cards");
+    expect(instructions[1]).toContain("visible size/color choices");
+    expect(instructions[2]).toContain("populated cart item row");
+    expect(instructions[2]).toContain("price");
   });
 
   it("normalizes Persian, Finglish, and English briefs without losing the user's copy language", () => {
@@ -743,6 +996,193 @@ describe("brief planner and constrained design generation", () => {
     }
   });
 
+  it.each(["```json", "```", "```JSON"])("normalizes one complete %s fence without weakening JSON or design validation", (fence) => {
+    const plan = planFor(request({ screenNames: ["Home", "Detail"] }));
+    const generated = generatedResponse(plan.screens.map(({ id }) => id));
+    const raw = JSON.stringify(generated);
+    const fenced = `\uFEFF ${fence}\n${raw}\n\`\`\`\n`;
+    expect(validateGeneratedDesignResponse(fenced, plan).success).toBe(false);
+    expect(normalizeGeneratedDesignResponse(fenced, plan)).toEqual(normalizeGeneratedDesignResponse(raw, plan));
+    for (const invalid of [
+      `${fence}\n${raw.slice(0, -1)}\n\`\`\``,
+      `Here is the design:\n${fenced}`,
+      `${fenced}\n${fenced}`,
+      `${fence}\n${JSON.stringify({ ...generated, script: "unsafe" })}\n\`\`\``,
+    ]) {
+      expect(normalizeGeneratedDesignResponse(invalid, plan).success).toBe(false);
+    }
+  });
+
+  it("prepares a home header whose tagged search frame is itself the input", () => {
+    const plan = planFor(request({
+      screenCount: 1,
+      screenNames: ["Home"],
+      language: "fa",
+    }));
+    const generated = generatedResponse([plan.screens[0]!.id]);
+    const root = generated.screens[0]!.children[0]!;
+    const frame = (
+      pattern: "app-bar" | "search" | "navigation",
+      children: GeneratedDesignNode[],
+      height: number,
+    ): GeneratedDesignNode => ({
+      ...root, name: pattern, pattern, width: 334, height, padding: 0, gap: 8, children,
+    });
+    const search = frame("search", [{
+      ...textNode("جستجوی محصولات"), qualityRole: "body", fontSize: 16, height: 24,
+    }], 44);
+    search.qualityRole = "input";
+    const navigation = frame("navigation", ["خانه", "محصولات"].map((text) => ({
+      ...textNode(text), width: 100, height: 44, fontSize: 16, qualityRole: "button",
+    })), 44);
+    navigation.layout = "horizontal";
+    root.height = 180;
+    root.padding = 8;
+    root.gap = 8;
+    root.children = [
+      frame("app-bar", [{ ...textNode("فروشگاه"), height: 32 }], 32),
+      search,
+      navigation,
+    ];
+    const options = { scope: "section", sectionId: "identity", visualCompositionVersion: 1 } as const;
+    const result = prepareGeneratedDesign(JSON.stringify(generated), plan, options);
+    if (!result.success) throw new Error(result.errors.join("\n"));
+    const input = result.data.visualSpecs[0]!.nodes.find(({ pattern }) => pattern === "search");
+    expect(input).toMatchObject({ qualityRole: "input", nodeType: "frame", height: 44 });
+    expect(createDesignSectionInstructions(plan, plan.screens[0]!, createDesignSections(plan)[0]!))
+      .toContain('qualityRole="input" on the search frame itself');
+    search.qualityRole = "decorative";
+    const missing = prepareGeneratedDesign(JSON.stringify(generated), plan, options);
+    expect(missing).toMatchObject({ success: false, errors: expect.arrayContaining([
+      expect.stringContaining("search_field_missing"),
+    ]) });
+  });
+
+  it("reflows crowded header controls within the section without losing Persian copy or RTL order", () => {
+    const plan = planFor(request({ screenNames: ["Home", "Detail"], language: "fa" }));
+    const generated = generatedResponse(plan.screens.map(({ id }) => id));
+    const root = generated.screens[1]!.children[0]!;
+    root.height = 100;
+    root.padding = 12;
+    root.children = [{
+      ...root,
+      name: "اقدام‌ها",
+      layout: "horizontal",
+      width: 318,
+      height: 40,
+      padding: 16,
+      gap: 8,
+      children: ["جستجو", "حساب", "سبد"].map((text) => ({
+        ...textNode(text),
+        width: 100,
+        height: 24,
+        fontSize: 16,
+        textAlign: "right",
+        qualityRole: "button",
+      })),
+    }];
+    const raw = JSON.stringify(generated);
+    const result = normalizeGeneratedDesignResponse(raw, plan, "identity");
+    if (!result.success) throw new Error(result.errors.join("\n"));
+    const section = result.data.design.screens[1]!.children[0]!;
+    const actions = section.children[0]!;
+    expect(section.height).toBeLessThanOrEqual(210);
+    expect(actions.layout).toBe("vertical");
+    expect(actions.children.map(({ height, qualityRole }) => [height, qualityRole])).toEqual([
+      [44, "button"], [44, "button"], [44, "button"],
+    ]);
+    expect(actions.children.map((child) => child.children[0]?.text)).toEqual([
+      "جستجو", "حساب", "سبد",
+    ]);
+    expect(actions.children.every((child) => child.children[0]?.textAlign === "right")).toBe(true);
+    expect(validateGeneratedDesignResponse(JSON.stringify(result.data.design), plan).success).toBe(true);
+    expect(normalizeGeneratedDesignResponse(JSON.stringify(result.data.design), plan, "identity")).toEqual(result);
+    expect(JSON.stringify(generated)).toBe(raw);
+
+    actions.children[0]!.width = 420;
+    actions.children[0]!.qualityRole = "input";
+    actions.layout = "horizontal";
+    const oversizedInput = normalizeGeneratedDesignResponse(JSON.stringify(result.data.design), plan, "identity");
+    if (!oversizedInput.success) throw new Error(oversizedInput.errors.join("\n"));
+    expect(oversizedInput.data.design.screens[1]!.children[0]!.children[0]).toMatchObject({
+      layout: "vertical",
+      children: [{ width: 294, height: 44, qualityRole: "input" }, expect.anything(), expect.anything()],
+    });
+  });
+
+  it("normalizes misplaced section metadata and accommodates a taller repaired identity section", () => {
+    const plan = planFor(request({ screenCount: 1, screenNames: ["Home"], language: "fa" }));
+    const design = generatedResponse([plan.screens[0]!.id]);
+    const root = design.screens[0]!.children[0]!;
+    Object.assign(root, { width: 350, height: 140, padding: 12, gap: 8 });
+    root.children = [
+      { ...textNode("فروشگاه"), height: 32, sectionId: "identity" },
+      {
+        ...root, name: "Navigation", width: 326, height: 40, padding: 8,
+        layout: "horizontal", sectionId: "identity",
+        children: ["خانه", "جستجو", "سبد", "حساب"].map((text) => ({
+          ...textNode(text), width: 100, height: 32, qualityRole: "button",
+        })),
+      },
+    ];
+    const normalized = normalizeGeneratedDesignResponse(JSON.stringify(design), plan, "identity", 1);
+    if (!normalized.success) throw new Error(normalized.errors.join("\n"));
+    const header = normalized.data.design.screens[0]!.children[0]!;
+    expect(header.height).toBeLessThanOrEqual(210);
+    expect(header.children.every(({ sectionId }) => sectionId === undefined)).toBe(true);
+    const rows = header.children[1]!.children;
+    expect(rows.map(({ layout, children }) => [layout, children.length])).toEqual([
+      ["horizontal", 2], ["horizontal", 2],
+    ]);
+    expect(rows.flatMap(({ children }) => children.map(({ height }) => height))).toEqual([44, 44, 44, 44]);
+    expect(normalizeGeneratedDesignResponse(JSON.stringify(normalized.data.design), plan, "identity", 1))
+      .toMatchObject({ success: true, data: { design: normalized.data.design } });
+    expect(validateGeneratedDesignResponse(JSON.stringify(normalized.data.design), plan).success).toBe(true);
+  });
+
+  it("keeps wrapped controls within width across feasible variants and reports infeasible height", () => {
+    const plan = planFor(request({ screenCount: 1, screenNames: ["Home"], language: "fa" }));
+    for (const width of [80, 100, 140, 156]) {
+      for (const count of [4, 6, 12]) {
+        const design = generatedResponse([plan.screens[0]!.id]);
+        const root = design.screens[0]!.children[0]!;
+        Object.assign(root, { width: 350, height: 48, padding: 8, gap: 8, layout: "horizontal" });
+        root.children = Array.from({ length: count }, () => ({
+          ...textNode("خرید"), width, height: 43, qualityRole: "button",
+        }));
+        const result = normalizeGeneratedDesignResponse(JSON.stringify(design), plan, "identity", 1);
+        if (count === 12 && width >= 140) {
+          expect(result).toMatchObject({ success: false, errors: expect.arrayContaining([
+            expect.stringMatching(/^layout_infeasible:.*Available: 350×300 px/u),
+          ]) });
+          continue;
+        }
+        if (!result.success) throw new Error(result.errors.join("\n"));
+        const header = result.data.design.screens[0]!.children[0]!;
+        expect(generatedSectionLayoutFits(header)).toBe(true);
+        expect(header.height).toBeLessThanOrEqual(300);
+      }
+    }
+  });
+
+  it("repairs a scrolling primary section using its content budget rather than the viewport height", () => {
+    const plan = planFor(request({ screenNames: ["Home", "Detail"] }));
+    const generated = generatedResponse(plan.screens.map(({ id }) => id));
+    const root = generated.screens[1]!.children[0]!;
+    root.height = 1200;
+    root.children.push({ ...textNode("خرید"), width: 24, height: 24, qualityRole: "button" });
+    const raw = JSON.stringify(generated);
+    expect(normalizeGeneratedDesignResponse(raw, plan).success).toBe(false);
+    const result = normalizeGeneratedDesignResponse(raw, plan, "primary");
+    if (!result.success) throw new Error(result.errors.join("\n"));
+    expect(result.data.design.screens[1]!.children[0]!.children[1]).toMatchObject({
+      type: "frame", width: 44, height: 44, qualityRole: "button",
+    });
+    expect(normalizeGeneratedDesignResponse(JSON.stringify(result.data.design), plan, "primary")).toEqual(result);
+    root.height = 1700;
+    expect(normalizeGeneratedDesignResponse(JSON.stringify(generated), plan, "primary").success).toBe(false);
+  });
+
   it("keeps exact paths for impossible repairs and resumes only the failed screen", () => {
     const plan = planFor(request({ screenNames: ["Home", "Detail"], language: "fa" }));
     const generated = generatedResponse(plan.screens.map(({ id }) => id));
@@ -751,7 +1191,7 @@ describe("brief planner and constrained design generation", () => {
       type: "rectangle",
       text: null,
       qualityRole: "button",
-      width: 20,
+      width: 160,
       height: 20,
     };
     generated.screens[1]!.children = [
@@ -777,15 +1217,16 @@ describe("brief planner and constrained design generation", () => {
     );
     expect(failed).toMatchObject({
       success: false,
-      errors: [
+      errors: expect.arrayContaining([
         "screens.detail.children[0].children[0] button is below the 44 px minimum tap target.",
         "screens.detail.children[0].children[1] button is below the 44 px minimum tap target.",
-      ],
+      ]),
     });
     if (failed.success) return;
     expect(createDesignInstructions(screenPlan, failed.errors)).toContain(failed.errors[0]);
     expect(saved).toHaveLength(1);
     const fixed = structuredClone(generated.screens[1]!);
+    fixed.children[0]!.padding = 0;
     fixed.children[0]!.gap = 12;
     const repaired = normalizeGeneratedDesignResponse(
       JSON.stringify({ ...generated, screens: [fixed] }),
@@ -1033,6 +1474,32 @@ describe("brief planner and constrained design generation", () => {
       text: "تازه‌ترین محصولات  ·  SKU-32",
       textAlign: "right",
       textAutoResize: "height",
+    });
+  });
+
+  it("maps Persian header labels in a horizontal row with fixed widths and content-driven heights", () => {
+    const plan = planFor(request({ screenCount: 1, screenNames: ["Home"], language: "fa" }));
+    const design = generatedResponse([plan.screens[0]!.id]);
+    const frame = design.screens[0]!.children[0]!;
+    frame.layout = "horizontal";
+    frame.children = ["فروشگاه", "جستجو"].map((label) => ({
+      ...textNode(label),
+      width: 110,
+      textAlign: "right",
+    }));
+    const prepared = prepareGeneratedDesign(JSON.stringify(design), plan, {
+      scope: "section",
+      sectionId: "identity",
+    });
+    if (!prepared.success) throw new Error(prepared.errors.join("\n"));
+    expect(prepared.data.batch.screens[0]?.children[0]).toMatchObject({
+      layout: { counterAxisAlign: "center" },
+      children: ["فروشگاه", "جستجو"].map((label) => expect.objectContaining({
+        text: label,
+        width: 110,
+        textAlign: "right",
+        sizing: { width: "fixed", height: "hug" },
+      })),
     });
   });
 

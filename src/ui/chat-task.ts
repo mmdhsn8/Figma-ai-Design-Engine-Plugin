@@ -2721,7 +2721,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         const existingRoot = link.nativeRoots.find(({ screenId }) => screenId === event.screenId);
         if (
           existingRoot &&
-          (existingRoot.nodeId !== nativeRoot.nodeId || existingRoot.logicalRef !== nativeRoot.logicalRef)
+          (existingRoot.nodeId !== nativeRoot.nodeId ||
+            existingRoot.logicalRef !== nativeRoot.logicalRef)
         )
           throw new Error(
             "multi_screen_identity_conflict: A verified screen changed its saved native identity.",
@@ -2792,10 +2793,28 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         const root = nativeRoots[index];
         if (root) stage.logicalRefs = [root.logicalRef];
       });
+      const assetCoverage = outcome.assetCoverage;
+      const assetCoverageText = assetCoverage
+        ? request.locale === "fa-IR"
+          ? assetCoverage.status === "placeholder-backed"
+            ? `پوشش تصویر: ${assetCoverage.placeholders} جایگاه با جای‌نگهدارِ برچسب‌خورده و ${assetCoverage.authorizedAssets} تصویر مجاز.`
+            : assetCoverage.status === "complete"
+              ? `پوشش تصویر: ${assetCoverage.authorizedAssets} تصویر مجاز برای ${assetCoverage.requiredSlots} جایگاه.`
+              : assetCoverage.status === "incomplete"
+                ? `پوشش تصویر ناقص است: ${assetCoverage.authorizedAssets} تصویر و ${assetCoverage.placeholders} جای‌نگهدار برای ${assetCoverage.requiredSlots} جایگاه.`
+                : "برای این صفحه‌ها جایگاه تصویر لازم نبود."
+          : assetCoverage.status === "placeholder-backed"
+            ? `Image coverage: ${assetCoverage.placeholders} labeled placeholders and ${assetCoverage.authorizedAssets} authorized images.`
+            : assetCoverage.status === "complete"
+              ? `Image coverage: ${assetCoverage.authorizedAssets} authorized images for ${assetCoverage.requiredSlots} required slots.`
+              : assetCoverage.status === "incomplete"
+                ? `Image coverage is incomplete: ${assetCoverage.authorizedAssets} authorized images and ${assetCoverage.placeholders} placeholders for ${assetCoverage.requiredSlots} required slots.`
+                : "These screens did not require image slots."
+        : "";
       task.text =
         request.locale === "fa-IR"
-          ? `${screenIds.length} صفحهٔ قابل‌ویرایش در فیگما ساخته و بررسی شد (${outcome.nodeCount} لایهٔ بومی).`
-          : `Created and verified ${screenIds.length} editable Figma screens (${outcome.nodeCount} native layers).`;
+          ? `${screenIds.length} صفحهٔ قابل‌ویرایش در فیگما ساخته و بررسی شد (${outcome.nodeCount} لایهٔ بومی).${assetCoverageText ? ` ${assetCoverageText}` : ""}`
+          : `Created and verified ${screenIds.length} editable Figma screens (${outcome.nodeCount} native layers).${assetCoverageText ? ` ${assetCoverageText}` : ""}`;
       task.pending = [];
       task.recent = [];
       task.status = "completed";
@@ -4092,6 +4111,10 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           const call = intentCalls[0]!;
           if (call.action.tool !== "classify_canvas_intent")
             throw new Error("The intent classifier returned an invalid tool action.");
+          if (task.generationIntent && call.action.intent !== "create")
+            throw new Error(
+              "Structured screen creation could not be confirmed. Start a new task with the screen count, names, and device family.",
+            );
           const replayed =
             task.intent === call.action.intent &&
             (!call.action.targetName || call.action.targetName === task.targetName);

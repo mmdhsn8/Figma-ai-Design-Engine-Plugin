@@ -133,12 +133,15 @@ async function draftRequestInternal(
 export async function loadSavedDraft(
   token: string,
   documentId: string,
+  generationId?: string,
 ): Promise<SavedDraft | null> {
-  const result = (await draftRequest(token, documentId, "load")) as { draft?: SavedDraft | null };
+  const result = (await draftRequest(token, documentId, "load", { generationId })) as { draft?: SavedDraft | null };
   if (!result.draft) return null;
   const manifest = DraftManifestSchema.parse(result.draft.manifest);
   if (manifest.documentId !== documentId)
     throw new Error("Saved draft belongs to another document.");
+  if (generationId && manifest.generationId !== generationId)
+    throw new Error("Saved draft belongs to another generation. Restart the updated Companion and retry.");
   return {
     manifest,
     screens: result.draft.screens.map((record) => ({

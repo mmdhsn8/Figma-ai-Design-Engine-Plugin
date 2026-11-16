@@ -32,8 +32,10 @@ export function createDraftStore(directory: string) {
     });
     return next;
   };
-  const projectPath = (owner: string, documentId: string) =>
-    join(directory, createHash("sha256").update(`${owner}:${documentId}`).digest("hex"));
+  const projectPath = (owner: string, documentId: string, generationId?: string) =>
+    join(directory, createHash("sha256")
+      .update(generationId ? JSON.stringify([owner, documentId, generationId]) : `${owner}:${documentId}`)
+      .digest("hex"));
   const envelopeFor = (data: unknown) => {
     const text = JSON.stringify(data);
     return JSON.stringify({
@@ -70,6 +72,18 @@ export function createDraftStore(directory: string) {
   };
   const manifestAt = async (path: string) =>
     DraftManifestSchema.parse(await read(join(path, "manifest.json"), 32 * 1024));
+  const existingManifest = async (path: string) => {
+    try {
+      return await manifestAt(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return null;
+    }
+  };
+  const resolveProjectPath = async (owner: string, documentId: string, generationId: string) => {
+    const scoped = projectPath(owner, documentId, generationId);
+    return (await existingManifest(scoped)) ? scoped : projectPath(owner, documentId);
+  };
   const sizesAt = async (path: string) => {
     let sizes = sizeIndexes.get(path);
     if (!sizes) {
@@ -107,13 +121,25 @@ export function createDraftStore(directory: string) {
         if (Buffer.byteLength(JSON.stringify(manifest)) > 16 * 1024)
           throw new Error("draft_manifest_16KiB_limit");
         await mkdir(directory, { recursive: true, mode: 0o700 });
-        const path = projectPath(owner, manifest.documentId);
+        const legacyPath = projectPath(owner, manifest.documentId);
+        const path =
+          manifest.chatTaskId &&
+          (await existingManifest(legacyPath))?.generationId !== manifest.generationId
+            ? projectPath(owner, manifest.documentId, manifest.generationId)
+            : legacyPath;
         const projects = await readdir(directory, { withFileTypes: true });
-        if (
-          !projects.some((entry) => join(directory, entry.name) === path) &&
-          projects.filter((entry) => entry.isDirectory()).length >= 8
-        )
-          throw new Error("draft_retention_full_delete_old_project");
+        if (!projects.some((entry) => entry.isDirectory() && join(directory, entry.name) === path)) {
+          const manifests = await Promise.all(
+            projects.filter((entry) => entry.isDirectory()).map((entry) =>
+              existingManifest(join(directory, entry.name)).catch(() => null),
+            ),
+          );
+          const chatDraft = Boolean(manifest.chatTaskId);
+          const retained = manifests.filter((entry) => Boolean(entry?.chatTaskId) === chatDraft);
+          // Chat has a draft per generation, including retries that never save a section.
+          if (retained.length >= (chatDraft ? 32 : 8))
+            throw new Error("draft_retention_full_delete_old_project");
+        }
         await mkdir(path, { recursive: true, mode: 0o700 });
         try {
           const existing = await manifestAt(path);
@@ -137,7 +163,7 @@ export function createDraftStore(directory: string) {
       nodeId?: string,
     ) =>
       serial(async () => {
-        const path = projectPath(owner, documentId);
+        const path = await resolveProjectPath(owner, documentId, generationId);
         const manifest = await manifestAt(path);
         if (manifest.generationId !== generationId) throw new Error("draft_generation_mismatch");
         const design = validateDraftScreen(manifest, value);
@@ -200,7 +226,7 @@ export function createDraftStore(directory: string) {
       value: unknown,
     ) =>
       serial(async () => {
-        const path = projectPath(owner, documentId);
+        const path = await resolveProjectPath(owner, documentId, generationId);
         const manifest = await manifestAt(path);
         if (manifest.generationId !== generationId) throw new Error("draft_generation_mismatch");
         const { transaction, design } = validateDraftSection(manifest, transactionValue, value);
@@ -257,7 +283,7 @@ export function createDraftStore(directory: string) {
     ) =>
       serial(async () => {
         const transactionInput = GenerationTransactionSchema.parse(transactionValue);
-        const path = projectPath(owner, documentId);
+        const path = await resolveProjectPath(owner, documentId, generationId);
         const manifest = await manifestAt(path);
         if (manifest.generationId !== generationId) throw new Error("draft_generation_mismatch");
         const recordValue = await read(
@@ -282,9 +308,11 @@ export function createDraftStore(directory: string) {
         await atomic(filePath, updated);
         setIndexedSize(path, sizes, fileName, (await stat(filePath)).size);
       }),
-    load: (owner: string, documentId: string): Promise<SavedDraft | null> =>
+    load: (owner: string, documentId: string, generationId?: string): Promise<SavedDraft | null> =>
       serial(async () => {
-        const path = projectPath(owner, documentId);
+        const path = generationId
+          ? await resolveProjectPath(owner, documentId, generationId)
+          : projectPath(owner, documentId);
         // Recovery refreshes disk accounting, including externally changed/corrupt staging files.
         sizeIndexes.delete(path);
         sizeTotals.delete(path);
@@ -295,6 +323,7 @@ export function createDraftStore(directory: string) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
           throw error;
         }
+        if (generationId && manifest.generationId !== generationId) return null;
         const screens: SavedDraft["screens"] = [];
         const transactions: SavedSection[] = [];
         const warnings: string[] = [];

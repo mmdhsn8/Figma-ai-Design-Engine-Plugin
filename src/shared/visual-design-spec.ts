@@ -9,11 +9,21 @@ import {
 import { DESIGN_ICON_PATHS, type DesignIconName } from "./design-icons.js";
 import {
   DESIGN_PATTERN_IDS,
+  inferDesignScreenRole,
   inferPatternsForScreen,
   inferRequestedDesignPatterns,
+  patternsForSectionRole,
+  type DesignScreenRole,
+  type DesignSectionRole,
   type DesignPatternId,
 } from "./design-patterns.js";
 import type { DesignSkillPrompt } from "./design-skill.js";
+import {
+  createVisualCompositionContract,
+  summarizeVisualAssetCoverage,
+  validateVisualCompositionCoverage,
+  VisualCompositionContractSchema,
+} from "./visual-composition.js";
 
 export const DESIGN_BRIEF_VERSION = 1 as const;
 export const VISUAL_DESIGN_SPEC_VERSION = 1 as const;
@@ -81,6 +91,7 @@ const VisualNodeSchema = z
     name: z.string().trim().min(1).max(200),
     qualityRole: z.enum(["button", "input", "image", "heading", "body", "decorative"]),
     pattern: z.enum(DESIGN_PATTERN_IDS).optional(),
+    sectionId: z.enum(["identity", "primary", "supporting"]).optional(),
     width: z.number().finite().positive().max(10_000),
     height: z.number().finite().positive().max(10_000),
     layout: z.enum(["none", "vertical", "horizontal"]),
@@ -159,6 +170,7 @@ export const VisualDesignSpecSchema = z
       })
       .strict(),
     semanticTokens: BrandKitTokensSchema.optional(),
+    composition: VisualCompositionContractSchema.optional(),
     tokens: z
       .object({
         brand: z.string().regex(/^#[\da-f]{6}$/iu),
@@ -207,12 +219,12 @@ export interface VisualSpecSourceNode {
   gap: number;
   qualityRole: "button" | "input" | "image" | "heading" | "body" | "decorative";
   pattern?: DesignPatternId;
+  sectionId?: DesignSectionRole;
   cornerRadius?: number;
   strokePalette?: Exclude<VisualDesignPaletteRole, "none">;
   elevation?: "none" | "soft";
   iconName?: string;
   placeholder?: true;
-  sectionId?: "identity" | "primary" | "supporting";
   children: VisualSpecSourceNode[];
 }
 
@@ -244,12 +256,15 @@ export function createVisualDesignSpec(input: {
     id: string;
     name: string;
     familyName: string;
+    screenRole?: DesignScreenRole;
     width: number;
     height: number;
     devicePreset: "mobile" | "desktop";
   };
   projectScreenCount: number;
   requiredPatterns?: readonly DesignPatternId[];
+  compositionVersion?: 1;
+  sectionId?: DesignSectionRole;
   requireHighFidelityStructure?: boolean;
   palette: VisualDesignPalette;
   semanticTokens?: z.infer<typeof BrandKitTokensSchema>;
@@ -274,7 +289,12 @@ export function createVisualDesignSpec(input: {
     gap: 16,
     paletteRole: "page",
   });
-  const visit = (node: VisualSpecSourceNode, path: string, parentRef: string): void => {
+  const visit = (
+    node: VisualSpecSourceNode,
+    path: string,
+    parentRef: string,
+    sectionId: DesignSectionRole | undefined,
+  ): void => {
     const ref = `${input.screen.id}.${path.replaceAll("/", ".")}`;
     const interactiveText =
       node.type === "text" && (node.qualityRole === "button" || node.qualityRole === "input");
@@ -296,7 +316,7 @@ export function createVisualDesignSpec(input: {
           : node.fontSize >= 22
             ? "heading2"
             : "heading3"
-        : node.qualityRole === "button"
+        : node.qualityRole === "button" || interactiveText
           ? "button"
           : node.qualityRole === "decorative"
             ? "caption"
@@ -345,12 +365,13 @@ export function createVisualDesignSpec(input: {
       name: node.name,
       qualityRole: node.qualityRole,
       ...(node.pattern ? { pattern: node.pattern } : {}),
+      ...(sectionId ? { sectionId } : {}),
       width: node.width,
       height: node.height,
       layout: node.type === "frame" ? node.layout : node.type === "image" ? "vertical" : "none",
       padding: spacing ? nearestToken(node.padding, spacing) : node.padding,
       gap: spacing ? nearestToken(node.gap, spacing) : node.gap,
-      paletteRole: node.palette,
+      paletteRole: interactiveText ? "none" : node.palette,
       ...(cornerRadius ? { cornerRadius } : {}),
       ...(strokeColor
         ? { stroke: { color: strokeColor, width: input.semanticTokens?.stroke ?? 1 } }
@@ -384,14 +405,9 @@ export function createVisualDesignSpec(input: {
               ...(typographyToken?.letterSpacing !== undefined || node.letterSpacing !== undefined
                 ? { letterSpacing: typographyToken?.letterSpacing ?? node.letterSpacing }
                 : {}),
-              alignment: typographyToken
-                ? resolveBrandTextAlignment(
-                    input.semanticTokens,
-                    typographyRole,
-                    input.brief.prompt,
-                    node.textAlign,
-                  )
-                : node.textAlign,
+              alignment: resolveBrandTextAlignment(
+                input.semanticTokens, typographyRole, input.brief.prompt, node.textAlign,
+              ),
             },
           }
         : {}),
@@ -435,16 +451,9 @@ export function createVisualDesignSpec(input: {
           ...(typographyToken?.letterSpacing !== undefined || node.letterSpacing !== undefined
             ? { letterSpacing: typographyToken?.letterSpacing ?? node.letterSpacing }
             : {}),
-          alignment: typographyToken
-            ? resolveBrandTextAlignment(
-                input.semanticTokens,
-                typographyRole,
-                input.brief.prompt,
-                node.textAlign,
-              )
-            : input.brief.direction === "rtl"
-              ? "right"
-              : node.textAlign,
+          alignment: resolveBrandTextAlignment(
+            input.semanticTokens, typographyRole, input.brief.prompt, node.textAlign,
+          ),
         },
       });
     }
@@ -496,16 +505,67 @@ export function createVisualDesignSpec(input: {
     }
     const canContain = node.type === "frame" || node.type === "image";
     if (node.children.length && !canContain) return;
-    node.children.forEach((child, index) => visit(child, `${path}/n${index}`, ref));
+    node.children.forEach((child, index) => visit(child, `${path}/n${index}`, ref, sectionId));
   };
   const sectionIndexes = new Map<string, number>();
   input.children.forEach((node) => {
     const sectionId = node.sectionId ?? "main";
     const sectionIndex = sectionIndexes.get(sectionId) ?? 0;
     sectionIndexes.set(sectionId, sectionIndex + 1);
-    visit(node, `${sectionId}/n${sectionIndex}`, rootRef);
+    visit(node, `${sectionId}/n${sectionIndex}`, rootRef, node.sectionId);
   });
   const used = [...usedPatterns];
+  const screenRole = input.screen.screenRole ?? inferDesignScreenRole(input.screen.familyName);
+  const basePatterns =
+    input.requiredPatterns ??
+    inferPatternsForScreen(
+      input.brief.prompt,
+      input.brief.domain,
+      input.screen.familyName,
+      input.projectScreenCount,
+      input.brief.fidelity === "high_fidelity",
+    );
+  const skillPatterns = (input.designSkills ?? []).flatMap(
+    ({ requiredPatterns }) => requiredPatterns,
+  );
+  const fullPatterns = [...new Set([...basePatterns, ...skillPatterns])];
+  const scopedPatterns =
+    input.compositionVersion === 1
+      ? input.sectionId
+        ? patternsForSectionRole(fullPatterns, screenRole, input.sectionId)
+        : fullPatterns
+      : fullPatterns;
+  let composition: ReturnType<typeof createVisualCompositionContract> | undefined;
+  if (input.compositionVersion === 1) {
+    const compositionPatterns = [
+      ...new Set([
+        ...inferPatternsForScreen(
+          input.brief.prompt,
+          input.brief.domain,
+          input.screen.familyName,
+          input.projectScreenCount,
+          input.brief.fidelity === "high_fidelity",
+        ),
+        ...fullPatterns,
+      ]),
+    ];
+    const baseComposition = createVisualCompositionContract({
+      domain: input.brief.domain,
+      role: screenRole,
+      locale: input.brief.locale,
+      ...(input.sectionId ? { sectionId: input.sectionId } : {}),
+      mood: input.brief.brandDirection,
+      prompt: input.brief.prompt,
+      viewport: { width: input.screen.width, height: input.screen.height },
+      spacingScale: input.semanticTokens?.spacing ?? [4, 8, 12, 16, 24, 32],
+      requiredPatterns: compositionPatterns,
+      assetCoverage: summarizeVisualAssetCoverage(nodes, 0),
+    });
+    composition = {
+      ...baseComposition,
+      assets: summarizeVisualAssetCoverage(nodes, baseComposition.quality.minimumImageSlots),
+    };
+  }
   const spec: VisualDesignSpec = {
     version: VISUAL_DESIGN_SPEC_VERSION,
     brief: input.brief,
@@ -542,20 +602,9 @@ export function createVisualDesignSpec(input: {
       : input.brief.brandKit
         ? { semanticTokens: input.brief.brandKit.tokens }
         : {}),
+    ...(composition ? { composition } : {}),
     nodes,
-    requiredPatterns: [
-      ...new Set([
-        ...(input.requiredPatterns ??
-          inferPatternsForScreen(
-            input.brief.prompt,
-            input.brief.domain,
-            input.screen.familyName,
-            input.projectScreenCount,
-            input.brief.fidelity === "high_fidelity",
-          )),
-        ...(input.designSkills ?? []).flatMap(({ requiredPatterns }) => requiredPatterns),
-      ]),
-    ],
+    requiredPatterns: scopedPatterns,
     usedPatterns: used,
     imagePlaceholders,
     nativeAssertions: [
@@ -766,7 +815,7 @@ export function validateVisualDesignSpec(
       errors.push(
         `Pattern “${node.pattern}” must be attached to a native frame root (${node.logicalRef}).`,
       );
-    if (node.pattern === "product-card") {
+    if (node.pattern === "product-card" || node.pattern === "cart-item") {
       if (
         !(childrenByParent.get(node.logicalRef) ?? []).some((child) =>
           hasImageInSubtree.get(child.logicalRef),
@@ -791,6 +840,13 @@ export function validateVisualDesignSpec(
     errors.push("Node order must be parent-first for deterministic native rendering.");
   if (spec.screen.grid.margin * 2 >= spec.screen.width)
     errors.push("Grid margins consume the entire screen width.");
+  if (spec.composition) {
+    errors.push(...validateVisualCompositionCoverage(spec.composition, spec.nodes));
+    if (spec.composition.assets.status === "incomplete")
+      errors.push(
+        `visual_composition.asset_coverage_incomplete:${spec.composition.screenRole}:${spec.composition.assets.authorizedAssets}+${spec.composition.assets.placeholders}/${spec.composition.assets.requiredSlots}`,
+      );
+  }
   return errors.length
     ? { success: false, errors: [...new Set(errors)].slice(0, 16) }
     : { success: true, data: spec };

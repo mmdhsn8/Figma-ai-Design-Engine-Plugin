@@ -26,7 +26,7 @@ import { MAX_NATIVE_QUALITY_SCAN_NODES } from "../src/shared/native-visual-quali
 import { BrandKitRevisionSchema, pinBrandKit } from "../src/shared/brand-kit";
 import {
   createChatScreenLogicalRef,
-  ChatGenerationIntentSchema,
+  parseChatGenerationIntent,
   type MultiScreenDesignRequest,
   type MultiScreenProgressEvent,
 } from "../src/shared/chat-generation";
@@ -785,6 +785,8 @@ describe("progressive conversational canvas tasks", () => {
             });
             executionOrder.push(`provider:${screen.id}:${section.id}`);
             const raw = sectionDesignFixture(screen.id, section.title);
+            if (screenIndex === 0 && section.id === "primary")
+              raw.screens[0]!.children[0]!.height = 1_000;
             const normalized = normalizeGeneratedDesignResponse(JSON.stringify(raw), {
               ...planResult.data,
               screens: planResult.data.screens.filter(({ id }) => id === screen.id),
@@ -832,7 +834,7 @@ describe("progressive conversational canvas tasks", () => {
               activeStore = createDraftStore(directory);
               executionOrder.push("reload-after-save-before-render");
             }
-            const checkpoint = await activeStore.load("mock-account", documentId);
+            const checkpoint = await activeStore.load("mock-account", documentId, request.generationId);
             const saved = checkpoint?.transactions.find(
               ({ transaction: stored }) => stored.idempotency_key === transaction.idempotency_key,
             );
@@ -929,6 +931,18 @@ describe("progressive conversational canvas tasks", () => {
           const nativeRoot = { screenId: screen.id, nodeId: verified.nodeId, logicalRef };
           nativeRoots.push(nativeRoot);
           const verifiedRoot = mock.page.findAll((node) => node.id === verified.nodeId)[0];
+          expect(verifiedRoot).toMatchObject({
+            width: 390,
+            height: 844,
+            clipsContent: true,
+            overflowDirection: "VERTICAL",
+          });
+          if (screenIndex === 0) {
+            const primary = mock.page.findAll(
+              (node) => node.getPluginData("fad.design.logical-ref") === `${screen.id}.primary.n0`,
+            )[0];
+            expect(primary?.height).toBe(1_000);
+          }
           expect(
             mock.page.findAll(
               (node) => node.getPluginData("fad.tool.task-id.v1") === request.taskId,
@@ -947,7 +961,7 @@ describe("progressive conversational canvas tasks", () => {
             totalScreens: 3,
           });
         }
-        const saved = await activeStore.load("mock-account", documentId);
+        const saved = await activeStore.load("mock-account", documentId, request.generationId);
         expect(saved?.transactions).toHaveLength(9);
         expect(saved?.transactions.every(({ rendered }) => rendered)).toBe(true);
         const roots = mock.page.findAll(
@@ -990,14 +1004,11 @@ describe("progressive conversational canvas tasks", () => {
     const current = task();
     current.id = "chat-generation-001";
     current.documentId = "file-test-56-page_current";
-    current.prompt = "برای پرتال سلامت من سه صفحه فارسی طراحی کن";
+    current.prompt = "برای پرتال سلامت من سه صفحه فارسی طراحی کن، با لایه‌های قابل‌ویرایش";
     current.model = "provider/model-exact";
-    current.generationIntent = ChatGenerationIntentSchema.parse({
-      schemaVersion: 1,
-      screenCount: 3,
-      target: "mobile",
-      locale: "fa-IR",
-    });
+    const route = parseChatGenerationIntent(current.prompt);
+    if (route.kind !== "ready") throw new Error("Expected structured generation eligibility.");
+    current.generationIntent = route.intent;
     current.brandKit = chatBrandKit();
     current.designSkills = [chatDesignSkill()];
     delete current.intent;

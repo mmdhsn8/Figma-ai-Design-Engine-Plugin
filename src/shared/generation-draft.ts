@@ -12,6 +12,7 @@ import {
   generatedSectionLayoutFits,
   validateGeneratedDesignResponse,
   createDesignSections,
+  generatedSectionMaxHeight,
   type GeneratedDesign,
 } from "./design-generation.js";
 import {
@@ -34,6 +35,7 @@ export const DraftManifestSchema = z
     generationId: DraftIdentitySchema,
     chatTaskId: ChatTaskIdentitySchema.optional(),
     planFingerprint: PlanFingerprintSchema.optional(),
+    visualCompositionVersion: z.literal(1).optional(),
     model: z.string().min(1).max(200),
     request: DesignGenerationRequestSchema,
     brandKit: PinnedBrandKitSchema.optional(),
@@ -89,7 +91,7 @@ export function validateDraftSection(
     screen.children.length !== 1 ||
     screen.children[0]!.type !== "frame" ||
     screen.children[0]!.width > plannedScreen.width - 40 ||
-    screen.children[0]!.height > (plannedScreen.devicePreset === "mobile" ? 210 : 240) ||
+    screen.children[0]!.height > generatedSectionMaxHeight(plannedScreen, transaction.section_id) ||
     !generatedSectionLayoutFits(screen.children[0]!)
   )
     throw new Error("draft_section_root_invalid");

@@ -5,6 +5,7 @@ import { PinnedDesignSkillsSchema, type PinnedDesignSkill } from "./design-skill
 import { createDesignPlan, DesignGenerationRequestSchema } from "./design-generation";
 import { DEFAULT_MAX_ROW_WIDTH, DEFAULT_MIN_CANVAS_GAP } from "../plugin/canvas-placement";
 import { MAX_SECTION_BYTES, MAX_SECTION_NODES, utf8Bytes } from "./generation-limits";
+import { VisualAssetCoverageSchema } from "./visual-composition";
 
 const StableIdSchema = z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u);
 const ScreenIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,100}$/u);
@@ -58,7 +59,11 @@ export const MultiScreenProgressEventSchema = z
   })
   .strict()
   .superRefine((event, context) => {
-    if (event.phase === "screen-verified" && event.screenId && event.nativeRoot?.screenId !== event.screenId)
+    if (
+      event.phase === "screen-verified" &&
+      event.screenId &&
+      event.nativeRoot?.screenId !== event.screenId
+    )
       context.addIssue({
         code: "custom",
         path: ["nativeRoot"],
@@ -130,6 +135,7 @@ export const MultiScreenGenerationOutcomeSchema = z
     verifiedScreenIds: z.array(ScreenIdSchema).min(1).max(10),
     nativeRoots: z.array(MultiScreenNativeRootSchema).max(10).optional(),
     nodeCount: z.number().int().nonnegative().max(100_000),
+    assetCoverage: VisualAssetCoverageSchema.optional(),
   })
   .strict()
   .superRefine((outcome, context) => {
@@ -145,12 +151,17 @@ export const MultiScreenGenerationOutcomeSchema = z
         message: "Every planned screen needs one native verification result.",
       });
     if (
-      (outcome.nativeRoots !== undefined &&
-        (outcome.nativeRoots.length !== outcome.screenIds.length ||
-          outcome.screenIds.some((id) => !outcome.nativeRoots!.some((root) => root.screenId === id)) ||
-          new Set(outcome.nativeRoots.map(({ screenId }) => screenId)).size !== outcome.nativeRoots.length ||
-          new Set(outcome.nativeRoots.map(({ nodeId }) => nodeId)).size !== outcome.nativeRoots.length ||
-          new Set(outcome.nativeRoots.map(({ logicalRef }) => logicalRef)).size !== outcome.nativeRoots.length))
+      outcome.nativeRoots !== undefined &&
+      (outcome.nativeRoots.length !== outcome.screenIds.length ||
+        outcome.screenIds.some(
+          (id) => !outcome.nativeRoots!.some((root) => root.screenId === id),
+        ) ||
+        new Set(outcome.nativeRoots.map(({ screenId }) => screenId)).size !==
+          outcome.nativeRoots.length ||
+        new Set(outcome.nativeRoots.map(({ nodeId }) => nodeId)).size !==
+          outcome.nativeRoots.length ||
+        new Set(outcome.nativeRoots.map(({ logicalRef }) => logicalRef)).size !==
+          outcome.nativeRoots.length)
     )
       context.addIssue({
         code: "custom",
@@ -736,13 +747,14 @@ export type ParsedChatGenerationIntent =
 
 export function parseChatGenerationIntent(prompt: string): ParsedChatGenerationIntent {
   const normalized = prompt.trim().toLocaleLowerCase();
+  const intentText = normalized.replace(/قابل[\s‌-]*ویرایش/gu, "");
   const createVerb =
     /(?:\b(?:create|design|build|make|generate)\b|(?:طراحی|بساز|ایجاد|طراحى|بسازید))/iu.test(
       normalized,
     );
   if (
     !createVerb ||
-    /\b(?:edit|change|update|modify|fix|restyle)\b|(?:ویرایش|تغییر|اصلاح|بهبود)/iu.test(normalized)
+    /\b(?:edit|change|update|modify|fix|restyle)\b|(?:ویرایش|تغییر|اصلاح|بهبود)/iu.test(intentText)
   )
     return { kind: "not_a_handoff" };
   const screenTerm =

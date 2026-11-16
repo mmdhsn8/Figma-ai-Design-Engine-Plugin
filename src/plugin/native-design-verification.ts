@@ -184,6 +184,7 @@ export async function verifyNativeDesign(
   rootNodeId: string,
   expectedPageId: string,
   spec: VisualDesignSpec,
+  requireVerticalScroll = false,
 ): Promise<NativeDesignVerification> {
   const found = await api.getNodeByIdAsync(rootNodeId);
   if (!found || found.type !== "FRAME")
@@ -465,6 +466,14 @@ export async function verifyNativeDesign(
     }
   }
   const rootSpec = spec.nodes.find((node) => node.logicalRef === `${spec.screen.id}.root`);
+  if (requireVerticalScroll && (!nativeTree.clipsContent || nativeTree.overflowDirection !== "VERTICAL"))
+    nativeFindings.push({
+      code: "viewport-mismatch",
+      ref: rootSpec?.logicalRef,
+      message: "The mobile viewport must clip and scroll vertically.",
+      expected: "clipsContent=true, overflowDirection=VERTICAL",
+      actual: `${nativeTree.clipsContent}, ${nativeTree.overflowDirection}`,
+    });
   if (
     rootSpec &&
     (Math.abs(root.width - spec.screen.width) > 1 || Math.abs(root.height - spec.screen.height) > 1)

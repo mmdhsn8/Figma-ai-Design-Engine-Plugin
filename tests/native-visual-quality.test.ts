@@ -12,6 +12,43 @@ import {
   reported23OperationMobileProxy,
 } from "./professional-design-fixtures";
 
+it("measures the incident's cross-axis clips in translated parent-local coordinates", () => {
+  const children: NativeVisualNode[] = [
+    [355, 6892, 350, 48],
+    [506, 7256, 310, 22],
+    [490, 7008, 350, 22],
+    [530, 7800, 350, 48],
+  ].map(([x, y, width, height], index) => ({
+    ref: `child-${index}`,
+    name: `Child ${index}`,
+    type: "TEXT",
+    x: x! - 510,
+    y: y! - 6889,
+    width: width!,
+    height: height!,
+    absoluteTransform: [[1, 0, x!], [0, 1, y!]],
+    visible: true,
+  }));
+  const findings = auditNativeSection([{
+    ref: "root",
+    name: "Mobile viewport",
+    type: "FRAME",
+    x: 510,
+    y: 6889,
+    width: 390,
+    height: 844,
+    visible: true,
+    clipsContent: true,
+    layoutMode: "NONE",
+    overflowDirection: "VERTICAL",
+    absoluteTransform: [[1, 0, 510], [0, 1, 6889]],
+    children,
+  }], []);
+  expect(findings.filter(({ code }) => code === "clipped-child").map(({ actual }) =>
+    JSON.parse(actual!).overflow,
+  )).toEqual([155, 4, 20]);
+});
+
 const codes = (input: Parameters<typeof auditStorefrontDesign>[0]) =>
   auditStorefrontDesign(input).map(({ code }) => code);
 

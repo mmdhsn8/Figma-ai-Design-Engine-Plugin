@@ -9,6 +9,11 @@ export const DESIGN_PATTERN_IDS = [
   "service-card",
   "image-gallery",
   "list-item",
+  "variant-selector",
+  "cart-item",
+  "quantity-control",
+  "price-summary",
+  "trust-row",
   "form",
   "checkout-block",
   "stat-card",
@@ -20,6 +25,18 @@ export const DESIGN_PATTERN_IDS = [
 ] as const;
 
 export type DesignPatternId = (typeof DESIGN_PATTERN_IDS)[number];
+
+export const DESIGN_SCREEN_ROLES = [
+  "home",
+  "listing",
+  "detail",
+  "cart",
+  "checkout",
+  "account",
+  "other",
+] as const;
+export type DesignScreenRole = (typeof DESIGN_SCREEN_ROLES)[number];
+export type DesignSectionRole = "identity" | "primary" | "supporting";
 
 export interface DesignPatternDefinition {
   id: DesignPatternId;
@@ -60,7 +77,8 @@ export const DESIGN_PATTERN_CATALOG: readonly DesignPatternDefinition[] = [
   {
     id: "search",
     label: "Search",
-    composition: "labeled input surface, search icon, and optional filter affordance",
+    composition:
+      'labeled input surface with qualityRole="input" on the search frame itself or a descendant input frame, at least 44×44 px, visible body-role placeholder text, search icon, and optional filter affordance; an icon, button, label, or pattern tag alone is not an input',
     domains: ["commerce", "saas", "education", "content", "travel"],
   },
   {
@@ -95,6 +113,38 @@ export const DESIGN_PATTERN_CATALOG: readonly DesignPatternDefinition[] = [
     composition:
       "aligned leading icon or thumbnail, primary label, secondary metadata, and optional trailing action",
     domains: ["all"],
+  },
+  {
+    id: "variant-selector",
+    label: "Product variant selector",
+    composition:
+      "visible size or color choices with touch-sized options and a clearly selected choice",
+    domains: ["commerce"],
+  },
+  {
+    id: "cart-item",
+    label: "Cart item",
+    composition:
+      "thumbnail or disclosed image placeholder, product name, variant, quantity control, and line price",
+    domains: ["commerce"],
+  },
+  {
+    id: "quantity-control",
+    label: "Quantity control",
+    composition: "decrease and increase affordances around a readable current quantity",
+    domains: ["commerce"],
+  },
+  {
+    id: "price-summary",
+    label: "Price summary",
+    composition: "aligned subtotal, applicable delivery/discount, and clearly emphasized total",
+    domains: ["commerce", "finance"],
+  },
+  {
+    id: "trust-row",
+    label: "Trust and delivery row",
+    composition: "one or two concise delivery, returns, payment or support assurances",
+    domains: ["commerce", "finance", "travel"],
   },
   {
     id: "form",
@@ -161,6 +211,12 @@ const PATTERN_TERMS: Readonly<Record<DesignPatternId, RegExp>> = {
   "service-card": /\b(?:service\s+cards?|service\s+list)\b|کارت خدمات|خدمات/iu,
   "image-gallery": /\b(?:image\s+gallery|gallery|photos?|imagery)\b|گالری تصویر|تصاویر/iu,
   "list-item": /\b(?:list|activity\s+feed|recent\s+items)\b|فهرست|لیست|فعالیت‌های اخیر/iu,
+  "variant-selector":
+    /\b(?:variant|size|color)\s+(?:selector|options?)\b|انتخاب(?:گر)?\s*(?:سایز|رنگ)|سایزها|رنگ‌ها/iu,
+  "cart-item": /\b(?:cart|basket)\s+items?\b|اقلام?\s*سبد|محصولات?\s*سبد/iu,
+  "quantity-control": /\bquantity\s+(?:control|stepper)\b|کنترل\s*تعداد|تعداد\s*محصول/iu,
+  "price-summary": /\b(?:price|order)\s+summary\b|خلاصه\s*(?:قیمت|سفارش)|جمع\s*کل/iu,
+  "trust-row": /\b(?:trust|delivery|shipping)\s+(?:row|details?)\b|ارسال|مرجوعی|ضمانت/iu,
   form: /\b(?:form|input\s+fields?|sign\s*in|sign\s*up|login)\b|فرم|ورود|ثبت‌نام/iu,
   "checkout-block": /\b(?:checkout|payment|order\s+summary|cart)\b|پرداخت|تسویه|سبد خرید/iu,
   "stat-card": /\b(?:kpi|statistics|stat\s+cards?|metrics?)\b|شاخص|آمار|معیار/iu,
@@ -171,18 +227,196 @@ const PATTERN_TERMS: Readonly<Record<DesignPatternId, RegExp>> = {
   footer: /\bfooter\b|پاورقی|پایین صفحه/iu,
 };
 
+const LEGACY_PATTERN_IDS = [
+  "app-bar",
+  "navigation",
+  "hero-banner",
+  "cta-group",
+  "search",
+  "category-chips",
+  "product-card",
+  "service-card",
+  "image-gallery",
+  "list-item",
+  "form",
+  "checkout-block",
+  "stat-card",
+  "data-table",
+  "empty-state",
+  "loading-state",
+  "error-state",
+  "footer",
+] as const satisfies readonly DesignPatternId[];
+const LEGACY_PATTERN_SET = new Set<DesignPatternId>(LEGACY_PATTERN_IDS);
+
 export function inferRequestedDesignPatterns(prompt: string): DesignPatternId[] {
   return DESIGN_PATTERN_IDS.filter((id) => PATTERN_TERMS[id].test(prompt));
 }
 
-export function inferPatternsForScreen(
+const COMMERCE_ROLE_PATTERNS: Readonly<Record<DesignScreenRole, readonly DesignPatternId[]>> = {
+  home: [
+    "app-bar",
+    "navigation",
+    "search",
+    "hero-banner",
+    "cta-group",
+    "category-chips",
+    "product-card",
+    "trust-row",
+    "footer",
+  ],
+  listing: ["app-bar", "navigation", "search", "category-chips", "product-card", "footer"],
+  detail: ["app-bar", "image-gallery", "variant-selector", "cta-group", "trust-row"],
+  cart: [
+    "app-bar",
+    "cart-item",
+    "quantity-control",
+    "price-summary",
+    "checkout-block",
+    "cta-group",
+    "trust-row",
+  ],
+  checkout: ["app-bar", "form", "price-summary", "checkout-block", "cta-group", "trust-row"],
+  account: ["app-bar", "form", "cta-group", "footer"],
+  other: [],
+};
+
+const COMMERCE_ROLE_SECTION_PATTERNS: Readonly<
+  Record<DesignScreenRole, Readonly<Record<DesignSectionRole, readonly DesignPatternId[]>>>
+> = {
+  home: {
+    identity: ["app-bar", "navigation", "search"],
+    primary: ["hero-banner", "cta-group", "category-chips", "product-card"],
+    supporting: ["trust-row", "footer"],
+  },
+  listing: {
+    identity: ["app-bar", "search"],
+    primary: ["category-chips", "product-card"],
+    supporting: ["navigation", "footer"],
+  },
+  detail: {
+    identity: ["app-bar"],
+    primary: ["image-gallery", "variant-selector", "cta-group"],
+    supporting: ["trust-row"],
+  },
+  cart: {
+    identity: ["app-bar"],
+    primary: ["cart-item", "quantity-control", "price-summary", "checkout-block", "cta-group"],
+    supporting: ["trust-row"],
+  },
+  checkout: {
+    identity: ["app-bar"],
+    primary: ["form", "price-summary", "checkout-block", "cta-group"],
+    supporting: ["trust-row"],
+  },
+  account: {
+    identity: ["app-bar"],
+    primary: ["form", "cta-group"],
+    supporting: ["footer"],
+  },
+  other: {
+    identity: ["app-bar", "navigation", "search"],
+    primary: [],
+    supporting: ["footer", "empty-state", "loading-state", "error-state"],
+  },
+};
+
+export function inferDesignScreenRole(familyName: string): DesignScreenRole {
+  const family = familyName.normalize("NFKC").toLocaleLowerCase();
+  if (/cart|basket|سبد\s*(?:خرید)?|سبدخرید/iu.test(family)) return "cart";
+  if (/checkout|payment|place\s+order|تسویه|پرداخت/iu.test(family)) return "checkout";
+  if (/detail|product\s+view|item\s+view|product\s+page|جزئیات|مشخصات\s*محصول/iu.test(family))
+    return "detail";
+  if (/home|landing|welcome|خانه|صفحه\s*اصلی|اصلی|خوش‌آمد|خوشامد/iu.test(family)) return "home";
+  if (/account|profile|settings|حساب|پروفایل|تنظیمات/iu.test(family)) return "account";
+  if (/catalog|browse|listing|products?|shop|search|محصولات|فهرست|جستجو|فروشگاه/iu.test(family))
+    return "listing";
+  return "other";
+}
+
+export function commerceRolePatterns(role: DesignScreenRole): readonly DesignPatternId[] {
+  return COMMERCE_ROLE_PATTERNS[role];
+}
+
+export function patternsForSectionRole(
+  patterns: readonly DesignPatternId[],
+  role: DesignScreenRole,
+  section: DesignSectionRole,
+): DesignPatternId[] {
+  const rolePatterns = new Set(COMMERCE_ROLE_PATTERNS[role]);
+  const sectionPatterns = new Set(COMMERCE_ROLE_SECTION_PATTERNS[role][section]);
+  return patterns.filter((pattern) => {
+    if (rolePatterns.has(pattern)) return sectionPatterns.has(pattern);
+    if (section === "identity") return ["app-bar", "navigation", "search"].includes(pattern);
+    if (section === "supporting")
+      return ["footer", "trust-row", "empty-state", "loading-state", "error-state"].includes(
+        pattern,
+      );
+    return !["app-bar", "navigation", "footer", "trust-row"].includes(pattern);
+  });
+}
+
+export function commerceRoleSectionGuidance(
+  role: DesignScreenRole,
+  section: DesignSectionRole,
+): string | undefined {
+  const guidance: Partial<Record<DesignScreenRole, Record<DesignSectionRole, string>>> = {
+    home: {
+      identity:
+        "Use a compact Persian RTL brand/search header; keep search and navigation controls touch-sized.",
+      primary:
+        "Make the campaign visually dominant, then show category shortcuts and at least two distinct side-by-side product cards. Each card needs its own product name, toman price, image slot, and restrained action.",
+      supporting:
+        "Use a concise delivery/returns trust row and a compact bottom navigation. Keep this section secondary to the campaign and product cards.",
+    },
+    listing: {
+      identity: "Keep the app bar compact and make search/discovery immediately visible.",
+      primary:
+        "Build a balanced mobile product grid with at least two distinct product cards, consistent image ratios, concise names, toman prices and clear product hierarchy.",
+      supporting:
+        "Add compact navigation or one helpful merchandising/trust detail without repeating the product grid.",
+    },
+    detail: {
+      identity: "Use only the compact product-detail app bar and relevant back/favorite actions.",
+      primary:
+        "Prioritize a coherent product image gallery, product title and toman price, visible size/color choices with a selected state, and one prominent add-to-cart action. Keep details in a clear RTL reading order.",
+      supporting:
+        "Show concise delivery/returns assurance and useful product information. Do not repeat the gallery or replace product details with a second generic card.",
+    },
+    cart: {
+      identity: "Use a compact cart app bar with a clear cart title and relevant back action.",
+      primary:
+        "Show a populated cart item row with thumbnail/image slot, product name, selected variant, quantity stepper and line price. Follow it with subtotal, applicable discount/delivery, total and one prominent checkout CTA. Do not show an empty-cart state unless the brief explicitly requests it.",
+      supporting:
+        "Add concise delivery, discount or payment reassurance only when relevant; avoid repeating the item row or checkout summary.",
+    },
+    checkout: {
+      identity: "Keep the checkout app bar compact and show the current checkout step when useful.",
+      primary:
+        "Group clearly labeled delivery/payment fields with a transparent order summary and one primary confirmation action.",
+      supporting:
+        "Use concise delivery/payment reassurance and preserve room for validation messages.",
+    },
+    account: {
+      identity: "Use a compact account app bar with the current destination clearly named.",
+      primary:
+        "Show the requested account identity and grouped account controls with clear labels.",
+      supporting: "Add only relevant secondary account navigation or help.",
+    },
+  };
+  return guidance[role]?.[section];
+}
+
+export function inferLegacyPatternsForScreen(
   prompt: string,
   domain: string,
   familyName: string,
   screenCount: number,
   includeHighFidelityDefaults = false,
 ): DesignPatternId[] {
-  const requested = inferRequestedDesignPatterns(prompt);
+  const requested = inferRequestedDesignPatterns(prompt).filter((pattern) =>
+    LEGACY_PATTERN_SET.has(pattern),
+  );
   const family = familyName.toLocaleLowerCase();
   const home = /home|overview|landing|welcome|خانه|اصلی|نمای کلی|خوش‌آمد|خوشامد/iu.test(family);
   const catalog = /product|catalog|browse|search|محصول|جستجو/iu.test(family);
@@ -319,6 +553,47 @@ export function inferPatternsForScreen(
   });
   const required = new Set([...defaults, ...suitableRequested]);
   return DESIGN_PATTERN_IDS.filter((pattern) => required.has(pattern));
+}
+
+export function inferPatternsForScreen(
+  prompt: string,
+  domain: string,
+  familyName: string,
+  screenCount: number,
+  includeHighFidelityDefaults = false,
+): DesignPatternId[] {
+  const legacy = inferLegacyPatternsForScreen(
+    prompt,
+    domain,
+    familyName,
+    screenCount,
+    includeHighFidelityDefaults,
+  );
+  if (domain !== "commerce" || !includeHighFidelityDefaults) return legacy;
+  const role = inferDesignScreenRole(familyName);
+  if (role === "other") return legacy;
+  const rolePatterns = commerceRolePatterns(role);
+  const conflictingPatterns: Partial<Record<DesignScreenRole, readonly DesignPatternId[]>> = {
+    listing: ["hero-banner", "image-gallery", "variant-selector", "cart-item", "quantity-control"],
+    detail: ["search", "category-chips", "product-card", "cart-item", "quantity-control"],
+    cart: ["hero-banner", "search", "category-chips", "product-card", "image-gallery", "form"],
+    checkout: ["hero-banner", "search", "category-chips", "product-card", "image-gallery"],
+    account: ["hero-banner", "search", "category-chips", "product-card", "image-gallery"],
+    home: ["cart-item", "quantity-control", "price-summary", "variant-selector"],
+  };
+  const conflicts = new Set(conflictingPatterns[role] ?? []);
+  const family = familyName.toLocaleLowerCase();
+  const start = prompt.toLocaleLowerCase().indexOf(family);
+  const hasLocalExplicitRequirement = (pattern: DesignPatternId): boolean =>
+    start >= 0 &&
+    PATTERN_TERMS[pattern].test(
+      prompt.slice(Math.max(0, start - 120), start + family.length + 180),
+    );
+  const selected = new Set<DesignPatternId>(rolePatterns);
+  legacy.forEach((pattern) => {
+    if (!conflicts.has(pattern) || hasLocalExplicitRequirement(pattern)) selected.add(pattern);
+  });
+  return DESIGN_PATTERN_IDS.filter((pattern) => selected.has(pattern));
 }
 
 export function designPatternInstructions(domain: string): string {

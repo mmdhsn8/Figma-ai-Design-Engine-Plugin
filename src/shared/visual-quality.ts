@@ -94,19 +94,24 @@ function resolveColor(
   return typeof token === "string" ? token : undefined;
 }
 
-function luminance(hex: string): number | undefined {
+function channels(hex: string): number[] | undefined {
   if (!/^#[\da-f]{6}$/i.test(hex)) return undefined;
-  const channels = [1, 3, 5].map((index) => Number.parseInt(hex.slice(index, index + 2), 16) / 255);
+  return [1, 3, 5].map((index) => Number.parseInt(hex.slice(index, index + 2), 16) / 255);
+}
+
+function luminance(channels: number[]): number {
   const linear = channels.map((channel) =>
     channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4,
   );
   return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
 }
 
-export function contrastRatio(foreground: string, background: string): number | undefined {
-  const first = luminance(foreground);
-  const second = luminance(background);
-  if (first === undefined || second === undefined) return undefined;
+export function contrastRatio(foreground: string, background: string, opacity = 1): number | undefined {
+  const fg = channels(foreground);
+  const bg = channels(background);
+  if (!fg || !bg || !Number.isFinite(opacity) || opacity < 0 || opacity > 1) return undefined;
+  const first = luminance(fg.map((channel, index) => channel * opacity + bg[index]! * (1 - opacity)));
+  const second = luminance(bg);
   const lighter = Math.max(first, second);
   const darker = Math.min(first, second);
   return (lighter + 0.05) / (darker + 0.05);

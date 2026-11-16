@@ -72,7 +72,7 @@ const controllerBundle =
   pluginBundle.slice(0, uiStart) + pluginBundle.slice(uiEnd + uiEndMarker.length);
 assert.doesNotMatch(
   controllerBundle,
-  /\b(?:TextEncoder|TextDecoder|Buffer)\b|\bprocess\.|\bwindow\.|\bfetch\(/u,
+  /\b(?:TextEncoder|TextDecoder|Buffer|structuredClone)\b|\bprocess\.|\bwindow\.|\bfetch\(/u,
   "Compiled Plugin Main must not depend on browser or Node-only globals.",
 );
 assert.ok(
@@ -243,6 +243,7 @@ try {
   });
   assert.equal(health.status, 200);
   assert.deepEqual(await health.json(), { companion: "running" });
+  assert.equal(health.headers.get("x-fad-draft-scope"), "generation-v1");
   console.log(
     "Compiled companion boots on ephemeral loopback; current plugin/UI/companion entrypoints verified. No OAuth or Figma Desktop acceptance performed.",
   );

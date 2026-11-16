@@ -20,6 +20,24 @@ async function setup() {
 }
 
 describe("durable per-screen draft checkpoints", () => {
+  it("keeps two Chat generations isolated from the existing document draft across reload", async () => {
+    const { manifest, design } = draftFixture();
+    const { directory, store } = await setup();
+    const first = { ...manifest, generationId: "generation-chat-one", chatTaskId: "chat-task-one" };
+    const second = { ...manifest, generationId: "generation-chat-two", chatTaskId: "chat-task-two" };
+    await store.start("owner", manifest);
+    expect(await store.load("owner", manifest.documentId, manifest.generationId)).not.toBeNull();
+    expect(await store.load("owner", manifest.documentId, first.generationId)).toBeNull();
+    await store.start("owner", first);
+    await store.start("owner", second);
+    await store.saveScreen("owner", manifest.documentId, first.generationId, design);
+    const reopened = createDraftStore(directory);
+    expect((await reopened.load("owner", manifest.documentId, first.generationId))?.screens).toHaveLength(1);
+    expect((await reopened.load("owner", manifest.documentId, second.generationId))?.screens).toHaveLength(0);
+    expect((await reopened.load("owner", manifest.documentId))?.manifest).toEqual(manifest);
+    expect(await reopened.load("other-owner", manifest.documentId, first.generationId)).toBeNull();
+  });
+
   it("commits ordered section transactions before render, survives restart, and composes legacy screen views", async () => {
     const { manifest } = draftFixture();
     const { directory, store } = await setup();
@@ -196,6 +214,11 @@ describe("durable per-screen draft checkpoints", () => {
     expect((await store.load("owner", manifest.documentId))?.screens).toHaveLength(1);
     expect(await readFile(join(path, "screen-home.json.corrupt"), "utf8")).toContain("wrong");
     expect(DraftManifestSchema.safeParse({ ...manifest, version: 0 }).success).toBe(false);
+    const legacyManifest = { ...manifest };
+    delete (legacyManifest as Partial<typeof legacyManifest>).visualCompositionVersion;
+    expect(DraftManifestSchema.parse(legacyManifest)).not.toHaveProperty(
+      "visualCompositionVersion",
+    );
     expect(
       DraftManifestSchema.safeParse({ ...manifest, accessToken: "never store credentials" })
         .success,

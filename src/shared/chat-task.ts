@@ -1088,6 +1088,11 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
       ? { lastNativeRepairPipelineVersion: stage.nativeRepairPipelineVersion }
       : {}),
     taskId: task.id,
+    generationRoute: task.generationLink
+      ? "structured_route_selected"
+      : task.generationIntent
+        ? "structured_multiscreen_eligible"
+        : "legacy_chat_checkpoint_without_structured_intent",
     ...(task.intent ? { intent: task.intent } : {}),
     ...(task.inspectionOutcome ? { inspectionOutcome: task.inspectionOutcome } : {}),
     ...(task.inspectionSummary ? { inspectionSummary: task.inspectionSummary } : {}),

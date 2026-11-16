@@ -1,4 +1,5 @@
-import { createDesignPlan } from "../shared/design-generation";
+import { createDesignPlan, generatedSectionMaxHeight } from "../shared/design-generation";
+import { expandClippedSectionTextParent } from "./section-geometry-recovery";
 import {
   validateDraftSection,
   validateDraftScreen,
@@ -50,6 +51,17 @@ function visualVerificationError(result: NativeDesignVerification): string | und
     .slice(0, 6)
     .map((finding) => {
       const location = `${finding.code}${finding.ref ? `:${finding.ref}` : ""}`;
+      if (finding.code === "clipped-child" && finding.actual && finding.expected) {
+        try {
+          const { child, overflow, measurement } = JSON.parse(finding.actual);
+          const { parent } = JSON.parse(finding.expected);
+          const box = (bounds: { x: number; y: number; width: number; height: number }) =>
+            `${bounds.x},${bounds.y} ${bounds.width}×${bounds.height}`;
+          return `${location} (parent ${box(parent)}; child ${box(child)}; overflow ${overflow}px; ${measurement})`;
+        } catch {
+          // Keep the original diagnostic when compact geometry is unavailable.
+        }
+      }
       const evidence =
         finding.expected !== undefined || finding.actual !== undefined
           ? ` (${finding.expected ?? "expected evidence unavailable"} → ${finding.actual ?? "actual evidence unavailable"})`
@@ -121,7 +133,11 @@ export function createGenerationController(
         if (message.type === "generation-prepare") {
           if (message.manifest.documentId !== documentId)
             throw new Error("Document/page changed; reopen the draft in its original page.");
-          const plan = createDesignPlan(message.manifest.request, message.manifest.brandKit);
+          const plan = createDesignPlan(
+            message.manifest.request,
+            message.manifest.brandKit,
+            message.manifest.visualCompositionVersion === 1 ? message.manifest.designSkills : undefined,
+          );
           if (!plan.success) throw new Error("Saved plan is invalid.");
           await resolvePinnedBrandVisualAssets(api.clientStorage, message.manifest.brandKit);
           const nodeIds = createGenerationSkeletons(
@@ -130,6 +146,7 @@ export function createGenerationController(
             plan.data,
             message.screenIds,
             message.focusInitial,
+            true,
           );
           return {
             type: "generation-result",
@@ -146,7 +163,11 @@ export function createGenerationController(
             message.transaction,
             message.design,
           );
-          const plan = createDesignPlan(message.manifest.request, message.manifest.brandKit);
+          const plan = createDesignPlan(
+            message.manifest.request,
+            message.manifest.brandKit,
+            message.manifest.visualCompositionVersion === 1 ? message.manifest.designSkills : undefined,
+          );
           if (!plan.success) throw new Error("Saved plan is invalid.");
           const brandAssets = await resolvePinnedBrandVisualAssets(
             api.clientStorage,
@@ -158,7 +179,12 @@ export function createGenerationController(
               ...plan.data,
               screens: plan.data.screens.filter(({ id }) => id === checked.transaction.screen_id),
             },
-            { scope: "section", sectionId: checked.transaction.section_id, assets: brandAssets },
+            {
+              scope: "section",
+              sectionId: checked.transaction.section_id,
+              assets: brandAssets,
+              visualCompositionVersion: message.manifest.visualCompositionVersion,
+            },
           );
           if (!prepared.success) throw new Error(prepared.errors.join(" "));
           if (prepared.data.nodeCount > 250)
@@ -171,6 +197,7 @@ export function createGenerationController(
             prepared.data.batch.designSystem.namespace = message.manifest.generationId;
           }
           const result = await renderMultiScreenDesign(api, prepared.data.batch, {
+            scrollMobileSections: true,
             resume: true,
             verifyTouchTargets: true,
             transaction: checked.transaction,
@@ -203,12 +230,34 @@ export function createGenerationController(
             throw new Error(
               "The saved visual specification is unavailable for native verification.",
             );
-          const verification = await verifyNativeDesign(
-            api,
-            nodeId,
-            api.currentPage.id,
-            visualSpec,
+          const pageId = api.currentPage.id;
+          const verify = () => verifyNativeDesign(
+            api, nodeId, pageId, visualSpec,
+            prepared.data.batch.screens[0]?.devicePreset === "mobile",
           );
+          let verification = await verify();
+          const screen = plan.data.screens.find(({ id }) => id === checked.transaction.screen_id);
+          if (!verification.verified && screen && message.manifest.visualCompositionVersion === 1) {
+            const root = await api.getNodeByIdAsync(nodeId);
+            if (root?.type === "FRAME" && root.parent === api.currentPage && identity() === documentId) {
+              const undo = expandClippedSectionTextParent(
+                root, checked.transaction, verification,
+                generatedSectionMaxHeight(screen, checked.transaction.section_id),
+              );
+              if (undo) {
+                let accepted = false;
+                try {
+                  const repaired = await verify();
+                  if (repaired.verified && identity() === documentId) {
+                    accepted = true;
+                    verification = repaired;
+                  }
+                } finally {
+                  if (!accepted) undo();
+                }
+              }
+            }
+          }
           const verificationError = visualVerificationError(verification);
           if (verificationError) throw new Error(verificationError);
           return {
@@ -228,7 +277,11 @@ export function createGenerationController(
           if (message.manifest.documentId !== documentId)
             throw new Error("Document/page changed; reopen the draft in its original page.");
           const design = validateDraftScreen(message.manifest, message.design);
-          const plan = createDesignPlan(message.manifest.request, message.manifest.brandKit);
+          const plan = createDesignPlan(
+            message.manifest.request,
+            message.manifest.brandKit,
+            message.manifest.visualCompositionVersion === 1 ? message.manifest.designSkills : undefined,
+          );
           if (!plan.success) throw new Error("Saved plan is invalid.");
           const brandAssets = await resolvePinnedBrandVisualAssets(
             api.clientStorage,
@@ -241,7 +294,11 @@ export function createGenerationController(
               ...plan.data,
               screens: plan.data.screens.filter(({ id }) => id === screenId),
             },
-            { assets: brandAssets },
+            {
+              assets: brandAssets,
+              // Older drafts omit this optional contract version and retain legacy preflight.
+              visualCompositionVersion: message.manifest.visualCompositionVersion,
+            },
           );
           if (!prepared.success) throw new Error(prepared.errors.join(" "));
           const roots = api.currentPage.findAll(
@@ -262,6 +319,8 @@ export function createGenerationController(
             roots[0].id,
             api.currentPage.id,
             prepared.data.visualSpecs[0]!,
+            prepared.data.batch.screens[0]?.devicePreset === "mobile" &&
+              Boolean(message.manifest.visualCompositionVersion),
           );
           const verificationError = visualVerificationError(verification);
           if (verificationError) throw new Error(verificationError);
@@ -271,8 +330,7 @@ export function createGenerationController(
           if (message.manifest.chatTaskId && logicalRef) {
             const duplicateRefs = api.currentPage.findAll(
               (node) =>
-                node.getPluginData(CHAT_REF_PLUGIN_KEY) === logicalRef &&
-                node.id !== roots[0]!.id,
+                node.getPluginData(CHAT_REF_PLUGIN_KEY) === logicalRef && node.id !== roots[0]!.id,
             );
             if (duplicateRefs.length)
               throw new Error("Native Chat screen reference is already in use on this page.");
@@ -298,7 +356,11 @@ export function createGenerationController(
         if (message.manifest.documentId !== documentId)
           throw new Error("Document/page changed; reopen the draft in its original page.");
         const design = validateDraftScreen(message.manifest, message.design);
-        const plan = createDesignPlan(message.manifest.request, message.manifest.brandKit);
+        const plan = createDesignPlan(
+            message.manifest.request,
+            message.manifest.brandKit,
+            message.manifest.visualCompositionVersion === 1 ? message.manifest.designSkills : undefined,
+          );
         if (!plan.success) throw new Error("Saved plan is invalid.");
         const brandAssets = await resolvePinnedBrandVisualAssets(
           api.clientStorage,
@@ -310,7 +372,10 @@ export function createGenerationController(
             ...plan.data,
             screens: plan.data.screens.filter(({ id }) => id === design.screens[0]!.id),
           },
-          { assets: brandAssets },
+          {
+            assets: brandAssets,
+            visualCompositionVersion: message.manifest.visualCompositionVersion,
+          },
         );
         if (!prepared.success) throw new Error(prepared.errors.join(" "));
         if (prepared.data.nodeCount > 10_000)

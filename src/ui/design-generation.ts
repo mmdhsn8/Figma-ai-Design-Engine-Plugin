@@ -12,7 +12,11 @@ import {
   createVisualDesignSpec,
   type VisualDesignSpec,
 } from "../shared/visual-design-spec";
-import { inferPatternsForScreen } from "../shared/design-patterns";
+import {
+  inferLegacyPatternsForScreen,
+  inferPatternsForScreen,
+  patternsForSectionRole,
+} from "../shared/design-patterns";
 import {
   resolveBrandKitTokens,
   resolveBrandTextAlignment,
@@ -21,6 +25,11 @@ import {
   type BrandKitTokens,
 } from "../shared/brand-kit";
 import type { VisualAsset } from "../shared/visual-schema";
+import { contrastRatio } from "../shared/visual-quality";
+import {
+  summarizeVisualAssetCoverage,
+  type VisualAssetCoverage,
+} from "../shared/visual-composition";
 
 export type PreparedGeneratedDesign = {
   json: string;
@@ -28,6 +37,7 @@ export type PreparedGeneratedDesign = {
   nodeCount: number;
   visualSpecs: VisualDesignSpec[];
   brandConflicts: string[];
+  assetCoverage: VisualAssetCoverage;
 };
 
 export type PreparedDesignResult =
@@ -57,12 +67,17 @@ export function prepareGeneratedDesign(
     scope?: "screen" | "section";
     sectionId?: "identity" | "primary" | "supporting";
     assets?: VisualAsset[];
+    visualCompositionVersion?: 1;
   } = {},
 ): PreparedDesignResult {
-  const parsed = normalizeGeneratedDesignResponse(raw, plan);
+  const parsed = normalizeGeneratedDesignResponse(
+    raw,
+    plan,
+    options.scope === "section" ? options.sectionId : undefined,
+  );
   if (!parsed.success) return parsed;
 
-  const design = structuredClone(parsed.data.design);
+  const design = parsed.data.design;
   const pinnedAssetIds = new Set(plan.brandKit?.assets.map(({ assetId }) => assetId) ?? []);
   const resolvedAssets = options.assets ?? [];
   if (resolvedAssets.some(({ id }) => !pinnedAssetIds.has(id)))
@@ -98,8 +113,15 @@ export function prepareGeneratedDesign(
   for (const screen of plan.screens) {
     const source = screensById.get(screen.id);
     if (!source) return { success: false, errors: [`Missing generated screen “${screen.id}”.`] };
-    if (options.scope === "section" && options.sectionId)
-      for (const node of source.children) node.sectionId ??= options.sectionId;
+    if (options.scope === "section" && options.sectionId) {
+      const assignSection = (nodes: GeneratedDesignNode[]): void => {
+        for (const node of nodes) {
+          node.sectionId = options.sectionId;
+          assignSection(node.children);
+        }
+      };
+      assignSection(source.children);
+    }
     if (plan.brandKit) {
       const logoResult = applyPinnedBrandLogo(
         source.children,
@@ -109,27 +131,28 @@ export function prepareGeneratedDesign(
       );
       if (!logoResult.success) return { success: false, errors: [logoResult.error] };
     }
-    const requestedPatterns = inferPatternsForScreen(
+    const inferredPatterns = (
+      options.visualCompositionVersion === 1 ? inferPatternsForScreen : inferLegacyPatternsForScreen
+    )(
       plan.request.prompt,
       plan.domain,
       screen.familyName,
       plan.request.screenCount * (plan.request.target === "both" ? 2 : 1),
       plan.fidelity === "high_fidelity",
-    ).filter((pattern) => {
-      if (options.scope !== "section") return true;
-      if (options.sectionId === "identity")
-        return ["app-bar", "navigation", "search"].includes(pattern);
-      if (options.sectionId === "primary")
-        return !["app-bar", "navigation", "footer"].includes(pattern);
-      if (options.sectionId === "supporting")
-        return ["footer", "empty-state", "loading-state", "error-state"].includes(pattern);
-      return false;
-    });
+    );
+    const requestedPatterns =
+      options.scope === "section" && options.sectionId
+        ? patternsForSectionRole(inferredPatterns, screen.screenRole, options.sectionId)
+        : inferredPatterns;
     const visualSpec = createVisualDesignSpec({
       brief: plan.brief,
       screen,
       projectScreenCount: plan.request.screenCount * (plan.request.target === "both" ? 2 : 1),
       requiredPatterns: requestedPatterns,
+      ...(options.visualCompositionVersion === 1
+        ? { compositionVersion: options.visualCompositionVersion }
+        : {}),
+      ...(options.scope === "section" && options.sectionId ? { sectionId: options.sectionId } : {}),
       designSkills: plan.designSkills,
       requireHighFidelityStructure: options.scope !== "section",
       palette: design.palette,
@@ -213,6 +236,14 @@ export function prepareGeneratedDesign(
   const json = JSON.stringify(batch, null, 2);
   const validated = parseMultiScreenText(json);
   if (!validated.success) return { success: false, errors: validated.errors.slice(0, 12) };
+  const requiredImageSlots = visualSpecs.reduce(
+    (total, spec) => total + (spec.composition?.quality.minimumImageSlots ?? 0),
+    0,
+  );
+  const assetCoverage = summarizeVisualAssetCoverage(
+    visualSpecs.flatMap((spec) => spec.nodes),
+    requiredImageSlots,
+  );
   return {
     success: true,
     data: {
@@ -221,6 +252,7 @@ export function prepareGeneratedDesign(
       nodeCount: validated.nodeCount,
       visualSpecs,
       brandConflicts,
+      assetCoverage,
     },
   };
 }
@@ -288,6 +320,59 @@ function resolvePalette(
   return { palette, conflicts };
 }
 
+/** Repairs only fresh, validated section text against known solid surfaces. */
+export function normalizeGeneratedSectionContrast(design: GeneratedDesign, plan: DesignPlan) {
+  const palette = plan.brandKit
+    ? resolvePalette(design.palette, plan.request.prompt, plan.brandKit, plan.request.theme).palette
+    : design.palette;
+  const repairs: Array<{
+    path: string;
+    from: keyof GeneratedDesign["palette"];
+    to: "text" | "muted";
+    before: number;
+    after: number;
+    surface: string;
+  }> = [];
+  const findings: string[] = [];
+  let visited = 0;
+  const visit = (node: GeneratedDesignNode, surface: string | undefined, path: string): GeneratedDesignNode => {
+    if (++visited > 250) return node;
+    if (node.type === "text") {
+      if (!surface) {
+        if (findings.length < 8)
+          findings.push(`contrast_unresolved: ${path} needs a solid, measurable text surface.`);
+        return node;
+      }
+      const role = node.palette === "none" ? "text" : node.palette;
+      const ratio = (candidate: keyof typeof palette) =>
+        contrastRatio(palette[candidate], surface, node.opacity ?? 1) ?? 0;
+      const before = ratio(role);
+      if (before >= 4.5) return node;
+      const candidates = role === "muted" ? (["muted", "text"] as const) : (["text", "muted"] as const);
+      const to = candidates.find((candidate) => ratio(candidate) >= 4.5);
+      if (to) {
+        repairs.push({ path, from: role, to, before, after: ratio(to), surface });
+        return { ...node, palette: to };
+      }
+      if (findings.length < 8)
+        findings.push(`contrast_unresolved: ${path} has ${before.toFixed(2)}:1 on ${surface}. Use an opaque solid surface and a text role that reaches 4.5:1.`);
+      return node;
+    }
+    if (!node.children.length) return node;
+    const childSurface = node.type !== "frame" || (node.opacity ?? 1) !== 1
+      ? undefined
+      : node.palette === "none" ? surface : palette[node.palette];
+    const children = node.children.map((child, index) => visit(child, childSurface, `${path}.${index}`));
+    return children.some((child, index) => child !== node.children[index]) ? { ...node, children } : node;
+  };
+  const screens = design.screens.map((screen, index) => ({
+    ...screen,
+    children: screen.children.map((node, child) => visit(node, palette.page, `screens.${index}.children.${child}`)),
+  }));
+  if (visited > 250) findings.push("local_repair_unsupported: contrast preflight exceeded the section node budget.");
+  return { design: repairs.length ? { ...design, screens } : design, repairs, findings };
+}
+
 function applyPinnedBrandLogo(
   children: GeneratedDesignNode[],
   pinned: PinnedBrandKit,
@@ -330,7 +415,6 @@ function applyPinnedBrandLogo(
     qualityRole: "image",
     assetId: brandAsset.assetId,
     children: [],
-    sectionId: "identity",
   });
   return { success: true };
 }
@@ -342,7 +426,10 @@ export function applyPinnedBrandLogoToSection(
   assets: VisualAsset[],
 ): GeneratedDesign {
   if (!plan.brandKit) return design;
-  const screens = structuredClone(design.screens);
+  const screens = design.screens.map((screen) => ({
+    ...screen,
+    children: screen.children.map((node) => ({ ...node, children: [...node.children] })),
+  }));
   for (const screen of screens) {
     const result = applyPinnedBrandLogo(screen.children, plan.brandKit, assets, {
       scope: "section",
@@ -482,7 +569,7 @@ function mapNode(
       color: token ?? { token: DESIGN_GENERATION_COLOR_TOKENS.text },
       textAlign: textAlignment,
       width: node.width,
-      sizing: { width: "fill", height: "hug" },
+      sizing: { width: parentLayout === "horizontal" ? "fixed" : "fill", height: "hug" },
       textAutoResize: "height",
       qualityRole: node.qualityRole,
       logicalRef,
@@ -520,7 +607,7 @@ function mapNode(
                 bottom: padding,
                 left: padding,
               },
-              counterAxisAlign: "stretch" as const,
+              counterAxisAlign: node.layout === "horizontal" ? "center" as const : "stretch" as const,
             },
           }
         : {}),

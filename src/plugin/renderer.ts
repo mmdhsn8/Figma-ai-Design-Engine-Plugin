@@ -137,6 +137,7 @@ export interface MultiScreenRenderResult {
 }
 
 export interface MultiScreenRenderOptions {
+  scrollMobileSections?: boolean;
   beforeScreen?: () => void;
   transaction?: GenerationTransaction;
   onSectionVisible?: (nodeId: string) => void;
@@ -254,6 +255,7 @@ export function createGenerationSkeletons(
   plan: DesignPlan,
   screenIds: string[],
   focusInitial = false,
+  scrollMobileSections = false,
 ): string[] {
   const selected = plan.screens.filter(({ id }) => screenIds.includes(id));
   if (selected.length !== screenIds.length || new Set(screenIds).size !== screenIds.length)
@@ -305,6 +307,10 @@ export function createGenerationSkeletons(
       created.push(frame);
       frame.name = uniqueName(api, `Generating — ${screen.name}`, new Set());
       frame.resize(screen.width, screen.height);
+      if (scrollMobileSections && screen.devicePreset === "mobile") {
+        frame.clipsContent = true;
+        frame.overflowDirection = "VERTICAL";
+      }
       frame.x = position.x;
       frame.y = position.y;
       frame.fills = [{ type: "SOLID", color: hexToRgb(skeletonBackground) }];
@@ -2031,6 +2037,12 @@ export async function renderMultiScreenDesign(
             );
 
           const created: SceneNode[] = [];
+          if (transaction.sequence === 0 && !wasCommitted && existingRoot.children.length === 0)
+            setSolidFill(existingRoot, screenSpec.document.background);
+          if (options.scrollMobileSections && screen.devicePreset === "mobile") {
+            existingRoot.clipsContent = true;
+            existingRoot.overflowDirection = "VERTICAL";
+          }
           for (const [nodeIndex, childSpec] of screenSpec.document.children.entries()) {
             const node = appendDesignNode(
               existingRoot,
@@ -2123,6 +2135,10 @@ export async function renderMultiScreenDesign(
         root.setPluginData(MULTI_SCREEN_BATCH_KEY, batch.id);
         root.setPluginData(MULTI_SCREEN_ID_KEY, screen.id);
         root.setPluginData(SEMANTIC_NODE_ID_KEY, `screen:${screen.id}`);
+        if (transaction && options.scrollMobileSections && screen.devicePreset === "mobile") {
+          root.clipsContent = true;
+          root.overflowDirection = "VERTICAL";
+        }
         root.setPluginData("fad.design.logical-ref", `${screen.id}.root`);
         if (options.resume) root.setPluginData("fad.generation.commit", "pending");
         root.setPluginData(

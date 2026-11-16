@@ -10,8 +10,72 @@ import { createFigmaToolExecutor } from "../src/plugin/figma-tool-executor";
 import { runChatTask } from "../src/ui/chat-task";
 import type { AuthorizedChatTurn } from "../src/ui/companion-client";
 import { createMockApi, type MockNode } from "./figma-mock";
+import { expandClippedSectionTextParent } from "../src/plugin/section-geometry-recovery";
+import { createGenerationTransaction } from "../src/shared/generation-transaction";
+import { sectionDesignFixture } from "./generation-fixture";
+import { auditNativeSection } from "../src/shared/native-visual-quality";
 
 describe("registered plugin saved verification recovery", () => {
+  it("measures a six pixel bottom clip and expands only a matching committed vertical parent", () => {
+    const childGeometry: NativeVisualNode = {
+      type: "TEXT", name: "Synthetic label", ref: "label", visible: true,
+      x: 2641, y: 6959, width: 206, height: 17,
+      absoluteTransform: [[1, 0, 2641], [0, 1, 6959]],
+    };
+    const findings = auditNativeSection([{
+      type: "FRAME", name: "Synthetic container", visible: true,
+      x: 2639, y: 6926, width: 210, height: 44, clipsContent: true,
+      absoluteTransform: [[1, 0, 2639], [0, 1, 6926]], children: [childGeometry],
+    }], ["label"]);
+    const clip = findings.find(({ code }) => code === "clipped-child");
+    expect(JSON.parse(clip!.actual!).overflow).toBe(6);
+    const design = sectionDesignFixture("home");
+    const sectionNode = design.screens[0]!.children[0]!;
+    sectionNode.children = [{ ...sectionNode, children: sectionNode.children }];
+    const transaction = createGenerationTransaction({
+      generationId: "test-generation", documentScope: "test-document",
+      screenId: "home", sectionId: "identity", transactionId: "test-transaction", design,
+    });
+    const mock = createMockApi();
+    const root = mock.api.createFrame();
+    const section = mock.api.createFrame();
+    const parent = mock.api.createFrame();
+    const label = mock.api.createText();
+    root.appendChild(section);
+    section.appendChild(parent);
+    parent.appendChild(label);
+    Object.defineProperty(section, "findAll", {
+      value: (predicate: (node: SceneNode) => boolean) => [parent, label].filter(predicate),
+    });
+    root.setPluginData("fad.multi-screen.batch-id", transaction.generation_id);
+    root.setPluginData("fad.multi-screen.screen-id", transaction.screen_id);
+    section.setPluginData("fad.generation.transaction.key", transaction.idempotency_key);
+    section.setPluginData("fad.generation.semantic-id", transaction.operation.node_id);
+    parent.setPluginData("fad.generation.semantic-id", transaction.operation.node_ids[1]!);
+    label.setPluginData("fad.generation.semantic-id", transaction.operation.node_ids[2]!);
+    label.setPluginData("fad.design.logical-ref", "label");
+    parent.layoutMode = "VERTICAL";
+    parent.clipsContent = true;
+    parent.resize(210, 44);
+    section.resize(350, 150);
+    label.resize(206, 17);
+    label.textAutoResize = "HEIGHT";
+    label.layoutPositioning = "AUTO";
+    Object.defineProperty(label, "relativeTransform", { value: [[1, 0, 2], [0, 1, 33]] });
+    const verification = {
+      verified: false, truncated: false, rootNodeId: root.id,
+      nodeCount: 4, findings, missingPatterns: [],
+    };
+    expect(expandClippedSectionTextParent(root, transaction, verification, 151)).toBeUndefined();
+    const undo = expandClippedSectionTextParent(root, transaction, verification, 300);
+    expect(undo).toBeTypeOf("function");
+    expect(parent.height).toBe(50);
+    expect(expandClippedSectionTextParent(root, transaction, verification, 300)).toBeUndefined();
+    undo!();
+    expect(parent.height).toBe(44);
+    label.setPluginData("fad.generation.semantic-id", "unrelated");
+    expect(expandClippedSectionTextParent(root, transaction, verification, 300)).toBeUndefined();
+  });
   it("plans and applies native HUG for measured horizontal Auto Layout overflow", () => {
     const taskId = "task-horizontal-overflow";
     const nodes: NativeVisualNode[] = [

@@ -437,6 +437,7 @@ function isIntentionalScrollOverflow(parent: NativeVisualNode, child: NativeVisu
     : rect(parent);
   const inner = relative ?? rect(child);
   const epsilon = 1e-3;
+  if (direction === "VERTICAL" && inner.y < outer.y - epsilon) return false;
   const overflowsX =
     inner.x < outer.x - epsilon || inner.x + inner.width > outer.x + outer.width + epsilon;
   const overflowsY =

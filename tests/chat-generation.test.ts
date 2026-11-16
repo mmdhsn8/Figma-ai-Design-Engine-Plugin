@@ -59,6 +59,7 @@ describe("Chat to structured generation contract", () => {
   it.each([
     ["یک صفحه برای اپ بساز", 1],
     ["برای اپ من سه صفحه فارسی طراحی کن", 3],
+    ["برای فروشگاه لباس فارسی من سه صفحه موبایل طراحی کن: صفحه اصلی، جزئیات محصول و سبد خرید.\nراست‌به‌چپ، عرض ۳۹۰ پیکسل و لایه‌های قابل‌ویرایش در Figma. از Brand Kit و Skills فعال استفاده کن.", 3],
     ["برای فروشگاه من ۱۰ صفحه طراحی کن", 10],
     ["Create ten screens for my dashboard", 10],
   ])("parses bounded create intent: %s", (prompt, count) => {

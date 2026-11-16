@@ -1,0 +1,7 @@
+# Normalization contract
+
+For visual composition v1 fresh sections, retain the existing schema and geometry pass. Resolve the generated palette with the same Brand Kit and task precedence used for mapping. Walk validated section nodes up to the section budget. For text, use the immediate opaque frame surface or inherit a known solid page/surface. Apply sRGB source-over for leaf text opacity and WCAG linearization and luminance. Compare at 4.5:1, the existing section preflight target. Opaque gradients and arbitrary image backgrounds are outside structured generation's supported solid surface contract. Unsupported or translucent group backgrounds with text fail closed.
+
+Preserve a passing role. Otherwise try the existing text and muted roles in deterministic semantic order. Never change a parent fill, global style, copy, identity or geometry. If no authorized role passes, return a bounded contrast_unresolved finding. No arbitrary fallback color is introduced. Report numeric path, role, surface, and before/after ratios from the pure normalizer and aggregate the successful repairs in section metrics. Preserve incoming objects and normalized serialization on repeat. Run existing mapped visual audit, composition checks, transaction validation and native QA afterward.
+
+Recovery reads already saved sections without invoking this fresh-section pass. This change leaves native-only measurement mismatches as blocking findings.

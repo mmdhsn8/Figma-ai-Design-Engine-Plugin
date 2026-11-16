@@ -2026,6 +2026,24 @@ export function createFigmaToolExecutor(
       const x = "x" in action ? action.x : undefined;
       const y = "y" in action ? action.y : undefined;
       const isPageParent = parent.type === "PAGE";
+      const checkHorizontalPlacement = (
+        target: typeof parent,
+        width: number,
+      ) => {
+        if (
+          target.type === "FRAME" &&
+          operation.taskId &&
+          target.getPluginData(TASK_PLUGIN_KEY) === operation.taskId &&
+          target.layoutMode === "NONE" &&
+          target.clipsContent &&
+          target.overflowDirection === "VERTICAL" &&
+          x !== undefined &&
+          y !== undefined &&
+          (x < -0.001 || x + width > target.width + 0.001)
+        )
+          throw new Error("Horizontal clipping in vertical scroll frame. Set parent-local x so the child fits the frame width.");
+      };
+      if (action.tool !== "create_text") checkHorizontalPlacement(parent, action.size.width);
       const placement =
         isPageParent && (x === undefined || y === undefined)
           ? planCanvasPlacements(
@@ -2055,6 +2073,7 @@ export function createFigmaToolExecutor(
             actualParent,
           );
           textAction = normalized.action;
+          checkHorizontalPlacement(actualParent, textAction.size.width);
           compatibilityNormalizations = normalized.normalizations;
           fontFallback = loaded.fallback;
           markNativeMutation();

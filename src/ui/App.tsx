@@ -68,13 +68,18 @@ import {
 import {
   createDesignPlan,
   createDesignSections,
+  generatedSectionMaxHeight,
   normalizeGeneratedDesignResponse,
   type GeneratedDesign,
   type DesignGenerationRequest,
   type DesignPlan,
 } from "../shared/design-generation";
 import { createGenerationTransaction } from "../shared/generation-transaction";
-import { applyPinnedBrandLogoToSection, prepareGeneratedDesign } from "./design-generation";
+import {
+  applyPinnedBrandLogoToSection,
+  normalizeGeneratedSectionContrast,
+  prepareGeneratedDesign,
+} from "./design-generation";
 import {
   getInferenceEligibility,
   getInferenceStatusLabel,
@@ -2993,9 +2998,11 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           "multi_screen_plan_conflict: The generation renderer plan differs from the saved Chat plan.",
         );
     }
-    if (generationBlockReason || !companionToken || !generationModel) {
+    // The standalone form can be empty during an authorized Chat handoff.
+    const standaloneBlockReason = handoff ? null : generationBlockReason;
+    if (standaloneBlockReason || !companionToken || !generationModel) {
       setGenerationState("failed");
-      const message = generationBlockReason ?? "Connect the authorized companion first.";
+      const message = standaloneBlockReason ?? "Connect the authorized companion first.";
       setGenerationErrors([message]);
       if (handoff) throw new Error(message);
       return;
@@ -3057,6 +3064,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               planFingerprint: handoff.request.planFingerprint,
             }
           : {}),
+        visualCompositionVersion: 1,
         model: generationModel,
         request: planData.request,
         ...(pinnedBrand ? { brandKit: pinnedBrand } : {}),
@@ -3240,7 +3248,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         throw new Error(
           "multi_screen_document_conflict: The saved Chat task belongs to a different Figma document or page.",
         );
-      const recovered = await loadSavedDraft(companionToken, documentId);
+      const recovered = await loadSavedDraft(companionToken, documentId, handoff?.request.generationId);
       if (recovered) {
         if (
           handoff &&
@@ -3441,9 +3449,18 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             if (generationRequest.current !== requestId) return;
 
             const validationStarted = performance.now();
-            const validated = normalizeGeneratedDesignResponse(raw, screenPlan);
+            const validated = normalizeGeneratedDesignResponse(
+              raw, screenPlan, section.id, draft.manifest.visualCompositionVersion,
+            );
             const issues = validated.success ? [] : validated.errors;
             if (validated.success) {
+              if (validated.data.tapTargetRepairs?.length) {
+                const repairCount = validated.data.tapTargetRepairs.length;
+                setStageMetrics((metrics) => ({
+                  ...metrics,
+                  [`${screen.id}.${section.id}.tapTargetRepairs`]: repairCount,
+                }));
+              }
               let generated = {
                 ...validated.data.design,
                 projectName: draft.projectName ?? validated.data.design.projectName,
@@ -3460,7 +3477,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                 generated.screens[0]?.children.length !== 1 ||
                 sectionRoot?.type !== "frame" ||
                 sectionRoot.width > screen.width - 40 ||
-                sectionRoot.height > (screen.devicePreset === "mobile" ? 210 : 240) ||
+                sectionRoot.height > generatedSectionMaxHeight(screen, section.id) ||
                 sectionRoot.layout === "none"
               ) {
                 issues.push(
@@ -3469,6 +3486,39 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
               } else {
                 sectionRoot.sectionId = section.id;
                 try {
+                  if (draft.manifest.visualCompositionVersion === 1) {
+                    const contrast = normalizeGeneratedSectionContrast(generated, screenPlan);
+                    if (contrast.findings.length) throw new Error(contrast.findings.join(" "));
+                    generated = contrast.design;
+                    if (contrast.repairs.length)
+                      setStageMetrics((metrics) => ({
+                        ...metrics,
+                        [`${screen.id}.${section.id}.contrastRepairs`]: contrast.repairs.length,
+                      }));
+                  }
+                  const compositionPreflight = prepareGeneratedDesign(
+                    JSON.stringify(generated),
+                    screenPlan,
+                    {
+                      scope: "section",
+                      sectionId: section.id,
+                      assets: brandVisualAssets,
+                      visualCompositionVersion: draft.manifest.visualCompositionVersion,
+                    },
+                  );
+                  if (!compositionPreflight.success)
+                    throw new Error(compositionPreflight.errors.join(" "));
+                  if (draft.manifest.visualCompositionVersion === 1) {
+                    const contrast = auditVisualQuality(compositionPreflight.data.batch).diagnostics
+                      .find(({ code }) => code === "low-contrast");
+                    if (contrast) {
+                      throw new Error(
+                        `${contrast.path}: ${contrast.message} Use a contrasting palette role for this text or its parent surface.`,
+                      );
+                    }
+                  }
+                  if (compositionPreflight.data.nodeCount > 250)
+                    throw new Error("The section exceeds 250 native layers after preparation. Simplify the section.");
                   const transaction = createGenerationTransaction({
                     generationId: draft.manifest.generationId,
                     documentScope: documentId,
@@ -3576,7 +3626,10 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         palette: draft.palette,
         screens: completeScreens,
       } satisfies GeneratedDesign);
-      const prepared = prepareGeneratedDesign(raw, planData, { assets: brandVisualAssets });
+      const prepared = prepareGeneratedDesign(raw, planData, {
+        assets: brandVisualAssets,
+        visualCompositionVersion: draft.manifest.visualCompositionVersion,
+      });
       if (!prepared.success)
         throw new Error(
           `Saved sections did not compose into a valid complete design. ${prepared.errors.join(" ")}`,
@@ -3622,6 +3675,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         verifiedScreenIds: planData.screens.map(({ id }) => id),
         ...(handoff ? { nativeRoots } : {}),
         nodeCount: prepared.data.nodeCount,
+        ...(draft.manifest.visualCompositionVersion === 1
+          ? { assetCoverage: prepared.data.assetCoverage }
+          : {}),
       };
       await emitHandoffProgress("complete");
       const audit = auditVisualQuality(prepared.data.batch);
@@ -3644,7 +3700,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       setDraftNotice(
         `${draft.transactions.length} section transactions are durably saved and reconciled. Reopen resumes from the first unfinished section.`,
       );
-      setSavedDraft(await loadSavedDraft(companionToken, documentId));
+      if (!handoff) setSavedDraft(await loadSavedDraft(companionToken, documentId));
     } catch (error) {
       if (generationRequest.current !== requestId) return;
       const resumeMessage = draft.transactions.length

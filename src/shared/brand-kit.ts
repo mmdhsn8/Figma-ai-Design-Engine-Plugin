@@ -347,7 +347,7 @@ export function resolveBrandKitTokens(
   pinned: PinnedBrandKit,
   mode: "light" | "dark" = "light",
 ): BrandKitTokens {
-  const tokens = structuredClone(pinned.tokens);
+  const tokens = pinned.tokens;
   const themes = new Map(tokens.themes.map((theme) => [theme.mode, theme]));
   const resolved: Record<string, string> = {};
   const apply = (current: "light" | "dark", visited: Set<string>): void => {
@@ -359,7 +359,7 @@ export function resolveBrandKitTokens(
     Object.assign(resolved, theme.palette);
   };
   apply(mode, new Set());
-  if (!Object.keys(resolved).length) return tokens;
+  if (!Object.keys(resolved).length) return BrandKitTokensSchema.parse(tokens);
   const palette = { ...tokens.palette, custom: { ...tokens.palette.custom } } as Record<
     string,
     unknown
