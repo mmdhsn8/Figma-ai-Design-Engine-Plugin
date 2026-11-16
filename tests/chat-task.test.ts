@@ -1796,7 +1796,10 @@ describe("progressive conversational canvas tasks", () => {
     expect(current.inspectionSummary?.framesInspected).toBe(8);
   });
 
-  it("deterministically discovers and inspects an edit target before refusing a replacement root", async () => {
+  it.each([
+    [undefined, "UNPLANNED"],
+    ["universal-design-v1", "UNIVERSAL_CLASSIFY"],
+  ] as const)("deterministically discovers an edit target under the %s route before refusing a replacement root", async (executionRoute, firstLifecycle) => {
     const h = harness(
       [
         turn("classify_canvas_intent", { intent: "edit", targetName: "Charm Home" }),
@@ -1826,6 +1829,7 @@ describe("progressive conversational canvas tasks", () => {
     );
     const current = task();
     delete current.intent;
+    if (executionRoute) current.executionRoute = executionRoute;
 
     await runChatTask(current, h.deps);
     expect(current.intent).toBe("edit");
@@ -1839,7 +1843,7 @@ describe("progressive conversational canvas tasks", () => {
       pageId: "page:charm",
       nodeId: "node-charm-home",
     });
-    expect(h.lifecycles).toEqual(["UNPLANNED", "EDIT_PLANNING", "PLAN_SAVED"]);
+    expect(h.lifecycles).toEqual([firstLifecycle, "EDIT_PLANNING", "PLAN_SAVED"]);
     expect(current.failure?.code).toBe("native_execution_blocked");
     expect(current.ledger.some(({ call }) => call.action.tool === "create_frame")).toBe(false);
   });
@@ -4747,7 +4751,9 @@ describe("document-scoped canvas task checkpoints", () => {
     expect(wrongPage.error).toContain("Document/page changed");
   });
 
-  it("persists and reloads strict checkpoints and rejects cross-page saves without deleting work", async () => {
+  it.each(["legacy", "universal-design-v1"] as const)("persists and reloads strict checkpoints with the saved %s route", async (executionRoute) => {
+    const savedTask = task();
+    savedTask.executionRoute = executionRoute;
     const data = new Map<string, unknown>();
     const api = {
       fileKey: "file-test",
@@ -4763,29 +4769,30 @@ describe("document-scoped canvas task checkpoints", () => {
     const saved = await handleChatTaskStorage(api, {
       type: "chat-task-save",
       requestId: "save-task-001",
-      documentId: task().documentId,
-      task: task(),
+      documentId: savedTask.documentId,
+      task: savedTask,
     });
     expect(saved.success).toBe(true);
     const loaded = await handleChatTaskStorage(api, {
       type: "chat-task-load",
       requestId: "load-task-001",
     });
-    expect(loaded.task).toEqual(task());
+    expect(loaded.task).toEqual(savedTask);
+    expect(loaded.task?.executionRoute).toBe(executionRoute);
     (api.currentPage as unknown as { id: string }).id = "page:2";
     expect(
       (
         await handleChatTaskStorage(api, {
           type: "chat-task-save",
           requestId: "save-task-002",
-          documentId: task().documentId,
-          task: task(),
+          documentId: savedTask.documentId,
+          task: savedTask,
         })
       ).success,
     ).toBe(false);
     expect(data.size).toBe(1);
     data.set("fad.chat-task.v1:file-test-page_2", {
-      ...task(),
+      ...savedTask,
       documentId: "file-test-page_2",
       executeJavaScript: "bad",
     });

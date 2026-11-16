@@ -4144,8 +4144,6 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
             throw new Error(
               "Structured screen creation could not be confirmed. Start a new task with the screen count, names, and device family.",
             );
-          if (task.executionRoute === "universal-design-v1" && call.action.intent !== "create")
-            throw new Error("universal_route_intent_conflict: This saved create route cannot be reinterpreted as an edit or inspection.");
           const replayed =
             task.intent === call.action.intent &&
             (!call.action.targetName || call.action.targetName === task.targetName);
@@ -4156,7 +4154,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           if (readOnly()) {
             transition("INSPECTING");
             activePhase = "inspection";
-          } else if (task.executionRoute === "universal-design-v1") {
+          } else if (task.executionRoute === "universal-design-v1" && task.intent === "create") {
             transition("UNIVERSAL_PLANNING");
             activePhase = "planning";
           } else if (task.intent === "edit") {

@@ -2,15 +2,15 @@
 
 ## مسیر اجرا
 
-`Chat input → local intent/flag route → existing ChatTask → authenticated Companion + selected model → ProjectPlanDraftV1 → ProjectPlanV1 → one DesignProgramV1 per screen → existing declarative adapter/renderer → task-owned native registration → task-native readback → ChatTask completion`.
+`Chat input → persisted engine preference → existing ChatTask → intent classification → authenticated Companion + selected model → Universal project plan for new designs / existing scoped tools for edits and inspection → task-owned native registration → task-native readback → ChatTask completion`.
 
-مسیر create از داخل submit موجود در `src/ui/App.tsx` انتخاب می‌شود؛ controller یا markup جدیدی ساخته نشده است. وقتی flag خاموش است، درخواست به مسیر قبلی می‌رود. وقتی روشن است فقط درخواست create روشن و بدون فرمان edit به `universal-design-v1` می‌رود. edit، inspect، resume و درخواست mixed create/edit به legacy می‌روند. بعد از checkpoint مسیر یا model task عوض نمی‌شود.
+همهٔ taskهای تازه با انتخاب Universal (مقدار پیش‌فرض) در همان submit موجود `src/ui/App.tsx` ساخته می‌شوند؛ این شامل promptهای edit و inspect هم هست. بعد از classification، create از Universal planner/composer استفاده می‌کند و edit/inspect/explain به ابزارهای scoped و جریان اجرایی موجود می‌روند. انتخاب Legacy مسیر قدیمی را برای taskهای تازه نگه می‌دارد. انتخاب در `figma.clientStorage` پایدار می‌ماند؛ task فعال یا resume شده فقط از route ذخیره‌شده در `ChatTask` پیروی می‌کند و انتخاب فعلی Settings آن را تغییر نمی‌دهد.
 
 Classification، planning، composition و semantic repair ابزارهای typed در lifecycleهای `UNIVERSAL_CLASSIFY`, `UNIVERSAL_PLANNING`, `UNIVERSAL_COMPOSING`, `UNIVERSAL_REPAIR` هستند. درخواست مدل از همان Companion/account authorization و مدل pinned در ChatTask استفاده می‌کند. برنامهٔ native از route جدید مستقل ساخته نمی‌شود؛ `renderDesignProgramLocal` به adapter Phase 2 و `renderMultiScreenDesign` موجود تحویل می‌دهد.
 
-## Rollout و rollback
+## تنظیم و سازگاری
 
-کلید محلی `fad.universal-design-chat.v1` فقط وقتی دقیقاً `enabled` باشد فعال است؛ نبودن storage یا مقدار دیگر یعنی legacy. برای rollout محدود، آن را از DevTools کنسول UI پلاگین فعال کنید؛ برای بازگشت `localStorage.removeItem("fad.universal-design-chat.v1")` اجرا و task تازه‌ای شروع کنید. task در حال اجرا route ذخیره‌شدهٔ خودش را نگه می‌دارد. Manifest، شناسه، Chat appearance، CSS، legacy structured generation و JSON import تغییر نکرده‌اند.
+Settings → Design Engine دو گزینهٔ `Universal Engine (New)` و `Legacy Engine (Old)` دارد. انتخاب صریح در `fad.design-engine-preference.v1` در Figma `clientStorage` ذخیره می‌شود. نصب خالی و کاربر موجود بدون انتخاب صریح Legacy به Universal مهاجرت می‌کند. flag آزمایشی `fad.universal-design-chat.v1` فقط برای مهاجرت یک‌باره خوانده می‌شود؛ مقادیر آن هیچ‌وقت به‌تنهایی انتخاب Legacy محسوب نمی‌شوند و بعد از ذخیرهٔ انتخاب جدید پاک می‌شود. Manifest، شناسه و Chat UI تغییر نکرده‌اند؛ History، Brand Kit، Skills، Login و Native Renderer از bridgeها و مسیرهای موجود استفاده می‌کنند.
 
 ## نقاط scope
 

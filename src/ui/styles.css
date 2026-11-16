@@ -5410,3 +5410,60 @@ body:has(.app-shell.is-chat-view) #root {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.design-engine-options {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.design-engine-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 1px solid #353740;
+  border-radius: 7px;
+  background: #202127;
+  cursor: pointer;
+}
+
+.design-engine-option:has(input:checked) {
+  border-color: #7563aa;
+  background: #242333;
+}
+
+.design-engine-option input {
+  flex: none;
+  margin: 2px 0 0;
+  accent-color: #a992e8;
+}
+
+.design-engine-option-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.design-engine-option-copy strong {
+  color: #ecebf0;
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.design-engine-option-copy small {
+  color: #92939c;
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.design-engine-option:has(input:disabled) {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.design-engine-retry {
+  margin-inline-start: 8px;
+}

@@ -11,7 +11,12 @@ import { createFigmaToolExecutor } from "../src/plugin/figma-tool-executor";
 import { createMockApi } from "./figma-mock";
 import type { AuthorizedChatTurn } from "../src/ui/companion-client";
 import type { PluginToUIMessage } from "../src/shared/messages";
-import { selectChatExecutionRoute, universalDesignRouteEnabled } from "../src/ui/universal-design-route";
+import { selectChatExecutionRoute } from "../src/ui/universal-design-route";
+import {
+  DEFAULT_DESIGN_ENGINE,
+  migrateExperimentalEngineFlag,
+  resolveDesignEnginePreference,
+} from "../src/shared/design-engine-preference";
 
 type Case = {
   name: string;
@@ -372,13 +377,13 @@ function makeHarness(input: Case, options: {
 }
 
 describe("universal design Chat route", () => {
-  it.each([
-    ["Persian editable output property", "سه صفحهٔ جدید و قابل‌ویرایش بساز تا بعداً بتوانم صفحهٔ چهارم را تغییر بدهم."],
-    ["English editable output property", "Create 3 new editable screens that I can modify later, including an Edit Profile screen."],
-  ])("routes %s to a create plan only when the local flag is enabled", (_name, prompt) => {
-    expect(isClearCreateRequest(prompt)).toBe(true);
-    expect(selectChatExecutionRoute(prompt, false)).toBe("legacy");
-    expect(selectChatExecutionRoute(prompt, true)).toBe("universal-design-v1");
+  it("defaults every new Chat task to Universal, independent of prompt intent", () => {
+    expect(DEFAULT_DESIGN_ENGINE).toBe("universal");
+    expect(selectChatExecutionRoute()).toBe("universal-design-v1");
+    expect(selectChatExecutionRoute("universal")).toBe("universal-design-v1");
+    expect(selectChatExecutionRoute("legacy")).toBe("legacy");
+    expect(isClearCreateRequest("سه صفحهٔ جدید و قابل‌ویرایش بساز تا بعداً بتوانم صفحهٔ چهارم را تغییر بدهم.")).toBe(true);
+    expect(selectChatExecutionRoute("universal")).toBe("universal-design-v1");
   });
 
   it.each([
@@ -395,15 +400,27 @@ describe("universal design Chat route", () => {
     "Continue the saved task.",
     "Resume task chat-001.",
     "Create 3 screens and then edit screen 4 in the existing file.",
-  ])("does not opt an existing edit or continuation into universal creation: %s", (prompt) => {
-    expect(selectChatExecutionRoute(prompt, true)).toBe("legacy");
+  ])("keeps engine preference separate from prompt classification: %s", (prompt) => {
+    expect(selectChatExecutionRoute("universal")).toBe("universal-design-v1");
+    expect(selectChatExecutionRoute("legacy")).toBe("legacy");
+    expect(prompt.length).toBeGreaterThan(0);
   });
 
-  it("keeps the rollout flag explicit, local and disabled by default", () => {
-    const storage = { getItem: vi.fn(() => null) };
-    expect(universalDesignRouteEnabled(storage as unknown as Storage)).toBe(false);
-    expect(universalDesignRouteEnabled({ getItem: () => "enabled" } as unknown as Storage)).toBe(true);
-    expect(universalDesignRouteEnabled({ getItem: () => "true" } as unknown as Storage)).toBe(false);
+  it.each([
+    [null, "universal"],
+    ["enabled", "universal"],
+    ["disabled", "universal"],
+    ["legacy", "universal"],
+    ["true", "universal"],
+    ["unknown", "universal"],
+  ] as const)("migrates old experimental flag %s to the default engine %s", (oldValue, engine) => {
+    expect(migrateExperimentalEngineFlag(oldValue)).toBe(engine);
+  });
+
+  it("prefers a persisted engine selection over the retired experimental flag", () => {
+    expect(resolveDesignEnginePreference({ version: 1, selectedEngine: "legacy" }, "enabled")).toBe("legacy");
+    expect(resolveDesignEnginePreference({ version: 1, selectedEngine: "universal" }, "legacy")).toBe("universal");
+    expect(resolveDesignEnginePreference(undefined, "enabled")).toBe("universal");
   });
 
   it("normalizes an open-domain plan with stable ordered screen identities and exact request bounds", () => {

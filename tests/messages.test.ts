@@ -158,6 +158,35 @@ describe("plugin message contract", () => {
     ).toBe(true);
   });
 
+  it("validates Design Engine preference requests and persistent read results", () => {
+    expect(
+      UIToPluginSchema.safeParse({ type: "load-design-engine-preference", requestId: "engine-load-1" })
+        .success,
+    ).toBe(true);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "save-design-engine-preference",
+        requestId: "engine-save-1",
+        selectedEngine: "legacy",
+      }).success,
+    ).toBe(true);
+    expect(
+      UIToPluginSchema.safeParse({
+        type: "save-design-engine-preference",
+        requestId: "engine-save-2",
+        selectedEngine: "unknown",
+      }).success,
+    ).toBe(false);
+    expect(
+      PluginToUISchema.safeParse({
+        type: "design-engine-preference-loaded",
+        requestId: "engine-load-1",
+        state: "valid",
+        selectedEngine: "legacy",
+      }).success,
+    ).toBe(true);
+  });
+
   it("accepts typed validate and generate requests", () => {
     expect(
       UIToPluginSchema.safeParse({ type: "validate", requestId: "r1", json: "{}" }).success,

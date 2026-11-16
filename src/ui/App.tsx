@@ -19,6 +19,12 @@ import {
 import type { FigmaToolOperation } from "../shared/figma-tools";
 import { type ChatInputItem } from "../shared/chat-tools";
 import {
+  DEFAULT_DESIGN_ENGINE,
+  LEGACY_UNIVERSAL_ROUTE_FLAG_KEY,
+  resolveDesignEnginePreference,
+  type DesignEngine,
+} from "../shared/design-engine-preference";
+import {
   chatHistoryExportJson,
   chatHistoryTitle,
   duplicateChatHistoryConversation,
@@ -36,7 +42,8 @@ import {
 import { runChatTask, chatTaskInput } from "./chat-task";
 import { chatHistoryBridge, chatTaskBridge } from "./chat-task-bridge";
 import { renderDesignProgramBridge } from "./design-program-bridge";
-import { selectChatExecutionRoute, universalDesignRouteEnabled } from "./universal-design-route";
+import { designEnginePreferenceBridge } from "./design-engine-preference-bridge";
+import { selectChatExecutionRoute } from "./universal-design-route";
 import { taskNativeBridge } from "./task-native-bridge";
 import { ChatHistoryView } from "./chat-history-view";
 import { ChatDeleteDialog } from "./chat-delete-dialog";
@@ -245,6 +252,7 @@ export type CompanionConnectionState =
 
 export type ModelDiscoveryState = "idle" | "loading" | "loaded" | "empty" | "error";
 type ModelPreferenceState = "loading" | "empty" | "valid" | "invalid" | "unavailable";
+type DesignEnginePreferenceState = "loading" | "ready" | "saving" | "unavailable";
 export function modelCatalogStateLabel(state: ModelCatalogState): string {
   return (
     {
@@ -620,6 +628,12 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const [savedModelPreference, setSavedModelPreference] = useState("");
   const [modelPreferenceState, setModelPreferenceState] = useState<ModelPreferenceState>("loading");
   const [modelPreferenceError, setModelPreferenceError] = useState<string | null>(null);
+  const [designEnginePreference, setDesignEnginePreference] = useState<DesignEngine>(DEFAULT_DESIGN_ENGINE);
+  const [designEnginePreferenceState, setDesignEnginePreferenceState] = useState<DesignEnginePreferenceState>("loading");
+  const [designEnginePreferenceError, setDesignEnginePreferenceError] = useState<string | null>(null);
+  const designEnginePreferenceRef = useRef<DesignEngine>(DEFAULT_DESIGN_ENGINE);
+  const designEnginePreferenceReady = useRef(false);
+  const designEnginePreferenceLoadInFlight = useRef<Promise<DesignEngine> | null>(null);
   const [modelCatalogError, setModelCatalogError] = useState<string | null>(null);
   const [modelCatalogLoadedAt, setModelCatalogLoadedAt] = useState<number | null>(null);
   const modelPreferenceResponses = useRef(
@@ -1259,6 +1273,12 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       } else if (message.type === "design-skills-result") {
         // The Design Skills bridge owns these request-scoped responses.
         return;
+      } else if (
+        message.type === "design-engine-preference-loaded" ||
+        message.type === "design-engine-preference-saved"
+      ) {
+        // The Design Engine preference bridge owns these request-scoped responses.
+        return;
       } else {
         const counts = message.counts;
         const fonts = [
@@ -1485,6 +1505,105 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   }, [companionStatus?.auth, companionStatus?.safeMessage, companionToken, updateCompanionStatus]);
 
   const nextRequestId = () => `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  const clearLegacyDesignEngineFlag = () => {
+    try {
+      if (typeof localStorage !== "undefined") localStorage.removeItem(LEGACY_UNIVERSAL_ROUTE_FLAG_KEY);
+    } catch {
+      // The plugin clientStorage value is authoritative after migration.
+    }
+  };
+
+  const loadDesignEnginePreference = useCallback((): Promise<DesignEngine> => {
+    if (designEnginePreferenceReady.current) return Promise.resolve(designEnginePreferenceRef.current);
+    if (designEnginePreferenceLoadInFlight.current) return designEnginePreferenceLoadInFlight.current;
+    setDesignEnginePreferenceState("loading");
+    const load = (async () => {
+      try {
+        const stored = await designEnginePreferenceBridge({
+          type: "load-design-engine-preference",
+          requestId: nextRequestId(),
+        });
+        if (stored.type !== "design-engine-preference-loaded" || stored.state === "unavailable")
+          throw new Error("Figma could not read the saved Design Engine choice.");
+
+        let oldFlag: string | null = null;
+        if (stored.state !== "valid") {
+          try {
+            if (typeof localStorage !== "undefined") oldFlag = localStorage.getItem(LEGACY_UNIVERSAL_ROUTE_FLAG_KEY);
+          } catch {
+            oldFlag = null;
+          }
+        }
+        const selectedEngine = resolveDesignEnginePreference(
+          stored.state === "valid" && stored.selectedEngine
+            ? { version: 1, selectedEngine: stored.selectedEngine }
+            : undefined,
+          oldFlag,
+        );
+        if (stored.state !== "valid") {
+          const saved = await designEnginePreferenceBridge({
+            type: "save-design-engine-preference",
+            requestId: nextRequestId(),
+            selectedEngine,
+          });
+          if (saved.type !== "design-engine-preference-saved" || !saved.success)
+            throw new Error("Figma could not migrate and save the Design Engine choice.");
+        }
+
+        clearLegacyDesignEngineFlag();
+        designEnginePreferenceRef.current = selectedEngine;
+        designEnginePreferenceReady.current = true;
+        setDesignEnginePreference(selectedEngine);
+        setDesignEnginePreferenceState("ready");
+        setDesignEnginePreferenceError(null);
+        return selectedEngine;
+      } catch (error) {
+        designEnginePreferenceReady.current = false;
+        setDesignEnginePreferenceState("unavailable");
+        const message = error instanceof Error ? error.message : "The Design Engine choice could not be loaded.";
+        setDesignEnginePreferenceError(`${message} New Chat tasks are paused until the saved engine is confirmed.`);
+        throw error;
+      }
+    })();
+    const shared = load.finally(() => {
+      if (designEnginePreferenceLoadInFlight.current === shared)
+        designEnginePreferenceLoadInFlight.current = null;
+    });
+    designEnginePreferenceLoadInFlight.current = shared;
+    return shared;
+  }, []);
+
+  const saveDesignEnginePreference = useCallback(async (selectedEngine: DesignEngine) => {
+    const wasReady = designEnginePreferenceReady.current;
+    const previous = designEnginePreferenceRef.current;
+    designEnginePreferenceReady.current = false;
+    setDesignEnginePreferenceState("saving");
+    setDesignEnginePreferenceError(null);
+    try {
+      const saved = await designEnginePreferenceBridge({
+        type: "save-design-engine-preference",
+        requestId: nextRequestId(),
+        selectedEngine,
+      });
+      if (saved.type !== "design-engine-preference-saved" || !saved.success)
+        throw new Error("Figma could not save this Design Engine choice.");
+      clearLegacyDesignEngineFlag();
+      designEnginePreferenceRef.current = selectedEngine;
+      designEnginePreferenceReady.current = true;
+      setDesignEnginePreference(selectedEngine);
+      setDesignEnginePreferenceState("ready");
+    } catch (error) {
+      designEnginePreferenceRef.current = previous;
+      designEnginePreferenceReady.current = wasReady;
+      setDesignEnginePreferenceState(wasReady ? "ready" : "unavailable");
+      setDesignEnginePreferenceError(error instanceof Error ? error.message : "Figma could not save this Design Engine choice.");
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadDesignEnginePreference().catch(() => undefined);
+  }, [loadDesignEnginePreference]);
 
   const requestModelPreference = useCallback(
     (
@@ -1912,9 +2031,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     const text = chatInput.trim();
     if (!retry && !text) return;
     const generationIntent = !retry ? parseChatGenerationIntent(text) : undefined;
-    const selectedRoute = !retry
-      ? selectChatExecutionRoute(text, universalDesignRouteEnabled())
-      : undefined;
     if (
       generationIntent?.kind === "out_of_range" ||
       generationIntent?.kind === "unsupported_target"
@@ -1938,6 +2054,13 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       setChatInput("");
       return;
     }
+    if (!retry && !designEnginePreferenceReady.current) {
+      setChatActivity("The saved Design Engine choice is not ready. Open Settings and retry its load before starting a new task.");
+      return;
+    }
+    const selectedRoute = !retry
+      ? selectChatExecutionRoute(designEnginePreferenceRef.current)
+      : undefined;
     const boundedGenerationIntent =
       generationIntent?.kind === "ready" ? generationIntent.intent : undefined;
     if (!activeChatIdRef.current) await createNewChat();
@@ -4153,6 +4276,67 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           <p className="page-description">
             Manage local pairing, ChatGPT access, account-visible models, and developer diagnostics.
           </p>
+          <section className="ai-gate-panel design-engine-panel" aria-labelledby="design-engine-title">
+            <div className="design-system-heading">
+              <div>
+                <span className="section-kicker">NEW CHAT TASKS</span>
+                <h2 id="design-engine-title">Design Engine</h2>
+              </div>
+              <span className={`system-status ${designEnginePreference === "universal" ? "is-ready" : ""}`}>
+                {designEnginePreferenceState === "loading"
+                  ? "Loading choice…"
+                  : designEnginePreferenceState === "saving"
+                    ? "Saving choice…"
+                    : designEnginePreferenceState === "unavailable"
+                      ? "Choice unavailable"
+                    : designEnginePreference === "universal"
+                      ? "Default engine"
+                      : "Legacy selected"}
+              </span>
+            </div>
+            <p className="ai-gate-note">
+              Choose the engine for new Chat tasks. Universal uses project planning for new designs and the existing scoped tools for edits and inspection. Active or resumed tasks keep their saved engine.
+            </p>
+            <fieldset className="design-engine-options" disabled={designEnginePreferenceState === "loading" || designEnginePreferenceState === "saving"}>
+              <legend className="sr-only">Design Engine for new Chat tasks</legend>
+              <label className="design-engine-option">
+                <input
+                  type="radio"
+                  name="design-engine-preference"
+                  value="universal"
+                  checked={designEnginePreference === "universal"}
+                  onChange={() => void saveDesignEnginePreference("universal")}
+                />
+                <span className="design-engine-option-copy">
+                  <strong>Universal Engine (New)</strong>
+                  <small>Default for new Chat tasks</small>
+                </span>
+              </label>
+              <label className="design-engine-option">
+                <input
+                  type="radio"
+                  name="design-engine-preference"
+                  value="legacy"
+                  checked={designEnginePreference === "legacy"}
+                  onChange={() => void saveDesignEnginePreference("legacy")}
+                />
+                <span className="design-engine-option-copy">
+                  <strong>Legacy Engine (Old)</strong>
+                  <small>Use the previous Chat planning and generation flow</small>
+                </span>
+              </label>
+            </fieldset>
+            {designEnginePreferenceError && (
+              <p className="ai-gate-error" role="alert">
+                {designEnginePreferenceError}
+                {designEnginePreferenceState === "unavailable" && (
+                  <button className="secondary-action design-engine-retry" type="button" onClick={() => void loadDesignEnginePreference().catch(() => undefined)}>
+                    Retry saved choice
+                  </button>
+                )}
+              </p>
+            )}
+          </section>
         </section>
       ) : activeView === "home" ? (
         <HomeDashboard

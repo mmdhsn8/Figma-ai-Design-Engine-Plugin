@@ -16,6 +16,7 @@ import { renderDesignProgramLocal } from "./design-program-spike";
 import { handleChatTaskStorage } from "./chat-task-storage";
 import { handleChatHistoryStorage } from "./chat-history-storage";
 import { handleModelPreferenceStorage } from "./model-preference-storage";
+import { handleDesignEnginePreferenceStorage } from "./design-engine-preference-storage";
 import { handleBrandKitStorage } from "./brand-kit-storage";
 import { handleDesignSkillStorage } from "./design-skill-storage";
 
@@ -280,6 +281,14 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     message.data.type === "save-model-preference"
   ) {
     send(await handleModelPreferenceStorage(figma.clientStorage, message.data));
+    return;
+  }
+
+  if (
+    message.data.type === "load-design-engine-preference" ||
+    message.data.type === "save-design-engine-preference"
+  ) {
+    send(await handleDesignEnginePreferenceStorage(figma.clientStorage, message.data));
     return;
   }
 

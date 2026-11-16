@@ -4,7 +4,7 @@
 
 ## محیط و قبل/بعد
 
-قبل از شروع، در UI پلاگین hash/manifest build و model slug/account را کنترل کنید؛ انتخاب و page ID، node count، screenshot و وضعیت task را ثبت کنید. Flag آزمایشی را در کنسول UI فعال کنید: `localStorage.setItem("fad.universal-design-chat.v1", "enabled")`. مسیر فقط برای task create تازه فعال است.
+قبل از شروع، در UI پلاگین hash/manifest build و model slug/account را کنترل کنید؛ انتخاب engine باید در Settings → Design Engine روی Universal باشد. انتخاب و page ID، node count، screenshot و وضعیت task را ثبت کنید. مسیر Universal برای taskهای تازه به‌طور پیش‌فرض فعال است؛ taskهای edit و inspect از ابزارهای scoped موجود استفاده می‌کنند و taskهای resume شده route checkpoint خود را حفظ می‌کنند.
 
 دو prompt نمونه:
 

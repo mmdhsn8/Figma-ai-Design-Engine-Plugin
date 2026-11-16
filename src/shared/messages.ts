@@ -21,6 +21,7 @@ import { ModelIdSchema } from "./model-preference";
 import { BrandKitStorageCommandSchema, BrandKitStorageResultSchema } from "./brand-kit";
 import { DesignSkillStorageCommandSchema, DesignSkillStorageResultSchema } from "./design-skill";
 import { DesignProgramV1Schema } from "./design-program";
+import { DesignEngineSchema } from "./design-engine-preference";
 
 const RequestSchema = z.object({
   requestId: z.string().min(1).max(100),
@@ -331,6 +332,14 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       selectedModel: ModelIdSchema,
     })
     .strict(),
+  z.object({ type: z.literal("load-design-engine-preference"), requestId: z.string().min(1).max(100) }).strict(),
+  z
+    .object({
+      type: z.literal("save-design-engine-preference"),
+      requestId: z.string().min(1).max(100),
+      selectedEngine: DesignEngineSchema,
+    })
+    .strict(),
   RequestSchema.extend({ type: z.literal("validate") }).strict(),
   RequestSchema.extend({ type: z.literal("generate") }).strict(),
   RequestSchema.extend({
@@ -360,6 +369,22 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       type: z.literal("model-preference-saved"),
       requestId: z.string().min(1).max(100),
       success: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("design-engine-preference-loaded"),
+      requestId: z.string().min(1).max(100),
+      state: z.enum(["empty", "valid", "invalid", "unavailable"]),
+      selectedEngine: DesignEngineSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("design-engine-preference-saved"),
+      requestId: z.string().min(1).max(100),
+      success: z.boolean(),
+      selectedEngine: DesignEngineSchema.optional(),
     })
     .strict(),
   z
