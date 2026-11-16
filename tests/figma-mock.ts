@@ -26,13 +26,21 @@ export function createMockApi() {
       listener({ nodeChanges: [] } as unknown as NodeChangeEvent);
     emitDocumentChange();
   };
+  let nextId = 1;
+  const styleMetadata = () => {
+    const data = new Map<string, string>();
+    return {
+      getPluginData: (key: string) => data.get(key) ?? "",
+      setPluginData: (key: string, value: string) => data.set(key, value),
+      remove: () => undefined,
+    };
+  };
   const paintStyles = [
-    { id: "paint-token-brand", name: "Color/Brand", paints: [] },
+    { ...styleMetadata(), id: "paint-token-brand", name: "Color/Brand", paints: [], type: "PAINT" },
   ] as unknown as PaintStyle[];
   const textStyles = [
-    { id: "text-token-heading", name: "Typography/Heading" },
+    { ...styleMetadata(), id: "text-token-heading", name: "Typography/Heading", type: "TEXT" },
   ] as unknown as TextStyle[];
-  let nextId = 1;
   const detach = (node: MockNode) => {
     if (!node.parent) return;
     if (node.parent.type === "PAGE") {
@@ -355,6 +363,22 @@ export function createMockApi() {
     createComponent: () => makeNode("COMPONENT") as unknown as ComponentNode,
     createRectangle: () => makeNode("RECTANGLE") as unknown as RectangleNode,
     createText: () => makeNode("TEXT") as unknown as TextNode,
+    createPaintStyle: () => {
+      const style = {
+        ...styleMetadata(), id: `mock-paint-style:${nextId++}`, name: "", paints: [], type: "PAINT",
+      } as unknown as PaintStyle;
+      paintStyles.push(style);
+      return style;
+    },
+    createTextStyle: () => {
+      const style = {
+        ...styleMetadata(), id: `mock-text-style:${nextId++}`, name: "", type: "TEXT",
+        fontName: { family: "Inter", style: "Regular" }, fontSize: 16,
+        lineHeight: { unit: "AUTO" }, letterSpacing: { unit: "PIXELS", value: 0 }, textDecoration: "NONE",
+      } as unknown as TextStyle;
+      textStyles.push(style);
+      return style;
+    },
     listAvailableFontsAsync: async () => [
       { fontName: { family: "Inter", style: "Regular" } },
       { fontName: { family: "Arial", style: "Regular" } },

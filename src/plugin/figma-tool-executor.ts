@@ -43,6 +43,21 @@ const CHAT_GENERATION_TASK_KEY = "fad.generation.chat-task-id";
 const MAX_PAYLOAD_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 48 * 1024;
 const OPERATION_TIMEOUT_MS = 10_000;
+const NativeGenerationAdoptionSchema = z.object({
+  taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+  documentId: z.string().min(1).max(300),
+  pageId: z.string().min(1).max(200),
+  batchId: z.string().min(1).max(100),
+  roots: z.array(z.object({
+    screenId: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,79}$/u),
+    rootNodeId: z.string().min(1).max(100),
+    nodes: z.array(z.object({
+      nodeId: z.string().min(1).max(100),
+      ref: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u),
+      semanticRole: z.string().trim().min(1).max(60),
+    }).strict()).min(1).max(300),
+  }).strict()).min(1).max(10),
+}).strict();
 const ReferenceCandidateSchema = z
   .object({
     canonicalRef: z.string().max(80),
@@ -240,6 +255,12 @@ const StoredStateSchema = z.discriminatedUnion("version", [
 type StoredState = z.infer<typeof StoredStateV2Schema>;
 type StoredOperationResult = NonNullable<StoredState["operations"][string]["result"]>;
 type ToolStateDiagnostic = z.infer<typeof FigmaToolStateDiagnosticSchema>;
+export type NativeGenerationAdoption = z.infer<typeof NativeGenerationAdoptionSchema>;
+export type FigmaToolExecutor = ((message: Extract<UIToPluginMessage, {
+  type: "tool-execute" | "tool-cancel" | "tool-pause" | "tool-delete-consent" | "task-native-inspect" | "task-native-focus";
+}>) => Promise<void>) & {
+  registerRenderedGeneration(request: NativeGenerationAdoption): Promise<{ registeredRefs: number; persistenceMs: number }>;
+};
 
 class ToolStateError extends Error {
   constructor(
@@ -3649,7 +3670,7 @@ export function createFigmaToolExecutor(
     }
   };
 
-  return async (
+  const execute = async (
     message: Extract<
       UIToPluginMessage,
       {
@@ -3788,4 +3809,129 @@ export function createFigmaToolExecutor(
     queue = next.catch(() => undefined);
     await next;
   };
+
+  const registerRenderedGeneration = async (
+    request: NativeGenerationAdoption,
+  ): Promise<{ registeredRefs: number; persistenceMs: number }> => {
+    const parsed = NativeGenerationAdoptionSchema.parse(request);
+    await queue;
+    assertTaskPageScope(parsed.documentId, parsed.pageId);
+    const rootsSeen = new Set<string>();
+    const refsSeen = new Set<string>();
+    const claims: Array<{ node: SceneNode; screenId: string; ref: string; semanticRole: string }> = [];
+    for (const expected of parsed.roots) {
+      if (rootsSeen.has(expected.screenId)) throw new Error("A generated screen identity was supplied more than once.");
+      rootsSeen.add(expected.screenId);
+      const matches = api.currentPage.findAll((node) =>
+        node.getPluginData("fad.multi-screen.batch-id") === parsed.batchId &&
+        node.getPluginData("fad.multi-screen.screen-id") === expected.screenId,
+      );
+      const root = matches.length === 1 && matches[0]?.id === expected.rootNodeId ? matches[0] : undefined;
+      if (!root || root.type !== "FRAME" || root.parent?.type !== "PAGE" ||
+        root.getPluginData("fad.generation.commit") !== "complete")
+        throw new Error("Only one completed renderer-created page root can be registered.");
+      const actualNodes: SceneNode[] = [];
+      const pending: SceneNode[] = [root];
+      while (pending.length) {
+        const node = pending.pop()!;
+        actualNodes.push(node);
+        pending.push(...directChildren(node));
+      }
+      if (claims.length + actualNodes.length > 200)
+        throw new Error("The renderer adoption seam is limited to 200 native nodes per task.");
+      const actualById = new Map(actualNodes.map((node) => [node.id, node]));
+      if (expected.nodes.length !== actualNodes.length || new Set(expected.nodes.map(({ nodeId }) => nodeId)).size !== expected.nodes.length || expected.nodes.some(({ nodeId }) => !actualById.has(nodeId)))
+        throw new Error("The renderer subtree changed after validation; its complete node set must be re-inspected.");
+      for (const nodeInput of expected.nodes) {
+        const node = actualById.get(nodeInput.nodeId)!;
+        if (!/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u.test(nodeInput.ref) || refsSeen.has(nodeInput.ref))
+          throw new Error("Generated stable refs must be unique and within the task reference bounds.");
+        refsSeen.add(nodeInput.ref);
+        if ((node.getPluginData(TASK_PLUGIN_KEY) && node.getPluginData(TASK_PLUGIN_KEY) !== parsed.taskId) ||
+          (node.getPluginData(CHAT_GENERATION_TASK_KEY) && node.getPluginData(CHAT_GENERATION_TASK_KEY) !== parsed.taskId) ||
+          (node.getPluginData(REF_PLUGIN_KEY) && node.getPluginData(REF_PLUGIN_KEY) !== nodeInput.ref))
+          throw new Error("A renderer node is already claimed by a different task or ref.");
+        const pageCollisions = api.currentPage.findAll((candidate) => candidate.id !== node.id && candidate.getPluginData(REF_PLUGIN_KEY) === nodeInput.ref);
+        if (pageCollisions.length) throw new Error("A generated stable ref is already assigned to another node on this page.");
+        const ancestorIds = new Set<string>([root.id]);
+        let ancestor = node.parent;
+        while (ancestor && ancestor.type !== "PAGE" && ancestor.type !== "DOCUMENT") {
+          ancestorIds.add(ancestor.id);
+          ancestor = ancestor.parent;
+        }
+        if (!ancestorIds.has(root.id) || !belongsToPage(node, api.currentPage))
+          throw new Error("A renderer node is outside its verified task-owned screen root.");
+        claims.push({ node, screenId: expected.screenId, ref: nodeInput.ref, semanticRole: nodeInput.semanticRole });
+      }
+    }
+    if (parsed.roots.length !== rootsSeen.size || claims.length === 0)
+      throw new Error("At least one complete renderer-created screen is required.");
+
+    const pageId = parsed.pageId;
+    const state = await loadState(pageId);
+    const pendingPluginWrites: Array<{ node: SceneNode; key: string; previous: string }> = [];
+    const changedRefs: string[] = [];
+    let persistenceMs: number;
+    try {
+      for (const { node, screenId, ref, semanticRole } of claims) {
+        const operationId = `adopt-${fingerprint(`${parsed.taskId}:${parsed.batchId}:${screenId}:${ref}`).slice(0, 24)}`;
+        const creationFingerprint = fingerprint(JSON.stringify(["native-render-adoption-v1", parsed.taskId, parsed.batchId, screenId, node.id, ref, node.type]));
+        const existing = state.refs[ref];
+        if (existing) {
+          if (existing.nodeId !== node.id || existing.pageId !== pageId || existing.taskId !== parsed.taskId || existing.creationOperationId !== operationId || state.operations[operationId]?.status !== "completed")
+            throw new Error("A stable generated ref conflicts with previously persisted task state.");
+          continue;
+        }
+        const priorOperation = state.operations[operationId];
+        if (priorOperation && (priorOperation.creationRef !== ref || priorOperation.taskId !== parsed.taskId))
+          throw new Error("Renderer adoption operation identity conflicts with persisted tool history.");
+        for (const [key, value] of [[TASK_PLUGIN_KEY, parsed.taskId], [CHAT_GENERATION_TASK_KEY, parsed.taskId], [REF_PLUGIN_KEY, ref], [OP_PLUGIN_KEY, operationId], [FINGERPRINT_PLUGIN_KEY, creationFingerprint], ["fad.design.semantic-role", semanticRole]]) {
+          pendingPluginWrites.push({ node, key, previous: node.getPluginData(key) });
+          node.setPluginData(key, value);
+        }
+        const readback = creationReadback(node);
+        pendingPluginWrites.push({ node, key: CREATION_READBACK_KEY, previous: node.getPluginData(CREATION_READBACK_KEY) });
+        node.setPluginData(CREATION_READBACK_KEY, readback);
+        changedRefs.push(ref);
+        state.refs[ref] = {
+          nodeId: node.id,
+          pageId,
+          parentId: node.parent?.id,
+          nodeType: node.type,
+          creationFingerprint,
+          taskId: parsed.taskId,
+          alias: ref,
+          creationOperationId: operationId,
+        };
+        state.operations[operationId] = {
+          operationId,
+          taskId: parsed.taskId,
+          creationRef: ref,
+          idempotencyKey: `adopt:${parsed.batchId}:${ref}`.slice(0, 120),
+          fingerprint: creationFingerprint,
+          status: "completed",
+          updatedAt: Date.now(),
+          result: {
+            operationId,
+            success: true,
+            replayed: false,
+            acknowledgementStatus: "confirmed_mutation",
+            logicalRef: ref,
+            summary: "Verified completed native renderer output for local Phase 2 scoped editing.",
+          },
+        };
+      }
+      const persistenceStarted = performance.now();
+      await saveState(state, pageId);
+      persistenceMs = Math.max(0, performance.now() - persistenceStarted);
+      assertTaskPageScope(parsed.documentId, pageId);
+    } catch (error) {
+      for (const write of pendingPluginWrites.reverse()) write.node.setPluginData(write.key, write.previous);
+      for (const ref of changedRefs) delete state.refs[ref];
+      throw error;
+    }
+    return { registeredRefs: claims.length, persistenceMs };
+  };
+
+  return Object.assign(execute, { registerRenderedGeneration });
 }
