@@ -762,6 +762,23 @@ export function isClearCreateRequest(prompt: string): boolean {
   );
 }
 
+const CANVAS_TARGET = /\b(?:screens?|pages?|views?|frames?|layers?|nodes?|components?|dashboards?|interfaces?|mockups?|wireframes?|layouts?|canvas|figma|designs?|prototypes?|buttons?|cards?|sign[- ]?up|log[- ]?in)\b|صفحه|اسکرین|فریم|لایه|داشبورد|رابط کاربری|بوم|فیگما|وایرفریم|کامپوننت|دکمه/iu;
+const ENGLISH_CANVAS_COMMAND = /(?:^|[,.!?:;]\s*)(?:(?:please|kindly)\s+|(?:can|could|would|will) you\s+|i (?:need|want) you to\s+)*(?:create|design|build|make|generate|edit|change|update|modify|fix|restyle|inspect|audit|continue|find|remove|move|resize|align|set|add)\b/iu;
+const PERSIAN_CANVAS_COMMAND = /بساز|(?:طراحی|ایجاد|ویرایش|تغییر|اصلاح|بهبود|بررسی|ادامه|پیدا|حذف|اضافه|جابه‌جا)\s*(?:کن|بده|بدید|ده)/u;
+const ADVICE_REQUEST = /\b(?:how (?:do|can|should|would) (?:i|we)|how to|what (?:is|are)|why|can you (?:teach|explain how))\b|چطور|چگونه|چیست/iu;
+
+export function isExplicitCanvasRequest(prompt: string): boolean {
+  return CANVAS_TARGET.test(prompt) && !ADVICE_REQUEST.test(prompt) &&
+    (ENGLISH_CANVAS_COMMAND.test(prompt.trim()) || PERSIAN_CANVAS_COMMAND.test(prompt));
+}
+
+export function greetingReply(prompt: string): string | undefined {
+  const greeting = prompt.trim().replace(/[\s.!؟?!،,]+$/gu, "");
+  if (/^(?:hi|hello|hey)$/iu.test(greeting)) return "Hi! How can I help?";
+  if (/^(?:سلام|درود)$/u.test(greeting)) return "سلام! چطور می‌تونم کمک کنم؟";
+  return undefined;
+}
+
 export function parseChatGenerationIntent(prompt: string): ParsedChatGenerationIntent {
   const normalized = prompt.trim().toLocaleLowerCase();
   if (!isClearCreateRequest(normalized)) return { kind: "not_a_handoff" };

@@ -1,18 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 import { ChatTaskSchema, chatTaskSafeDiagnostic, type ChatTask } from "../src/shared/chat-task";
-import { parseResponsesFunctionCalls, type ChatInputItem } from "../src/shared/chat-tools";
+import { ChatInputItemSchema, parseResponsesFunctionCalls, validateChatRequestInput, type ChatInputItem, type ChatLifecycleState } from "../src/shared/chat-tools";
 import { parseChatGenerationIntent, isClearCreateRequest } from "../src/shared/chat-generation";
 import { UniversalDesignProgramV1Schema, parseDesignProgram, type DesignProgramNode, type DesignProgramV1 } from "../src/shared/design-program";
 import { compositionVariationSeed, createDefaultVisualLanguage, type ProjectVisualLanguageV1 } from "../src/shared/design-composition";
 import { ProjectPlanDraftSchema, parseProjectPlanDraft } from "../src/shared/universal-design";
 import { compileDesignProgram } from "../src/shared/design-program-adapter";
+import { auditDesignProgramContrast, normalizeDesignProgramContrast } from "../src/shared/design-program-quality";
 import { runChatTask } from "../src/ui/chat-task";
 import { renderDesignProgramLocal } from "../src/plugin/design-program-spike";
 import { createFigmaToolExecutor } from "../src/plugin/figma-tool-executor";
+import { handleChatTaskStorage } from "../src/plugin/chat-task-storage";
 import { createMockApi } from "./figma-mock";
 import { brandAssetContentHash, BrandKitRevisionSchema, createBrandVisualAsset, pinBrandKit, type PinnedBrandKit } from "../src/shared/brand-kit";
 import { ONE_PIXEL_PNG } from "./visual-fixtures";
-import type { AuthorizedChatTurn } from "../src/ui/companion-client";
+import { CompanionClientError, type AuthorizedChatTurn } from "../src/ui/companion-client";
 import type { PluginToUIMessage } from "../src/shared/messages";
 import { selectChatExecutionRoute } from "../src/ui/universal-design-route";
 import {
@@ -336,6 +338,19 @@ function pinnedBrandFixture(): PinnedBrandKit {
   }));
 }
 
+function addContrastFailure(program: DesignProgramV1) {
+  const root = program.screens[0]!.root;
+  if (root.type !== "container") throw new Error("Expected fixture root.");
+  root.background = "#FFFFFF";
+  for (const [index, foreground] of ["#AAAAAA", "#999999"].entries()) {
+    const region = root.children[index];
+    if (region?.type !== "container" || region.children[0]?.type !== "text") throw new Error("Expected fixture text.");
+    delete region.background;
+    region.children[0].color = foreground;
+  }
+  return program;
+}
+
 function makeHarness(input: Case, options: {
   firstPlanMalformed?: boolean;
   firstProgramViewportMismatch?: boolean;
@@ -344,6 +359,7 @@ function makeHarness(input: Case, options: {
   brandKit?: PinnedBrandKit;
   planLanguage?: ProjectVisualLanguageV1;
   localComponent?: boolean;
+  lowContrast?: boolean;
   providerDelayMs?: number;
   providerDelayForScreen?: (screenId: string) => number;
   maxConcurrentModelCalls?: 1 | 2;
@@ -354,12 +370,15 @@ function makeHarness(input: Case, options: {
   const sent: PluginToUIMessage[] = [];
   const executor = createFigmaToolExecutor(mock.api, (message) => sent.push(message));
   const checkpoints: ChatTask[] = [];
+  const renderReceipts = new Map<string, string>();
   const modelInputs: ChatInputItem[][] = [];
   const lifecycles: string[] = [];
   const modelCompletionScreenIds: string[] = [];
   let providerCall = 0;
   let authChecks = 0;
-  const model = vi.fn(async (items: ChatInputItem[], lifecycle: string) => {
+  const model = vi.fn<(
+    items: ChatInputItem[], lifecycle: string, requestId?: string, signal?: AbortSignal,
+  ) => Promise<AuthorizedChatTurn>>(async (items, lifecycle) => {
     modelInputs.push(items);
     lifecycles.push(lifecycle);
     const index = ++providerCall;
@@ -389,6 +408,7 @@ function makeHarness(input: Case, options: {
         throw new Error("The compose fixture did not receive a stable screen identity.");
       modelCompletionScreenIds.push(screenId!);
       const program = programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
+      if (options.lowContrast) addContrastFailure(program);
       if (options.localComponent) {
         const fixed = { mode: "fixed" as const, value: 48 };
         const box = { width: fixed, height: fixed, interaction: "none" as const };
@@ -447,7 +467,7 @@ function makeHarness(input: Case, options: {
     signal: new AbortController().signal,
     now: () => 1_000 + providerCall * 10,
     assertAuthorized: vi.fn(async () => { authChecks++; }),
-    renderProgram: vi.fn(async (program: DesignProgramV1, requestId: string) => {
+    renderProgram: vi.fn(async (program: DesignProgramV1, requestId: string, expectedRootNodeId?: string) => {
       expect(requestId).toContain("_render_screen-");
       const latest = checkpoints.at(-1);
       expect(latest?.projectPlan).toBeDefined();
@@ -461,9 +481,15 @@ function makeHarness(input: Case, options: {
         documentId: task.documentId,
         pageId: "page:current",
         executor,
+        expectedRootNodeId,
+        lookupNode: (id) => mock.api.getNodeByIdAsync(id),
+        rootReceipt: {
+          read: () => renderReceipts.get(program.screens[0]!.id) ?? "",
+          write: (id) => renderReceipts.set(program.screens[0]!.id, id),
+        },
       });
       if (!rendered.success)
-        return { type: "design-program-render-result" as const, requestId, taskId: task.id, success: false, errorCode: rendered.code, findings: rendered.findings };
+        return { type: "design-program-render-result" as const, requestId, taskId: task.id, success: false, errorCode: rendered.code, nativeRootNodeId: rendered.nativeRootNodeId, findings: rendered.findings };
       const root = rendered.roots[0]!;
       return {
         type: "design-program-render-result" as const,
@@ -471,6 +497,7 @@ function makeHarness(input: Case, options: {
         taskId: task.id,
         success: true,
         screenId: root.screenId,
+        nativeRootNodeId: root.nodeId,
         rootRef: root.ref,
         nativeBatchId: rendered.batchId,
         adoptionOperationIds: rendered.operationIds,
@@ -514,6 +541,294 @@ function scriptedMarineCase(screenCount: number): Case {
 }
 
 describe("universal design Chat route", () => {
+  it("keeps RTL typography and repairs component text only when its surface is internal to the master", () => {
+    const input = { ...scriptedMarineCase(1), locale: "fa-IR" as const };
+    const program = programFor(input, 0);
+    const screen = program.screens[0]!;
+    const root = screen.root;
+    if (root.type !== "container") throw new Error("Expected fixture root.");
+    const region = root.children[0];
+    if (region?.type !== "container" || region.children[0]?.type !== "text") throw new Error("Expected fixture region.");
+    const label = region.children[0];
+    const fixed = { mode: "fixed" as const, value: 60 };
+    const master: Extract<DesignProgramNode, { type: "container" }> = {
+      ...region, width: fixed, height: fixed, background: "#111111", children: [{ ...label, id: "master-label", color: "#333333" }],
+    };
+    program.componentsV1 = [{ id: "status-chip", root: master }];
+    program.tokens.colors = { page: "#FFFFFF", background: "#FFFFFF", text: "#17202A", muted: "#444444", surface: "#FFFFFF", "raised-surface": "#FFFFFF" };
+    root.children.push({ type: "instance", id: "status-instance", name: "Status chip", semanticRole: "status", interaction: "none", componentId: "status-chip", width: fixed, height: fixed });
+    const normalized = normalizeDesignProgramContrast(program);
+    expect(normalized.repairs).toContainEqual(expect.objectContaining({
+      path: "componentsV1.status-chip.master-label.color", foreground: "#333333", background: "#111111", replacement: "#FFFFFF",
+    }));
+    expect(auditDesignProgramContrast(normalized.program)).toEqual([]);
+    const compiled = compileDesignProgram(normalized.program);
+    expect(compiled.success, JSON.stringify(compiled.findings)).toBe(true);
+    const repairedMaster = normalized.program.componentsV1![0]!.root;
+    if (repairedMaster.type !== "container") throw new Error("Expected fixture master.");
+    expect(repairedMaster.children[0]).toEqual({ ...master.children[0], color: "token:surface" });
+    expect(normalized.program.locale).toEqual(program.locale);
+
+    delete master.background;
+    root.background = "#333333";
+    expect(normalizeDesignProgramContrast(program).repairs).not.toContainEqual(expect.objectContaining({ path: "componentsV1.status-chip.master-label.color" }));
+    expect(auditDesignProgramContrast(program)).toContainEqual(expect.objectContaining({
+      path: "screens.screen-01.root.status-instance.master-label.color",
+      message: "#333333 over #333333 at alpha 1 measures 1.0000:1. Required at least 4.5:1.",
+    }));
+  });
+
+  it.each([1, 3, 10])("repairs two inherited-surface contrast failures before each native dispatch for %i screens", async (count) => {
+    const brandKit = pinnedBrandFixture();
+    const h = makeHarness(scriptedMarineCase(count), { lowContrast: true, brandKit });
+    await runChatTask(h.task, h.deps);
+    expect(h.lifecycles).not.toContain("UNIVERSAL_REPAIR");
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(count);
+    const programs = h.deps.renderProgram.mock.calls.map(([program]) => program);
+    for (const program of programs) {
+      expect(program.tokens.colors.text).toBe(brandKit.tokens.palette.text);
+      expect(auditDesignProgramContrast(program)).toEqual([]);
+      expect(normalizeDesignProgramContrast(program).program).toBe(program);
+      const root = program.screens[0]!.root;
+      if (root.type !== "container") throw new Error("Expected fixture root.");
+      for (const region of root.children.slice(0, 2)) {
+        if (region.type !== "container") throw new Error("Expected fixture region.");
+        expect(region.children[0]).toMatchObject({ color: "token:text" });
+        expect(region.background).toBeUndefined();
+      }
+    }
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(count);
+  });
+
+  it("repairs an exhausted saved preflight on reload before dispatch and preserves the adopted root on Resume", async () => {
+    const h = makeHarness(scriptedMarineCase(1));
+    const signal = new AbortController();
+    const originalSave = h.deps.save.getMockImplementation()!;
+    h.deps.save.mockImplementation(async (snapshot) => {
+      await originalSave(snapshot);
+      if (snapshot.universalScreens?.[0]?.status === "program_saved") signal.abort();
+    });
+    await expect(runChatTask(h.task, { ...h.deps, signal: signal.signal })).rejects.toThrow();
+    expect(h.deps.renderProgram).not.toHaveBeenCalled();
+    const saved = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    const screen = saved.universalScreens![0]!;
+    const broken = addContrastFailure(screen.program!);
+    const parsed = parseDesignProgram(broken);
+    if (!parsed.success) throw new Error("Expected valid saved program.");
+    const findings = auditDesignProgramContrast(broken);
+    expect(findings.map(({ path, message }) => [path, message])).toEqual([
+      ["screens.screen-01.root.copy-1.color", "#AAAAAA over #FFFFFF at alpha 1 measures 2.3231:1. Required at least 4.5:1."],
+      ["screens.screen-01.root.copy-2.color", "#999999 over #FFFFFF at alpha 1 measures 2.8490:1. Required at least 4.5:1."],
+    ]);
+    screen.status = "repair_pending";
+    screen.repairAttempts = 1;
+    screen.repairDispatches = 1;
+    screen.fingerprint = parsed.fingerprint;
+    screen.findings = findings.map(({ code, path, message }) => ({ code, path, message }));
+    h.deps.save.mockImplementation(originalSave);
+    h.model.mockClear();
+    await runChatTask(saved, h.deps);
+    expect(h.model).not.toHaveBeenCalled();
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(1);
+    expect(saved.universalScreens![0]!.repairAttempts).toBe(1);
+    const rootIds = h.mock.roots.map(({ id }) => id);
+    const reloaded = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    await runChatTask(reloaded, h.deps);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(1);
+    expect(h.mock.roots.map(({ id }) => id)).toEqual(rootIds);
+  });
+
+  it("reports measurable contrast failures without requesting model repair when the active palette has no compliant color", async () => {
+    const input = scriptedMarineCase(1);
+    const language = createDefaultVisualLanguage({ styleDirection: "Quiet archival", density: "medium", locale: input.locale });
+    const colorRoles = Object.fromEntries(Object.keys(language.colorRoles).map((role) => [role, "#B0B0B0"])) as ProjectVisualLanguageV1["colorRoles"];
+    const h = makeHarness(input, { lowContrast: true, planLanguage: { ...language, colorRoles } });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow(/program_contrast_unresolved.*copy-1.*#AAAAAA.*copy-2.*#999999/u);
+    expect(h.lifecycles).not.toContain("UNIVERSAL_REPAIR");
+    expect(h.deps.renderProgram).not.toHaveBeenCalled();
+    expect(h.mock.roots).toHaveLength(0);
+  });
+
+  it.each([1, 3, 10])("retains valid sibling programs after a network interruption in a %i-screen task", async (count) => {
+    const h = makeHarness(scriptedMarineCase(count), { maxConcurrentModelCalls: 2 });
+    const original = h.model.getMockImplementation()!;
+    let firstFailure = false;
+    let siblingSignal: AbortSignal | undefined;
+    let siblingStarted!: () => void;
+    let finishSibling!: () => void;
+    const siblingReady = new Promise<void>((resolve) => { siblingStarted = resolve; });
+    const siblingGate = new Promise<void>((resolve) => { finishSibling = resolve; });
+    h.model.mockImplementation(async (items, lifecycle, id, signal) => {
+      if (lifecycle === "UNIVERSAL_COMPOSING" && id?.endsWith("screen-01_c1")) {
+        if (count > 1) await siblingReady;
+        firstFailure = true;
+        throw new CompanionClientError("connection_failed");
+      }
+      if (lifecycle === "UNIVERSAL_COMPOSING" && id?.endsWith("screen-02_c1")) {
+        siblingSignal = signal;
+        siblingStarted();
+        await siblingGate;
+      }
+      return original(items, lifecycle, id, signal);
+    });
+    const running = runChatTask(h.task, h.deps);
+    const failed = expect(running).rejects.toMatchObject({ category: "connection_failed" });
+    if (count > 1) {
+      await vi.waitFor(() => expect(firstFailure).toBe(true));
+      await vi.waitFor(() => expect(h.checkpoints.at(-1)?.universalScreens?.[0]?.errorCode).toBe("connection_failed"));
+      expect(siblingSignal?.aborted).toBe(false);
+      finishSibling();
+    }
+    await failed;
+    expect(h.mock.roots).toHaveLength(0);
+    expect(h.task.status).toBe("failed");
+    const saved = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    if (count > 1) {
+      expect(saved.universalScreens?.[1]?.status).toBe("program_saved");
+      expect(saved.universalScreens?.[1]?.composeAttempts).toBe(1);
+    }
+    await runChatTask(saved, h.deps);
+    expect(saved.status).toBe("completed");
+    if (count > 1) expect(saved.universalScreens?.[1]?.composeAttempts).toBe(1);
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(count);
+  });
+
+  it.each(["hi", "hello", "سلام"])("answers %s without a model planner or native operation", async (prompt) => {
+    const h = makeHarness({ ...cases[0]!, brief: prompt });
+    await runChatTask(h.task, h.deps);
+    expect(h.task.status).toBe("completed");
+    expect(h.task.text).toBeTruthy();
+    expect(h.task.projectPlan).toBeUndefined();
+    expect(h.model).not.toHaveBeenCalled();
+    expect(h.deps.renderProgram).not.toHaveBeenCalled();
+    expect(h.deps.execute).not.toHaveBeenCalled();
+    expect(h.mock.nodes).toHaveLength(0);
+  });
+
+  it.each(["How do I design a mobile screen in Figma?", "I design screens for work."])("keeps discussion tool-free for %s", async (brief) => {
+    const h = makeHarness({ ...cases[0]!, brief });
+    h.model.mockResolvedValueOnce(modelTurn("classify_canvas_intent", { intent: "create" }, 1));
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("unexpected tool call");
+    expect(h.model.mock.calls.map(([, state]) => state)).toEqual(["CONVERSATION"]);
+    expect(h.deps.execute).not.toHaveBeenCalled();
+    expect(h.deps.renderProgram).not.toHaveBeenCalled();
+    expect(h.mock.nodes).toHaveLength(0);
+  });
+
+  it("blocks an old misrouted greeting without rewriting its checkpoint", async () => {
+    const h = makeHarness({ ...cases[0]!, brief: "hello" });
+    h.task.intent = "create";
+    h.task.lifecycle = "UNIVERSAL_PLANNING";
+    const previous = structuredClone(h.task);
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("does not authorize Canvas work");
+    expect(h.task).toEqual(previous);
+    expect(h.deps.save).not.toHaveBeenCalled();
+    expect(h.model).not.toHaveBeenCalled();
+    expect(h.mock.nodes).toHaveLength(0);
+  });
+
+  it("retains the attached native frame on pre-adoption geometry failure and reuses it after reload", async () => {
+    const input = { ...cases[2]!, screens: cases[2]!.screens.slice(0, 1), brief: "Design one desktop screen for an analytics workspace." };
+    const h = makeHarness(input);
+    let badBounds = true;
+    const createText = h.mock.api.createText.bind(h.mock.api);
+    h.mock.api.createText = () => {
+      const text = createText();
+      Object.defineProperty(text, "absoluteRenderBounds", { configurable: true, get: () => badBounds
+        ? { x: -10_000, y: -10_000, width: 100, height: 100 } : text.absoluteBoundingBox });
+      return text;
+    };
+    const unrelated = h.mock.api.createFrame();
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("native_geometry_failed");
+    const root = h.mock.roots.find((node) => node.getPluginData("fad.design.program-built.v1") === "1")!;
+    expect(root).toBeDefined();
+    expect(root.parent?.id).toBe(h.mock.page.id);
+    expect(root.removed).toBe(false);
+    expect(h.task.universalScreens?.[0]?.nativeRootNodeId).toBe(root.id);
+    expect(h.mock.roots.map(({ id }) => id)).toContain(unrelated.id);
+    const position = [root.x, root.y];
+    badBounds = false;
+    const saved = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    await runChatTask(saved, h.deps);
+    expect(saved.status).toBe("completed");
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete").map(({ id }) => id)).toEqual([root.id]);
+    expect([root.x, root.y]).toEqual(position);
+  });
+
+  it("uses the creation receipt after a lost acknowledgement and refuses to replace a missing root", async () => {
+    const input = { ...cases[2]!, screens: cases[2]!.screens.slice(0, 1), brief: "Design one desktop screen for analytics." };
+    const h = makeHarness(input);
+    const render = h.deps.renderProgram.getMockImplementation()!;
+    h.deps.renderProgram.mockImplementationOnce(async (program, id) => {
+      await render(program, id);
+      throw new Error("Lost render acknowledgement");
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("Lost render acknowledgement");
+    const root = h.mock.roots.find((node) => node.getPluginData("fad.generation.commit") === "complete")!;
+    expect(root).toBeDefined();
+    const saved = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    expect(saved.universalScreens?.[0]?.nativeRootNodeId).toBeUndefined();
+    root.remove();
+    await expect(runChatTask(saved, h.deps)).rejects.toThrow("native_root_missing");
+    expect(h.mock.roots).toHaveLength(0);
+    expect(h.deps.renderProgram.mock.calls[1]?.[1]).not.toBe(h.deps.renderProgram.mock.calls[0]?.[1]);
+  });
+
+  it("keeps the native root when cancellation arrives after rendering and reconciles it on resume", async () => {
+    const input = { ...cases[2]!, screens: cases[2]!.screens.slice(0, 1), brief: "Design one desktop screen for analytics." };
+    const h = makeHarness(input);
+    const cancel = new AbortController();
+    const render = h.deps.renderProgram.getMockImplementation()!;
+    h.deps.signal = cancel.signal;
+    h.deps.renderProgram.mockImplementationOnce(async (program, id) => {
+      const response = await render(program, id);
+      cancel.abort();
+      return response;
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("request_cancelled");
+    const root = h.mock.roots.find((node) => node.getPluginData("fad.generation.commit") === "complete")!;
+    expect(root.removed).toBe(false);
+    const saved = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    expect(saved.universalScreens?.[0]?.status).toBe("rendering");
+    await runChatTask(saved, { ...h.deps, signal: new AbortController().signal });
+    expect(saved.status).toBe("completed");
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete").map(({ id }) => id)).toEqual([root.id]);
+  });
+
+  it("accepts the actual long ten-screen planning request and resumes its saved task after interruption", async () => {
+    const input = scriptedMarineCase(10);
+    input.brief += " " + "Show illustrative records and preserve data provenance. ".repeat(80);
+    const h = makeHarness(input, { firstPlanMalformed: true, maxConcurrentModelCalls: 1 });
+    const model = h.model.getMockImplementation()!;
+    const render = h.deps.renderProgram.getMockImplementation()!;
+    let longPlanRequests = 0;
+    h.model.mockImplementation(async (items, state) => {
+      if (state === "UNIVERSAL_PLANNING") {
+        expect(items.at(-1)).toMatchObject({ role: "user", content: expect.stringMatching(/^UNIVERSAL_DESIGN_PLAN_V1\n/u) });
+        expect(ChatInputItemSchema.safeParse(items.at(-1)).success).toBe(false);
+        longPlanRequests++;
+      }
+      expect(validateChatRequestInput(JSON.parse(JSON.stringify(items)), state as ChatLifecycleState))
+        .toEqual({ success: true, data: items });
+      return model(items, state);
+    });
+    h.deps.renderProgram.mockImplementationOnce(async (program, id) => {
+      await render(program, id);
+      throw new Error("Interrupted after native commit");
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("Interrupted after native commit");
+    const persisted = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    expect(persisted.projectPlan?.screenCount).toBe(10);
+    const firstRoot = h.mock.roots.find((node) => node.getPluginData("fad.generation.commit") === "complete");
+    expect(firstRoot).toBeDefined();
+    await runChatTask(persisted, h.deps);
+    expect(longPlanRequests).toBe(2);
+    expect(persisted.status).toBe("completed");
+    const roots = h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete");
+    expect(roots).toHaveLength(10);
+    expect(roots.map(({ id }) => id)).toContain(firstRoot!.id);
+  });
+
   it("restarts a lost Companion planning turn from the persisted attempt without writing a native node", async () => {
     const h = makeHarness(cases[0]!);
     const original = h.model.getMockImplementation()!;
@@ -574,7 +889,7 @@ describe("universal design Chat route", () => {
     });
     const running = runChatTask(h.task, h.deps);
     await bothStarted;
-    controller.abort();
+    controller.abort("user_stop");
     await expect(running).rejects.toThrow("request_cancelled");
     expect(h.deps.renderProgram).not.toHaveBeenCalled();
     expect(h.mock.roots).toHaveLength(0);
@@ -634,9 +949,15 @@ describe("universal design Chat route", () => {
 
   it("keeps native placement order when the first screen finishes fastest", async () => {
     const input = scriptedMarineCase(3);
-    const h = makeHarness(input, {
-      providerDelayForScreen: (screenId) => screenId === "screen-02" ? 45 : screenId === "screen-03" ? 5 : 1,
-      maxConcurrentModelCalls: 2,
+    const h = makeHarness(input, { maxConcurrentModelCalls: 2 });
+    const model = h.model.getMockImplementation()!;
+    let releaseSecond!: () => void;
+    const thirdCompleted = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    h.model.mockImplementation(async (items, lifecycle, requestId, signal) => {
+      if (requestId?.endsWith("screen-02_c1")) await thirdCompleted;
+      const result = await model(items, lifecycle, requestId, signal);
+      if (requestId?.endsWith("screen-03_c1")) releaseSecond();
+      return result;
     });
     await runChatTask(h.task, h.deps);
     expect(h.modelCompletionScreenIds.indexOf("screen-01")).toBeLessThan(h.modelCompletionScreenIds.indexOf("screen-02"));
@@ -1095,22 +1416,38 @@ describe("universal design Chat route", () => {
     const h = makeHarness(input);
     const actualRender = h.deps.renderProgram.getMockImplementation();
     expect(actualRender).toBeDefined();
+    const rememberSnapshot = h.deps.save.getMockImplementation()!;
+    const chatId = "chat-ambiguous-render";
+    let saveSequence = 0;
+    h.deps.save.mockImplementation(async (snapshot) => {
+      const saved = await handleChatTaskStorage(h.mock.api, {
+        type: "chat-task-save", requestId: `ambiguous-render-save-${++saveSequence}`,
+        documentId: snapshot.documentId, chatId, task: snapshot,
+      });
+      expect(saved).toMatchObject({ success: true, revision: expect.any(Object) });
+      await rememberSnapshot(snapshot);
+    });
     h.deps.renderProgram.mockImplementationOnce(async (program, requestId) => {
       await actualRender!(program, requestId);
       throw new Error("Simulated lost native render acknowledgement");
     });
     await expect(runChatTask(h.task, h.deps)).rejects.toThrow("lost native render acknowledgement");
-    const persisted = ChatTaskSchema.parse(structuredClone(h.task));
+    const loaded = await handleChatTaskStorage(h.mock.api, {
+      type: "chat-task-load", requestId: "ambiguous-render-reload", documentId: h.task.documentId, chatId,
+    });
+    const persisted = ChatTaskSchema.parse(loaded.task);
+    expect(persisted.id).toBe(h.task.id);
     expect(persisted.projectPlan).toBeDefined();
     expect(persisted.universalScreens?.[0]).toMatchObject({ status: "rendering", program: expect.any(Object) });
     const rootsBefore = h.mock.nodes.filter((node) => node.parent?.type === "PAGE" && node.getPluginData("fad.generation.commit") === "complete");
     expect(rootsBefore).toHaveLength(1);
     const providerCallsBeforeResume = h.model.mock.calls.length;
-    await runChatTask(h.task, h.deps);
+    await runChatTask(persisted, h.deps);
     const rootsAfterResume = h.mock.nodes.filter((node) => node.parent?.type === "PAGE" && node.getPluginData("fad.generation.commit") === "complete");
     expect(rootsAfterResume).toHaveLength(1);
     expect(h.model.mock.calls).toHaveLength(providerCallsBeforeResume);
-    expect(h.task.status).toBe("completed");
+    expect(rootsAfterResume[0]?.id).toBe(rootsBefore[0]?.id);
+    expect(persisted.status).toBe("completed");
   });
 
   it("shares the strict DesignProgramV1 boundary and refuses unverified references and remote assets", () => {

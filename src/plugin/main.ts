@@ -17,6 +17,7 @@ import { renderDesignProgramLocal } from "./design-program-spike";
 import { handleChatTaskStorage } from "./chat-task-storage";
 import { CHAT_TASK_MAX_BYTES } from "../shared/chat-task";
 import { utf8Bytes } from "../shared/generation-limits";
+import { traceCheckpoint } from "../shared/chat-checkpoint-wire";
 import { handleChatHistoryStorage } from "./chat-history-storage";
 import { handleModelPreferenceStorage } from "./model-preference-storage";
 import { handleDesignEnginePreferenceStorage } from "./design-engine-preference-storage";
@@ -123,45 +124,44 @@ async function fontWarnings(input: DesignSpec | MultiScreenSpec): Promise<string
 }
 
 figma.ui.onmessage = async (rawMessage: unknown) => {
-  if (rawMessage && typeof rawMessage === "object" && "type" in rawMessage && rawMessage.type === "chat-task-save") {
-    const save = rawMessage as { requestId?: unknown; documentId?: unknown; task?: unknown };
-    try {
-      const serializedTask = JSON.stringify(save.task);
-      const payloadBytes = serializedTask === undefined ? 0 : utf8Bytes(serializedTask);
-      if (
-        payloadBytes > CHAT_TASK_MAX_BYTES &&
-        typeof save.requestId === "string" && save.requestId.length > 0 && save.requestId.length <= 100 &&
-        typeof save.documentId === "string" && save.documentId.length > 0 && save.documentId.length <= 300
-      ) {
-        send({
-          type: "chat-task-result",
-          requestId: save.requestId,
-          success: false,
-          documentId: save.documentId,
-          errorCategory: "checkpoint_storage",
-          errorCode: "checkpoint_size_limit",
-          error: "Task checkpoint exceeds its 512 KiB safety budget. Existing canvas changes are retained.",
+  if (rawMessage && typeof rawMessage === "object" && "type" in rawMessage &&
+      (rawMessage.type === "chat-task-save" || rawMessage.type === "chat-task-load")) {
+    const request = rawMessage as { requestId?: unknown; documentId?: unknown; task?: unknown };
+    const requestId = typeof request.requestId === "string" && request.requestId.length <= 100
+      ? request.requestId : "";
+    const documentId = typeof request.documentId === "string" && request.documentId.length <= 300
+      ? request.documentId : "";
+    const postResult = (result: Extract<PluginToUIMessage, { type: "chat-task-result" }>) => {
+      try {
+        send(result);
+        traceCheckpoint("controller", "ack_posted", requestId, {
+          success: result.success, code: result.errorCode, ...result.revision,
         });
+      } catch {
+        traceCheckpoint("controller", "ack_post_failed", requestId);
+      }
+    };
+    const rejectCheckpoint = (errorCode: string, error: string) => postResult({
+      type: "chat-task-result", requestId, documentId, success: false,
+      errorCategory: "checkpoint_storage", errorCode, error,
+    });
+    traceCheckpoint("controller", "received", requestId, { operation: rawMessage.type });
+    try {
+      const raw = rawMessage.type === "chat-task-save" ? JSON.stringify(request.task) : undefined;
+      if (raw !== undefined && utf8Bytes(raw) > CHAT_TASK_MAX_BYTES) {
+        rejectCheckpoint("checkpoint_size_limit", "Task checkpoint exceeds its 512 KiB safety budget. Existing canvas changes are retained.");
         return;
       }
       const checkpoint = ChatTaskStorageMessageSchema.safeParse(rawMessage);
-      if (checkpoint.success) {
-        const normalizedTask = checkpoint.data.type === "chat-task-save" ? JSON.stringify(checkpoint.data.task) : undefined;
-        send(await handleChatTaskStorage(figma, checkpoint.data, {
-          prevalidated: true,
-          payloadBytes: normalizedTask === undefined ? payloadBytes : utf8Bytes(normalizedTask),
-        }));
+      if (!checkpoint.success) {
+        rejectCheckpoint("checkpoint_protocol_error", "Figma received an invalid checkpoint message. Reload the development plugin before retrying.");
         return;
       }
+      postResult(await handleChatTaskStorage(figma, checkpoint.data, { prevalidated: true }));
     } catch {
-      // The shared protocol parser below reports malformed or non-serializable requests.
+      rejectCheckpoint("checkpoint_controller_failed", "Figma could not process the checkpoint request.");
     }
-  } else {
-    const checkpoint = ChatTaskStorageMessageSchema.safeParse(rawMessage);
-    if (checkpoint.success) {
-      send(await handleChatTaskStorage(figma, checkpoint.data, { prevalidated: true }));
-      return;
-    }
+    return;
   }
   const message = UIToPluginSchema.safeParse(rawMessage);
   if (!message.success) {
@@ -194,7 +194,9 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
   }
   if (message.data.type === "design-program-render") {
     const request = message.data;
-    const pageId = figma.currentPage.id;
+    const page = figma.currentPage;
+    const pageId = page.id;
+    const receiptKey = `fad.program-root.v1:${request.taskId}:${request.program.screens[0]?.id}`;
     const activeDocumentId = () => {
       const localId = figma.root.getPluginData("fad.document-id");
       const fileId = figma.fileKey ?? localId;
@@ -221,6 +223,13 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         executor: figmaToolExecutor,
         assets,
         assertCurrentScope,
+        requestId: request.requestId,
+        expectedRootNodeId: request.expectedRootNodeId,
+        rootReceipt: {
+          read: () => page.getPluginData(receiptKey),
+          write: (nodeId) => page.setPluginData(receiptKey, nodeId),
+        },
+        lookupNode: (nodeId) => figma.getNodeByIdAsync(nodeId),
       });
       if (!result.success) {
         send({
@@ -229,6 +238,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
           taskId: request.taskId,
           success: false,
           errorCode: result.code,
+          ...(result.nativeRootNodeId ? { nativeRootNodeId: result.nativeRootNodeId } : {}),
           findings: result.findings.slice(0, 20),
         });
         return;
@@ -241,6 +251,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         taskId: request.taskId,
         success: true,
         screenId: root.screenId,
+        nativeRootNodeId: root.nodeId,
         rootRef: root.ref,
         nativeBatchId: result.batchId,
         adoptionOperationIds: result.operationIds,

@@ -38,7 +38,7 @@ export function taskNativeBridge(message: Request): Promise<Response> {
     };
     const timer = window.setTimeout(() => {
       finish();
-      reject(new Error("Figma did not respond to the task-layer request. Refresh and try again."));
+      reject(Object.assign(new Error("Figma did not respond to the task-layer request. Resume to retry native readback."), { code: "native_readback_timeout" }));
     }, 15_000);
     window.addEventListener("message", receive);
     parent.postMessage({ pluginMessage: message }, "*");

@@ -4866,7 +4866,7 @@ describe("document-scoped canvas task checkpoints", () => {
       chatId: original.chatId,
     });
     expect(writes).toEqual([first.text]);
-    expect(recoveryRead.task).toBeNull();
+    expect(recoveryRead).toMatchObject({ success: false, errorCode: "checkpoint_queue_full" });
     releaseFirst();
     await expect(Promise.all([firstSave, secondSave])).resolves.toMatchObject([
       { success: true },
@@ -4901,6 +4901,7 @@ describe("document-scoped canvas task checkpoints", () => {
       schemaCorrections: 0,
     }));
     const checkpoint = ChatTaskSchema.parse(savedTask);
+    checkpoint.targetName = undefined;
     expect(new TextEncoder().encode(JSON.stringify(checkpoint)).byteLength).toBeGreaterThan(200_000);
     const data = new Map<string, unknown>();
     const api = {
@@ -4958,7 +4959,7 @@ describe("document-scoped canvas task checkpoints", () => {
         chatId: checkpoint.chatId,
         documentId: checkpoint.documentId,
       });
-      expect(recovered.task).toEqual(checkpoint);
+      expect(recovered.task).toEqual(JSON.parse(JSON.stringify(checkpoint)));
       expect(recovered.task?.id).toBe(checkpoint.id);
       expect(recovered.task?.universalScreens?.map(({ screenId }) => screenId)).toEqual(
         checkpoint.universalScreens?.map(({ screenId }) => screenId),
@@ -4969,16 +4970,22 @@ describe("document-scoped canvas task checkpoints", () => {
     }
   });
 
-  it("stops before native dispatch when an interrupted storage write cannot be confirmed within the bounded recovery window", async () => {
+  it.each([
+    [false, "checkpoint_write_unconfirmed"],
+    [true, "checkpoint_storage_quota"],
+  ] as const)("fails closed when storage is interrupted (late quota rejection: %s)", async (rejectLate, code) => {
     vi.useFakeTimers();
-    const savedTask = ChatTaskSchema.parse({ ...task(), documentId: "file-interrupted-page_1", chatId: "chat-interrupt-0001" });
+    const fileKey = rejectLate ? "file-late-quota" : "file-interrupted";
+    const savedTask = ChatTaskSchema.parse({ ...task(), documentId: `${fileKey}-page_1`, chatId: "chat-interrupt-0001" });
     const api = {
-      fileKey: "file-interrupted",
+      fileKey,
       currentPage: { id: "page:1" },
       root: { getPluginData: () => "local", setPluginData: () => {} },
       clientStorage: {
         getAsync: async () => undefined,
-        setAsync: async () => new Promise<void>(() => undefined),
+        setAsync: async () => new Promise<void>((_resolve, reject) => {
+          if (rejectLate) setTimeout(() => reject(new Error("Quota exceeded")), 12_000);
+        }),
         deleteAsync: async () => undefined,
       },
     } as unknown as PluginAPI;
@@ -4997,7 +5004,7 @@ describe("document-scoped canvas task checkpoints", () => {
     const parentPostMessage = vi.fn(({ pluginMessage }: { pluginMessage: unknown }) => {
       const message = pluginMessage as Extract<UIToPluginMessage, { type: "chat-task-load" | "chat-task-save" }>;
       void handleChatTaskStorage(api, message).then((response) => {
-        if (message.type === "chat-task-load") dispatch(response);
+        dispatch(response);
       });
     });
     vi.stubGlobal("window", fakeWindow);
@@ -5010,7 +5017,7 @@ describe("document-scoped canvas task checkpoints", () => {
         chatId: savedTask.chatId,
         task: savedTask,
       });
-      const assertion = expect(pendingSave).rejects.toMatchObject({ code: "checkpoint_timeout" });
+      const assertion = expect(pendingSave).rejects.toMatchObject({ code });
       await vi.advanceTimersByTimeAsync(15_000);
       await assertion;
       expect(parentPostMessage.mock.calls.length).toBeGreaterThan(2);

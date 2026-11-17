@@ -1142,7 +1142,7 @@ describe("Figma UI companion client", () => {
     );
     await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
     await new Promise((resolve) => setTimeout(resolve, 0));
-    controller.abort();
+    controller.abort("user_stop");
 
     await expect(pending).rejects.toMatchObject({
       category: "request_cancelled",
@@ -1150,6 +1150,7 @@ describe("Figma UI companion client", () => {
         requestId,
         requestPhase: "companion_sse",
         terminationReason: "user_cancelled",
+        cancellationOrigin: "user_stop",
         outcome: "cancelled",
       },
     });

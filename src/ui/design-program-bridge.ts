@@ -33,7 +33,7 @@ export function renderDesignProgramBridge(
     };
     const timer = window.setTimeout(() => {
       finish();
-      reject(new Error("Figma did not confirm the saved screen render. Resume will replay the same program identity."));
+      reject(Object.assign(new Error("Figma did not acknowledge the render in time. Resume will reconcile the saved native screen identity."), { code: "native_render_ack_timeout" }));
     }, 60_000);
     window.addEventListener("message", receive);
     parent.postMessage({ pluginMessage: request }, "*");

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { CHAT_ABORT_ORIGINS } from "./chat-cancellation.js";
 import { DESIGN_PROGRAM_VERSION, DesignProgramV1Schema } from "./design-program.js";
 import { createDefaultVisualLanguage, ProjectVisualLanguageV1Schema } from "./design-composition.js";
 
@@ -271,6 +272,7 @@ export const UniversalDesignTraceEventSchema = z.object({
   qaFindingCodes: z.array(z.string().regex(/^[a-z0-9_-]{1,80}$/u)).max(8).optional(),
   qaCoverage: z.enum(["complete", "incomplete"]).optional(),
   code: z.string().regex(/^[A-Za-z0-9_.:-]{1,100}$/u).optional(),
+  cancellationOrigin: z.enum(CHAT_ABORT_ORIGINS).optional(),
 }).strict();
 export type UniversalDesignTraceEvent = z.infer<typeof UniversalDesignTraceEventSchema>;
 
@@ -383,6 +385,7 @@ export const UniversalScreenCheckpointSchema = z
     program: DesignProgramV1Schema.optional(),
     fingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u).optional(),
     rootRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u).optional(),
+    nativeRootNodeId: z.string().min(1).max(100).optional(),
     nativeBatchId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
     adoptionOperationIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u)).max(200).optional(),
     nativeNodeCount: z.number().int().min(0).max(300).optional(),

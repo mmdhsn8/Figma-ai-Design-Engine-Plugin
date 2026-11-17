@@ -1,3 +1,4 @@
+import { CHAT_ABORT_ORIGINS, chatAbortOrigin } from "../shared/chat-cancellation";
 import { ChatTurnTimingSchema } from "../shared/chat-tools";
 import { z } from "zod";
 import { COMPANION_BASE_URL } from "../companion/config";
@@ -88,6 +89,7 @@ export const InferenceDiagnosticSchema = z
     requestPhase: z
       .enum(["upstream_headers", "upstream_stream", "companion_http", "companion_sse"])
       .optional(),
+    cancellationOrigin: z.enum(CHAT_ABORT_ORIGINS).optional(),
     terminationReason: z
       .enum([
         "upstream_inactivity",
@@ -96,6 +98,8 @@ export const InferenceDiagnosticSchema = z
         "local_network_interruption",
         "upstream_transport_interruption",
         "user_cancelled",
+        "caller_cancelled",
+        "session_changed",
         "http_failure",
         "stream_eof",
         "response_completed",
@@ -230,6 +234,7 @@ export type CompanionErrorCategory =
   | "session_expired"
   | "request_timed_out"
   | "request_cancelled"
+  | "stale_task_session"
   | "service_unavailable"
   | "connection_failed"
   | "model_not_verified_for_account"
@@ -608,8 +613,9 @@ export async function streamAuthorizedChat(
         requestStartedAtMs,
         startedAt,
         "companion_http",
-        cancelled ? "user_cancelled" : "local_network_interruption",
+        cancelled ? "caller_cancelled" : "local_network_interruption",
         cancelled ? "cancelled" : "transport_error",
+        signal,
       ),
     );
   }
@@ -812,11 +818,13 @@ async function readAuthorizedChatStream(
             requestStartedAtMs,
             startedAt,
             "companion_sse",
-            "user_cancelled",
+            "caller_cancelled",
             "cancelled",
+            signal,
           ),
         );
       const { done, value } = await reader.read();
+      if (signal?.aborted) break;
       if (done) break;
       bytes += value.byteLength;
       if (bytes > 1024 * 1024) throw new CompanionClientError("response_too_large");
@@ -830,11 +838,6 @@ async function readAuthorizedChatStream(
         if (terminal) return terminal;
       }
     }
-    buffer += decoder.decode();
-    if (buffer.trim()) {
-      const terminal = processFrame(buffer);
-      if (terminal) return terminal;
-    }
     if (signal?.aborted)
       throw new CompanionClientError(
         "request_cancelled",
@@ -844,10 +847,16 @@ async function readAuthorizedChatStream(
           requestStartedAtMs,
           startedAt,
           "companion_sse",
-          "user_cancelled",
+          "caller_cancelled",
           "cancelled",
+          signal,
         ),
       );
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const terminal = processFrame(buffer);
+      if (terminal) return terminal;
+    }
     throw new CompanionClientError(
       "response_incomplete",
       chatTransportDiagnostic(
@@ -872,8 +881,9 @@ async function readAuthorizedChatStream(
         requestStartedAtMs,
         startedAt,
         "companion_sse",
-        cancelled ? "user_cancelled" : "local_network_interruption",
+        cancelled ? "caller_cancelled" : "local_network_interruption",
         cancelled ? "cancelled" : "transport_error",
+        signal,
       ),
     );
   } finally {
@@ -901,15 +911,17 @@ function chatTransportDiagnostic(
   requestStartedAtMs: number,
   startedAt: number,
   requestPhase: "companion_http" | "companion_sse",
-  terminationReason: "local_network_interruption" | "user_cancelled" | "stream_eof",
+  terminationReason: "local_network_interruption" | "caller_cancelled" | "stream_eof",
   outcome: "transport_error" | "cancelled" | "stream_ended_without_terminal",
+  signal?: AbortSignal,
 ): InferenceDiagnostic {
   return InferenceDiagnosticSchema.parse({
     model: /^[A-Za-z0-9._:/-]{1,200}$/u.test(model) ? model : "unavailable",
     requestId,
     requestStartedAtMs,
     requestPhase,
-    terminationReason,
+    terminationReason: signal?.reason === "user_stop" ? "user_cancelled" : terminationReason,
+    ...(signal?.aborted ? { cancellationOrigin: chatAbortOrigin(signal) } : {}),
     stage: requestPhase === "companion_http" ? "http" : "stream",
     outcome,
     elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
@@ -1097,6 +1109,7 @@ function mapError(value: string): CompanionErrorCategory {
     "session_expired",
     "request_timed_out",
     "request_cancelled",
+    "stale_task_session",
     "service_unavailable",
     "connection_failed",
     "model_not_verified_for_account",

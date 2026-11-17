@@ -24,12 +24,18 @@ import { DesignProgramV1Schema } from "./design-program";
 import { DesignEngineSchema } from "./design-engine-preference";
 import { NATIVE_GEOMETRY_VERSION } from "./native-geometry";
 
+const CheckpointRevisionSchema = z.object({
+  hash: z.string().regex(/^[a-f0-9]{16}$/u),
+  bytes: z.number().int().nonnegative(),
+}).strict();
+
 const ChatTaskLoadMessageSchema = z
   .object({
     type: z.literal("chat-task-load"),
     requestId: z.string().min(1).max(100),
     chatId: ChatHistoryChatIdSchema.optional(),
     documentId: z.string().min(1).max(300).optional(),
+    confirm: CheckpointRevisionSchema.optional(),
   })
   .strict();
 const ChatTaskSaveMessageSchema = z
@@ -39,6 +45,7 @@ const ChatTaskSaveMessageSchema = z
     documentId: z.string().min(1).max(300),
     chatId: ChatHistoryChatIdSchema.optional(),
     task: ChatTaskSchema.nullable(),
+    revision: CheckpointRevisionSchema.optional(),
   })
   .strict();
 export const ChatTaskStorageMessageSchema = z.discriminatedUnion("type", [
@@ -230,6 +237,7 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
       documentId: z.string().min(1).max(300),
       brandKit: PinnedBrandKitSchema.optional(),
+      expectedRootNodeId: z.string().min(1).max(100).optional(),
       program: DesignProgramV1Schema,
     })
     .strict()
@@ -247,6 +255,7 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       geometry: z.object({
         programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u),
         requireReceipt: z.boolean(),
+        expectedRootNodeId: z.string().min(1).max(100).optional(),
       }).strict().optional(),
     })
     .strict(),
@@ -436,6 +445,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       success: z.boolean(),
       documentId: z.string().max(300),
       task: ChatTaskSchema.nullable().optional(),
+      revision: CheckpointRevisionSchema.optional(),
       errorCategory: z.enum(["checkpoint_storage"]).optional(),
       errorCode: z
         .string()
@@ -452,6 +462,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       success: z.boolean(),
       screenId: z.string().regex(/^screen-(?:0[1-9]|10)$/u).optional(),
       rootRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u).optional(),
+      nativeRootNodeId: z.string().min(1).max(100).optional(),
       nativeBatchId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
       adoptionOperationIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u)).max(200).optional(),
       programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u).optional(),
@@ -477,6 +488,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
       nodes: z.array(TaskNativeNodeSchema).max(500).optional(),
       geometry: NativeGeometryReportSchema.optional(),
+      expectedRootStatus: z.enum(["present", "unexpected_parent", "missing", "removed"]).optional(),
       unresolvedRefs: z.array(TaskNativeUnresolvedRefSchema).max(500).optional(),
       truncated: z.boolean().optional(),
       toolStateDiagnostic: FigmaToolStateDiagnosticSchema.optional(),

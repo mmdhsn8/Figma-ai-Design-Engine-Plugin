@@ -1,3 +1,4 @@
+import { CHAT_ABORT_ORIGINS } from "./chat-cancellation";
 import { z } from "zod";
 import { ModelIdSchema } from "./model-preference";
 import { PinnedBrandKitSchema } from "./brand-kit";
@@ -109,6 +110,16 @@ const SAFE_FAILURE_CODES = new Set([
   "checkpoint_load_failed",
   "checkpoint_save_failed",
   "checkpoint_timeout",
+  "checkpoint_load_timeout",
+  "checkpoint_write_unconfirmed",
+  "checkpoint_read_unconfirmed",
+  "checkpoint_storage_quota",
+  "checkpoint_protocol_error",
+  "checkpoint_transport_failed",
+  "checkpoint_controller_failed",
+  "checkpoint_revision_mismatch",
+  "checkpoint_scope_mismatch",
+  "checkpoint_queue_full",
   "inspection_failed",
   "inspection_blocked",
   "missing_or_uninspected",
@@ -247,6 +258,7 @@ export const ChatRequestDiagnosticSchema = z
     timeoutSource: z
       .enum(["upstream_headers", "upstream_inactivity", "overall_deadline"])
       .optional(),
+    cancellationOrigin: z.enum(CHAT_ABORT_ORIGINS).optional(),
     terminationReason: z
       .enum([
         "upstream_inactivity",
@@ -255,6 +267,8 @@ export const ChatRequestDiagnosticSchema = z
         "local_network_interruption",
         "upstream_transport_interruption",
         "user_cancelled",
+        "caller_cancelled",
+        "session_changed",
         "http_failure",
         "stream_eof",
         "response_completed",
@@ -711,6 +725,7 @@ export const ChatTaskSchema = z
         ]),
         code: z.string().max(80),
         phase: ChatTaskFailurePhaseSchema.optional(),
+        cancellationOrigin: z.enum(CHAT_ABORT_ORIGINS).optional(),
         cancellationSource: z
           .enum(["ui_abort", "native_batch_cancelled", "unspecified"])
           .optional(),

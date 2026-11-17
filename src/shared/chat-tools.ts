@@ -8,6 +8,7 @@ import { DESIGN_PATTERN_IDS } from "./design-patterns.js";
 import { DesignProgramV1Schema, UniversalDesignProgramV1Schema } from "./design-program.js";
 import { ProjectPlanDraftSchema } from "./universal-design.js";
 import { ProjectVisualLanguageV1Schema } from "./design-composition.js";
+import { utf8Bytes } from "./generation-limits.js";
 
 export const CHAT_TOOL_NAMES = [
   "classify_canvas_intent",
@@ -42,6 +43,7 @@ export const CHAT_LIFECYCLE_STATES = [
   "UNIVERSAL_COMPOSING",
   "UNIVERSAL_REPAIR",
   "UNIVERSAL_CLASSIFY",
+  "CONVERSATION",
 ] as const;
 export const ChatLifecycleStateSchema = z.enum(CHAT_LIFECYCLE_STATES);
 export type ChatLifecycleState = z.infer<typeof ChatLifecycleStateSchema>;
@@ -357,6 +359,72 @@ export const ChatFunctionCallSchema = z
   });
 
 export type ChatInputItem = z.infer<typeof ChatInputItemSchema>;
+
+export const MAX_CHAT_PROVIDER_INPUT_BYTES = 56 * 1024;
+export const UNIVERSAL_CONTEXT_PREFIX = {
+  plan: "UNIVERSAL_DESIGN_PLAN_V1\n",
+  compose: "UNIVERSAL_DESIGN_COMPOSE_V1\n",
+  repair: "UNIVERSAL_DESIGN_REPAIR_V1\n",
+} as const;
+
+const universalContextByLifecycle: Partial<Record<ChatLifecycleState, string>> = {
+  UNIVERSAL_PLANNING: UNIVERSAL_CONTEXT_PREFIX.plan,
+  UNIVERSAL_COMPOSING: UNIVERSAL_CONTEXT_PREFIX.compose,
+  UNIVERSAL_REPAIR: UNIVERSAL_CONTEXT_PREFIX.repair,
+};
+const UniversalContextItemSchema = z.object({
+  role: z.literal("user"),
+  content: z.string().max(MAX_CHAT_PROVIDER_INPUT_BYTES),
+}).strict();
+
+function invalidChatRecord(record: Record<string, unknown> | undefined, generated: boolean): string {
+  if (record?.type === "function_call" || record?.type === "function_call_output") {
+    if (!CallIdSchema.safeParse(record.call_id).success) return "invalid tool call ID";
+    if (record.type === "function_call") {
+      if (!ChatToolNameSchema.safeParse(record.name).success) return "unsupported tool name";
+      if (typeof record.arguments !== "string") return "tool arguments must be a JSON string";
+      if (record.arguments.length > 24_000) return "tool arguments exceed 24,000 characters";
+    } else {
+      if (typeof record.output !== "string") return "tool result output must be a string";
+      if (record.output.length > 8_000) return "tool result output exceeds 8,000 characters";
+    }
+    return "unsupported fields on a tool record";
+  }
+  if (record?.role === "user" || record?.role === "assistant") {
+    if (typeof record.content !== "string") return "message content must be text";
+    if (generated && record.content.length > MAX_CHAT_PROVIDER_INPUT_BYTES)
+      return "generated Universal context exceeds its size limit";
+    if (!generated && record.content.length > 8_000) return "chat message exceeds 8,000 characters";
+    return "unsupported fields on a chat message";
+  }
+  return "expected a user message, assistant message, function_call, or function_call_output";
+}
+
+// The provider request includes generated context in addition to persisted history.
+// Only the lifecycle's generated context uses the larger wire budget.
+export function validateChatRequestInput(input: unknown[], lifecycle: ChatLifecycleState):
+  { success: true; data: ChatInputItem[] } | { success: false; issues: string[] } {
+  const prefix = universalContextByLifecycle[lifecycle];
+  const data: ChatInputItem[] = [];
+  const issues: string[] = [];
+  for (const [index, item] of input.entries()) {
+    const record = isRecord(item) ? item : undefined;
+    const generated = prefix !== undefined && record?.role === "user" &&
+      typeof record.content === "string" && record.content.startsWith(prefix);
+    const parsed = generated
+      ? UniversalContextItemSchema.safeParse(item)
+      : ChatInputItemSchema.safeParse(item);
+    if (parsed.success) {
+      if (generated && "content" in parsed.data && utf8Bytes(parsed.data.content) > MAX_CHAT_PROVIDER_INPUT_BYTES)
+        issues.push(`Record ${index + 1}: generated Universal context exceeds its UTF-8 byte limit.`);
+      else data.push(parsed.data);
+      continue;
+    }
+    issues.push(`Record ${index + 1}: ${invalidChatRecord(record, generated)}.`);
+  }
+  return issues.length ? { success: false, issues: issues.slice(0, 8) } : { success: true, data };
+}
+
 export type ChatFunctionCall = z.infer<typeof ChatFunctionCallSchema>;
 export type ChatAction = FigmaToolAction;
 
@@ -483,6 +551,7 @@ export const CHAT_FUNCTION_TOOLS = CHAT_TOOL_NAMES.map((name) => ({
 }));
 
 export function chatFunctionToolsForState(state: ChatLifecycleState) {
+  if (state === "CONVERSATION") return [];
   const allowed = new Set<ChatToolName>(
     state === "INSPECTING"
       ? ["get_document_context", "inspect_nodes"]

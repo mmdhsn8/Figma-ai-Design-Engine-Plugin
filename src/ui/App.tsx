@@ -1,3 +1,4 @@
+import { chatAbortOrigin, type ChatAbortOrigin } from "../shared/chat-cancellation";
 import { composeStorefrontSection, isSampleStorefront } from "../shared/storefront-layout";
 import { PROFESSIONAL_VISUAL_VERSION } from "../shared/professional-visual";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
@@ -204,6 +205,16 @@ function messagesForTask(task: ChatTask): ChatMessage[] {
         : {}),
     },
   ];
+}
+
+function abortChatRun(controller: AbortController | null, origin: ChatAbortOrigin, task?: ChatTask | null) {
+  if (!controller || controller.signal.aborted) return;
+  console.info("[FAD_CHAT_CANCEL] " + JSON.stringify({
+    actor: "ui", event: "abort", atMs: Date.now(), cancellationOrigin: origin,
+    taskId: task?.id, lifecycle: task?.lifecycle,
+    requestIds: task?.universalScreens?.flatMap(({ activeRequestId }) => activeRequestId ? [activeRequestId] : []),
+  }));
+  controller.abort(origin);
 }
 
 function reconcileTaskMessageError(messages: ChatMessage[], task: ChatTask | null): ChatMessage[] {
@@ -1014,6 +1025,11 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
   const updateCompanionStatus = useCallback(
     (status: CompanionStatus | null) => {
+      if (!status) {
+        // An unavailable status observation does not revoke the last known session.
+        setCompanionStatus(null);
+        return;
+      }
       const nextSessionId = status?.sessionId ?? null;
       const previousSessionId = observedCompanionSessionId.current;
       const authenticated = Boolean(
@@ -1025,7 +1041,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         (nextSessionId && previousSessionId && nextSessionId !== previousSessionId) ||
         (observedCompanionAuthorization.current && !authenticated)
       ) {
-        chatAbort.current?.abort();
+        abortChatRun(chatAbort.current, nextSessionId && previousSessionId && nextSessionId !== previousSessionId
+          ? "session_changed" : "authorization_revoked", chatTask.current);
         invalidateModelCatalog();
       }
       if (
@@ -1074,7 +1091,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     () => () => {
       generationRequest.current = null;
       generationAbort.current?.abort();
-      chatAbort.current?.abort();
+      abortChatRun(chatAbort.current, "plugin_closed", chatTask.current);
       modelReadinessRequests.current.invalidate();
       if (modelDiscoveryRetry.current !== null) window.clearTimeout(modelDiscoveryRetry.current);
       for (const pending of modelPreferenceResponses.current.values()) {
@@ -1400,6 +1417,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           } catch (error) {
             if (cancelled) return;
             if (error instanceof CompanionClientError && error.category === "pairing_required") {
+              abortChatRun(chatAbort.current, "authorization_revoked", chatTask.current);
               invalidateModelCatalog();
               setCompanionToken(null);
               updateCompanionStatus(null);
@@ -2082,9 +2100,17 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         session.sessionId !== observedCompanionSessionId.current
       )
         throw new Error("Wait for the current Companion account to reconnect before running Chat.");
+      const staleSession = () => new CompanionClientError(
+        "stale_task_session", undefined, undefined,
+        "The Companion session changed or lost authorization. Reconnect and resume the saved task.",
+      );
       const checkChatSession = () => {
-        if (controller.signal.aborted || observedCompanionSessionId.current !== session.sessionId)
-          throw new Error("Stopped because the Companion session changed.");
+        if (controller.signal.aborted) {
+          const origin = chatAbortOrigin(controller.signal);
+          if (origin === "session_changed" || origin === "authorization_revoked") throw staleSession();
+          throw new CompanionClientError("request_cancelled");
+        }
+        if (observedCompanionSessionId.current !== session.sessionId) throw staleSession();
       };
       if (!retry) {
         const loaded = await chatTaskBridge({
@@ -2209,6 +2235,22 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         ]);
         setChatInput("");
       }
+      const failedCheckpoint = retry && chatTask.current?.failure?.category === "checkpoint_storage"
+        ? chatTask.current
+        : null;
+      if (failedCheckpoint) {
+        const recovered = await chatTaskBridge({
+          type: "chat-task-load",
+          requestId: nextRequestId(),
+          chatId: taskChatId,
+          documentId: failedCheckpoint.documentId,
+        });
+        checkChatSession();
+        if (recovered.task?.id !== failedCheckpoint.id)
+          throw new Error("Storage recovery could not find this task's saved checkpoint on its original page.");
+        chatTask.current = recovered.task;
+        setChatTaskSnapshot(recovered.task);
+      }
       const task = chatTask.current;
       if (!task) return;
       checkChatSession();
@@ -2249,9 +2291,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                 latest.accountScope !== session.accountScope ||
                 !latest.planUseAuthorized
               )
-                throw new Error(
-                  "Stopped because the Companion account changed during screen generation.",
-                );
+                throw staleSession();
             },
           });
         },
@@ -2275,9 +2315,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             latest.accountScope !== session.accountScope ||
             !latest.planUseAuthorized
           )
-            throw new Error("Stopped because the Companion account changed during universal screen planning.");
+            throw staleSession();
         },
-        renderProgram: async (program, requestId) => {
+        renderProgram: async (program, requestId, expectedRootNodeId) => {
           checkChatSession();
           const response = await renderDesignProgramBridge({
             type: "design-program-render",
@@ -2285,6 +2325,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             taskId: task.id,
             documentId: task.documentId,
             brandKit: task.brandKit,
+            expectedRootNodeId,
             program,
           });
           checkChatSession();
@@ -2315,7 +2356,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           const latest = await getCompanionStatus(companionToken);
           checkChatSession();
           if (latest.sessionId !== session.sessionId || !latest.planUseAuthorized)
-            throw new Error("Stopped because the Companion session changed.");
+            throw staleSession();
           return new Promise<ChatToolResult>((resolve, reject) =>
             runToolOperations(
               operations.map((operation) => ({
@@ -2345,14 +2386,19 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       setChatActivity(chatTaskProgress(task));
     } catch (error) {
       if (chatTask.current) setChatTaskSnapshot(structuredClone(chatTask.current));
-      const stopped = chatStopRequested.current || controller.signal.aborted;
+      const stopped = chatStopRequested.current;
+      const origin = controller.signal.aborted ? chatAbortOrigin(controller.signal) : undefined;
       const message = stopped
         ? "Stopped. Confirmed changes remain on Canvas. Resume reconciles in-flight operation IDs before continuing."
-        : error instanceof CompanionClientError && error.safeMessage
-          ? error.safeMessage
-          : error instanceof Error && error.message !== "chat_stopped"
-            ? error.message
-            : companionErrorText(error);
+        : origin === "session_changed" || origin === "authorization_revoked"
+          ? "The Companion session changed or lost authorization. Reconnect and resume the saved task."
+          : error instanceof CompanionClientError && error.safeMessage
+            ? error.safeMessage
+            : error instanceof CompanionClientError
+              ? companionErrorText(error)
+              : error instanceof Error && error.message !== "chat_stopped"
+                ? error.message
+                : companionErrorText(error);
       setChatMessages((messages) =>
         messages.map((item) => (item.id === assistantId ? { ...item, error: message } : item)),
       );
@@ -2369,7 +2415,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
   const stopChat = () => {
     chatStopRequested.current = true;
-    chatAbort.current?.abort();
+    abortChatRun(chatAbort.current, "user_stop", chatTask.current);
     if (toolBatchId.current) cancelToolBatch();
     setChatActivity("Stopping; the current native operation will finish or time out…");
   };
@@ -3007,6 +3053,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     setCompanionBusy(true);
     try {
       await disconnectLocalSession(companionToken);
+      abortChatRun(chatAbort.current, "authorization_revoked", chatTask.current);
       const cleared = await persistRestoreTicket(null);
       setRestoreTicket(null);
       setRestoreStorageWarning(!cleared);
@@ -3034,6 +3081,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       const result = switchAccount
         ? await switchChatGPTAccount(companionToken)
         : await disconnectChatGPT(companionToken);
+      abortChatRun(chatAbort.current, switchAccount ? "session_changed" : "authorization_revoked", chatTask.current);
       clearConnectedAccountDetails();
       updateCompanionStatus(await getCompanionStatus(companionToken));
       setCompanionError(

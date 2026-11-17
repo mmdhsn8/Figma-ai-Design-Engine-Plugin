@@ -1,20 +1,15 @@
 import { PluginToUISchema, type UIToPluginMessage } from "../shared/messages";
 import type { PluginToUIMessage } from "../shared/messages";
-import type { ChatTask } from "../shared/chat-task";
-import { ChatTaskSchema } from "../shared/chat-task";
+import {
+  checkpointHash,
+  checkpointJson,
+  checkpointRevision,
+  traceCheckpoint,
+} from "../shared/chat-checkpoint-wire";
 
 const CHAT_TASK_WRITE_ACK_TIMEOUT_MS = 10_000;
 const CHAT_TASK_WRITE_RECONCILE_TIMEOUT_MS = 5_000;
 const CHAT_TASK_WRITE_RECONCILE_POLL_MS = 1_250;
-
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
-  }
-  return JSON.stringify(value) ?? "undefined";
-}
 
 export class ChatTaskBridgeError extends Error {
   readonly category = "checkpoint_storage";
@@ -27,108 +22,133 @@ export class ChatTaskBridgeError extends Error {
   }
 }
 
+type CheckpointResult = Extract<PluginToUIMessage, { type: "chat-task-result" }>;
+
 export function chatTaskBridge(
   message: Extract<UIToPluginMessage, { type: "chat-task-load" | "chat-task-save" }>,
 ) {
-  return new Promise<
-    Extract<import("../shared/messages").PluginToUIMessage, { type: "chat-task-result" }>
-  >((resolve, reject) => {
-    let timer: number | undefined;
-    let reconciliationDeadline: number | undefined;
-    let reconciliationPoll: number | undefined;
-    let finished = false;
+  const json = message.type === "chat-task-save" ? checkpointJson(message.task) : undefined;
+  const expected = json === undefined ? undefined : checkpointRevision(json);
+  const outbound =
+    message.type === "chat-task-save"
+      ? { ...message, task: JSON.parse(json!), revision: expected }
+      : message;
+
+  return new Promise<CheckpointResult>((resolve, reject) => {
+    let deadline: number | undefined;
+    let poll: number | undefined;
     let recoveryRequestId: string | undefined;
     let recoveryAttempt = 0;
-    let reconciliationStartedAt: number | undefined;
+    let lastMismatch = false;
+    const trace = (event: string, details = {}) =>
+      traceCheckpoint("ui", event, message.requestId, { ...expected, ...details });
     const finish = () => {
-      if (finished) return;
-      finished = true;
-      if (timer !== undefined) clearTimeout(timer);
-      if (reconciliationDeadline !== undefined) clearTimeout(reconciliationDeadline);
-      if (reconciliationPoll !== undefined) clearTimeout(reconciliationPoll);
+      window.clearTimeout(deadline);
+      window.clearTimeout(poll);
       window.removeEventListener("message", receive);
     };
-    const requestRecoveryRead = () => {
-      recoveryAttempt++;
-      recoveryRequestId = `${message.requestId.slice(0, 72)}_reconcile_${recoveryAttempt}`;
-      parent.postMessage({
-        pluginMessage: {
-          type: "chat-task-load",
-          requestId: recoveryRequestId,
-          documentId: message.documentId,
-          ...(message.chatId ? { chatId: message.chatId } : {}),
-        },
-      }, "*");
+    const fail = (error: string, code: string) => {
+      trace("failed", { code });
+      finish();
+      reject(new ChatTaskBridgeError(error, code));
     };
-    const timeout = () => {
-      timer = undefined;
-      if (message.type !== "chat-task-save") {
-        finish();
-        reject(new ChatTaskBridgeError("Task checkpoint load timed out; saved data was not changed.", "checkpoint_load_timeout"));
-        return;
+    const post = (request: typeof outbound | typeof message) => {
+      try {
+        parent.postMessage({ pluginMessage: request }, "*");
+      } catch {
+        fail("Figma could not transfer the checkpoint request.", "checkpoint_transport_failed");
       }
-      reconciliationStartedAt = Date.now();
-      reconciliationDeadline = window.setTimeout(() => {
-        finish();
-        reject(new ChatTaskBridgeError(
+    };
+    const requestRecoveryRead = () => {
+      recoveryRequestId = `${message.requestId.slice(0, 72)}_reconcile_${++recoveryAttempt}`;
+      trace("confirm_post", { readCorrelation: checkpointHash(recoveryRequestId) });
+      post({
+        type: "chat-task-load",
+        requestId: recoveryRequestId,
+        documentId: message.documentId,
+        ...(message.chatId ? { chatId: message.chatId } : {}),
+        confirm: expected,
+      });
+    };
+    const reconcile = () => {
+      if (recoveryRequestId) return;
+      window.clearTimeout(deadline);
+      deadline = window.setTimeout(() => {
+        fail(
           "Task checkpoint save could not be confirmed after a storage read; no further canvas batch was started. Retry storage recovery before resuming.",
-          "checkpoint_timeout",
-        ));
+          lastMismatch ? "checkpoint_write_unconfirmed" : "checkpoint_timeout",
+        );
       }, CHAT_TASK_WRITE_RECONCILE_TIMEOUT_MS);
       requestRecoveryRead();
     };
     const receive = (event: MessageEvent) => {
-      const parsed = PluginToUISchema.safeParse(event.data?.pluginMessage);
-      if (
-        !parsed.success ||
-        parsed.data.type !== "chat-task-result" ||
-        (parsed.data.requestId !== message.requestId && parsed.data.requestId !== recoveryRequestId)
-      )
+      const raw = event.data?.pluginMessage;
+      if (!raw || (raw.requestId !== message.requestId && raw.requestId !== recoveryRequestId))
         return;
-      if (parsed.data.requestId === recoveryRequestId && message.type === "chat-task-save") {
-        if (!parsed.data.success) {
-          finish();
-          reject(new ChatTaskBridgeError(
-            parsed.data.error ?? "Task checkpoint recovery could not read the saved task.",
-            parsed.data.errorCode ?? "checkpoint_recovery_failed",
-          ));
-          return;
-        }
-        const expected = message.task === null ? null : ChatTaskSchema.safeParse(message.task);
-        const expectedTask = expected === null ? null : expected.success ? expected.data : undefined;
-        const savedTask = (parsed.data.task as ChatTask | null | undefined) ?? null;
-        if (expectedTask !== undefined && stableJson(savedTask) === stableJson(expectedTask)) {
-          finish();
-          resolve({ type: "chat-task-result", requestId: message.requestId, success: true, documentId: parsed.data.documentId });
-        } else {
-          const elapsed = Date.now() - (reconciliationStartedAt ?? Date.now());
-          if (elapsed >= CHAT_TASK_WRITE_RECONCILE_TIMEOUT_MS) {
-            finish();
-            reject(new ChatTaskBridgeError(
-              "The latest saved task does not match the checkpoint being committed; no further canvas batch was started. Retry storage recovery before resuming.",
-              "checkpoint_write_unconfirmed",
-            ));
-          } else {
-            reconciliationPoll = window.setTimeout(requestRecoveryRead, CHAT_TASK_WRITE_RECONCILE_POLL_MS);
-          }
-        }
+      if (raw.type !== "chat-task-result" && raw.type !== "protocol-error") return;
+      const parsed = PluginToUISchema.safeParse(raw);
+      if (!parsed.success || parsed.data.type === "protocol-error") {
+        fail(
+          "Figma rejected the checkpoint message. Reload the development plugin before retrying.",
+          "checkpoint_protocol_error",
+        );
         return;
       }
-      if (parsed.data.requestId === message.requestId && message.type === "chat-task-save" && recoveryRequestId && !parsed.data.success)
+      const result = parsed.data;
+      if (result.type !== "chat-task-result") return;
+      const confirming = result.requestId === recoveryRequestId;
+      trace(confirming ? "confirm_received" : "ack_received", {
+        receivedHash: result.revision?.hash,
+        receivedBytes: result.revision?.bytes,
+        code: result.errorCode,
+        success: result.success,
+      });
+      if (!result.success) {
+        if (!confirming && result.errorCode === "checkpoint_read_unconfirmed") {
+          reconcile();
+          return;
+        }
+        fail(
+          result.error ?? "Task checkpoint storage failed.",
+          result.errorCode ?? "checkpoint_storage_failed",
+        );
         return;
+      }
+      const sameScope = !message.documentId || result.documentId === message.documentId;
+      const sameRevision =
+        !expected ||
+        (result.revision?.hash === expected.hash && result.revision.bytes === expected.bytes);
+      if (!sameScope) {
+        fail(
+          "Figma returned a checkpoint for a different document or page.",
+          "checkpoint_scope_mismatch",
+        );
+        return;
+      }
+      if (!sameRevision) {
+        lastMismatch = true;
+        if (confirming) {
+          window.clearTimeout(poll);
+          poll = window.setTimeout(requestRecoveryRead, CHAT_TASK_WRITE_RECONCILE_POLL_MS);
+        } else reconcile();
+        return;
+      }
+      trace("confirmed");
       finish();
-      if (parsed.data.success) resolve(parsed.data);
-        else
-          reject(
-            new ChatTaskBridgeError(
-              parsed.data.error ?? "Task checkpoint could not be saved.",
-              parsed.data.errorCode ?? "checkpoint_load_failed",
-            ),
-          );
+      resolve(confirming ? { ...result, requestId: message.requestId } : result);
     };
-    timer = window.setTimeout(timeout, CHAT_TASK_WRITE_ACK_TIMEOUT_MS);
+    deadline = window.setTimeout(() => {
+      trace("ack_deadline");
+      if (expected) reconcile();
+      else
+        fail(
+          "Task checkpoint load timed out; saved data was not changed.",
+          "checkpoint_load_timeout",
+        );
+    }, CHAT_TASK_WRITE_ACK_TIMEOUT_MS);
     window.addEventListener("message", receive);
-    parent.postMessage({ pluginMessage: message }, "*");
+    trace("post", { operation: message.type });
+    post(outbound);
   });
 }
 

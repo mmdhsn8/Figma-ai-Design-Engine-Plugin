@@ -1,3 +1,4 @@
+import { chatAbortOrigin, isChatAbortOrigin, type ChatAbortOrigin } from "../shared/chat-cancellation.js";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createReadStream } from "node:fs";
@@ -46,7 +47,7 @@ import {
   ChatFunctionCallValidationError,
   ChatFunctionCallValidationIssueSchema,
   ChatLifecycleStateSchema,
-  ChatInputItemSchema,
+  validateChatRequestInput,
   chatFunctionToolsForState,
   parseResponsesFunctionCalls,
   type ChatFunctionCallValidationIssue,
@@ -245,6 +246,8 @@ type TerminationReason =
   | "local_network_interruption"
   | "upstream_transport_interruption"
   | "user_cancelled"
+  | "caller_cancelled"
+  | "session_changed"
   | "http_failure"
   | "stream_eof"
   | "response_completed"
@@ -259,6 +262,7 @@ interface ResponsesDiagnostic {
   lastEventAtMs?: number;
   requestPhase?: RequestPhase | "companion_http" | "companion_sse";
   terminationReason?: TerminationReason;
+  cancellationOrigin?: ChatAbortOrigin;
   timeoutSource?: "upstream_headers" | "upstream_inactivity" | "overall_deadline";
   headersMs?: number;
   firstDeltaMs?: number;
@@ -531,7 +535,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
 
   async function close(): Promise<void> {
     clearPendingAuthorization();
-    abortActiveInferenceRequests();
+    abortActiveInferenceRequests("companion_shutdown");
     generationAttempts.clear();
     generationStreamRetries.clear();
     pairingAttempts.clear();
@@ -767,7 +771,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       } else if (tokenHash) {
         sessionTokenHashes.delete(tokenHash);
       }
-      abortActiveInferenceRequests();
+      abortActiveInferenceRequests("authorization_revoked");
       generationAttempts.clear();
       generationStreamRetries.clear();
       sendJson(response, 200, { disconnected: true });
@@ -1674,16 +1678,18 @@ export function createCompanionServer(options: CompanionServerOptions) {
       });
       return;
     }
-    const inputResult = z.array(ChatInputItemSchema).min(1).max(40).safeParse(body.value.input);
+    const inputResult = validateChatRequestInput(body.value.input, lifecycleResult.data);
     if (!inputResult.success) {
       sendJson(response, 400, {
         error: "chat_request_invalid",
         requestId: correlatedId,
-        message: "Chat history contains an unsupported message or tool result.",
+        message: `${inputResult.issues[0]} This request was stopped before reaching the provider. Saved history is retained. Reopen the chat and retry from its saved task.`,
+        issues: inputResult.issues,
       });
       return;
     }
     const universalScreenRequest = UNIVERSAL_SCREEN_REQUEST_ID.test(correlatedId);
+    const taskId = universalScreenRequest ? correlatedId.split("_p6_screen-")[0] : undefined;
     const activeRequests = [...activeChatControllers.keys()];
     const hasLegacyOrNonScreenChat = activeRequests.some((activeId) => !UNIVERSAL_SCREEN_REQUEST_ID.test(activeId));
     const chatCapacityExceeded = activeChatControllers.has(correlatedId) || (universalScreenRequest
@@ -1709,9 +1715,9 @@ export function createCompanionServer(options: CompanionServerOptions) {
     const clientAbort = new AbortController();
     activeChatControllers.set(correlatedId, clientAbort);
     activeInferenceControllers.add(clientAbort);
-    const abortForClient = () => clientAbort.abort();
+    const abortForClient = () => clientAbort.abort("client_disconnected");
     const abortForClosedResponse = () => {
-      if (!response.writableEnded) clientAbort.abort();
+      if (!response.writableEnded) clientAbort.abort("client_disconnected");
     };
     request.once("aborted", abortForClient);
     response.once("close", abortForClosedResponse);
@@ -1730,15 +1736,40 @@ export function createCompanionServer(options: CompanionServerOptions) {
         });
         return;
       }
-      if (clientAbort.signal.aborted || liveSession !== session.value) {
-        if (!request.aborted && !response.destroyed)
-          sendJson(response, 401, {
-            error: "signed_out",
-            requestId: correlatedId,
-            message: "The local companion session expired. Reconnect in Settings.",
-          });
-        return;
-      }
+      let loggedRefresh = false;
+      const checkChatScope = (completed?: ResponsesDiagnostic) => {
+        const current = liveSession;
+        // A token refresh replaces the credentials object while retaining the authorized session.
+        const identityChanged = current?.sessionId !== session.value.sessionId ||
+          current.subjectHash !== session.value.subjectHash;
+        const origin = clientAbort.signal.aborted ? chatAbortOrigin(clientAbort.signal)
+          : identityChanged ? "session_changed"
+          : !current.scopes.has(PLAN_USE_SCOPE) ? "authorization_revoked" : undefined;
+        if (!origin) {
+          if (!loggedRefresh && current !== session.value) {
+            loggedRefresh = true;
+            console.info("[FAD_CHAT_CANCEL] " + JSON.stringify({
+              actor: "companion", event: "same_session_refresh", atMs: now(),
+              taskId, requestId: correlatedId, lifecycle,
+              requestPhase: streamStarted ? "upstream_stream" : "upstream_headers",
+            }));
+          }
+          return;
+        }
+        const cancelled = origin !== "session_changed" && origin !== "authorization_revoked";
+        throw new ResponsesStreamError(cancelled ? "request_cancelled" : "stale_task_session", {
+          ...completed,
+          model: sanitizeDiagnosticModel(model),
+          requestId: correlatedId,
+          requestStartedAtMs,
+          requestPhase: streamStarted ? "upstream_stream" : "upstream_headers",
+          stage: streamStarted ? "stream" : "http",
+          outcome: cancelled ? "cancelled" : "failed",
+          terminationReason: cancelled ? "caller_cancelled" : "session_changed",
+          cancellationOrigin: origin,
+        });
+      };
+      checkChatScope();
       if (!session.value.models.some(({ slug }) => slug === model)) {
         sendJson(response, 400, {
           error: "model_not_verified_for_account",
@@ -1771,11 +1802,11 @@ export function createCompanionServer(options: CompanionServerOptions) {
           },
           body: JSON.stringify({
             model,
-            instructions: isUniversalLifecycle(lifecycle) ? `${UNIVERSAL_CHAT_INSTRUCTIONS}\n${chatLifecycleGuidance(lifecycle)}` : `${CHAT_INSTRUCTIONS}\n${chatLifecycleGuidance(lifecycle)}\nCurrent lifecycle state: ${lifecycle}. Planning contract v1: plan_canvas_task accepts planVersion, brief, stages, optional designName, and targetRefs (required for edits). Each stage contains title, goal, optional purpose, priority, navigation, dependsOn, contentPlaceholders, componentOpportunities, pageId, logicalRefs, completionCriteria, estimatedMutations and propertyEdit. For a stage that only updates properties of one existing node, provide propertyEdit as a set_properties action with the requested values even if they already match. For enhancement of an existing design, declare new layer aliases in the saved stage when known. During execution, the runner checkpoints fresh aliases from a valid batch under the approved existing frame within the stage reference limit. Order parents before children and reuse the original alias in later calls. Never use a native task- ref as a new alias. For existing design enhancements, prefer in-place edits, and specify measurable hierarchy, spacing, typography, and layout outcomes. For a screen background color request, use the existing screen frame ref and only the requested fill in propertyEdit. The runner resolves the effective background layer and verifies it locally. Existing verified edit refs may satisfy acceptance without mutation; estimates are advisory. Use one operation for a one-property edit. Work above 32 mutations is continued locally in persisted segments, so never replan at that boundary. Never copy checkpoint execution metadata into planning arguments. Once a saved plan exists, execute its unfinished stages; do not call plan_canvas_task again. Runtime progress is locally owned.`,
+            instructions: lifecycle === "CONVERSATION" ? "Reply conversationally in the user's language. Do not plan or claim any Canvas action." : isUniversalLifecycle(lifecycle) ? `${UNIVERSAL_CHAT_INSTRUCTIONS}\n${chatLifecycleGuidance(lifecycle)}` : `${CHAT_INSTRUCTIONS}\n${chatLifecycleGuidance(lifecycle)}\nCurrent lifecycle state: ${lifecycle}. Planning contract v1: plan_canvas_task accepts planVersion, brief, stages, optional designName, and targetRefs (required for edits). Each stage contains title, goal, optional purpose, priority, navigation, dependsOn, contentPlaceholders, componentOpportunities, pageId, logicalRefs, completionCriteria, estimatedMutations and propertyEdit. For a stage that only updates properties of one existing node, provide propertyEdit as a set_properties action with the requested values even if they already match. For enhancement of an existing design, declare new layer aliases in the saved stage when known. During execution, the runner checkpoints fresh aliases from a valid batch under the approved existing frame within the stage reference limit. Order parents before children and reuse the original alias in later calls. Never use a native task- ref as a new alias. For existing design enhancements, prefer in-place edits, and specify measurable hierarchy, spacing, typography, and layout outcomes. For a screen background color request, use the existing screen frame ref and only the requested fill in propertyEdit. The runner resolves the effective background layer and verifies it locally. Existing verified edit refs may satisfy acceptance without mutation; estimates are advisory. Use one operation for a one-property edit. Work above 32 mutations is continued locally in persisted segments, so never replan at that boundary. Never copy checkpoint execution metadata into planning arguments. Once a saved plan exists, execute its unfinished stages; do not call plan_canvas_task again. Runtime progress is locally owned.`,
             input: inputResult.data,
-            tools: availableTools,
-            tool_choice: "auto",
-            parallel_tool_calls: true,
+            ...(lifecycle === "CONVERSATION"
+              ? { tool_choice: "none" }
+              : { tools: availableTools, tool_choice: "auto", parallel_tool_calls: true }),
             store: false,
             stream: true,
           }),
@@ -1811,15 +1842,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
         });
         return;
       }
-      if (clientAbort.signal.aborted || liveSession !== session.value) {
-        if (!response.destroyed)
-          sendJson(response, 401, {
-            error: "signed_out",
-            requestId: correlatedId,
-            message: "The companion session changed before the model response started.",
-          });
-        return;
-      }
+      checkChatScope();
       response.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-store",
@@ -1857,8 +1880,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
         correlatedId,
         requestStartedAtMs,
       );
-      if (clientAbort.signal.aborted || liveSession !== session.value)
-        throw new ResponsesStreamError("request_cancelled", completed.diagnostic);
+      checkChatScope(completed.diagnostic);
       const timing = {
         upstreamHeadersMs: completed.diagnostic.headersMs,
         upstreamFirstDeltaMs: completed.diagnostic.firstDeltaMs,
@@ -2016,6 +2038,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
                 stage: "stream" as const,
                 outcome: "cancelled" as const,
                 errorCode: "client_disconnected",
+                cancellationOrigin: clientAbort.signal.aborted ? chatAbortOrigin(clientAbort.signal) : "client_disconnected",
+                terminationReason: "caller_cancelled",
               };
         logChatDiagnostic({
           ...diagnostic,
@@ -2023,10 +2047,13 @@ export function createCompanionServer(options: CompanionServerOptions) {
           model,
           inputMode,
           chatState: "failed",
+          lifecycle, taskId,
         });
         return;
       }
-      const category =
+      const origin = clientAbort.signal.aborted ? chatAbortOrigin(clientAbort.signal) : undefined;
+      const scopeEnded = origin === "session_changed" || origin === "authorization_revoked";
+      const category = scopeEnded ? "stale_task_session" :
         error instanceof Error && error.message === "response_too_large"
           ? "response_too_large"
           : classifyResponsesTransportError(error);
@@ -2036,7 +2063,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
         authStatus = "scope_granted";
       }
       safeMessage = category;
-      const diagnostic =
+      const detected =
         error instanceof ResponsesStreamError
           ? error.diagnostic
           : {
@@ -2052,6 +2079,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
                 error instanceof RequestTimeoutError ? error.timeoutKind : undefined,
               ),
               requestId: correlatedId,
+              ...(clientAbort.signal.aborted ? { cancellationOrigin: chatAbortOrigin(clientAbort.signal), terminationReason: "caller_cancelled" as const } : {}),
               ...(requestStartedAtMs !== undefined ? { requestStartedAtMs } : {}),
               requestPhase: "upstream_headers" as const,
               ...(requestStartedAt !== undefined
@@ -2060,11 +2088,15 @@ export function createCompanionServer(options: CompanionServerOptions) {
                   ? { elapsedMs: error.elapsedMs }
                   : {}),
             };
+      const diagnostic: ResponsesDiagnostic = scopeEnded
+        ? { ...detected, outcome: "failed", terminationReason: "session_changed", cancellationOrigin: origin }
+        : detected;
       logChatDiagnostic({
         ...diagnostic,
         requestId: correlatedId,
         model,
         inputMode,
+        lifecycle, taskId,
         chatState:
           diagnostic.chatState ?? (category === "response_incomplete" ? "incomplete" : "failed"),
       });
@@ -2675,7 +2707,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
     forgetRegistration: boolean,
   ): Promise<void> {
     clearPendingAuthorization();
-    abortActiveInferenceRequests();
+    abortActiveInferenceRequests("authorization_revoked");
     generationAttempts.clear();
     generationStreamRetries.clear();
     const session = liveSession;
@@ -2727,9 +2759,9 @@ export function createCompanionServer(options: CompanionServerOptions) {
     });
   }
 
-  function abortActiveInferenceRequests(): void {
+  function abortActiveInferenceRequests(origin: ChatAbortOrigin): void {
     designProgress = undefined;
-    for (const controller of activeInferenceControllers) controller.abort();
+    for (const controller of activeInferenceControllers) controller.abort(origin);
     activeDesignController = undefined;
     activeSmokeController = undefined;
     activeChatControllers.clear();
@@ -3109,6 +3141,7 @@ function classifyError(error: unknown): string {
     "sign_in_timed_out",
     "account_mismatch",
     "request_cancelled",
+    "stale_task_session",
     "public_client_unsupported",
     "host_id_invalid",
     "installation_store_invalid",
@@ -3759,7 +3792,7 @@ export async function readCompletedResponse(
       await reader.cancel();
       throw new ResponsesStreamError(
         "request_cancelled",
-        diagnostic("cancelled", { terminationReason: "user_cancelled" }),
+        diagnostic("cancelled", { terminationReason: "caller_cancelled", cancellationOrigin: chatAbortOrigin(signal) }),
       );
     }
     while (true) {
@@ -3786,7 +3819,7 @@ export async function readCompletedResponse(
         if (signal?.aborted)
           throw new ResponsesStreamError(
             "request_cancelled",
-            diagnostic("cancelled", { terminationReason: "user_cancelled" }),
+            diagnostic("cancelled", { terminationReason: "caller_cancelled", cancellationOrigin: chatAbortOrigin(signal) }),
           );
         if (error instanceof Error && error.message === "stream_idle_timeout") {
           throw timeoutError("idle");
@@ -3817,7 +3850,7 @@ export async function readCompletedResponse(
     if (signal?.aborted) {
       throw new ResponsesStreamError(
         "request_cancelled",
-        diagnostic("cancelled", { terminationReason: "user_cancelled" }),
+        diagnostic("cancelled", { terminationReason: "caller_cancelled", cancellationOrigin: chatAbortOrigin(signal) }),
       );
     }
     if (performance.now() >= deadline) throw timeoutError("overall");
@@ -3852,7 +3885,8 @@ export async function readCompletedResponse(
       category,
       diagnostic(outcome, {
         terminationReason:
-          category === "request_cancelled" ? "user_cancelled" : "upstream_transport_interruption",
+          category === "request_cancelled" ? "caller_cancelled" : "upstream_transport_interruption",
+        ...(signal?.aborted ? { cancellationOrigin: chatAbortOrigin(signal) } : {}),
       }),
     );
   } finally {
@@ -3910,6 +3944,9 @@ function responsesChatOutputText(outputItems: unknown[]): { text: string; refusa
 
 function logChatDiagnostic(diagnostic: Record<string, unknown>): void {
   const safe = {
+    ...(typeof diagnostic.taskId === "string" && /^[A-Za-z0-9_-]{8,60}$/u.test(diagnostic.taskId)
+      ? { taskId: diagnostic.taskId } : {}),
+    ...(ChatLifecycleStateSchema.safeParse(diagnostic.lifecycle).success ? { lifecycle: diagnostic.lifecycle } : {}),
     requestId:
       typeof diagnostic.requestId === "string" &&
       /^[A-Za-z0-9_-]{8,100}$/u.test(diagnostic.requestId)
@@ -3924,6 +3961,7 @@ function logChatDiagnostic(diagnostic: Record<string, unknown>): void {
     diagnostic.requestPhase === "companion_sse"
       ? { requestPhase: diagnostic.requestPhase }
       : {}),
+    ...(isChatAbortOrigin(diagnostic.cancellationOrigin) ? { cancellationOrigin: diagnostic.cancellationOrigin } : {}),
     ...(typeof diagnostic.terminationReason === "string" &&
     /^[a-z_]{1,80}$/u.test(diagnostic.terminationReason)
       ? { terminationReason: diagnostic.terminationReason }
@@ -4020,6 +4058,8 @@ function chatErrorMessage(category: string, diagnostic?: ResponsesDiagnostic): s
       return "The model response timed out. You can retry this message.";
     case "request_cancelled":
       return "The model request was stopped.";
+    case "stale_task_session":
+      return "The authorized Companion session changed. Reconnect and resume the saved task.";
     case "response_incomplete":
       return diagnostic?.incompleteReason === "max_output_tokens"
         ? "The model hit its output-token limit before finishing. Ask for a smaller change and retry."

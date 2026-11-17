@@ -28,6 +28,7 @@ import { streamAuthorizedChat } from "../src/ui/companion-client";
 import type { PluginToUIMessage } from "../src/shared/messages";
 import { UIToPluginSchema, PluginToUISchema } from "../src/shared/messages";
 import { FigmaToolBatchSchema } from "../src/shared/figma-tools";
+import { UNIVERSAL_CONTEXT_PREFIX } from "../src/shared/chat-tools";
 
 const discovery: OidcDiscovery = {
   issuer: OIDC_ISSUER,
@@ -51,6 +52,107 @@ afterEach(async () => {
 });
 
 describe("loopback companion", () => {
+  it.each(["headers", "stream"] as const)("keeps the first screen alive during %s while its sibling refreshes the same OAuth session", async (phase) => {
+    const harness = await createHarness({ refresh: true, expiresIn: 120 });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const gate = harness.stallNextChatHeaders(phase);
+    const send = (requestId: string) => request(harness.handle, "/v1/chat", { token, body: {
+      requestId, model: "account-model", lifecycle: "UNIVERSAL_COMPOSING",
+      input: [{ role: "user", content: "Compose the saved screen." }],
+    } });
+    const first = send("chat-refresh-0001_p6_screen-01_c1");
+    await gate.started;
+    try {
+      harness.advanceTime(70_000);
+      const second = await send("chat-refresh-0001_p6_screen-02_c1");
+      expect(await second.text()).toContain("event: done");
+      expect(harness.refreshRequest).toContain("grant_type=refresh_token");
+    } finally {
+      gate.release();
+    }
+    const events = await (await first).text();
+    expect(events).toContain("event: done");
+    expect(events).not.toContain("request_cancelled");
+  });
+
+  it("reports a real account disconnect during a provider stream as lost authorization", async () => {
+    const harness = await createHarness();
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const gate = harness.stallNextChatHeaders("stream");
+    const pending = request(harness.handle, "/v1/chat", { token, body: {
+      requestId: "chat-scope-0001_p6_screen-01_c1", model: "account-model", lifecycle: "UNIVERSAL_COMPOSING",
+      input: [{ role: "user", content: "Compose the saved screen." }],
+    } });
+    await gate.started;
+    const response = await pending;
+    try {
+      const switched = await request(harness.handle, "/v1/account/switch", { token, body: {} });
+      expect(switched.status).toBe(200);
+      const events = await response.text();
+      expect(events).toContain('"error":"stale_task_session"');
+      expect(events).toContain('"cancellationOrigin":"authorization_revoked"');
+      expect(events).not.toContain("event: done");
+    } finally {
+      gate.release();
+    }
+  });
+
+  it("requests a conversational reply without exposing Canvas tools", async () => {
+    const harness = await createHarness();
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const response = await request(harness.handle, "/v1/chat", { token, body: {
+      requestId: "conversation-no-tools", model: "account-model", lifecycle: "CONVERSATION",
+      input: [{ role: "user", content: "What makes a layout readable?" }],
+    } });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("event: done");
+    const upstream = JSON.parse(harness.responsesRequests.at(-1)!.body);
+    expect(upstream.tool_choice).toBe("none");
+    expect(upstream).not.toHaveProperty("tools");
+  });
+
+  it("forwards long Universal context and ordered tool records, and reports unsupported records without poisoning the next request", async () => {
+    const harness = await createHarness();
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const history = [{ role: "user", content: "Plan the original project." }, {
+      type: "function_call", call_id: "call-universal-context",
+      name: "classify_canvas_intent", arguments: JSON.stringify({ intent: "create" }),
+    }, {
+      type: "function_call_output", call_id: "call-universal-context",
+      output: JSON.stringify({ success: true, intent: "create" }),
+    }];
+    const brief = "Describe realistic illustrative sample data. ".repeat(110);
+    const generated = { role: "user", content: UNIVERSAL_CONTEXT_PREFIX.plan + JSON.stringify({
+      contract: "ProjectPlanDraftV1", brief, context: { originalBrief: brief, requestedScreenCount: 10 },
+    }) };
+    const input = [...history, generated];
+    const send = (requestId: string, items: unknown[], lifecycle = "UNIVERSAL_PLANNING") =>
+      request(harness.handle, "/v1/chat", { token, body: { requestId, model: "account-model", input: items, lifecycle } });
+    const count = harness.responsesRequests.length;
+    const invalid = await send("invalid-history-001", [
+      ...history, { type: "function_call_output", call_id: "call-invalid-output", output: { private: "must-not-echo" } }, generated,
+    ]);
+    expect(invalid.status).toBe(400);
+    const diagnostic = await invalid.json();
+    expect(diagnostic).toMatchObject({
+      error: "chat_request_invalid",
+      issues: ["Record 4: tool result output must be a string."],
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("must-not-echo");
+    const wrongLifecycle = await send("wrong-lifecycle-01", input, "EXECUTING_STAGE");
+    expect(wrongLifecycle.status).toBe(400);
+    await wrongLifecycle.text();
+    expect(harness.responsesRequests).toHaveLength(count);
+    const retry = await send("valid-history-0001", input);
+    expect(retry.status).toBe(200);
+    expect(await retry.text()).toContain("event: done");
+    expect(JSON.parse(harness.responsesRequests.at(-1)!.body).input).toEqual(input);
+  });
+
   it("rejects a delayed model catalog response after the authenticated account changes", async () => {
     const harness = await createHarness();
     const token = await harness.pair();
@@ -1607,7 +1709,7 @@ describe("loopback companion", () => {
         diagnostics.mock.calls.some(
           ([, line]) =>
             String(line).includes('"requestId":"chat-cancel-0001"') &&
-            String(line).includes('"terminationReason":"user_cancelled"'),
+            String(line).includes('"cancellationOrigin":"client_disconnected"'),
         ),
       ).toBe(true),
     );
@@ -3863,6 +3965,7 @@ async function createHarness(
   });
   let stallNextResponses = false;
   const chatHeaderGates: Array<{ started: Promise<void>; markStarted(): void; wait: Promise<void>; release(): void }> = [];
+  const chatStreamGates: typeof chatHeaderGates = [];
   let nextResponsesUsageFailure = false;
   const resetResponseStreamWaiter = () => {
     responseStreamStarted = new Promise<void>((resolve) => {
@@ -3977,6 +4080,21 @@ async function createHarness(
           });
         });
       }
+      const chatStreamGate = responsePayload.tool_choice === "auto" ? chatStreamGates.shift() : undefined;
+      if (chatStreamGate) {
+        let cancelled = false;
+        return new Response(new ReadableStream({
+          async start(controller) {
+            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Preparing screen." })}\n\n`));
+            chatStreamGate.markStarted();
+            await chatStreamGate.wait;
+            if (cancelled) return;
+            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [] } })}\n\n`));
+            controller.close();
+          },
+          cancel() { cancelled = true; },
+        }), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }
       if (options.stallDesignHeaders && JSON.parse(String(init?.body ?? "")).text) {
         return await new Promise<Response>((_resolve, reject) => {
           init?.signal?.addEventListener(
@@ -4034,7 +4152,7 @@ async function createHarness(
           { status: 200, headers: { "Content-Type": "text/event-stream" } },
         );
       }
-      if (Array.isArray(responsePayload.tools)) {
+      if (Array.isArray(responsePayload.tools) || responsePayload.tool_choice === "none") {
         if (
           typeof responsePayload.tool_choice === "object" &&
           responsePayload.tool_choice !== null
@@ -4273,12 +4391,12 @@ async function createHarness(
       stallNextResponses = true;
       resetResponseStreamWaiter();
     },
-    stallNextChatHeaders() {
+    stallNextChatHeaders(phase: "headers" | "stream" = "headers") {
       let markStarted!: () => void;
       let release!: () => void;
       const started = new Promise<void>((resolve) => { markStarted = resolve; });
       const wait = new Promise<void>((resolve) => { release = resolve; });
-      chatHeaderGates.push({ started, markStarted, wait, release });
+      (phase === "headers" ? chatHeaderGates : chatStreamGates).push({ started, markStarted, wait, release });
       return { started, release };
     },
     failNextResponseWithUsage() {

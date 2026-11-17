@@ -8,6 +8,7 @@ import {
   type MultiScreenSpec,
 } from "./multi-screen-schema";
 import { auditVisualQuality } from "./visual-quality";
+import { auditDesignProgramContrast, programColor, programPageColor } from "./design-program-quality";
 import type { VisualAsset } from "./visual-schema";
 import {
   designProgramTokens,
@@ -20,11 +21,6 @@ import {
 export type DesignProgramCompileResult =
   | { success: true; batch: MultiScreenSpec; fingerprint: string; nodeCount: number; findings: DesignProgramFinding[]; semanticRoles: Array<{ logicalRef: string; role: string }> }
   | { success: false; findings: DesignProgramFinding[] };
-
-function resolveColor(color: string, program: DesignProgramV1): string {
-  if (!color.startsWith("token:")) return color;
-  return program.tokens.colors[color.slice(6)] ?? color;
-}
 
 function semanticRadius(semanticRole: string, program: DesignProgramV1): number | undefined {
   const radii = program.visualLanguageV1?.radii;
@@ -74,7 +70,7 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
     return {
       ...common,
       type: "frame",
-      background: node.background ? resolveColor(node.background, program) : undefined,
+      background: node.background ? programColor(program, node.background) : undefined,
       ...(node.background ? { cornerRadius: semanticRadius(node.semanticRole, program) } : {}),
       children,
       layout: {
@@ -95,16 +91,16 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
           : node.textRole === "body" || node.textRole === "action" ? language?.bodySize : undefined;
     const headingRole = node.textRole === "display" || node.textRole === "title" || node.textRole === "heading";
     return {
-      ...common, type: "text", text: node.text, fontSize: roleSize ?? node.fontSize, color: resolveColor(node.color, program),
+      ...common, type: "text", text: node.text, fontSize: roleSize ?? node.fontSize, color: programColor(program, node.color),
       fontFamily: headingRole || node.weight === "bold" || node.weight === "semibold" ? program.tokens.headingFont : program.tokens.bodyFont,
       fontStyle: node.weight === "bold" ? "Bold" : node.weight === "semibold" ? "Semi Bold" : node.weight === "medium" ? "Medium" : "Regular",
       textAlign: node.align ?? (direction === "rtl" ? "right" : "left"),
       textAutoResize: node.width.mode === "hug" && node.height.mode === "hug" ? "width-and-height" : "height",
     };
   }
-  if (node.type === "rectangle") return { ...common, type: "rectangle", fill: resolveColor(node.fill, program), cornerRadius: node.cornerRadius ?? semanticRadius(node.semanticRole, program) ?? 0 };
-  if (node.type === "ellipse") return { ...common, type: "ellipse", fill: resolveColor(node.fill, program) };
-  if (node.type === "vector") return { ...common, type: "vector", pathData: node.pathData, fill: resolveColor(node.fill, program) };
+  if (node.type === "rectangle") return { ...common, type: "rectangle", fill: programColor(program, node.fill), cornerRadius: node.cornerRadius ?? semanticRadius(node.semanticRole, program) ?? 0 };
+  if (node.type === "ellipse") return { ...common, type: "ellipse", fill: programColor(program, node.fill) };
+  if (node.type === "vector") return { ...common, type: "vector", pathData: node.pathData, fill: programColor(program, node.fill) };
   if (node.type === "instance") return { type: "instance", name: common.name, sizing: common.sizing, logicalRef: common.logicalRef, componentId: node.componentId };
   if (node.asset.source === "user-approved-brand-kit" && node.asset.assetRef && availableAssetIds.has(node.asset.assetRef))
     return { ...common, type: "image", assetId: node.asset.assetRef, fit: "crop", alt: node.asset.label, qualityRole: "image" };
@@ -137,7 +133,7 @@ export function compileDesignProgram(value: unknown, options: { assets?: VisualA
     if (!nativeDisplayName(screen.title)) findings.push({ code: "unsupported_display_name", path: `screens.${screen.id}.title`, message: "Screen title contains a slash or control character.", severity: "error" });
   }
   if (findings.length) return { success: false, findings };
-  const pageColor = program.visualLanguageV1?.colorRoles.page ?? program.tokens.colors.page ?? "#FFFFFF";
+  const pageColor = programPageColor(program);
   const screens = [...program.screens].sort((a, b) => a.order - b.order).map((screen) => {
     const contentHeight = screen.scroll === "vertical"
       ? Math.max(screen.viewport.height, screen.root.height.value + 48)
@@ -191,8 +187,11 @@ export function compileDesignProgram(value: unknown, options: { assets?: VisualA
   };
   const checked = parseMultiScreenValue(batchValue);
   if (!checked.success) return { success: false, findings: checked.errors.map((message) => ({ code: "native_schema_rejected", path: "batch", message, severity: "error" })) };
-  for (const diagnostic of auditVisualQuality(checked.data).diagnostics)
-    findings.push({ code: `quality_${diagnostic.code}`, path: diagnostic.path, message: diagnostic.message, severity: "warning" });
+  findings.push(...auditDesignProgramContrast(program));
+  for (const diagnostic of auditVisualQuality(checked.data).diagnostics) {
+    if (diagnostic.code !== "low-contrast")
+      findings.push({ code: `quality_${diagnostic.code}`, path: diagnostic.path, message: diagnostic.message, severity: "warning" });
+  }
   const semanticRoles: Array<{ logicalRef: string; role: string }> = [];
   for (const screen of program.screens) {
     const visit = (node: DesignProgramNode) => {

@@ -1375,7 +1375,12 @@ export function createFigmaToolExecutor(
       }
     }
     assertTaskPageScope(message.documentId, pageId);
-    return { nodes, unresolvedRefs, truncated: owned.length > visibleNodes.length, ...(geometry ? { geometry } : {}) };
+    const expectedId = message.geometry?.expectedRootNodeId;
+    const expected = expectedId ? await api.getNodeByIdAsync(expectedId) : undefined;
+    assertTaskPageScope(message.documentId, pageId);
+    const expectedRootStatus = !expectedId ? undefined : expected?.removed ? "removed"
+      : !expected ? "missing" : expected.parent?.id !== pageId ? "unexpected_parent" : "present";
+    return { nodes, unresolvedRefs, expectedRootStatus, truncated: owned.length > visibleNodes.length, ...(geometry ? { geometry } : {}) } as const;
   };
 
   const focusTaskNativeNodes = async (
@@ -3712,6 +3717,15 @@ export function createFigmaToolExecutor(
     if (message.type === "task-native-inspect") {
       try {
         const result = await inspectTaskNativeNodes(message);
+        if (message.geometry) console.log("[FAD_NATIVE_PROGRAM] " + JSON.stringify({
+          event: "final_readback", atMs: Date.now(), requestId: message.requestId,
+          taskId: message.taskId, fingerprint: message.geometry.programFingerprint,
+          coverage: result.geometry?.coverage, truncated: result.truncated,
+          expectedRootNodeId: message.geometry.expectedRootNodeId, expectedRootStatus: result.expectedRootStatus,
+          unresolvedRefs: result.unresolvedRefs,
+          nodes: result.nodes?.slice(0, 200).map(({ id, parentId, ref, x, y, visible }) =>
+            ({ id, parentId, ref, x, y, visible })),
+        }));
         send({
           type: "task-native-inspection-result",
           requestId: message.requestId,

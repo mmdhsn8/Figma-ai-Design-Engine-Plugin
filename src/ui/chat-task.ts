@@ -1,3 +1,4 @@
+import { chatAbortOrigin } from "../shared/chat-cancellation";
 import {
   ChatFunctionCallSchema,
   parseResponsesFunctionCalls,
@@ -67,6 +68,9 @@ import {
   MultiScreenProgressEventSchema,
   type MultiScreenDesignRequest,
   type MultiScreenProgressEvent,
+  greetingReply,
+  isExplicitCanvasRequest,
+  isClearCreateRequest,
 } from "../shared/chat-generation";
 import { runUniversalDesignTask } from "./universal-design-task";
 import type { DesignProgramV1 } from "../shared/design-program";
@@ -155,7 +159,7 @@ type Dependencies = {
     progress: (event: MultiScreenProgressEvent) => Promise<void>,
   ): Promise<unknown>;
   assertAuthorized?(): Promise<void>;
-  renderProgram?(program: DesignProgramV1, requestId: string): Promise<DesignProgramRenderResponse>;
+  renderProgram?(program: DesignProgramV1, requestId: string, expectedRootNodeId?: string): Promise<DesignProgramRenderResponse>;
   inspectProgram?(
     request: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
   ): Promise<Extract<PluginToUIMessage, { type: "task-native-inspection-result" }>>;
@@ -182,6 +186,7 @@ function safeRequestDiagnostic(error: unknown) {
     "timeoutKind",
     "timeoutSource",
     "terminationReason",
+    "cancellationOrigin",
     "elapsedMs",
     "headersMs",
     "idleMs",
@@ -3712,6 +3717,32 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     : task.stages.length
       ? "native_execution"
       : "planning";
+  const reply = greetingReply(task.prompt);
+  const conversation = reply !== undefined ||
+    (!isExplicitCanvasRequest(task.prompt) &&
+      (task.executionRoute === "universal-design-v1" || (!task.intent && !task.stages.length && !task.ledger.length)));
+  if (conversation) {
+    if (task.intent || task.projectPlan || task.universalScreens?.length ||
+        task.stages.length || task.ledger.length || task.pending.length)
+      throw new Error("This saved request does not authorize Canvas work. Its checkpoint and native layers were retained.");
+    check();
+    const text = reply ?? await deps.model([
+      ...task.context.filter((item) => "role" in item).slice(-3),
+      { role: "user", content: task.prompt },
+    ], "CONVERSATION");
+    check();
+    if (typeof text !== "string" && text.kind !== "done")
+      throw new Error("The conversational reply contained an unexpected tool call. No Canvas action was run.");
+    task.text = (typeof text === "string" ? text : text.text).slice(0, 8_000);
+    task.pending = [];
+    task.recent = [];
+    task.status = "completed";
+    transition("TASK_COMPLETED");
+    delete task.error;
+    delete task.failure;
+    await save();
+    return;
+  }
   syncCapacityAccounting(task);
   if (task.executionRoute === "universal-design-v1" && !task.intent && !task.stages.length)
     transition("UNIVERSAL_CLASSIFY");
@@ -4144,6 +4175,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           const call = intentCalls[0]!;
           if (call.action.tool !== "classify_canvas_intent")
             throw new Error("The intent classifier returned an invalid tool action.");
+          if (task.executionRoute === "universal-design-v1" && call.action.intent === "create" &&
+              !isClearCreateRequest(task.prompt))
+            throw new Error("The original request does not authorize creating a new Canvas design.");
           if (task.generationIntent && call.action.intent !== "create")
             throw new Error(
               "Structured screen creation could not be confirmed. Start a new task with the screen count, names, and device family.",
@@ -6142,11 +6176,14 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
   } catch (error) {
     const transportCategory =
       error && typeof error === "object" && "category" in error ? String(error.category) : "";
+    const abortOrigin = deps.signal.aborted ? chatAbortOrigin(deps.signal) : undefined;
+    const sessionEnded = abortOrigin === "session_changed" || abortOrigin === "authorization_revoked" ||
+      transportCategory === "stale_task_session";
     const isCancelled =
-      deps.signal.aborted ||
-      transportCategory === "request_cancelled" ||
+      !sessionEnded && (deps.signal.aborted ||
+      (task.executionRoute !== "universal-design-v1" && transportCategory === "request_cancelled") ||
       (error instanceof Error &&
-        /^(?:Stopped|Stopped between native operations)/u.test(error.message));
+        /^(?:Stopped|Stopped between native operations)/u.test(error.message)));
     task.status = isCancelled ? "stopped" : "failed";
     if (task.generationLink) {
       task.generationLink.status = isCancelled ? "paused" : "failed";
@@ -6163,7 +6200,11 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       ? task.intent === "edit"
         ? "Edit cancelled. Verified target evidence and any confirmed native changes are retained."
         : "Inspection cancelled. Saved read-only evidence is retained."
-      : (error instanceof Error ? error.message : "Stage failed safely.").slice(0, 500);
+      : sessionEnded ? "The Companion session changed or lost authorization. Reconnect and resume the saved task."
+      : (["chat_request_invalid", "request_cancelled"].includes(transportCategory) && error && typeof error === "object" &&
+          "safeMessage" in error && typeof error.safeMessage === "string"
+        ? error.safeMessage
+        : error instanceof Error ? error.message : "Stage failed safely.").slice(0, 500);
     if (readOnly() && isCancelled) {
       const checkpoint = readOnlyCheckpoint(task);
       task.inspectionOutcome = "CANCELLED";
@@ -6240,7 +6281,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                             ? "inspection"
                             : "planning",
         phase,
-        code: isCancelled
+        code: sessionEnded ? "stale_task_session" : isCancelled
           ? "request_cancelled"
           : checkpointFailure && checkpointCode && /^[a-z_]{1,80}$/u.test(checkpointCode)
             ? checkpointCode
@@ -6270,6 +6311,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
                                     ? "planning_failed"
                                     : "task_paused",
         committedOperations: chatTaskCommittedOperationCount(task),
+        ...(abortOrigin ? { cancellationOrigin: abortOrigin } : {}),
         ...(isCancelled
           ? {
               cancellationSource: deps.signal.aborted

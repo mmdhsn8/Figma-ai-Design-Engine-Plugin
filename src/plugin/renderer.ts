@@ -146,8 +146,8 @@ export interface MultiScreenRenderOptions {
   beforeScreen?: () => void;
   prepareScreen?: (root: FrameNode, screenId: string) => void;
   verifyScreen?: (root: FrameNode, screenId: string, reused: boolean, recovering?: boolean) => void;
-  canDiscardPendingScreen?: (root: FrameNode, screenId: string) => boolean;
   canRecoverPendingScreen?: (root: FrameNode) => boolean;
+  preserveFailedProgramNodes?: boolean;
   markScreenBuilt?: (root: FrameNode, screenId: string) => void;
   preserveSelection?: boolean;
   verifyPlacement?: boolean;
@@ -1965,9 +1965,7 @@ export async function renderMultiScreenDesign(
         if (root?.getPluginData("fad.generation.commit") === "pending") {
           if (root.type === "FRAME" && options.canRecoverPendingScreen?.(root))
             recoveringRoot = root;
-          else if (options.canDiscardPendingScreen && (root.type !== "FRAME" || !options.canDiscardPendingScreen(root, screen.id)))
-            throw new DesignRenderError("Pending native root ownership could not be confirmed for recovery.");
-          else root.remove();
+          else throw new DesignRenderError("A pending native root was retained. Inspect it before resuming.");
         }
         else if (root && !existingRoot)
           throw new DesignRenderError(
@@ -2262,7 +2260,8 @@ export async function renderMultiScreenDesign(
           for (const placement of replanned) placementById.set(placement.id, placement);
           actualPlacement = placementById.get(placementId) ?? plannedScreen;
         }
-        placeTopLevelNode(root, measuredBounds, actualPlacement);
+        if (!recoveringRoot || !options.preserveFailedProgramNodes)
+          placeTopLevelNode(root, measuredBounds, actualPlacement);
         if (transaction) {
           const sectionRoot = root.children[0];
           if (!sectionRoot || sectionRoot.type !== "FRAME")
@@ -2311,7 +2310,7 @@ export async function renderMultiScreenDesign(
           status: "generated",
         });
       } catch (error) {
-        screenTracker.cleanup();
+        if (!options.preserveFailedProgramNodes) screenTracker.cleanup();
         requiresReplan = true;
         const message =
           error instanceof Error ? error.message : "Figma could not create this screen.";
@@ -2354,13 +2353,15 @@ export async function renderMultiScreenDesign(
 
     const generatedScreens = screenResults.filter((screen) => screen.status === "generated").length;
     if (generatedScreens === 0) {
-      sharedTracker.cleanup();
-      styleBindings?.rollback();
+      if (!options.preserveFailedProgramNodes) {
+        sharedTracker.cleanup();
+        styleBindings?.rollback();
+      }
       const rolledBackAssets =
         componentCreated.length > 0 || (styleBindings?.report.created.length ?? 0) > 0;
       componentCreated.length = 0;
       if (styleBindings) styleBindings.report.created.length = 0;
-      if (rolledBackAssets) {
+      if (rolledBackAssets && !options.preserveFailedProgramNodes) {
         warnings.push(
           "New shared design-system assets were rolled back because no screen succeeded.",
         );
@@ -2426,8 +2427,10 @@ export async function renderMultiScreenDesign(
   } catch (error) {
     const message = error instanceof Error ? error.message : "Figma could not generate the batch.";
     if (successfulRoots.length === 0) {
-      sharedTracker.cleanup();
-      styleBindings?.rollback();
+      if (!options.preserveFailedProgramNodes) {
+        sharedTracker.cleanup();
+        styleBindings?.rollback();
+      }
       try {
         if (!options.preserveSelection) api.currentPage.selection = previousSelection;
       } catch {
