@@ -32,6 +32,7 @@ type Case = {
   entities: string[];
   goals: string[];
   screens: Array<{ name: string; role: string; purpose: string }>;
+  independentScreens?: boolean;
 };
 
 const cases: Case[] = [
@@ -157,7 +158,7 @@ function draftFor(input: Case, regionCount = 3, visualLanguageV1?: ProjectVisual
       actions: [{ label: input.goals[order % input.goals.length]!, purpose: screen.purpose }],
       states: ["ready", "empty", "completed"],
       navigationOrders: order < input.screens.length - 1 ? [order + 1] : [],
-      dependencyOrders: order > 0 ? [order - 1] : [],
+      dependencyOrders: input.independentScreens ? [] : order > 0 ? [order - 1] : [],
       scroll: "vertical",
     })),
     knownFacts: ["The requested audience and main goal are stated in the brief."],
@@ -258,7 +259,7 @@ function programFor(input: Case, screenIndex: number, regionCount = 3): DesignPr
         entityRefs: planned.entityRefs,
         approvedAssetsUsed: [],
       },
-      dependsOn: screenIndex > 0 ? [`screen-${String(screenIndex).padStart(2, "0")}`] : [],
+      dependsOn: input.independentScreens || screenIndex === 0 ? [] : [`screen-${String(screenIndex).padStart(2, "0")}`],
       root: {
         type: "container",
         id: "screen-layout",
@@ -343,6 +344,9 @@ function makeHarness(input: Case, options: {
   brandKit?: PinnedBrandKit;
   planLanguage?: ProjectVisualLanguageV1;
   localComponent?: boolean;
+  providerDelayMs?: number;
+  providerDelayForScreen?: (screenId: string) => number;
+  maxConcurrentModelCalls?: 1 | 2;
 } = {}) {
   const task = taskFor(input);
   if (options.brandKit) task.brandKit = options.brandKit;
@@ -352,13 +356,23 @@ function makeHarness(input: Case, options: {
   const checkpoints: ChatTask[] = [];
   const modelInputs: ChatInputItem[][] = [];
   const lifecycles: string[] = [];
+  const modelCompletionScreenIds: string[] = [];
   let providerCall = 0;
-  let composed = 0;
   let authChecks = 0;
   const model = vi.fn(async (items: ChatInputItem[], lifecycle: string) => {
     modelInputs.push(items);
     lifecycles.push(lifecycle);
     const index = ++providerCall;
+    const requestItem = [...items].reverse().find((item) => "role" in item && item.role === "user");
+    const request = requestItem && "content" in requestItem ? requestItem.content : "";
+    const payloadText = request.includes("UNIVERSAL_DESIGN_") ? request.split("\n", 2)[1] ?? "{}" : "{}";
+    const payload = JSON.parse(payloadText) as { context?: { currentScreen?: { screenId?: string } } };
+    const requestedScreenId = payload.context?.currentScreen?.screenId;
+    const delayMs = requestedScreenId && options.providerDelayForScreen
+      ? options.providerDelayForScreen(requestedScreenId)
+      : options.providerDelayMs ?? 0;
+    if (delayMs > 0)
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
     if (lifecycle === "UNIVERSAL_CLASSIFY") return modelTurn("classify_canvas_intent", { intent: "create" }, index);
     if (lifecycle === "UNIVERSAL_PLANNING") {
       if (options.firstPlanMalformed && index === 2)
@@ -369,7 +383,11 @@ function makeHarness(input: Case, options: {
       return modelTurn("plan_universal_project", draftFor(input, options.sparseConfirmation ? 1 : 3, options.planLanguage), index);
     }
     if (lifecycle === "UNIVERSAL_COMPOSING") {
-      const screenIndex = composed++;
+      const screenId = payload.context?.currentScreen?.screenId;
+      const screenIndex = Number(screenId?.slice(-2)) - 1;
+      if (!Number.isInteger(screenIndex) || screenIndex < 0 || screenIndex >= input.screens.length)
+        throw new Error("The compose fixture did not receive a stable screen identity.");
+      modelCompletionScreenIds.push(screenId!);
       const program = programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
       if (options.localComponent) {
         const fixed = { mode: "fixed" as const, value: 48 };
@@ -399,9 +417,14 @@ function makeHarness(input: Case, options: {
       }, index);
     }
     if (lifecycle === "UNIVERSAL_REPAIR") {
-      const repair = checkpoints.at(-1)?.universalScreens?.find(({ status }) => status === "repair_pending");
-      if (!repair) throw new Error("The repair request has no persisted finding scope.");
-      const screenIndex = Number(repair.screenId.slice("screen-".length)) - 1;
+      const requestItem = [...items].reverse().find((item) => "role" in item && item.role === "user");
+      const request = requestItem && "content" in requestItem ? requestItem.content : "";
+      const payloadText = request.split("\n", 2)[1] ?? "{}";
+      const payload = JSON.parse(payloadText) as { context?: { screenId?: string; boundedFindings?: Array<{ code: string; path: string; message: string }> } };
+      const screenId = payload.context?.screenId;
+      const findings = payload.context?.boundedFindings;
+      if (!screenId || !findings) throw new Error("The repair request has no persisted finding scope.");
+      const screenIndex = Number(screenId.slice("screen-".length)) - 1;
       const program = programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
       if (options.repairViewportMismatch) {
         program.screens[0]!.viewport = input.platform === "mobile"
@@ -409,8 +432,8 @@ function makeHarness(input: Case, options: {
           : { preset: "mobile", width: 390, height: 844 };
       }
       return modelTurn("repair_design_program", {
-        screenId: repair.screenId,
-        findings: repair.findings,
+        screenId,
+        findings,
         program,
       }, index);
     }
@@ -465,8 +488,29 @@ function makeHarness(input: Case, options: {
       return result;
     }),
     timingEvidence: "mock" as const,
+    maxConcurrentModelCalls: options.maxConcurrentModelCalls,
   };
-  return { task, mock, sent, checkpoints, modelInputs, lifecycles, model, deps, get authChecks() { return authChecks; } };
+  return { task, mock, sent, checkpoints, modelInputs, lifecycles, modelCompletionScreenIds, model, deps, get authChecks() { return authChecks; } };
+}
+
+function scriptedMarineCase(screenCount: number): Case {
+  return {
+    name: "marine archive scripted timing baseline",
+    brief: `Design ${screenCount} desktop screens for a marine specimen archive with accession, provenance, care and loan workflows. Use illustrative records only.`,
+    purpose: "Help collection staff manage a marine specimen from accession through care and loan readiness.",
+    audience: "Museum collection and conservation staff",
+    platform: "desktop",
+    locale: "en-US",
+    tags: ["marine-archive", "specimen-custody"],
+    entities: ["specimen", "accession", "provenance", "conservation", "loan"],
+    goals: ["Record an accession", "Review provenance", "Coordinate conservation", "Prepare a loan"],
+    screens: Array.from({ length: screenCount }, (_, index) => ({
+      name: [`Accession intake ${index + 1}`, `Provenance review ${index + 1}`, `Conservation record ${index + 1}`, `Loan readiness ${index + 1}`][index % 4]!,
+      role: [`intake-${index + 1}`, `provenance-${index + 1}`, `conservation-${index + 1}`, `loan-${index + 1}`][index % 4]!,
+      purpose: `Complete the ${["accession", "provenance", "conservation", "loan"][index % 4]} work for the selected illustrative specimen ${index + 1}.`,
+    })),
+    independentScreens: true,
+  };
 }
 
 describe("universal design Chat route", () => {
@@ -490,6 +534,148 @@ describe("universal design Chat route", () => {
     expect(saved.status).toBe("completed");
     expect(saved.universalMetrics?.planRequests).toBe(2);
     expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(3);
+  });
+
+  it("recovers a lost per-screen provider response using the saved bounded attempt", async () => {
+    const h = makeHarness(cases[0]!);
+    const original = h.model.getMockImplementation()!;
+    let interrupted = false;
+    h.model.mockImplementation(async (input, lifecycle) => {
+      if (lifecycle === "UNIVERSAL_COMPOSING" && !interrupted) {
+        interrupted = true;
+        throw new Error("Simulated per-screen Companion disconnect");
+      }
+      return original(input, lifecycle);
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("per-screen Companion disconnect");
+    const saved = ChatTaskSchema.parse(structuredClone(h.checkpoints.at(-1)));
+    expect(saved.universalScreens?.[0]).toMatchObject({ status: "pending", composeAttempts: 1, errorCode: "provider_or_host_error" });
+    expect(h.mock.roots).toHaveLength(0);
+    await runChatTask(saved, h.deps);
+    expect(saved.status).toBe("completed");
+    expect(saved.universalScreens?.[0]?.composeAttempts).toBe(2);
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(3);
+  });
+
+  it("cancels concurrent screen calls, ignores late responses, and safely resumes the same task", async () => {
+    const h = makeHarness(scriptedMarineCase(3), {
+      providerDelayForScreen: () => 45,
+      maxConcurrentModelCalls: 2,
+    });
+    const controller = new AbortController();
+    h.deps.signal = controller.signal;
+    const original = h.model.getMockImplementation()!;
+    let started = 0;
+    let resolveStarted!: () => void;
+    const bothStarted = new Promise<void>((resolve) => { resolveStarted = resolve; });
+    h.model.mockImplementation(async (items, lifecycle) => {
+      if (lifecycle === "UNIVERSAL_COMPOSING" && ++started === 2) resolveStarted();
+      return original(items, lifecycle);
+    });
+    const running = runChatTask(h.task, h.deps);
+    await bothStarted;
+    controller.abort();
+    await expect(running).rejects.toThrow("request_cancelled");
+    expect(h.deps.renderProgram).not.toHaveBeenCalled();
+    expect(h.mock.roots).toHaveLength(0);
+    const saved = ChatTaskSchema.parse(structuredClone(h.checkpoints.at(-1)));
+    expect(saved.universalScreens?.some(({ status }) => status === "composing")).toBe(true);
+    const resumedDeps = { ...h.deps, signal: new AbortController().signal };
+    await runChatTask(saved, resumedDeps);
+    expect(saved.status).toBe("completed");
+    expect(saved.universalScreens?.map(({ status }) => status)).toEqual(["verified", "verified", "verified"]);
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(3);
+    expect(new Set(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete").map(({ id }) => id)).size).toBe(3);
+  });
+
+  it("reuses a compatible Phase 5 pending screen response without another provider request", async () => {
+    const input = { ...cases[0]!, screens: cases[0]!.screens.slice(0, 1), brief: "برای آموزش فارسی یک صفحهٔ موبایل جدید بساز." };
+    const h = makeHarness(input);
+    const original = h.model.getMockImplementation()!;
+    let interrupted = false;
+    h.model.mockImplementation(async (items, lifecycle) => {
+      if (lifecycle === "UNIVERSAL_COMPOSING" && !interrupted) {
+        interrupted = true;
+        throw new Error("Simulated interruption before a Phase 5 response");
+      }
+      return original(items, lifecycle);
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("before a Phase 5 response");
+    const saved = ChatTaskSchema.parse(structuredClone(h.checkpoints.at(-1)));
+    expect(saved.projectPlan?.screens).toHaveLength(1);
+    const pending = parseResponsesFunctionCalls([{
+      type: "function_call",
+      call_id: "phase5-pending-call-0001",
+      name: "compose_design_program",
+      arguments: JSON.stringify({ screenId: "screen-01", program: programFor(input, 0) }),
+    }]);
+    saved.pending = pending;
+    saved.recent = pending.map(({ functionCall }) => functionCall);
+    saved.universalScreens![0]!.status = "pending";
+    saved.universalScreens![0]!.composeAttempts = 0;
+    const requestsBeforeResume = h.model.mock.calls.filter(([, lifecycle]) => lifecycle === "UNIVERSAL_COMPOSING").length;
+    await runChatTask(saved, h.deps);
+    expect(saved.status).toBe("completed");
+    expect(saved.universalScreens?.[0]?.status).toBe("verified");
+    expect(h.model.mock.calls.filter(([, lifecycle]) => lifecycle === "UNIVERSAL_COMPOSING")).toHaveLength(requestsBeforeResume);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(1);
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(1);
+  });
+
+  it("does not schedule a dependent screen until its dependency program is checkpointed", async () => {
+    const input = { ...scriptedMarineCase(3), independentScreens: false };
+    const h = makeHarness(input, { providerDelayForScreen: (screenId) => screenId === "screen-01" ? 35 : 1, maxConcurrentModelCalls: 2 });
+    await runChatTask(h.task, h.deps);
+    expect(h.task.projectPlan?.screens.map(({ dependencies }) => dependencies)).toEqual([[], ["screen-01"], ["screen-02"]]);
+    expect(h.modelCompletionScreenIds).toEqual(["screen-01", "screen-02", "screen-03"]);
+    expect(h.task.universalMetrics?.peakConcurrentModelRequests).toBe(1);
+    expect(h.deps.renderProgram.mock.calls.map(([program]) => program.screens[0]?.id)).toEqual(["screen-01", "screen-02", "screen-03"]);
+  });
+
+  it("keeps native placement order when the first screen finishes fastest", async () => {
+    const input = scriptedMarineCase(3);
+    const h = makeHarness(input, {
+      providerDelayForScreen: (screenId) => screenId === "screen-02" ? 45 : screenId === "screen-03" ? 5 : 1,
+      maxConcurrentModelCalls: 2,
+    });
+    await runChatTask(h.task, h.deps);
+    expect(h.modelCompletionScreenIds.indexOf("screen-01")).toBeLessThan(h.modelCompletionScreenIds.indexOf("screen-02"));
+    expect(h.modelCompletionScreenIds.indexOf("screen-03")).toBeLessThan(h.modelCompletionScreenIds.indexOf("screen-02"));
+    expect(h.deps.renderProgram.mock.calls.map(([program]) => program.screens[0]?.id)).toEqual(["screen-01", "screen-02", "screen-03"]);
+    expect(h.task.universalScreens?.map(({ screenId, status }) => [screenId, status])).toEqual([
+      ["screen-01", "verified"], ["screen-02", "verified"], ["screen-03", "verified"],
+    ]);
+  });
+
+  it("reduces persisted concurrency after a provider capacity signal and resumes without a retry storm", async () => {
+    const h = makeHarness(scriptedMarineCase(3), { maxConcurrentModelCalls: 2 });
+    const original = h.model.getMockImplementation()!;
+    let capacityHit = false;
+    h.model.mockImplementation(async (items, lifecycle) => {
+      if (lifecycle === "UNIVERSAL_COMPOSING" && !capacityHit) {
+        const requestItem = [...items].reverse().find((item) => "role" in item && item.role === "user");
+        const requestText = requestItem && "content" in requestItem ? requestItem.content : "";
+        if (requestText.includes("screen-02")) {
+          capacityHit = true;
+          await new Promise<void>((resolve) => setTimeout(resolve, 30));
+          throw Object.assign(new Error("bounded provider capacity response"), { category: "inference_busy" });
+        }
+      }
+      return original(items, lifecycle);
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("bounded provider capacity response");
+    const saved = ChatTaskSchema.parse(structuredClone(h.checkpoints.at(-1)));
+    expect(saved.universalMetrics).toMatchObject({ concurrencyLimit: 1, schedulerMode: "serial", peakConcurrentModelRequests: 2 });
+    const callsBeforeResume = h.model.mock.calls.filter(([, lifecycle]) => lifecycle === "UNIVERSAL_COMPOSING").length;
+    expect(callsBeforeResume).toBeGreaterThanOrEqual(2);
+    expect(callsBeforeResume).toBeLessThanOrEqual(3);
+    await runChatTask(saved, h.deps);
+    expect(saved.status).toBe("completed");
+    expect(saved.universalMetrics?.concurrencyLimit).toBe(1);
+    expect(saved.universalMetrics?.peakConcurrentModelRequests).toBe(2);
+    expect(saved.universalScreens?.every(({ status }) => status === "verified")).toBe(true);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(3);
+    expect(h.model.mock.calls.filter(([, lifecycle]) => lifecycle === "UNIVERSAL_COMPOSING").length).toBeLessThanOrEqual(callsBeforeResume + 3);
   });
 
   it("rejects a schema-valid but changed saved program before replay", async () => {
@@ -623,12 +809,14 @@ describe("universal design Chat route", () => {
     h.deps.renderProgram.mockRejectedValueOnce(new Error("Simulated interruption before native creation"));
     await expect(runChatTask(h.task, h.deps)).rejects.toThrow("before native creation");
     expect(h.mock.roots).toHaveLength(0);
-    const saved = ChatTaskSchema.parse(structuredClone(h.task));
+    const saved = ChatTaskSchema.parse(structuredClone(h.checkpoints.at(-1)));
     expect(saved.universalScreens?.[0]).toMatchObject({ status: "rendering", program: expect.any(Object) });
+    const compositionCallsBeforeResume = h.lifecycles.filter((name) => name === "UNIVERSAL_COMPOSING").length;
+    const unsavedPrograms = saved.universalScreens!.filter(({ program }) => !program).length;
     await runChatTask(saved, h.deps);
     expect(saved.status).toBe("completed");
     expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(3);
-    expect(h.lifecycles.filter((name) => name === "UNIVERSAL_COMPOSING")).toHaveLength(3);
+    expect(h.lifecycles.filter((name) => name === "UNIVERSAL_COMPOSING").length - compositionCallsBeforeResume).toBe(unsavedPrograms);
   });
 
   it("reuses a task local component master across two native screen instances", async () => {
@@ -755,9 +943,11 @@ describe("universal design Chat route", () => {
     if (composedPrograms.length >= 3)
       expect(new Set(composedPrograms.slice(0, 3).map(({ screens }) => compositionTopology(screens[0]!.root))).size).toBe(3);
     expect(h.task.universalMetrics).toMatchObject({
+      intentRequests: 1,
       planRequests: 1,
       programRequests: input.screens.length,
       repairRequests: 0,
+      providerRounds: input.screens.length + 2,
       nativeBatches: input.screens.length,
       timingEvidence: "mock",
       benchmarkComparableTiming: "not-measured",
@@ -1064,4 +1254,99 @@ describe("universal design Chat route", () => {
     expect(replay.success, JSON.stringify(replay)).toBe(true);
     expect(mock.getImageImportCalls()).toBe(1);
   });
+
+  it("records the serial 1/3/10-screen baseline with deterministic provider delays", async () => {
+    const measurements: Array<Record<string, number>> = [];
+    for (const screenCount of [1, 3, 10]) {
+      for (let repetition = 1; repetition <= 3; repetition++) {
+        const input = scriptedMarineCase(screenCount);
+        const h = makeHarness(input, { providerDelayForScreen: (screenId) => screenId === "screen-01" ? 60 : 15, maxConcurrentModelCalls: 1 });
+        const startedAt = performance.now();
+        await runChatTask(h.task, h.deps);
+        measurements.push({
+          screens: screenCount,
+          repetition,
+          elapsedMs: Math.round(performance.now() - startedAt),
+          providerRequests: h.model.mock.calls.length,
+          providerRounds: h.task.universalMetrics!.providerRounds,
+          intentRequests: h.task.universalMetrics!.intentRequests,
+          intentClassificationMs: h.task.universalMetrics!.intentClassificationMs,
+          peakModelCalls: h.task.universalMetrics!.peakConcurrentModelRequests,
+          firstNativeMs: h.task.universalMetrics!.firstNativeProgressMs ?? -1,
+          firstVerifiedMs: h.task.universalMetrics!.firstVerifiedScreenMs ?? -1,
+          providerMs: h.task.universalMetrics!.providerLatencyMs,
+          compositionMs: h.task.universalMetrics!.programCompositionMs,
+          queueWaitMs: h.task.universalMetrics!.providerQueueWaitMs,
+          normalizationMs: h.task.universalMetrics!.programNormalizationMs,
+          preflightMs: h.task.universalMetrics!.programPreflightMs,
+          persistenceMs: h.task.universalMetrics!.persistenceMs,
+          nativeMs: h.task.universalMetrics!.nativeDurationMs,
+          readbackMs: h.task.universalMetrics!.readbackRoundTripMs,
+          nativeNodes: h.task.universalScreens!.reduce((sum, screen) => sum + (screen.nativeNodeCount ?? 0), 0),
+          nativeBatches: h.task.universalMetrics!.nativeBatches,
+        });
+        expect(h.task.status).toBe("completed");
+        expect(h.task.universalMetrics?.concurrencyLimit).toBe(1);
+        expect(h.task.universalMetrics?.peakConcurrentModelRequests).toBe(1);
+        expect(h.model).toHaveBeenCalledTimes(screenCount + 2);
+        expect(h.deps.renderProgram).toHaveBeenCalledTimes(screenCount);
+        expect(h.deps.inspectProgram).toHaveBeenCalledTimes(screenCount);
+      }
+    }
+    process.stderr.write(`PHASE6_SERIAL_BASELINE ${JSON.stringify(measurements)}\n`);
+  }, 60_000);
+
+  it("measures bounded screen scheduling at 1/3/10 with out-of-order provider completion and ordered native commits", async () => {
+    const measurements: Array<Record<string, number>> = [];
+    for (const screenCount of [1, 3, 10]) {
+      for (let repetition = 1; repetition <= 3; repetition++) {
+        const input = scriptedMarineCase(screenCount);
+        const h = makeHarness(input, {
+          providerDelayForScreen: (screenId) => screenId === "screen-01" ? 60 : 15,
+          maxConcurrentModelCalls: 2,
+        });
+        const startedAt = performance.now();
+        await runChatTask(h.task, h.deps);
+        const elapsedMs = Math.round(performance.now() - startedAt);
+        const metrics = h.task.universalMetrics!;
+        measurements.push({
+          screens: screenCount,
+          repetition,
+          elapsedMs,
+          providerRequests: h.model.mock.calls.length,
+          providerRounds: metrics.providerRounds,
+          intentRequests: metrics.intentRequests,
+          intentClassificationMs: metrics.intentClassificationMs,
+          peakModelCalls: metrics.peakConcurrentModelRequests,
+          firstNativeMs: metrics.firstNativeProgressMs ?? -1,
+          firstVerifiedMs: metrics.firstVerifiedScreenMs ?? -1,
+          providerMs: metrics.providerLatencyMs,
+          compositionMs: metrics.programCompositionMs,
+          queueWaitMs: metrics.providerQueueWaitMs,
+          normalizationMs: metrics.programNormalizationMs,
+          preflightMs: metrics.programPreflightMs,
+          persistenceMs: metrics.persistenceMs,
+          nativeMs: metrics.nativeDurationMs,
+          readbackMs: metrics.readbackRoundTripMs,
+          nativeNodes: h.task.universalScreens!.reduce((sum, screen) => sum + (screen.nativeNodeCount ?? 0), 0),
+          nativeBatches: metrics.nativeBatches,
+        });
+        expect(h.task.status).toBe("completed");
+        expect(h.task.universalManifest?.screens.map(({ screenId }) => screenId)).toEqual(input.screens.map((_, index) => `screen-${String(index + 1).padStart(2, "0")}`));
+        expect(h.task.universalScreens?.map(({ screenId, status }) => [screenId, status])).toEqual(input.screens.map((_, index) => [`screen-${String(index + 1).padStart(2, "0")}`, "verified"]));
+        expect(h.deps.renderProgram.mock.calls.map(([program]) => program.screens[0]?.id)).toEqual(input.screens.map((_, index) => `screen-${String(index + 1).padStart(2, "0")}`));
+        expect(h.deps.inspectProgram.mock.calls.map(([request]) => {
+          const inspect = request as unknown as { type?: string; refs?: string[] };
+          return inspect.type === "task-native-inspect" ? inspect.refs?.[0] : undefined;
+        })).toEqual(h.task.universalScreens!.map(({ rootRef }) => rootRef));
+        expect(metrics.peakConcurrentModelRequests).toBe(screenCount > 1 ? 2 : 1);
+        expect(metrics.timingEvidence).toBe("mock");
+        expect(metrics.traceEvents.every((event) => event.buildId === "phase6-universal-orchestrator-v1" && event.taskId === h.task.id)).toBe(true);
+        if (screenCount > 1) expect(h.modelCompletionScreenIds[0]).not.toBe("screen-01");
+        expect(JSON.stringify(chatTaskSafeDiagnostic(h.task))).not.toContain(input.brief);
+        expect(h.mock.nodes.filter((node) => node.parent?.type === "PAGE" && node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(screenCount);
+      }
+    }
+    process.stderr.write(`PHASE6_BOUNDED_PARALLEL_MOCK ${JSON.stringify(measurements)}\n`);
+  }, 60_000);
 });

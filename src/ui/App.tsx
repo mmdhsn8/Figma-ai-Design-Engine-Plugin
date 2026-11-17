@@ -2298,18 +2298,19 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             throw new Error("Figma returned an unexpected response for the universal screen readback.");
           return response;
         },
-        model: (input, lifecycle) =>
+        model: (input, lifecycle, requestId, requestSignal) =>
           streamAuthorizedChat(
             companionToken,
-            nextRequestId(),
+            requestId ?? nextRequestId(),
             executionModel,
             input,
             lifecycle,
             fetch,
-            controller.signal,
+            requestSignal ?? controller.signal,
             () => setChatActivity("Receiving the next bounded stage…"),
             (elapsedMs) => setChatActivity(`Model is working · ${Math.ceil(elapsedMs / 1_000)}s`),
           ),
+        isCurrent: () => chatTask.current === task,
         execute: async (operations) => {
           const latest = await getCompanionStatus(companionToken);
           checkChatSession();

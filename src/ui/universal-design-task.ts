@@ -3,7 +3,7 @@ import { compileDesignProgram } from "../shared/design-program-adapter";
 import { ChatFunctionCallSchema, type ChatFunctionCall, type ChatLifecycleState, type ChatInputItem } from "../shared/chat-tools";
 import { parseChatGenerationIntent } from "../shared/chat-generation";
 import { resolveBrandKitTokens } from "../shared/brand-kit";
-import { CHAT_TASK_MAX_VALIDATION_CORRECTIONS, ChatTaskSchema, type ChatTask } from "../shared/chat-task";
+import { CHAT_TASK_MAX_BYTES, CHAT_TASK_MAX_VALIDATION_CORRECTIONS, ChatTaskSchema, type ChatTask } from "../shared/chat-task";
 import { utf8Bytes } from "../shared/generation-limits";
 import { compositionVariationSeed, createDefaultVisualLanguage, ProjectVisualLanguageV1Schema, type ProjectVisualLanguageV1 } from "../shared/design-composition";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
@@ -11,9 +11,13 @@ import {
   parseProjectPlanDraft,
   projectPlanFingerprint,
   ProjectPlanV1Schema,
+  UniversalJobManifestV1Schema,
   UniversalDesignMetricsSchema,
   UniversalScreenCheckpointSchema,
+  UNIVERSAL_DESIGN_TRACE_BUILD_ID,
+  universalJobManifestFingerprint,
   type ProjectPlanV1,
+  type UniversalDesignTraceEvent,
   type UniversalScreenCheckpoint,
 } from "../shared/universal-design";
 import type { AuthorizedChatTurn } from "./companion-client";
@@ -22,7 +26,7 @@ import type { DesignProgramRenderResponse } from "./design-program-bridge";
 type NativeInspection = Extract<PluginToUIMessage, { type: "task-native-inspection-result" }>;
 
 export type UniversalDesignDependencies = {
-  model(input: ChatInputItem[], lifecycle: ChatLifecycleState): Promise<AuthorizedChatTurn>;
+  model(input: ChatInputItem[], lifecycle: ChatLifecycleState, requestId: string, signal?: AbortSignal): Promise<AuthorizedChatTurn>;
   save(task: ChatTask): Promise<void>;
   progress(message: string): void;
   assertAuthorized(): Promise<void>;
@@ -30,10 +34,14 @@ export type UniversalDesignDependencies = {
   inspectProgram(request: Extract<UIToPluginMessage, { type: "task-native-inspect" }>): Promise<NativeInspection>;
   signal: AbortSignal;
   now?: () => number;
+  monotonicNow?: () => number;
+  maxConcurrentModelCalls?: 1 | 2;
+  isCurrent?(): boolean;
   onPhase?(phase: "planning" | "native_execution" | "verification"): void;
   timingEvidence?: "live" | "mock";
 };
 
+export const UNIVERSAL_DESIGN_MAX_CONCURRENT_MODEL_CALLS: 1 | 2 = 2;
 const MAX_PROVIDER_INPUT_BYTES = 56 * 1024;
 const MAX_TASK_NATIVE_NODES = 200;
 
@@ -206,7 +214,7 @@ function finalizePlan(plan: ProjectPlanV1, task: ChatTask): { plan: ProjectPlanV
   return { plan: pinnedPlan, fingerprint: projectPlanFingerprint(pinnedPlan) };
 }
 
-function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", screen?: UniversalScreenCheckpoint): ChatInputItem[] {
+function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", screen?: UniversalScreenCheckpoint, validationFeedback?: string): ChatInputItem[] {
   const plan = task.projectPlan;
   const screenPlan = screen && plan?.screens.find(({ screenId }) => screenId === screen.screenId);
   if (purpose !== "plan" && (!plan || !screen || !screenPlan))
@@ -224,7 +232,7 @@ function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", sc
           repairAttempt: screen!.repairAttempts,
         };
   const routeInstruction = purpose === "plan"
-    ? "Return only one plan_universal_project tool call. Respect the exact count/device/language constraints in this context. Choose useful distinct screens if the brief did not provide a count. Do not guess private document data."
+    ? "Return only one plan_universal_project tool call. Respect the exact count/device/language constraints in this context. Choose useful distinct screens if the brief did not provide a count. Declare a screen dependency only when the saved content of that screen is required to author another; navigation alone is not a generation dependency. Do not guess private document data."
     : purpose === "compose"
       ? `Return only one compose_design_program tool call for the single currentScreen. Reuse the exact shared visualLanguageV1; choose a useful general archetype from the allowed vocabulary and explain the choice in decisionTrace. Give each planned region a real container nodeId in the editable tree, prioritize the user goal, and use the stable variation seed ${compositionVariationSeed(task.id, screen!.screenId)}. Use semantic textRole values so typography tokens apply. Follow contentSamplePolicy exactly and label fictional sample data as illustrative. Only use an image assetRef if its ID is in the pinned Brand Kit assetCatalog; otherwise make a visibly labeled native placeholder or editable vector. Do not force card grids, add at least three nodes, or include other screens.`
       : "Return only one repair_design_program tool call. Modify only the supplied invalid fields/findings in this saved one-screen program and preserve all other valid content.";
@@ -240,7 +248,7 @@ function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", sc
       ).values()].filter((definition) => utf8Bytes(JSON.stringify(definition)) <= 1_500).slice(0, 6),
     } : {}),
     instructions: routeInstruction,
-    ...(task.validationFeedback ? { priorValidation: task.validationFeedback.slice(0, 3_000) } : {}),
+    ...((validationFeedback ?? task.validationFeedback) ? { priorValidation: (validationFeedback ?? task.validationFeedback)!.slice(0, 3_000) } : {}),
   };
   const input: ChatInputItem[] = [
     ...inputHistory(task),
@@ -297,6 +305,45 @@ function initialMetrics(now: number, timingEvidence: "live" | "mock") {
     timingEvidence,
     benchmarkComparableTiming: "not-measured",
   });
+}
+
+function createJobManifest(task: ChatTask, plan: ProjectPlanV1, planFingerprint: string) {
+  if (!task.model) fail("model_not_pinned", "The task manifest requires the exact account-visible model already pinned to this Chat task.");
+  const base = {
+    version: 1 as const,
+    taskId: task.id,
+    engineRoute: "universal-design-v1" as const,
+    modelSlug: task.model,
+    planFingerprint,
+    designProgramVersion: plan.designProgramVersion,
+    platform: plan.platform,
+    locale: plan.locale,
+    direction: plan.direction,
+    screens: plan.screens.map(({ screenId, order, name, role, dependencies }) => ({ screenId, order, name, role, dependencies })),
+    ...(task.brandKit ? {
+      brandKit: {
+        id: task.brandKit.id,
+        revision: task.brandKit.revision,
+        tokenHash: task.brandKit.tokenHash,
+        assets: task.brandKit.assets.map(({ assetId, contentHash }) => ({ assetId, contentHash })).sort((a, b) => a.assetId.localeCompare(b.assetId)),
+      },
+    } : {}),
+    skills: (task.designSkills ?? []).map(({ id, revisionId }) => ({ id, revisionId })).sort((a, b) => a.id.localeCompare(b.id)),
+    capabilities: [...plan.capabilityFlags],
+    layoutCapabilities: ["auto-layout", "fill-and-hug-sizing", "bounded-wrap", "vertical-scroll", "native-components", "editable-text"],
+  };
+  return UniversalJobManifestV1Schema.parse({ ...base, fingerprint: universalJobManifestFingerprint(base) });
+}
+
+function safeErrorCode(error: unknown): string {
+  const candidate = error && typeof error === "object"
+    ? "code" in error && typeof error.code === "string"
+      ? error.code
+      : "category" in error && typeof error.category === "string"
+        ? error.category
+        : undefined
+    : undefined;
+  return candidate && /^[A-Za-z0-9_.:-]{1,100}$/u.test(candidate) ? candidate : "provider_or_host_error";
 }
 
 function pinnedBrandAssetIds(task: ChatTask): Set<string> {
@@ -529,28 +576,92 @@ function verifyNativeReadback(
 
 export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesignDependencies): Promise<void> {
   const now = deps.now ?? Date.now;
+  const monotonicNow = deps.monotonicNow ?? (() => performance.now());
+  const runStartedAt = monotonicNow();
+  const screenRunStartedAt = new Map<string, number>();
+  let saveQueue = Promise.resolve();
+  let taskStateQueue = Promise.resolve();
+  let activeScreenModelCalls = 0;
+  const withTaskLock = async <T>(work: () => Promise<T> | T): Promise<T> => {
+    const operation = taskStateQueue.then(work, work);
+    taskStateQueue = operation.then(() => undefined, () => undefined);
+    return operation;
+  };
   const check = () => {
     if (deps.signal.aborted) throw new UniversalDesignTaskError("request_cancelled", "The request stopped. Saved plans and confirmed screens are retained.");
+    if (deps.isCurrent && !deps.isCurrent()) throw new UniversalDesignTaskError("stale_task_session", "This task was replaced or selected elsewhere. Its late provider results were ignored.");
   };
   const transition = (lifecycle: ChatLifecycleState) => {
     if (task.lifecycle === lifecycle) return;
     task.lifecycle = lifecycle;
     task.lifecycleTransitions++;
   };
+  const recordTrace = (event: Omit<UniversalDesignTraceEvent, "eventId" | "taskId" | "engineRoute" | "buildId">) => {
+    const metrics = task.universalMetrics;
+    if (!metrics) return;
+    metrics.traceSequence++;
+    const traceEvent: UniversalDesignTraceEvent = {
+      eventId: `${task.id}_p6e${metrics.traceSequence}`,
+      taskId: task.id,
+      engineRoute: "universal-design-v1",
+      buildId: UNIVERSAL_DESIGN_TRACE_BUILD_ID,
+      ...event,
+    };
+    metrics.traceEvents = [...metrics.traceEvents, traceEvent].slice(-128);
+  };
   const save = async () => {
     check();
     const parsed = ChatTaskSchema.safeParse(task);
     if (!parsed.success)
       fail("checkpoint_invalid", "The universal route could not save a schema-valid checkpoint; no new native render was dispatched.");
-    await deps.save(parsed.data);
+    if (utf8Bytes(JSON.stringify(parsed.data)) > CHAT_TASK_MAX_BYTES)
+      fail("checkpoint_size_limit", "The task checkpoint reached its 512 KiB safety budget; existing canvas work is retained and no further native work was started.");
+    const startedAt = monotonicNow();
+    const pendingWrite = saveQueue.then(() => deps.save(parsed.data));
+    saveQueue = pendingWrite.then(() => undefined, () => undefined);
+    await pendingWrite;
+    const durationMs = Math.max(0, Math.round(monotonicNow() - startedAt));
+    if (task.universalMetrics) {
+      task.universalMetrics.persistenceMs += durationMs;
+      recordTrace({ stageId: "task", stage: "persistence", event: "checkpoint_saved", outcome: "completed", durationMs });
+    }
   };
   if (task.executionRoute !== "universal-design-v1" || task.intent !== "create")
     fail("route_intent_conflict", "Only the checkpointed universal create route can run this planner.");
   if (!task.model) fail("model_not_pinned", "The Chat task has no pinned account-visible model.");
-  task.universalMetrics ??= initialMetrics(now(), deps.timingEvidence ?? "live");
+  const importingIntentTiming = !task.universalMetrics;
+  if (importingIntentTiming) {
+    const intentRounds = task.modelRoundTrace.filter((round) => round.lifecycle === "UNIVERSAL_CLASSIFY");
+    const metrics = initialMetrics(Math.max(0, Math.floor(runStartedAt)), deps.timingEvidence ?? "live");
+    metrics.intentRequests = intentRounds.length;
+    metrics.intentClassificationMs = intentRounds.reduce((sum, round) => sum + (round.durationMs ?? 0), 0);
+    metrics.providerRounds = intentRounds.length;
+    metrics.providerInputBytes = intentRounds.reduce((sum, round) => sum + (round.inputBytes ?? 0), 0);
+    metrics.providerLatencyMs = metrics.intentClassificationMs;
+    metrics.providerFirstDeltaMs = intentRounds.reduce((sum, round) => sum + (round.timing?.upstreamFirstDeltaMs ?? 0), 0);
+    task.universalMetrics = metrics;
+  }
   const metricCheck = UniversalDesignMetricsSchema.safeParse(task.universalMetrics);
   if (!metricCheck.success) fail("metrics_checkpoint_invalid", "The saved route metrics are invalid.");
   task.universalMetrics = metricCheck.data;
+  task.universalMetrics.startedAtMs = Math.max(0, Math.floor(runStartedAt));
+  task.universalMetrics.schedulerMode = deps.maxConcurrentModelCalls === 1 ? "serial" : "bounded-parallel";
+  task.universalMetrics.concurrencyLimit = Math.min(task.universalMetrics.concurrencyLimit, deps.maxConcurrentModelCalls ?? UNIVERSAL_DESIGN_MAX_CONCURRENT_MODEL_CALLS) as 1 | 2;
+  if (importingIntentTiming) {
+    const intentRounds = task.modelRoundTrace.filter((round) => round.lifecycle === "UNIVERSAL_CLASSIFY");
+    intentRounds.forEach((round, index) => recordTrace({
+      stageId: "task",
+      stage: "intent",
+      event: "request_completed",
+      outcome: "completed",
+      ...(round.providerRequestId ? { providerRequestId: round.providerRequestId } : {}),
+      attempt: index + 1,
+      ...(round.durationMs !== undefined ? { durationMs: round.durationMs } : {}),
+      ...(round.inputBytes !== undefined ? { inputBytes: round.inputBytes } : {}),
+      ...(round.timing?.upstreamHeadersMs !== undefined ? { upstreamHeadersMs: round.timing.upstreamHeadersMs } : {}),
+      ...(round.timing?.upstreamFirstDeltaMs !== undefined ? { firstDeltaMs: round.timing.upstreamFirstDeltaMs } : {}),
+    }));
+  }
   await save();
 
   const requestTool = async (
@@ -587,22 +698,41 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       if (purpose === "plan") metrics.planRequests++;
       else if (purpose === "compose") metrics.programRequests++;
       else metrics.repairRequests++;
+      const attempt = purpose === "plan" ? metrics.planRequests : purpose === "compose" ? metrics.programRequests : metrics.repairRequests;
+      const requestId = `${task.id}_p6_${purpose}_${screen?.screenId ?? "task"}_${attempt}`;
+      recordTrace({ stageId: screen?.screenId ?? "task", stage: purpose, event: "request_started", outcome: "started", providerRequestId: requestId, attempt, inputBytes });
       // A lost provider response consumes the attempt, but never commits a plan or native effect.
       await save();
-      const startedAt = now();
+      const startedAt = monotonicNow();
       let turn: AuthorizedChatTurn;
       try {
-        turn = await deps.model(input, lifecycle);
+        turn = await deps.model(input, lifecycle, requestId, deps.signal);
       } catch (error) {
-        if (deps.signal.aborted) check();
+        recordTrace({ stageId: screen?.screenId ?? "task", stage: purpose, event: "request_failed", outcome: "failed", providerRequestId: requestId, attempt, durationMs: Math.max(0, Math.round(monotonicNow() - startedAt)), code: safeErrorCode(error) });
+        if (!deps.signal.aborted) await save();
+        if (deps.signal.aborted || (deps.isCurrent && !deps.isCurrent())) check();
         throw error;
       }
       check();
-      const durationMs = Math.max(0, now() - startedAt);
+      const durationMs = Math.max(0, Math.round(monotonicNow() - startedAt));
       task.rounds++;
       metrics.providerRounds++;
       metrics.providerInputBytes += inputBytes;
       metrics.providerLatencyMs += durationMs;
+      metrics.providerFirstDeltaMs += turn.timing?.upstreamFirstDeltaMs ?? 0;
+      recordTrace({
+        stageId: screen?.screenId ?? "task",
+        stage: purpose,
+        event: "request_completed",
+        outcome: "completed",
+        providerRequestId: requestId,
+        attempt,
+        durationMs,
+        inputBytes,
+        outputBytes: utf8Bytes(JSON.stringify(turn)),
+        ...(turn.timing?.upstreamHeadersMs !== undefined ? { upstreamHeadersMs: turn.timing.upstreamHeadersMs } : {}),
+        ...(turn.timing?.upstreamFirstDeltaMs !== undefined ? { firstDeltaMs: turn.timing.upstreamFirstDeltaMs } : {}),
+      });
       if (purpose === "plan") task.roundBreakdown.prePlan++;
       else task.roundBreakdown.planning++;
       if (screen) {
@@ -661,6 +791,151 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       task.recent = [call.functionCall];
       await save();
       return call;
+    }
+  };
+
+  const requestScreenCall = async (
+    screen: UniversalScreenCheckpoint,
+    purpose: "compose" | "repair",
+    requestSignal: AbortSignal,
+    queueWaitMs: number,
+  ): Promise<ChatFunctionCall> => {
+    const lifecycle: ChatLifecycleState = purpose === "compose" ? "UNIVERSAL_COMPOSING" : "UNIVERSAL_REPAIR";
+    const expectedTool = purpose === "compose" ? "compose_design_program" : "repair_design_program";
+    while (true) {
+      check();
+      if (requestSignal.aborted) throw new UniversalDesignTaskError("request_cancelled", "This bounded screen request was cancelled before a structured result was saved.");
+      await deps.assertAuthorized();
+      const reserved = await withTaskLock(async () => {
+        check();
+        const metrics = task.universalMetrics!;
+        if (task.rounds + activeScreenModelCalls >= 100)
+          fail("model_round_limit", "The existing 100-round Chat task limit was reached before the screen request started.");
+        if ((purpose === "compose" && metrics.programRequests >= 100) || (purpose === "repair" && metrics.repairRequests >= 10))
+          fail("model_request_limit", "The saved request budget for this screen stage is exhausted.");
+        if (purpose === "compose" && screen.composeAttempts >= 3)
+          fail("screen_compose_retry_limit", `The saved program request limit for ${screen.screenId} is exhausted; confirmed sibling screens are retained.`);
+        if (purpose === "repair" && screen.repairAttempts >= 1)
+          fail("program_repair_exhausted", `The bounded semantic repair for ${screen.screenId} is exhausted.`);
+        if (purpose === "repair" && screen.repairDispatches >= 3)
+          fail("screen_repair_request_limit", `The bounded repair request limit for ${screen.screenId} is exhausted.`);
+        const attempt = purpose === "compose" ? screen.composeAttempts + 1 : screen.repairDispatches + 1;
+        const requestId = `${task.id}_p6_${screen.screenId}_${purpose === "compose" ? "c" : "r"}${attempt}`;
+        const input = requestInput(task, purpose, screen, screen.schemaFeedback);
+        const inputBytes = utf8Bytes(JSON.stringify(input));
+        if (inputBytes > MAX_PROVIDER_INPUT_BYTES)
+          fail("request_too_large", `The bounded ${purpose} request for ${screen.screenId} exceeds its ${MAX_PROVIDER_INPUT_BYTES}-byte input limit.`);
+        if (purpose === "compose") {
+          screen.composeAttempts = attempt;
+          metrics.programRequests++;
+        } else {
+          screen.repairDispatches = attempt;
+          metrics.repairRequests++;
+        }
+        transition(lifecycle);
+        if (purpose === "compose") screen.status = "composing";
+        screen.activeRequestId = requestId;
+        screen.startedAtMs ??= now();
+        screenRunStartedAt.set(screen.screenId, screenRunStartedAt.get(screen.screenId) ?? monotonicNow());
+        metrics.providerQueueWaitMs += queueWaitMs;
+        activeScreenModelCalls++;
+        metrics.peakConcurrentModelRequests = Math.max(metrics.peakConcurrentModelRequests, activeScreenModelCalls);
+        recordTrace({ stageId: screen.screenId, stage: purpose, event: "request_started", outcome: "started", providerRequestId: requestId, attempt, inputBytes, queueWaitMs });
+        await save();
+        return { input, inputBytes, requestId, attempt };
+      });
+      const startedAt = monotonicNow();
+      let turn: AuthorizedChatTurn;
+      try {
+        turn = await deps.model(reserved.input, lifecycle, reserved.requestId, requestSignal);
+        if (requestSignal.aborted)
+          throw new UniversalDesignTaskError(deps.signal.aborted ? "request_cancelled" : "stale_task_session", "A late provider result was ignored after cancellation or task replacement.");
+        if (deps.isCurrent && !deps.isCurrent())
+          throw new UniversalDesignTaskError("stale_task_session", "A late provider result was ignored after cancellation or task replacement.");
+        check();
+      } catch (error) {
+        const durationMs = Math.max(0, Math.round(monotonicNow() - startedAt));
+        await withTaskLock(async () => {
+          activeScreenModelCalls = Math.max(0, activeScreenModelCalls - 1);
+          task.universalMetrics!.providerLatencyMs += durationMs;
+          if (purpose === "compose") task.universalMetrics!.programCompositionMs += durationMs;
+          const code = requestSignal.aborted && !deps.signal.aborted ? "cancelled_by_peer_failure" : safeErrorCode(error);
+          recordTrace({ stageId: screen.screenId, stage: purpose, event: "request_failed", outcome: "failed", providerRequestId: reserved.requestId, attempt: reserved.attempt, durationMs, queueWaitMs, inputBytes: reserved.inputBytes, code });
+          if (!deps.signal.aborted && (!deps.isCurrent || deps.isCurrent()) && code !== "cancelled_by_peer_failure") {
+            screen.status = purpose === "compose" ? "pending" : "repair_pending";
+            screen.errorCode = code.replace(/[^a-z0-9_]/giu, "_").toLocaleLowerCase().slice(0, 80);
+            delete screen.activeRequestId;
+            if (["inference_busy", "quota_or_rate_limit", "plan_use_not_admitted"].includes(code)) {
+              task.universalMetrics!.concurrencyLimit = 1;
+              task.universalMetrics!.schedulerMode = "serial";
+            }
+            await save();
+          }
+        });
+        throw error;
+      }
+      const durationMs = Math.max(0, Math.round(monotonicNow() - startedAt));
+      const outputBytes = utf8Bytes(JSON.stringify(turn));
+      const validation = await withTaskLock(async () => {
+        activeScreenModelCalls = Math.max(0, activeScreenModelCalls - 1);
+        const metrics = task.universalMetrics!;
+        task.rounds++;
+        metrics.providerRounds++;
+        metrics.providerInputBytes += reserved.inputBytes;
+        metrics.providerLatencyMs += durationMs;
+        if (purpose === "compose") metrics.programCompositionMs += durationMs;
+        metrics.providerFirstDeltaMs += turn.timing?.upstreamFirstDeltaMs ?? 0;
+        const roundBreakdown = task.roundBreakdown;
+        roundBreakdown.planning++;
+        const screenIndex = task.projectPlan?.screens.findIndex(({ screenId }) => screenId === screen.screenId) ?? -1;
+        const stage = screenIndex >= 0 ? task.stages[screenIndex] : undefined;
+        if (stage) {
+          stage.rounds++;
+          stage.roundBreakdown ??= { prePlan: 0, planning: 0, execution: 0, inspection: 0, completion: 0, correction: 0, continuation: 0, modelRetries: 0 };
+          stage.roundBreakdown.planning++;
+        }
+        const tools = turn.kind === "tool_calls" ? turn.calls.map(({ name }) => name) : [];
+        task.modelRoundTrace.push({ round: task.rounds, lifecycle, outcome: turn.kind, tools, validationCodes: turn.kind === "tool_validation" ? turn.issues.slice(0, 8).map(({ errorCode }) => errorCode) : [], durationMs, inputBytes: reserved.inputBytes, ...(turn.timing ? { timing: turn.timing } : {}) });
+        if (task.modelRoundTrace.length > 100) task.modelRoundTrace = task.modelRoundTrace.slice(-100);
+        recordTrace({
+          stageId: screen.screenId,
+          stage: purpose,
+          event: "request_completed",
+          outcome: "completed",
+          providerRequestId: reserved.requestId,
+          attempt: reserved.attempt,
+          durationMs,
+          queueWaitMs,
+          inputBytes: reserved.inputBytes,
+          outputBytes,
+          ...(turn.timing?.upstreamHeadersMs !== undefined ? { upstreamHeadersMs: turn.timing.upstreamHeadersMs } : {}),
+          ...(turn.timing?.upstreamFirstDeltaMs !== undefined ? { firstDeltaMs: turn.timing.upstreamFirstDeltaMs } : {}),
+        });
+        if (turn.kind === "tool_validation") {
+          if (task.validationCorrections >= CHAT_TASK_MAX_VALIDATION_CORRECTIONS || screen.schemaCorrections >= 2)
+            fail("model_schema_repair_exhausted", `The structured ${purpose} response for ${screen.screenId} remained invalid after its bounded correction budget.`);
+          task.validationCorrections++;
+          screen.schemaCorrections++;
+          const codes = [...new Set(turn.issues.slice(0, 8).map(({ errorCode, toolName }) => `${toolName ?? expectedTool}:${errorCode}`))];
+          screen.schemaFeedback = `The previous structured response failed boundary validation (${codes.join(", ")}). Return one corrected ${expectedTool} call for ${screen.screenId}; do not change its scope.`;
+          screen.status = purpose === "compose" ? "pending" : "repair_pending";
+          delete screen.activeRequestId;
+          await save();
+          return true;
+        }
+        return false;
+      });
+      if (validation) continue;
+      if (turn.kind !== "tool_calls" || turn.calls.length !== 1 || turn.calls[0]?.action.tool !== expectedTool) {
+        await withTaskLock(async () => {
+          screen.status = purpose === "compose" ? "pending" : "repair_pending";
+          screen.errorCode = "provider_tool_contract_invalid";
+          delete screen.activeRequestId;
+          await save();
+        });
+        fail("provider_tool_contract_invalid", `The provider did not return exactly one ${expectedTool} call for ${screen.screenId}.`);
+      }
+      return ChatFunctionCallSchema.parse(turn.calls[0]);
     }
   };
 
@@ -725,9 +1000,10 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       task.projectPlanFingerprint = finalized.fingerprint;
     }
     const plan = task.projectPlan!;
+    task.universalManifest = createJobManifest(task, plan, task.projectPlanFingerprint!);
     task.pending = [];
     task.recent = [];
-    task.universalScreens = plan.screens.map(({ screenId }) => checkpoint({ screenId, status: "pending", repairAttempts: 0, schemaCorrections: 0 }));
+    task.universalScreens = plan.screens.map(({ screenId }) => checkpoint({ screenId, status: "pending", composeAttempts: 0, repairDispatches: 0, repairAttempts: 0, schemaCorrections: 0 }));
     task.stages = ChatTaskSchema.parse({ ...task, stages: stageCandidates(plan) }).stages;
     transition("UNIVERSAL_COMPOSING");
     delete task.validationFeedback;
@@ -738,8 +1014,20 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     if (!plan.success || plan.data.taskId !== task.id || !task.projectPlanFingerprint || projectPlanFingerprint(plan.data) !== task.projectPlanFingerprint)
       fail("plan_checkpoint_inconsistent", "The saved universal project plan no longer matches its stable task identity or fingerprint.");
     task.projectPlan = plan.data;
+    const expectedManifest = createJobManifest(task, plan.data, task.projectPlanFingerprint);
+    if (task.universalManifest) {
+      const savedManifest = UniversalJobManifestV1Schema.safeParse(task.universalManifest);
+      if (!savedManifest.success || JSON.stringify(savedManifest.data) !== JSON.stringify(expectedManifest))
+        fail("job_manifest_inconsistent", "The saved engine, model, screen order, Brand Kit, Skills or capability manifest changed; existing native work was retained.");
+      task.universalManifest = savedManifest.data;
+    } else {
+      // Phase 5 checkpoint migration is additive: pin the exact already-saved route and context once.
+      task.universalManifest = expectedManifest;
+      recordTrace({ stageId: "task", stage: "task", event: "recovered", outcome: "recovered", code: "phase5_manifest_pinned" });
+      await save();
+    }
     if (!task.universalScreens)
-      task.universalScreens = plan.data.screens.map(({ screenId }) => checkpoint({ screenId, status: "pending", repairAttempts: 0, schemaCorrections: 0 }));
+      task.universalScreens = plan.data.screens.map(({ screenId }) => checkpoint({ screenId, status: "pending", composeAttempts: 0, repairDispatches: 0, repairAttempts: 0, schemaCorrections: 0 }));
     if (task.universalScreens.length !== plan.data.screenCount || task.universalScreens.some((item, index) => item.screenId !== plan.data.screens[index]?.screenId))
       fail("screen_checkpoint_inconsistent", "Saved screen checkpoints do not match the ordered project plan; no new root will be created.");
     if (task.stages.length !== plan.data.screenCount)
@@ -748,6 +1036,22 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
 
   const plan = task.projectPlan!;
   const screens = task.universalScreens!;
+  for (const screen of screens) {
+    Object.assign(screen, checkpoint(screen));
+    const pendingAction = task.pending.length === 1 ? task.pending[0]?.action : undefined;
+    const pendingMatchesScreen = pendingAction?.tool === "compose_design_program" || pendingAction?.tool === "repair_design_program"
+      ? pendingAction.screenId === screen.screenId
+      : false;
+    if ((screen.status === "composing" && !screen.program && !pendingMatchesScreen) ||
+      (screen.status === "repair_pending" && Boolean(screen.activeRequestId) && !pendingMatchesScreen)) {
+      recordTrace({ stageId: screen.screenId, stage: "compose", event: "recovered", outcome: "recovered", ...(screen.activeRequestId ? { providerRequestId: screen.activeRequestId } : {}), attempt: Math.max(1, screen.composeAttempts), code: "provider_result_not_checkpointed" });
+      if (screen.status === "composing") screen.status = "pending";
+      screen.errorCode = screen.status === "repair_pending" ? "repair_result_not_checkpointed" : "provider_result_not_checkpointed";
+      delete screen.activeRequestId;
+      screen.schemaFeedback = undefined;
+      await save();
+    }
+  }
   for (const screen of screens) {
     if (!["program_saved", "rendering", "rendered", "verified"].includes(screen.status)) continue;
     const parsed = parseDesignProgram(screen.program, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
@@ -759,15 +1063,218 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         screen.adoptionOperationIds?.length !== screen.nativeNodeCount))
       fail("native_checkpoint_inconsistent", "The saved checkpoint lacks complete native ownership evidence.");
   }
+
+  type ReadySignal = { promise: Promise<void>; resolve(): void; reject(error: unknown): void };
+  const readySignals = new Map<string, ReadySignal>();
+  for (const screen of screens) {
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    void promise.catch(() => undefined);
+    readySignals.set(screen.screenId, { promise, resolve, reject });
+  }
+  const scheduledPrograms = new Set(screens.filter((screen) =>
+    ["program_saved", "rendering", "rendered", "verified"].includes(screen.status) && Boolean(screen.program && screen.fingerprint),
+  ).map(({ screenId }) => screenId));
+  for (const screenId of scheduledPrograms) readySignals.get(screenId)!.resolve();
+
+  const schedulerController = new AbortController();
+  const abortScheduler = () => schedulerController.abort();
+  deps.signal.addEventListener("abort", abortScheduler, { once: true });
+  const schedulerQueuedAt = monotonicNow();
+  let schedulerFailure: unknown;
+  const composePending = new Set(screens.filter((screen) => !scheduledPrograms.has(screen.screenId)).map(({ screenId }) => screenId));
+  let phase5PendingScreenId: string | undefined;
+  const phase5PendingCall = task.pending.length === 1 ? task.pending[0] : undefined;
+  let phase5PendingReused = false;
+  if (task.pending.length) {
+    const savedAction = phase5PendingCall?.action;
+    if (savedAction?.tool !== "compose_design_program" && savedAction?.tool !== "repair_design_program")
+      fail("pending_response_scope_conflict", "A saved provider response has no compatible universal screen checkpoint; existing evidence was retained.");
+    phase5PendingScreenId = savedAction.screenId;
+    const savedScreen = screens.find((screen) => screen.screenId === phase5PendingScreenId);
+    const pendingMatchesStage = savedAction.tool === "compose_design_program"
+      ? Boolean(savedScreen && !savedScreen.program && composePending.has(phase5PendingScreenId))
+      : Boolean(savedScreen?.program && savedScreen.status === "repair_pending");
+    if (!pendingMatchesStage)
+      fail("pending_response_scope_conflict", "A saved Phase 5 response does not match any unfinished screen checkpoint.");
+    task.universalMetrics!.concurrencyLimit = 1;
+    task.universalMetrics!.schedulerMode = "serial";
+  }
+  const activeJobs = new Set<Promise<void>>();
+
+  const getScreenCall = async (screen: UniversalScreenCheckpoint, purpose: "compose" | "repair", signal: AbortSignal, queueWaitMs: number) => {
+    const expectedTool = purpose === "compose" ? "compose_design_program" : "repair_design_program";
+    if (phase5PendingCall && !phase5PendingReused && phase5PendingCall.action.tool === expectedTool &&
+      phase5PendingCall.action.screenId === screen.screenId) {
+      check();
+      if (signal.aborted) throw new UniversalDesignTaskError("request_cancelled", "The saved Phase 5 response was cancelled before it could be committed.");
+      await deps.assertAuthorized();
+      phase5PendingReused = true;
+      screen.status = purpose === "compose" ? "composing" : "repair_pending";
+      screen.activeRequestId = phase5PendingCall.callId;
+      recordTrace({ stageId: screen.screenId, stage: purpose, event: "recovered", outcome: "recovered", providerRequestId: phase5PendingCall.callId, attempt: Math.max(1, purpose === "compose" ? screen.composeAttempts : screen.repairDispatches), code: "phase5_pending_response_reused" });
+      await save();
+      return ChatFunctionCallSchema.parse(phase5PendingCall);
+    }
+    return requestScreenCall(screen, purpose, signal, queueWaitMs);
+  };
+  const clearConsumedPending = () => {
+    if (phase5PendingCall && !phase5PendingReused) return;
+    task.pending = [];
+    task.recent = [];
+  };
+
+  const composeOneScreen = async (screen: UniversalScreenCheckpoint, queueWaitMs: number) => {
+    const screenIndex = plan.screens.findIndex(({ screenId }) => screenId === screen.screenId);
+    const screenPlan = plan.screens[screenIndex];
+    if (!screenPlan) fail("checkpoint_incomplete", `The saved plan has no ${screen.screenId} screen definition.`);
+    screenRunStartedAt.set(screen.screenId, screenRunStartedAt.get(screen.screenId) ?? monotonicNow());
+    if (!screen.program) {
+      deps.progress(`Universal design route v1 · generating screen ${screenIndex + 1}/${plan.screenCount}: ${screenPlan.name}…`);
+      const call = await getScreenCall(screen, "compose", schedulerController.signal, queueWaitMs);
+      if (call.action.tool !== "compose_design_program") fail("provider_tool_contract_invalid", `The provider returned an unexpected action for ${screen.screenId}.`);
+      const normalizeStartedAt = monotonicNow();
+      const normalized = normalizedProgram(call.action.program, plan, screenPlan);
+      const normalizeMs = Math.max(0, Math.round(monotonicNow() - normalizeStartedAt));
+      const preflightStartedAt = monotonicNow();
+      const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
+      const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+      const compiled = compileDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+      const warnings = compiled.success ? compiled.findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })) : [];
+      const preflightMs = Math.max(0, Math.round(monotonicNow() - preflightStartedAt));
+      await withTaskLock(async () => {
+        if (schedulerController.signal.aborted) throw new UniversalDesignTaskError("request_cancelled", "The screen result was not committed after its task was cancelled.");
+        task.universalMetrics!.programNormalizationMs += normalizeMs;
+        task.universalMetrics!.programPreflightMs += preflightMs;
+        recordTrace({ stageId: screen.screenId, stage: "normalize", event: "program_normalized", outcome: "completed", durationMs: normalizeMs, outputBytes: utf8Bytes(JSON.stringify(normalized)) });
+        recordTrace({ stageId: screen.screenId, stage: "preflight", event: "preflight_completed", outcome: findings.length ? "failed" : "completed", durationMs: preflightMs, outputBytes: utf8Bytes(JSON.stringify(normalized)), ...(findings.length ? { qaFindingCodes: findings.slice(0, 8).map(({ code }) => code), qaCoverage: "complete" as const } : { qaFindingCodes: warnings.slice(0, 8).map(({ code }) => code), qaCoverage: "complete" as const }) });
+        screen.program = normalized;
+        screen.fingerprint = parsed.success ? parsed.fingerprint : undefined;
+        screen.findings = findings.length ? findings : warnings;
+        screen.status = findings.length ? "repair_pending" : "program_saved";
+        if (findings.length) screen.errorCode = "program_preflight_failed";
+        else delete screen.errorCode;
+        delete screen.activeRequestId;
+        delete screen.schemaFeedback;
+        clearConsumedPending();
+        transition(findings.length ? "UNIVERSAL_REPAIR" : "UNIVERSAL_COMPOSING");
+        await save();
+      });
+      deps.progress(`Universal design route v1 · saved screen ${screenIndex + 1}/${plan.screenCount}: ${screenPlan.name}.`);
+    }
+
+    if (screen.status === "repair_pending") {
+      if (!screen.program || !screen.findings?.length)
+        fail("repair_checkpoint_incomplete", `The saved ${screen.screenId} program has no bounded repair findings.`);
+      if (screen.repairAttempts >= 1 || screen.repairDispatches >= 3)
+        fail("program_repair_exhausted", `The saved ${screen.screenId} program exhausted its bounded semantic repair; native rendering was not started.`);
+      deps.progress(`Universal design route v1 · repairing ${screen.findings.length} measured finding(s) on ${screenPlan.name}…`);
+      const call = await getScreenCall(screen, "repair", schedulerController.signal, 0);
+      if (call.action.tool !== "repair_design_program" || call.action.screenId !== screen.screenId)
+        fail("repair_scope_mismatch", `The repair response changed the stable screen scope for ${screen.screenId}.`);
+      const supplied = new Set(screen.findings.map(({ code, path }) => `${code}:${path}`));
+      if (call.action.findings.some(({ code, path }) => !supplied.has(`${code}:${path}`)))
+        fail("repair_scope_mismatch", "The repair referenced findings outside the locally measured preflight report.");
+      if (JSON.stringify(call.action.program) === JSON.stringify(screen.program))
+        fail("program_repair_no_progress", `The bounded repair returned an unchanged program for ${screen.screenId}; further repair was stopped.`);
+      const normalizeStartedAt = monotonicNow();
+      const normalized = normalizedProgram(call.action.program, plan, screenPlan);
+      const normalizeMs = Math.max(0, Math.round(monotonicNow() - normalizeStartedAt));
+      const preflightStartedAt = monotonicNow();
+      const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
+      const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+      const compiled = compileDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+      const warnings = compiled.success ? compiled.findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })) : [];
+      const preflightMs = Math.max(0, Math.round(monotonicNow() - preflightStartedAt));
+      await withTaskLock(async () => {
+        if (schedulerController.signal.aborted) throw new UniversalDesignTaskError("request_cancelled", "The repaired screen result was not committed after its task was cancelled.");
+        task.universalMetrics!.programNormalizationMs += normalizeMs;
+        task.universalMetrics!.programPreflightMs += preflightMs;
+        recordTrace({ stageId: screen.screenId, stage: "normalize", event: "program_normalized", outcome: "completed", durationMs: normalizeMs, outputBytes: utf8Bytes(JSON.stringify(normalized)) });
+        recordTrace({ stageId: screen.screenId, stage: "preflight", event: "preflight_completed", outcome: findings.length ? "failed" : "completed", durationMs: preflightMs, outputBytes: utf8Bytes(JSON.stringify(normalized)), qaFindingCodes: (findings.length ? findings : warnings).slice(0, 8).map(({ code }) => code), qaCoverage: "complete" });
+        screen.repairAttempts++;
+        screen.program = normalized;
+        screen.fingerprint = parsed.success ? parsed.fingerprint : undefined;
+        screen.findings = findings.length ? findings : warnings;
+        screen.status = findings.length ? "repair_pending" : "program_saved";
+        if (findings.length) screen.errorCode = "program_preflight_failed";
+        else delete screen.errorCode;
+        delete screen.activeRequestId;
+        delete screen.schemaFeedback;
+        clearConsumedPending();
+        transition(findings.length ? "UNIVERSAL_REPAIR" : "UNIVERSAL_COMPOSING");
+        await save();
+      });
+      if (findings.length)
+        fail("program_repair_exhausted", `The bounded repair left ${findings.map(({ code }) => code).join(", ")} on ${screen.screenId}; no native render was dispatched.`);
+    }
+    if (screen.status !== "program_saved" && screen.status !== "rendering" && screen.status !== "rendered" && screen.status !== "verified")
+      fail("program_checkpoint_incomplete", `The ${screen.screenId} program was not durably saved before native work.`);
+  };
+
+  const schedulePrograms = async () => {
+    const pending = [...composePending];
+    if (phase5PendingScreenId) {
+      const index = pending.indexOf(phase5PendingScreenId);
+      if (index > 0) pending.unshift(...pending.splice(index, 1));
+    }
+    while (pending.length || activeJobs.size) {
+      check();
+      if (schedulerController.signal.aborted && !schedulerFailure)
+        schedulerFailure = new UniversalDesignTaskError("request_cancelled", "The screen scheduler stopped; saved programs and verified siblings are retained.");
+      let launched = false;
+      while (!schedulerFailure && !schedulerController.signal.aborted && activeJobs.size < task.universalMetrics!.concurrencyLimit) {
+        const readyIndex = pending.findIndex((screenId) => {
+          const screenPlan = plan.screens.find(({ screenId: candidate }) => candidate === screenId);
+          return screenPlan?.dependencies.every((dependency) => scheduledPrograms.has(dependency)) ?? false;
+        });
+        if (readyIndex < 0) break;
+        const [screenId] = pending.splice(readyIndex, 1);
+        const screen = screens.find(({ screenId: candidate }) => candidate === screenId)!;
+        const queuedAt = schedulerQueuedAt;
+        const queueWaitMs = Math.max(0, Math.round(monotonicNow() - queuedAt));
+        const job = composeOneScreen(screen, queueWaitMs).then(() => {
+          scheduledPrograms.add(screen.screenId);
+          readySignals.get(screen.screenId)!.resolve();
+        }).catch((error: unknown) => {
+          readySignals.get(screen.screenId)!.reject(error);
+          if (!schedulerFailure) {
+            schedulerFailure = error;
+            schedulerController.abort();
+          }
+        }).finally(() => activeJobs.delete(job));
+        activeJobs.add(job);
+        launched = true;
+      }
+      if (schedulerFailure) {
+        for (const screenId of pending) readySignals.get(screenId)!.reject(schedulerFailure);
+        pending.length = 0;
+      }
+      if (activeJobs.size) await Promise.race(activeJobs);
+      else if (pending.length && !launched)
+        fail("screen_dependency_blocked", "The saved screen dependency graph has no schedulable screen; no native work was started.");
+    }
+    if (schedulerFailure) throw schedulerFailure;
+  };
+  const schedulerDone = schedulePrograms();
+  void schedulerDone.catch(() => undefined);
+
+  try {
   for (const screen of screens) {
     check();
     if (screen.status === "verified") continue;
+    const ready = readySignals.get(screen.screenId);
+    if (!ready) fail("checkpoint_incomplete", `The ${screen.screenId} screen has no scheduler readiness checkpoint.`);
+    await ready.promise;
+    check();
     const screenPlan = plan.screens.find(({ screenId }) => screenId === screen.screenId);
     if (!screenPlan) fail("checkpoint_incomplete", "A saved screen checkpoint is absent from ProjectPlanV1.");
     const stageIndex = plan.screens.findIndex(({ screenId }) => screenId === screen.screenId);
     const stage = task.stages[stageIndex];
     if (!stage) fail("checkpoint_incomplete", "The screen has no matching existing Chat stage.");
     screen.startedAtMs ??= now();
+    screenRunStartedAt.set(screen.screenId, screenRunStartedAt.get(screen.screenId) ?? monotonicNow());
 
     if (screen.status === "pending" || !screen.program) {
       deps.onPhase?.("planning");
@@ -862,17 +1369,30 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       screen.status = "rendering";
       screen.errorCode = "render_in_flight";
       task.universalMetrics!.nativeBatches++;
+      const renderRequestId = `${task.id}_render_${screen.screenId}`;
+      recordTrace({ stageId: screen.screenId, stage: "native_render", event: "render_dispatched", outcome: "started", nativeOperationId: renderRequestId, attempt: screen.renderAttempts, nodeCount: estimated });
       await save();
       await deps.assertAuthorized();
       check();
       deps.progress(`Universal design route v1 · rendering editable native screen ${stageIndex + 1}/${plan.screenCount}: ${screenPlan.name}…`);
-      const renderStarted = now();
-      const response = await deps.renderProgram(screen.program, `${task.id}_render_${screen.screenId}`);
+      const renderStarted = monotonicNow();
+      let response: DesignProgramRenderResponse;
+      try {
+        response = await deps.renderProgram(screen.program, renderRequestId);
+      } catch (error) {
+        const durationMs = Math.max(0, Math.round(monotonicNow() - renderStarted));
+        task.universalMetrics!.nativeDurationMs += durationMs;
+        recordTrace({ stageId: screen.screenId, stage: "native_render", event: "request_failed", outcome: "failed", nativeOperationId: renderRequestId, attempt: screen.renderAttempts, durationMs, code: safeErrorCode(error) });
+        if (!deps.signal.aborted) await save();
+        throw error;
+      }
       check();
-      task.universalMetrics!.nativeDurationMs += Math.max(0, now() - renderStarted);
+      const renderDurationMs = Math.max(0, Math.round(monotonicNow() - renderStarted));
+      task.universalMetrics!.nativeDurationMs += renderDurationMs;
       if (!response.success) {
         screen.errorCode = response.errorCode ?? "native_render_error";
         screen.findings = (response.findings ?? []).slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }));
+        recordTrace({ stageId: screen.screenId, stage: "native_render", event: "request_failed", outcome: "failed", nativeOperationId: renderRequestId, attempt: screen.renderAttempts, durationMs: renderDurationMs, code: screen.errorCode, qaFindingCodes: screen.findings.map(({ code }) => code).slice(0, 8), qaCoverage: "incomplete" });
         await save();
         fail(screen.errorCode, `Figma did not confirm native rendering for ${screenPlan.name}; the persisted program is retained for safe resume.`);
       }
@@ -903,7 +1423,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         .map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }));
       if (nativeWarnings.length) screen.findings = [...(screen.findings ?? []).slice(0, 11), ...nativeWarnings].slice(0, 12);
       delete screen.errorCode;
-      task.universalMetrics!.firstNativeProgressMs ??= Math.max(0, now() - task.universalMetrics!.startedAtMs);
+      task.universalMetrics!.firstNativeProgressMs ??= Math.max(0, Math.round(monotonicNow() - runStartedAt));
+      recordTrace({ stageId: screen.screenId, stage: "native_render", event: "render_acknowledged", outcome: "completed", nativeOperationId: renderRequestId, nativeBatchId: response.nativeBatchId, attempt: screen.renderAttempts, durationMs: renderDurationMs, nodeCount: response.nativeNodeCount, qaFindingCodes: nativeWarnings.map(({ code }) => code).slice(0, 8), qaCoverage: "complete" });
       await save();
     }
 
@@ -914,15 +1435,31 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       deps.progress(`Universal design route v1 · reading back task-owned native screen ${stageIndex + 1}/${plan.screenCount}: ${screenPlan.name}…`);
       await deps.assertAuthorized();
       check();
-      const inspection = await deps.inspectProgram({
+      const inspectRequestId = `${task.id}_inspect_${screen.screenId}`;
+      const readbackStartedAt = monotonicNow();
+      recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "request_started", outcome: "started", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId });
+      let inspection: NativeInspection;
+      try {
+        inspection = await deps.inspectProgram({
         type: "task-native-inspect",
-        requestId: `${task.id}_inspect_${screen.screenId}`,
+        requestId: inspectRequestId,
         taskId: task.id,
         documentId: task.documentId,
         refs: [screen.rootRef],
         geometry: { programFingerprint: screen.fingerprint, requireReceipt: screen.geometryVersion === 1 },
-      });
+        });
+      } catch (error) {
+        const durationMs = Math.max(0, Math.round(monotonicNow() - readbackStartedAt));
+        task.universalMetrics!.readbackRoundTripMs += durationMs;
+        recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "request_failed", outcome: "failed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs, code: safeErrorCode(error), qaCoverage: "incomplete" });
+        if (!deps.signal.aborted) await save();
+        throw error;
+      }
       check();
+      const readbackDurationMs = Math.max(0, Math.round(monotonicNow() - readbackStartedAt));
+      task.universalMetrics!.readbackRoundTripMs += readbackDurationMs;
+      const readbackFindingCodes = inspection.geometry?.findings.map(({ code }) => code).slice(0, 8) ?? [];
+      recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "readback_completed", outcome: inspection.geometry?.coverage === "complete" ? "completed" : "failed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs: readbackDurationMs, nodeCount: inspection.geometry?.measuredNodes, qaFindingCodes: readbackFindingCodes, qaCoverage: inspection.geometry?.coverage === "complete" ? "complete" : "incomplete" });
       if (inspection.geometry) {
         task.universalMetrics!.nativeReadbackMs = (task.universalMetrics!.nativeReadbackMs ?? 0) + inspection.geometry.durationMs;
         if (inspection.geometry.findings.length) {
@@ -932,7 +1469,15 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
           await save();
         }
       }
-      const verified = verifyNativeReadback(inspection, screen, plan);
+      let verified: ReturnType<typeof verifyNativeReadback>;
+      try {
+        verified = verifyNativeReadback(inspection, screen, plan);
+      } catch (error) {
+        screen.errorCode = safeErrorCode(error).replace(/[^a-z0-9_]/giu, "_").toLocaleLowerCase().slice(0, 80);
+        recordTrace({ stageId: screen.screenId, stage: "verification", event: "request_failed", outcome: "failed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs: readbackDurationMs, qaFindingCodes: [...new Set([...readbackFindingCodes, ...(screen.findings ?? []).map(({ code }) => code)])].slice(0, 8), qaCoverage: "incomplete", code: screen.errorCode });
+        await save();
+        throw error;
+      }
       if (screens.some((other) => other !== screen && other.rootRef === screen.rootRef))
         fail("native_root_conflict", "Two planned screens resolve to the same task-owned native root.");
       screen.status = "verified";
@@ -942,18 +1487,28 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       stage.logicalRefs = [screen.rootRef];
       task.universalMetrics!.acceptedScreenTimesMs.push({
         screenId: screen.screenId,
-        elapsedMs: Math.max(0, now() - screen.startedAtMs!),
+        elapsedMs: Math.max(0, Math.round(monotonicNow() - (screenRunStartedAt.get(screen.screenId) ?? runStartedAt))),
       });
+      task.universalMetrics!.firstVerifiedScreenMs ??= Math.max(0, Math.round(monotonicNow() - runStartedAt));
+      recordTrace({ stageId: screen.screenId, stage: "verification", event: "readback_completed", outcome: "completed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs: readbackDurationMs, nodeCount: verified.nodeCount, qaFindingCodes: verified.findings.slice(0, 8), qaCoverage: "complete" });
       task.universalMetrics!.acceptedScreenTimesMs = [...new Map(task.universalMetrics!.acceptedScreenTimesMs.map((entry) => [entry.screenId, entry])).values()];
       transition("UNIVERSAL_COMPOSING");
       await save();
       deps.progress(`Universal design route v1 · verified ${stageIndex + 1}/${plan.screenCount}: ${screenPlan.name}.`);
     }
   }
+  await schedulerDone;
+  } catch (error) {
+    schedulerController.abort();
+    await schedulerDone.catch(() => undefined);
+    throw error;
+  } finally {
+    deps.signal.removeEventListener("abort", abortScheduler);
+  }
 
   if (screens.some(({ status }) => status !== "verified") || task.stages.some(({ completed }) => !completed))
     fail("native_verification_incomplete", "Not every planned screen has task-owned native readback; completion was refused.");
-  task.universalMetrics!.totalElapsedMs = Math.max(0, now() - task.universalMetrics!.startedAtMs);
+  task.universalMetrics!.totalElapsedMs = Math.max(0, Math.round(monotonicNow() - runStartedAt));
   const usedFallback = screens.some(({ findings }) => findings?.some(({ code }) => code === "native_font_fallback"));
   task.text = plan.locale.toLocaleLowerCase().startsWith("fa")
     ? `مسیر طراحی همگانی v1: ${plan.screenCount} صفحهٔ قابل‌ویرایش در فیگما ساخته و از لایه‌های بومی همان task بازخوانی شد. ${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} لایهٔ بومی ثبت شد.${usedFallback ? " برای یکی از فونت‌های در دسترس نبود‌ه از فونت جایگزین استفاده شد." : ""}`
@@ -964,5 +1519,6 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
   delete task.error;
   delete task.failure;
   transition("TASK_COMPLETED");
+  recordTrace({ stageId: "task", stage: "task", event: "task_completed", outcome: "completed", durationMs: task.universalMetrics!.totalElapsedMs, nodeCount: task.universalMetrics!.acceptedScreenTimesMs.length });
   await save();
 }

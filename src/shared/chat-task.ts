@@ -26,6 +26,7 @@ import {
 import { ChatGenerationIntentSchema, ChatGenerationLinkSchema } from "./chat-generation.js";
 import {
   ProjectPlanV1Schema,
+  UniversalJobManifestV1Schema,
   UniversalDesignMetricsSchema,
   UniversalScreenCheckpointSchema,
 } from "./universal-design.js";
@@ -461,6 +462,7 @@ export const ChatTaskSchema = z
     generationLink: ChatGenerationLinkSchema.optional(),
     projectPlan: ProjectPlanV1Schema.optional(),
     projectPlanFingerprint: z.string().regex(/^ppv1-[a-f0-9]{16}$/u).optional(),
+    universalManifest: UniversalJobManifestV1Schema.optional(),
     universalScreens: z.array(UniversalScreenCheckpointSchema).max(10).optional(),
     universalMetrics: UniversalDesignMetricsSchema.optional(),
     targetName: z.string().trim().min(1).max(100).optional(),
@@ -662,6 +664,7 @@ export const ChatTaskSchema = z
             outcome: z.enum(["done", "tool_calls", "tool_validation"]),
             tools: z.array(z.enum(CHAT_TOOL_NAMES)).max(10),
             validationCodes: z.array(z.string().regex(/^[A-Za-z0-9_]{1,80}$/u)).max(8),
+            providerRequestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
             durationMs: z.number().int().min(0).max(600_000).optional(),
             inputBytes: z
               .number()
@@ -1111,6 +1114,8 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
       ? {
           universalDesign: {
             version: task.universalMetrics.version,
+            intentRequests: task.universalMetrics.intentRequests,
+            intentClassificationMs: task.universalMetrics.intentClassificationMs,
             planRequests: task.universalMetrics.planRequests,
             programRequests: task.universalMetrics.programRequests,
             repairRequests: task.universalMetrics.repairRequests,
@@ -1120,16 +1125,29 @@ export function chatTaskSafeDiagnostic(task: ChatTask): Record<string, unknown> 
             nativeBatches: task.universalMetrics.nativeBatches,
             nativeDurationMs: task.universalMetrics.nativeDurationMs,
             firstNativeProgressMs: task.universalMetrics.firstNativeProgressMs,
+            firstVerifiedScreenMs: task.universalMetrics.firstVerifiedScreenMs,
             totalElapsedMs: task.universalMetrics.totalElapsedMs,
             acceptedScreenTimesMs: task.universalMetrics.acceptedScreenTimesMs,
             timingEvidence: task.universalMetrics.timingEvidence,
             benchmarkComparableTiming: task.universalMetrics.benchmarkComparableTiming,
-            screenStatus: (task.universalScreens ?? []).map(({ screenId, status, nativeNodeCount, verifiedNodeCount, errorCode }) => ({
+            schedulerMode: task.universalMetrics.schedulerMode,
+            concurrencyLimit: task.universalMetrics.concurrencyLimit,
+            peakConcurrentModelRequests: task.universalMetrics.peakConcurrentModelRequests,
+            providerQueueWaitMs: task.universalMetrics.providerQueueWaitMs,
+            providerFirstDeltaMs: task.universalMetrics.providerFirstDeltaMs,
+            programCompositionMs: task.universalMetrics.programCompositionMs,
+            programNormalizationMs: task.universalMetrics.programNormalizationMs,
+            programPreflightMs: task.universalMetrics.programPreflightMs,
+            persistenceMs: task.universalMetrics.persistenceMs,
+            readbackRoundTripMs: task.universalMetrics.readbackRoundTripMs,
+            traceEvents: task.universalMetrics.traceEvents,
+            screenStatus: (task.universalScreens ?? []).map(({ screenId, status, nativeNodeCount, verifiedNodeCount, errorCode, composeAttempts }) => ({
               screenId,
               status,
               ...(nativeNodeCount !== undefined ? { nativeNodeCount } : {}),
               ...(verifiedNodeCount !== undefined ? { verifiedNodeCount } : {}),
               ...(errorCode ? { errorCode } : {}),
+              composeAttempts,
             })),
           },
         }

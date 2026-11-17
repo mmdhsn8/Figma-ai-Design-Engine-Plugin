@@ -80,6 +80,8 @@ import {
 const MAX_BODY_BYTES = 16 * 1_024;
 const SMOKE_VERIFICATION_TTL_MS = 8 * 60 * 60 * 1_000;
 const MAX_CHAT_BODY_BYTES = 64 * 1_024;
+const MAX_ACTIVE_CHAT_REQUESTS = 2;
+const UNIVERSAL_SCREEN_REQUEST_ID = /^[A-Za-z0-9_-]{8,60}_p6_screen-(?:0[1-9]|10)_[cr]\d+$/u;
 const CHAT_INSTRUCTIONS = `You are a professional conversational Figma design assistant. Reply in the user's language. Never show JSON, schemas, internal tool payloads, or planning data as normal chat prose. For canvas work use only the supplied allowlisted tools; never execute code, use arbitrary APIs/URLs, claim unconfirmed changes, or silently omit requested content. Deletion is unavailable.
 
 For every canvas-related request without checkpointed intent, first call classify_canvas_intent alone exactly once: create, edit, inspect, explain, or continue. If the checkpoint already contains intent, continue it without classifying again. Never silently classify edit/continue as create. INSPECTING is read-only and is executed by the plugin's deterministic progressive inspection controller; do not choose or repeat discovery/inspection tools. The native controller advances bounded page-tree slices, persists its cursor, and supplies exact coverage and native inspection evidence. Summarize only that verified report. For INSPECTING, no mutation plan is needed or allowed. Multiple matches are valid. If no matches or some pages are inaccessible, report the saved outcome accurately and never claim an exhaustive scan without evidence. Never change selection. For create, get_document_context is an optional read-only aid, then call plan_canvas_task alone exactly once. For edit, the plugin controller performs progressive discovery and native target inspection before the model is asked to plan. In EDIT_PLANNING, call plan_canvas_task alone; include targetRefs copied from the verified target evidence, including the existing root ref. Keep all edit stages on that verified page, preserve the root, and use inspected refs for existing nodes. If multiple targets match, discovery is incomplete, or native inspection fails, report the blocker; do not guess, use selection, or create a replacement. Never invent refs or page IDs. Continue requests must inspect their identified existing target before planning.
@@ -363,7 +365,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
     { requestId: string; startedAt: number; diagnostic: Partial<ResponsesDiagnostic> } | undefined;
   let activeDesignController: AbortController | undefined;
   let activeSmokeController: AbortController | undefined;
-  let activeChatController: AbortController | undefined;
+  const activeChatControllers = new Map<string, AbortController>();
   let servers: Server[] = [];
   let actualPort = port;
 
@@ -1486,7 +1488,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       sendJson(response, 400, { error: "invalid_model" });
       return;
     }
-    if (activeDesignController || activeSmokeController || activeChatController) {
+    if (activeDesignController || activeSmokeController || activeChatControllers.size) {
       sendJson(response, 409, { error: "inference_busy" });
       return;
     }
@@ -1681,7 +1683,13 @@ export function createCompanionServer(options: CompanionServerOptions) {
       });
       return;
     }
-    if (activeDesignController || activeSmokeController || activeChatController) {
+    const universalScreenRequest = UNIVERSAL_SCREEN_REQUEST_ID.test(correlatedId);
+    const activeRequests = [...activeChatControllers.keys()];
+    const hasLegacyOrNonScreenChat = activeRequests.some((activeId) => !UNIVERSAL_SCREEN_REQUEST_ID.test(activeId));
+    const chatCapacityExceeded = activeChatControllers.has(correlatedId) || (universalScreenRequest
+      ? activeRequests.length >= MAX_ACTIVE_CHAT_REQUESTS || hasLegacyOrNonScreenChat
+      : activeRequests.length > 0);
+    if (activeDesignController || activeSmokeController || chatCapacityExceeded) {
       sendJson(response, 409, {
         error: "inference_busy",
         requestId: correlatedId,
@@ -1699,7 +1707,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       ? "continuation"
       : "initial";
     const clientAbort = new AbortController();
-    activeChatController = clientAbort;
+    activeChatControllers.set(correlatedId, clientAbort);
     activeInferenceControllers.add(clientAbort);
     const abortForClient = () => clientAbort.abort();
     const abortForClosedResponse = () => {
@@ -2081,7 +2089,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       request.off("aborted", abortForClient);
       response.off("close", abortForClosedResponse);
       activeInferenceControllers.delete(clientAbort);
-      if (activeChatController === clientAbort) activeChatController = undefined;
+      if (activeChatControllers.get(correlatedId) === clientAbort) activeChatControllers.delete(correlatedId);
     }
   }
 
@@ -2242,7 +2250,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       });
       return;
     }
-    if (activeDesignController || activeSmokeController || activeChatController) {
+    if (activeDesignController || activeSmokeController || activeChatControllers.size) {
       sendJson(response, 409, { error: "generation_busy" });
       return;
     }
@@ -2724,7 +2732,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
     for (const controller of activeInferenceControllers) controller.abort();
     activeDesignController = undefined;
     activeSmokeController = undefined;
-    activeChatController = undefined;
+    activeChatControllers.clear();
   }
 
   async function getAuthorizedSession(): Promise<

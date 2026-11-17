@@ -146,7 +146,7 @@ function resolveChatBrandColorTokens(actionValue: unknown, task: ChatTask): Figm
 }
 
 type Dependencies = {
-  model(input: ChatInputItem[], lifecycle: ChatLifecycleState): Promise<AuthorizedChatTurn>;
+  model(input: ChatInputItem[], lifecycle: ChatLifecycleState, requestId?: string, signal?: AbortSignal): Promise<AuthorizedChatTurn>;
   execute(operations: FigmaToolOperation[]): Promise<Result>;
   save(task: ChatTask): Promise<void>;
   progress(message: string): void;
@@ -159,7 +159,9 @@ type Dependencies = {
   inspectProgram?(
     request: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
   ): Promise<Extract<PluginToUIMessage, { type: "task-native-inspection-result" }>>;
+  isCurrent?(): boolean;
   timingEvidence?: "live" | "mock";
+  maxConcurrentModelCalls?: 1 | 2;
   signal: AbortSignal;
   now?: () => number;
   wait?: (ms: number, signal: AbortSignal) => Promise<void>;
@@ -3819,6 +3821,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           now,
           onPhase: (phase) => { activePhase = phase; },
           timingEvidence: deps.timingEvidence ?? "live",
+          maxConcurrentModelCalls: deps.maxConcurrentModelCalls,
+          isCurrent: deps.isCurrent,
         });
         return;
       }
@@ -5778,9 +5782,11 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       let turnDurationMs = 0;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const modelStarted = now();
-          turn = await deps.model(input, task.lifecycle);
-          turnDurationMs = Math.max(0, now() - modelStarted);
+          const universalIntentCall = task.executionRoute === "universal-design-v1" && task.lifecycle === "UNIVERSAL_CLASSIFY";
+          const requestId = universalIntentCall ? `${task.id}_p6_intent_${task.rounds + 1}` : undefined;
+          const modelStarted = universalIntentCall ? performance.now() : now();
+          turn = await deps.model(input, task.lifecycle, requestId, deps.signal);
+          turnDurationMs = Math.max(0, Math.round((universalIntentCall ? performance.now() : now()) - modelStarted));
           break;
         } catch (error) {
           if (
@@ -5820,6 +5826,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           turn.kind === "tool_validation"
             ? turn.issues.slice(0, 8).map(({ errorCode }) => errorCode)
             : [],
+        ...(task.executionRoute === "universal-design-v1" && task.lifecycle === "UNIVERSAL_CLASSIFY"
+          ? { providerRequestId: `${task.id}_p6_intent_${task.rounds}` }
+          : {}),
         durationMs: turnDurationMs,
         ...(turn.timing ? { timing: turn.timing } : {}),
         inputBytes: utf8Bytes(JSON.stringify(input)),

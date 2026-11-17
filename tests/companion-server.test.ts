@@ -77,6 +77,43 @@ describe("loopback companion", () => {
     });
   });
 
+  it("admits two independent universal Chat model streams and applies a hard third-request cap", async () => {
+    const harness = await createHarness();
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const firstGate = harness.stallNextChatHeaders();
+    const secondGate = harness.stallNextChatHeaders();
+    const firstAbort = new AbortController();
+    const secondAbort = new AbortController();
+    const body = (requestId: string) => ({
+      requestId,
+      model: "account-model",
+      input: [{ role: "user", content: "Create one marine specimen review screen." }],
+      lifecycle: "UNIVERSAL_COMPOSING",
+    });
+    const first = request(harness.handle, "/v1/chat", { token, signal: firstAbort.signal, body: body("chat-universal-0001_p6_screen-01_c1") });
+    await firstGate.started;
+    const duplicate = await request(harness.handle, "/v1/chat", { token, body: body("chat-universal-0001_p6_screen-01_c1") });
+    expect(duplicate.status).toBe(409);
+    await expect(duplicate.json()).resolves.toMatchObject({ error: "inference_busy" });
+    const second = request(harness.handle, "/v1/chat", { token, signal: secondAbort.signal, body: body("chat-universal-0001_p6_screen-02_c1") });
+    await secondGate.started;
+    const third = await request(harness.handle, "/v1/chat", { token, body: body("chat-universal-0001_p6_screen-03_c1") });
+    expect(third.status).toBe(409);
+    await expect(third.json()).resolves.toMatchObject({ error: "inference_busy", requestId: "chat-universal-0001_p6_screen-03_c1" });
+    firstGate.release();
+    secondGate.release();
+    const [firstResponse, secondResponse] = await Promise.all([first, second]);
+    expect(firstResponse.status).toBe(200);
+    expect(secondResponse.status).toBe(200);
+    expect(await firstResponse.text()).toContain("event: done");
+    expect(await secondResponse.text()).toContain("event: done");
+    expect(harness.responsesRequests.filter(({ body: rawBody }) => {
+      const parsed = JSON.parse(rawBody) as { tool_choice?: unknown };
+      return parsed.tool_choice === "auto";
+    })).toHaveLength(2);
+  }, 20_000);
+
   it("continues a persisted one-commit task without colliding with an inspected page alias", async () => {
     let sequence = 0;
     const call = (name: string, args: unknown) => ({
@@ -3824,7 +3861,7 @@ async function createHarness(
     markResponseStreamStarted = resolve;
   });
   let stallNextResponses = false;
-  let stallChatHeaders = false;
+  const chatHeaderGates: Array<{ started: Promise<void>; markStarted(): void; wait: Promise<void>; release(): void }> = [];
   let nextResponsesUsageFailure = false;
   const resetResponseStreamWaiter = () => {
     responseStreamStarted = new Promise<void>((resolve) => {
@@ -3923,18 +3960,20 @@ async function createHarness(
         input?: unknown[];
       };
       if (options.responsesFetchFailure) throw new TypeError("private transport failure text");
-      if (
-        stallChatHeaders &&
-        Array.isArray(responsePayload.tools) &&
-        responsePayload.tool_choice === "auto"
-      ) {
-        stallChatHeaders = false;
-        return await new Promise<Response>((_resolve, reject) => {
-          init?.signal?.addEventListener(
-            "abort",
-            () => reject(new DOMException("Aborted", "AbortError")),
-            { once: true },
-          );
+      const chatHeaderGate = Array.isArray(responsePayload.tools) && responsePayload.tool_choice === "auto"
+        ? chatHeaderGates.shift()
+        : undefined;
+      if (chatHeaderGate) {
+        chatHeaderGate.markStarted();
+        await new Promise<void>((resolve, reject) => {
+          const signal = init?.signal;
+          const abort = () => reject(new DOMException("Aborted", "AbortError"));
+          if (signal?.aborted) return abort();
+          signal?.addEventListener("abort", abort, { once: true });
+          void chatHeaderGate.wait.then(() => {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+          });
         });
       }
       if (options.stallDesignHeaders && JSON.parse(String(init?.body ?? "")).text) {
@@ -4234,7 +4273,12 @@ async function createHarness(
       resetResponseStreamWaiter();
     },
     stallNextChatHeaders() {
-      stallChatHeaders = true;
+      let markStarted!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => { markStarted = resolve; });
+      const wait = new Promise<void>((resolve) => { release = resolve; });
+      chatHeaderGates.push({ started, markStarted, wait, release });
+      return { started, release };
     },
     failNextResponseWithUsage() {
       nextResponsesUsageFailure = true;

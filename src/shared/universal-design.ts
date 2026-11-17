@@ -197,6 +197,83 @@ function canonical(value: unknown): unknown {
   return value;
 }
 
+export const UNIVERSAL_DESIGN_TRACE_BUILD_ID = "phase6-universal-orchestrator-v1" as const;
+
+export const UniversalJobManifestV1Schema = z
+  .object({
+    version: z.literal(1),
+    taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+    engineRoute: z.literal("universal-design-v1"),
+    modelSlug: z.string().min(1).max(200).regex(/^[A-Za-z0-9._:/-]+$/u),
+    planFingerprint: z.string().regex(/^ppv1-[a-f0-9]{16}$/u),
+    designProgramVersion: z.literal(DESIGN_PROGRAM_VERSION),
+    platform: z.enum(["mobile", "desktop"]),
+    locale: localeSchema,
+    direction: z.enum(["rtl", "ltr"]),
+    screens: z.array(z.object({
+      screenId: z.string().regex(/^screen-(?:0[1-9]|10)$/u),
+      order: orderRef,
+      name: text(100),
+      role: text(80),
+      dependencies: z.array(z.string().regex(/^screen-(?:0[1-9]|10)$/u)).max(8),
+    }).strict()).min(1).max(10),
+    brandKit: z.object({
+      id: text(80),
+      revision: z.number().int().positive(),
+      tokenHash: z.string().regex(/^[a-f0-9]{8}$/u),
+      assets: z.array(z.object({ assetId: text(80), contentHash: z.string().regex(/^[a-f0-9]{8}$/u) }).strict()).max(100),
+    }).strict().optional(),
+    skills: z.array(z.object({ id: text(80), revisionId: text(120) }).strict()).max(3),
+    capabilities: z.array(z.enum(["native-frame", "native-text", "native-shape", "auto-layout", "vertical-scroll", "local-placeholder-only", "pinned-brand-assets", "task-scoped-readback"])).max(12),
+    layoutCapabilities: z.array(z.enum(["auto-layout", "fill-and-hug-sizing", "bounded-wrap", "vertical-scroll", "native-components", "editable-text"])).max(8),
+    fingerprint: z.string().regex(/^ujm1-[a-f0-9]{16}$/u),
+  })
+  .strict()
+  .superRefine((manifest, context) => {
+    const fingerprint = universalJobManifestFingerprint({ ...manifest, fingerprint: undefined });
+    if (fingerprint !== manifest.fingerprint)
+      context.addIssue({ code: "custom", path: ["fingerprint"], message: "The immutable task manifest fingerprint does not match its saved values." });
+    if (manifest.screens.some((screen, index) => screen.order !== index || screen.screenId !== `screen-${String(index + 1).padStart(2, "0")}`))
+      context.addIssue({ code: "custom", path: ["screens"], message: "The manifest screen identities and order must be contiguous and stable." });
+  });
+export type UniversalJobManifestV1 = z.infer<typeof UniversalJobManifestV1Schema>;
+
+export function universalJobManifestFingerprint(manifest: unknown): string {
+  const value = JSON.stringify(canonical(manifest));
+  let hash = 0xcbf29ce484222325n;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= BigInt(value.charCodeAt(index));
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return `ujm1-${hash.toString(16).padStart(16, "0")}`;
+}
+
+export const UniversalDesignTraceEventSchema = z.object({
+  eventId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+  taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+  engineRoute: z.literal("universal-design-v1"),
+  buildId: z.literal(UNIVERSAL_DESIGN_TRACE_BUILD_ID),
+  stageId: z.string().regex(/^(?:task|screen-(?:0[1-9]|10))$/u),
+  stage: z.enum(["intent", "plan", "compose", "repair", "normalize", "preflight", "persistence", "native_render", "native_readback", "verification", "task"]),
+  event: z.enum(["request_started", "request_completed", "request_failed", "checkpoint_saved", "program_normalized", "preflight_completed", "render_dispatched", "render_acknowledged", "readback_completed", "recovered", "task_completed"]),
+  outcome: z.enum(["started", "completed", "failed", "recovered"]),
+  providerRequestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
+  nativeOperationId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
+  nativeBatchId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
+  attempt: z.number().int().min(1).max(10).optional(),
+  durationMs: z.number().int().nonnegative().max(86_400_000).optional(),
+  queueWaitMs: z.number().int().nonnegative().max(86_400_000).optional(),
+  inputBytes: z.number().int().nonnegative().max(10_000_000).optional(),
+  outputBytes: z.number().int().nonnegative().max(10_000_000).optional(),
+  upstreamHeadersMs: z.number().int().nonnegative().max(600_000).optional(),
+  firstDeltaMs: z.number().int().nonnegative().max(600_000).optional(),
+  nodeCount: z.number().int().nonnegative().max(500).optional(),
+  qaFindingCodes: z.array(z.string().regex(/^[a-z0-9_-]{1,80}$/u)).max(8).optional(),
+  qaCoverage: z.enum(["complete", "incomplete"]).optional(),
+  code: z.string().regex(/^[A-Za-z0-9_.:-]{1,100}$/u).optional(),
+}).strict();
+export type UniversalDesignTraceEvent = z.infer<typeof UniversalDesignTraceEventSchema>;
+
 export function projectPlanFingerprint(plan: ProjectPlanV1): string {
   const value = JSON.stringify(canonical(plan));
   let hash = 0xcbf29ce484222325n;
@@ -297,8 +374,12 @@ export function parseProjectPlanDraft(
 export const UniversalScreenCheckpointSchema = z
   .object({
     screenId: z.string().regex(/^screen-(?:0[1-9]|10)$/u),
-    status: z.enum(["pending", "repair_pending", "program_saved", "rendering", "rendered", "verified"]),
+    status: z.enum(["pending", "composing", "repair_pending", "program_saved", "rendering", "rendered", "verified"]),
     startedAtMs: z.number().int().nonnegative().optional(),
+    composeAttempts: z.number().int().min(0).max(10).default(0),
+    activeRequestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
+    schemaFeedback: z.string().max(500).optional(),
+    repairDispatches: z.number().int().min(0).max(3).default(0),
     program: DesignProgramV1Schema.optional(),
     fingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u).optional(),
     rootRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u).optional(),
@@ -320,6 +401,8 @@ export const UniversalDesignMetricsSchema = z
   .object({
     version: z.literal(1),
     startedAtMs: z.number().int().nonnegative(),
+    intentRequests: z.number().int().min(0).max(3).default(0),
+    intentClassificationMs: z.number().int().min(0).max(86_400_000).default(0),
     planRequests: z.number().int().min(0).max(3),
     programRequests: z.number().int().min(0).max(100),
     repairRequests: z.number().int().min(0).max(10),
@@ -332,9 +415,22 @@ export const UniversalDesignMetricsSchema = z
     nativeReadbackMs: z.number().finite().min(0).max(86_400_000).optional(),
     nativeGeometryRepairs: z.number().int().min(0).max(10).optional(),
     firstNativeProgressMs: z.number().int().nonnegative().optional(),
+    firstVerifiedScreenMs: z.number().int().nonnegative().optional(),
     totalElapsedMs: z.number().int().nonnegative().optional(),
     acceptedScreenTimesMs: z.array(z.object({ screenId: z.string().regex(/^screen-(?:0[1-9]|10)$/u), elapsedMs: z.number().int().nonnegative() }).strict()).max(10),
     timingEvidence: z.enum(["live", "mock"]),
     benchmarkComparableTiming: z.literal("not-measured"),
+    schedulerMode: z.enum(["serial", "bounded-parallel"]).default("bounded-parallel"),
+    concurrencyLimit: z.union([z.literal(1), z.literal(2)]).default(2),
+    peakConcurrentModelRequests: z.number().int().min(0).max(2).default(0),
+    providerQueueWaitMs: z.number().int().min(0).max(86_400_000).default(0),
+    providerFirstDeltaMs: z.number().int().min(0).max(86_400_000).default(0),
+    programCompositionMs: z.number().int().min(0).max(86_400_000).default(0),
+    programNormalizationMs: z.number().int().min(0).max(86_400_000).default(0),
+    programPreflightMs: z.number().int().min(0).max(86_400_000).default(0),
+    persistenceMs: z.number().int().min(0).max(86_400_000).default(0),
+    readbackRoundTripMs: z.number().int().min(0).max(86_400_000).default(0),
+    traceSequence: z.number().int().min(0).max(100_000).default(0),
+    traceEvents: z.array(UniversalDesignTraceEventSchema).max(128).default([]),
   })
   .strict();
