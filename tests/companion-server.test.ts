@@ -528,6 +528,7 @@ describe("loopback companion", () => {
       });
     let lost = false;
     let batch = 0;
+    let checkpointRequest = 0;
     const progress: string[] = [];
     const deps = {
       signal: new AbortController().signal,
@@ -547,7 +548,7 @@ describe("loopback companion", () => {
       save: async (checkpoint: typeof task) => {
         const saved = await handleChatTaskStorage(mock.api, {
           type: "chat-task-save",
-          requestId: "stability-save-01",
+          requestId: `stability-save-${++checkpointRequest}`,
           documentId: task.documentId,
           task: checkpoint,
         });

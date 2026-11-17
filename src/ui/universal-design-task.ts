@@ -1102,6 +1102,18 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     task.universalMetrics!.schedulerMode = "serial";
   }
   const activeJobs = new Set<Promise<void>>();
+  let screenPreparationQueue = Promise.resolve();
+  const withPreparationPriority = async <T>(work: () => T): Promise<T> => {
+    const operation = screenPreparationQueue.then(async () => {
+      await saveQueue;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await saveQueue;
+      check();
+      return work();
+    });
+    screenPreparationQueue = operation.then(() => undefined, () => undefined);
+    return operation;
+  };
 
   const getScreenCall = async (screen: UniversalScreenCheckpoint, purpose: "compose" | "repair", signal: AbortSignal, queueWaitMs: number) => {
     const expectedTool = purpose === "compose" ? "compose_design_program" : "repair_design_program";
@@ -1134,15 +1146,20 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       deps.progress(`Universal design route v1 · generating screen ${screenIndex + 1}/${plan.screenCount}: ${screenPlan.name}…`);
       const call = await getScreenCall(screen, "compose", schedulerController.signal, queueWaitMs);
       if (call.action.tool !== "compose_design_program") fail("provider_tool_contract_invalid", `The provider returned an unexpected action for ${screen.screenId}.`);
-      const normalizeStartedAt = monotonicNow();
-      const normalized = normalizedProgram(call.action.program, plan, screenPlan);
-      const normalizeMs = Math.max(0, Math.round(monotonicNow() - normalizeStartedAt));
-      const preflightStartedAt = monotonicNow();
-      const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
-      const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
-      const compiled = compileDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
-      const warnings = compiled.success ? compiled.findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })) : [];
-      const preflightMs = Math.max(0, Math.round(monotonicNow() - preflightStartedAt));
+      const composeAction = call.action;
+      const prepared = await withPreparationPriority(() => {
+        const normalizeStartedAt = monotonicNow();
+        const normalized = normalizedProgram(composeAction.program, plan, screenPlan);
+        const normalizeMs = Math.max(0, Math.round(monotonicNow() - normalizeStartedAt));
+        const preflightStartedAt = monotonicNow();
+        const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
+        const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+        const compiled = compileDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+        const warnings = compiled.success ? compiled.findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })) : [];
+        const preflightMs = Math.max(0, Math.round(monotonicNow() - preflightStartedAt));
+        return { normalized, normalizeMs, findings, parsed, warnings, preflightMs };
+      });
+      const { normalized, normalizeMs, findings, parsed, warnings, preflightMs } = prepared;
       await withTaskLock(async () => {
         if (schedulerController.signal.aborted) throw new UniversalDesignTaskError("request_cancelled", "The screen result was not committed after its task was cancelled.");
         task.universalMetrics!.programNormalizationMs += normalizeMs;
@@ -1173,20 +1190,25 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       const call = await getScreenCall(screen, "repair", schedulerController.signal, 0);
       if (call.action.tool !== "repair_design_program" || call.action.screenId !== screen.screenId)
         fail("repair_scope_mismatch", `The repair response changed the stable screen scope for ${screen.screenId}.`);
+      const repairAction = call.action;
       const supplied = new Set(screen.findings.map(({ code, path }) => `${code}:${path}`));
-      if (call.action.findings.some(({ code, path }) => !supplied.has(`${code}:${path}`)))
+      if (repairAction.findings.some(({ code, path }) => !supplied.has(`${code}:${path}`)))
         fail("repair_scope_mismatch", "The repair referenced findings outside the locally measured preflight report.");
-      if (JSON.stringify(call.action.program) === JSON.stringify(screen.program))
+      if (JSON.stringify(repairAction.program) === JSON.stringify(screen.program))
         fail("program_repair_no_progress", `The bounded repair returned an unchanged program for ${screen.screenId}; further repair was stopped.`);
-      const normalizeStartedAt = monotonicNow();
-      const normalized = normalizedProgram(call.action.program, plan, screenPlan);
-      const normalizeMs = Math.max(0, Math.round(monotonicNow() - normalizeStartedAt));
-      const preflightStartedAt = monotonicNow();
-      const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
-      const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
-      const compiled = compileDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
-      const warnings = compiled.success ? compiled.findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })) : [];
-      const preflightMs = Math.max(0, Math.round(monotonicNow() - preflightStartedAt));
+      const prepared = await withPreparationPriority(() => {
+        const normalizeStartedAt = monotonicNow();
+        const normalized = normalizedProgram(repairAction.program, plan, screenPlan);
+        const normalizeMs = Math.max(0, Math.round(monotonicNow() - normalizeStartedAt));
+        const preflightStartedAt = monotonicNow();
+        const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
+        const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+        const compiled = compileDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+        const warnings = compiled.success ? compiled.findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })) : [];
+        const preflightMs = Math.max(0, Math.round(monotonicNow() - preflightStartedAt));
+        return { normalized, normalizeMs, findings, parsed, warnings, preflightMs };
+      });
+      const { normalized, normalizeMs, findings, parsed, warnings, preflightMs } = prepared;
       await withTaskLock(async () => {
         if (schedulerController.signal.aborted) throw new UniversalDesignTaskError("request_cancelled", "The repaired screen result was not committed after its task was cancelled.");
         task.universalMetrics!.programNormalizationMs += normalizeMs;

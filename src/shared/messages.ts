@@ -24,6 +24,28 @@ import { DesignProgramV1Schema } from "./design-program";
 import { DesignEngineSchema } from "./design-engine-preference";
 import { NATIVE_GEOMETRY_VERSION } from "./native-geometry";
 
+const ChatTaskLoadMessageSchema = z
+  .object({
+    type: z.literal("chat-task-load"),
+    requestId: z.string().min(1).max(100),
+    chatId: ChatHistoryChatIdSchema.optional(),
+    documentId: z.string().min(1).max(300).optional(),
+  })
+  .strict();
+const ChatTaskSaveMessageSchema = z
+  .object({
+    type: z.literal("chat-task-save"),
+    requestId: z.string().min(1).max(100),
+    documentId: z.string().min(1).max(300),
+    chatId: ChatHistoryChatIdSchema.optional(),
+    task: ChatTaskSchema.nullable(),
+  })
+  .strict();
+export const ChatTaskStorageMessageSchema = z.discriminatedUnion("type", [
+  ChatTaskLoadMessageSchema,
+  ChatTaskSaveMessageSchema,
+]);
+
 const GeometryRectSchema = z.object({
   x: z.number().finite(), y: z.number().finite(),
   width: z.number().finite(), height: z.number().finite(),
@@ -199,23 +221,8 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       command: BrandKitStorageCommandSchema,
     })
     .strict(),
-  z
-    .object({
-      type: z.literal("chat-task-load"),
-      requestId: z.string().min(1).max(100),
-      chatId: ChatHistoryChatIdSchema.optional(),
-      documentId: z.string().min(1).max(300).optional(),
-    })
-    .strict(),
-  z
-    .object({
-      type: z.literal("chat-task-save"),
-      requestId: z.string().min(1).max(100),
-      documentId: z.string().min(1).max(300),
-      chatId: ChatHistoryChatIdSchema.optional(),
-      task: ChatTaskSchema.nullable(),
-    })
-    .strict(),
+  ChatTaskLoadMessageSchema,
+  ChatTaskSaveMessageSchema,
   z
     .object({
       type: z.literal("design-program-render"),

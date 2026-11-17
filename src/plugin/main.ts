@@ -1,6 +1,7 @@
 import { countDesignNodes, parseDesignText } from "../shared/schema";
 import { isMultiScreenInput, parseMultiScreenText } from "../shared/multi-screen-schema";
 import {
+  ChatTaskStorageMessageSchema,
   UIToPluginSchema,
   type PluginToUIMessage,
   type UIToPluginMessage,
@@ -14,6 +15,8 @@ import { createGenerationController } from "./generation-controller";
 import { createFigmaToolExecutor } from "./figma-tool-executor";
 import { renderDesignProgramLocal } from "./design-program-spike";
 import { handleChatTaskStorage } from "./chat-task-storage";
+import { CHAT_TASK_MAX_BYTES } from "../shared/chat-task";
+import { utf8Bytes } from "../shared/generation-limits";
 import { handleChatHistoryStorage } from "./chat-history-storage";
 import { handleModelPreferenceStorage } from "./model-preference-storage";
 import { handleDesignEnginePreferenceStorage } from "./design-engine-preference-storage";
@@ -120,6 +123,46 @@ async function fontWarnings(input: DesignSpec | MultiScreenSpec): Promise<string
 }
 
 figma.ui.onmessage = async (rawMessage: unknown) => {
+  if (rawMessage && typeof rawMessage === "object" && "type" in rawMessage && rawMessage.type === "chat-task-save") {
+    const save = rawMessage as { requestId?: unknown; documentId?: unknown; task?: unknown };
+    try {
+      const serializedTask = JSON.stringify(save.task);
+      const payloadBytes = serializedTask === undefined ? 0 : utf8Bytes(serializedTask);
+      if (
+        payloadBytes > CHAT_TASK_MAX_BYTES &&
+        typeof save.requestId === "string" && save.requestId.length > 0 && save.requestId.length <= 100 &&
+        typeof save.documentId === "string" && save.documentId.length > 0 && save.documentId.length <= 300
+      ) {
+        send({
+          type: "chat-task-result",
+          requestId: save.requestId,
+          success: false,
+          documentId: save.documentId,
+          errorCategory: "checkpoint_storage",
+          errorCode: "checkpoint_size_limit",
+          error: "Task checkpoint exceeds its 512 KiB safety budget. Existing canvas changes are retained.",
+        });
+        return;
+      }
+      const checkpoint = ChatTaskStorageMessageSchema.safeParse(rawMessage);
+      if (checkpoint.success) {
+        const normalizedTask = checkpoint.data.type === "chat-task-save" ? JSON.stringify(checkpoint.data.task) : undefined;
+        send(await handleChatTaskStorage(figma, checkpoint.data, {
+          prevalidated: true,
+          payloadBytes: normalizedTask === undefined ? payloadBytes : utf8Bytes(normalizedTask),
+        }));
+        return;
+      }
+    } catch {
+      // The shared protocol parser below reports malformed or non-serializable requests.
+    }
+  } else {
+    const checkpoint = ChatTaskStorageMessageSchema.safeParse(rawMessage);
+    if (checkpoint.success) {
+      send(await handleChatTaskStorage(figma, checkpoint.data, { prevalidated: true }));
+      return;
+    }
+  }
   const message = UIToPluginSchema.safeParse(rawMessage);
   if (!message.success) {
     send({

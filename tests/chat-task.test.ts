@@ -18,10 +18,10 @@ import {
 } from "../src/shared/chat-tools";
 import { chatTaskInput, runChatTask, waitForChatCapacity } from "../src/ui/chat-task";
 import { handleChatTaskStorage } from "../src/plugin/chat-task-storage";
-import { ChatTaskBridgeError } from "../src/ui/chat-task-bridge";
+import { chatTaskBridge, ChatTaskBridgeError } from "../src/ui/chat-task-bridge";
 import { CompanionClientError, type AuthorizedChatTurn } from "../src/ui/companion-client";
 import type { FigmaToolOperation } from "../src/shared/figma-tools";
-import type { PluginToUIMessage } from "../src/shared/messages";
+import type { PluginToUIMessage, UIToPluginMessage } from "../src/shared/messages";
 import { MAX_NATIVE_QUALITY_SCAN_NODES } from "../src/shared/native-visual-quality";
 import { BrandKitRevisionSchema, pinBrandKit } from "../src/shared/brand-kit";
 import {
@@ -4754,25 +4754,44 @@ describe("document-scoped canvas task checkpoints", () => {
   it.each(["legacy", "universal-design-v1"] as const)("persists and reloads strict checkpoints with the saved %s route", async (executionRoute) => {
     const savedTask = task();
     savedTask.executionRoute = executionRoute;
+    const saveRequestId = `save-task-001-${executionRoute}`;
     const data = new Map<string, unknown>();
+    const setAsync = vi.fn(async (key: string, value: unknown) => {
+      data.set(key, structuredClone(value));
+    });
     const api = {
       fileKey: "file-test",
       currentPage: { id: "page:1" },
       root: { getPluginData: () => "local", setPluginData: () => {} },
       clientStorage: {
         getAsync: async (key: string) => data.get(key),
-        setAsync: async (key: string, value: unknown) => {
-          data.set(key, structuredClone(value));
-        },
+        setAsync,
       },
     } as unknown as PluginAPI;
     const saved = await handleChatTaskStorage(api, {
       type: "chat-task-save",
-      requestId: "save-task-001",
+      requestId: saveRequestId,
       documentId: savedTask.documentId,
       task: savedTask,
     });
     expect(saved.success).toBe(true);
+    expect(saved.task).toBeUndefined();
+    const duplicate = await handleChatTaskStorage(api, {
+      type: "chat-task-save",
+      requestId: saveRequestId,
+      documentId: savedTask.documentId,
+      task: savedTask,
+    });
+    expect(duplicate).toEqual(saved);
+    expect(setAsync).toHaveBeenCalledTimes(1);
+    const conflictingDuplicate = await handleChatTaskStorage(api, {
+      type: "chat-task-save",
+      requestId: saveRequestId,
+      documentId: savedTask.documentId,
+      task: { ...savedTask, text: "different contents" },
+    });
+    expect(conflictingDuplicate).toMatchObject({ success: false, errorCode: "checkpoint_request_conflict" });
+    expect(setAsync).toHaveBeenCalledTimes(1);
     const loaded = await handleChatTaskStorage(api, {
       type: "chat-task-load",
       requestId: "load-task-001",
@@ -4800,5 +4819,205 @@ describe("document-scoped canvas task checkpoints", () => {
       (await handleChatTaskStorage(api, { type: "chat-task-load", requestId: "load-task-002" }))
         .success,
     ).toBe(false);
+  });
+
+  it("keeps concurrent saves ordered without blocking recovery reads", async () => {
+    const original = task();
+    original.chatId = "chat-queue-0001";
+    const first = ChatTaskSchema.parse({ ...original, text: "first revision" });
+    const second = ChatTaskSchema.parse({ ...original, text: "second revision" });
+    const data = new Map<string, unknown>();
+    let releaseFirst!: () => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const writes: string[] = [];
+    const api = {
+      fileKey: "file-test",
+      currentPage: { id: "page:1" },
+      root: { getPluginData: () => "local", setPluginData: () => {} },
+      clientStorage: {
+        getAsync: async (key: string) => data.get(key),
+        setAsync: async (key: string, value: unknown) => {
+          const saved = value as ChatTask;
+          writes.push(saved.text);
+          if (saved.text === first.text) {
+            markFirstStarted();
+            await firstGate;
+          }
+          data.set(key, structuredClone(value));
+        },
+      },
+    } as unknown as PluginAPI;
+    const save = (requestId: string, checkpoint: ChatTask) => handleChatTaskStorage(api, {
+      type: "chat-task-save",
+      requestId,
+      documentId: checkpoint.documentId,
+      chatId: checkpoint.chatId,
+      task: checkpoint,
+    });
+    const firstSave = save("queue-save-0001", first);
+    await firstStarted;
+    const secondSave = save("queue-save-0002", second);
+    const recoveryRead = await handleChatTaskStorage(api, {
+      type: "chat-task-load",
+      requestId: "queue-load-0001",
+      documentId: original.documentId,
+      chatId: original.chatId,
+    });
+    expect(writes).toEqual([first.text]);
+    expect(recoveryRead.task).toBeNull();
+    releaseFirst();
+    await expect(Promise.all([firstSave, secondSave])).resolves.toMatchObject([
+      { success: true },
+      { success: true },
+    ]);
+    expect(writes).toEqual([first.text, second.text]);
+    const recovered = await handleChatTaskStorage(api, {
+      type: "chat-task-load",
+      requestId: "queue-load-0002",
+      documentId: original.documentId,
+      chatId: original.chatId,
+    });
+    expect(recovered.task?.text).toBe(second.text);
+  });
+
+  it("reconciles a delayed 10-screen checkpoint after a lost save ack and reloads it after restart", async () => {
+    vi.useFakeTimers();
+    const savedTask = task();
+    savedTask.chatId = "chat-session-0001";
+    savedTask.intent = "create";
+    savedTask.executionRoute = "universal-design-v1";
+    savedTask.context = Array.from({ length: 28 }, (_, index) => ({
+      role: "user" as const,
+      content: `Checkpoint payload ${index + 1}: ${"x".repeat(7_900)}`,
+    }));
+    savedTask.universalScreens = Array.from({ length: 10 }, (_, index) => ({
+      screenId: `screen-${String(index + 1).padStart(2, "0")}`,
+      status: "pending" as const,
+      composeAttempts: 0,
+      repairDispatches: 0,
+      repairAttempts: 0,
+      schemaCorrections: 0,
+    }));
+    const checkpoint = ChatTaskSchema.parse(savedTask);
+    expect(new TextEncoder().encode(JSON.stringify(checkpoint)).byteLength).toBeGreaterThan(200_000);
+    const data = new Map<string, unknown>();
+    const api = {
+      fileKey: "file-test",
+      currentPage: { id: "page:1" },
+      root: { getPluginData: () => "local", setPluginData: () => {} },
+      clientStorage: {
+        getAsync: async (key: string) => data.get(key),
+        setAsync: async (key: string, value: unknown) => {
+          await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 12_000));
+          data.set(key, structuredClone(value));
+        },
+        deleteAsync: async (key: string) => data.delete(key),
+      },
+    } as unknown as PluginAPI;
+    const events = new EventTarget();
+    const fakeWindow = {
+      addEventListener: events.addEventListener.bind(events),
+      removeEventListener: events.removeEventListener.bind(events),
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    } as unknown as Window;
+    const dispatch = (pluginMessage: PluginToUIMessage) => {
+      const event = new Event("message");
+      Object.defineProperty(event, "data", { value: { pluginMessage } });
+      events.dispatchEvent(event);
+    };
+    const parentPostMessage = vi.fn(({ pluginMessage }: { pluginMessage: unknown }) => {
+      const message = pluginMessage as Extract<UIToPluginMessage, { type: "chat-task-load" | "chat-task-save" }>;
+      void handleChatTaskStorage(api, message).then((response) => {
+        // Simulate an acknowledgement lost between the Figma controller and UI.
+        if (message.type === "chat-task-load") dispatch(response);
+      });
+    });
+    vi.stubGlobal("window", fakeWindow);
+    vi.stubGlobal("parent", { postMessage: parentPostMessage });
+
+    try {
+      const pendingSave = chatTaskBridge({
+        type: "chat-task-save",
+        requestId: "large-screen-save-0001",
+        documentId: checkpoint.documentId,
+        chatId: checkpoint.chatId,
+        task: checkpoint,
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(parentPostMessage).toHaveBeenCalledTimes(2);
+      expect(parentPostMessage.mock.calls[1]?.[0].pluginMessage).toMatchObject({ type: "chat-task-load" });
+      await vi.advanceTimersByTimeAsync(2_500);
+      await expect(pendingSave).resolves.toMatchObject({ success: true, requestId: "large-screen-save-0001" });
+
+      const recovered = await handleChatTaskStorage(api, {
+        type: "chat-task-load",
+        requestId: "restart-recovery-0001",
+        chatId: checkpoint.chatId,
+        documentId: checkpoint.documentId,
+      });
+      expect(recovered.task).toEqual(checkpoint);
+      expect(recovered.task?.id).toBe(checkpoint.id);
+      expect(recovered.task?.universalScreens?.map(({ screenId }) => screenId)).toEqual(
+        checkpoint.universalScreens?.map(({ screenId }) => screenId),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops before native dispatch when an interrupted storage write cannot be confirmed within the bounded recovery window", async () => {
+    vi.useFakeTimers();
+    const savedTask = ChatTaskSchema.parse({ ...task(), documentId: "file-interrupted-page_1", chatId: "chat-interrupt-0001" });
+    const api = {
+      fileKey: "file-interrupted",
+      currentPage: { id: "page:1" },
+      root: { getPluginData: () => "local", setPluginData: () => {} },
+      clientStorage: {
+        getAsync: async () => undefined,
+        setAsync: async () => new Promise<void>(() => undefined),
+        deleteAsync: async () => undefined,
+      },
+    } as unknown as PluginAPI;
+    const events = new EventTarget();
+    const fakeWindow = {
+      addEventListener: events.addEventListener.bind(events),
+      removeEventListener: events.removeEventListener.bind(events),
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    } as unknown as Window;
+    const dispatch = (pluginMessage: PluginToUIMessage) => {
+      const event = new Event("message");
+      Object.defineProperty(event, "data", { value: { pluginMessage } });
+      events.dispatchEvent(event);
+    };
+    const parentPostMessage = vi.fn(({ pluginMessage }: { pluginMessage: unknown }) => {
+      const message = pluginMessage as Extract<UIToPluginMessage, { type: "chat-task-load" | "chat-task-save" }>;
+      void handleChatTaskStorage(api, message).then((response) => {
+        if (message.type === "chat-task-load") dispatch(response);
+      });
+    });
+    vi.stubGlobal("window", fakeWindow);
+    vi.stubGlobal("parent", { postMessage: parentPostMessage });
+    try {
+      const pendingSave = chatTaskBridge({
+        type: "chat-task-save",
+        requestId: "interrupted-write-0001",
+        documentId: savedTask.documentId,
+        chatId: savedTask.chatId,
+        task: savedTask,
+      });
+      const assertion = expect(pendingSave).rejects.toMatchObject({ code: "checkpoint_timeout" });
+      await vi.advanceTimersByTimeAsync(15_000);
+      await assertion;
+      expect(parentPostMessage.mock.calls.length).toBeGreaterThan(2);
+      expect(parentPostMessage.mock.calls[1]?.[0].pluginMessage).toMatchObject({ type: "chat-task-load" });
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
   });
 });
