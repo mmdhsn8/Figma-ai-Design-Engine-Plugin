@@ -9,7 +9,7 @@ export type MockNode = SceneNode & {
   [key: string]: unknown;
 };
 
-export function createMockApi() {
+export function createMockApi({ simulateFill = false } = {}) {
   const roots: MockNode[] = [];
   const nodes: MockNode[] = [];
   const storage = new Map<string, unknown>();
@@ -237,6 +237,13 @@ export function createMockApi() {
           )
             throw new Error("Figma requires a text FILL size to have an Auto Layout parent.");
           write(value);
+          if (simulateFill && value === "FILL" && node.parent?.type === "FRAME") {
+            const parent = node.parent;
+            if (property === "layoutSizingHorizontal" && (parent.layoutMode === "VERTICAL" || parent.children.length === 1))
+              node.resize(parent.width - parent.paddingLeft - parent.paddingRight, node.height);
+            if (property === "layoutSizingVertical" && (parent.layoutMode === "HORIZONTAL" || parent.children.length === 1))
+              node.resize(node.width, parent.height - parent.paddingTop - parent.paddingBottom);
+          }
         },
       });
     }
@@ -362,7 +369,28 @@ export function createMockApi() {
       nodes.find((node) => node.id === id && !node.removed) ?? null,
     createFrame: () => makeNode("FRAME") as unknown as FrameNode,
     createComponent: () => makeNode("COMPONENT") as unknown as ComponentNode,
+    createComponentFromNode: (frame: MockNode) => {
+      const component = frame as unknown as { type: string; createInstance: () => InstanceNode };
+      component.type = "COMPONENT";
+      component.createInstance = () => {
+        const copyNode = (source: MockNode, type = source.type): MockNode => {
+          const copy = makeNode(type);
+          copy.name = source.name;
+          copy.resize(source.width, source.height);
+          for (const key of ["layoutMode", "layoutWrap", "itemSpacing", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft", "primaryAxisAlignItems", "counterAxisAlignItems", "fills", "characters", "fontName", "fontSize", "textAlignHorizontal"] as const)
+            (copy as Record<string, unknown>)[key] = source[key];
+          for (const [key, value] of source.pluginData) copy.setPluginData(key, value);
+          for (const child of source.children) copy.appendChild(copyNode(child));
+          return copy;
+        };
+        const instance = copyNode(frame, "INSTANCE");
+        instance.getMainComponentAsync = async () => frame;
+        return instance as unknown as InstanceNode;
+      };
+      return frame as unknown as ComponentNode;
+    },
     createRectangle: () => makeNode("RECTANGLE") as unknown as RectangleNode,
+    createEllipse: () => makeNode("ELLIPSE") as unknown as EllipseNode,
     createImage: (bytes: Uint8Array) => {
       imageImportCalls++;
       return { hash: `mock-image-${bytes.length}-${bytes[0] ?? 0}` } as Image;

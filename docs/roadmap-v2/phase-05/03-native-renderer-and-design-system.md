@@ -1,0 +1,11 @@
+# Native rendering and design systems
+
+The existing renderer creates editable frames, text, rectangles, ellipses and vectors. Authorized raster assets become native fills. Safe SVG assets expand to vectors under an editable frame. Native checks verify asset IDs and shape types, image fills and SVG child counts.
+
+The shared renderer uses the existing font enumeration, exact font lookup, fallback and style registries. Identical loads are reused within each resolution pass. Universal Chat resolves Arabic-script text against available families with known Arabic coverage, preserving the requested font when it is in that set. The lookup includes Vazirmatn, Noto Arabic families, Tahoma and Arial and uses an available style. If no eligible font loads, the screen stops before native construction. English stays on the normal requested font path. Fallback is surfaced in the task.
+
+RTL rows reverse sibling order and map logical start to the right. Physical left and right padding remain physical. Text retains its original code point order, zero width joiners and non-joiners, Persian numbers and Latin content. Figma shapes that editable text. The verifier checks assigned fonts, text equality on construction, unrenderable code points, and native auto-resize without truncation. Figma's text API exposes font availability and paint bounds but no per-glyph outcome, so visual shaping checks remain in Desktop acceptance.
+
+Universal DesignProgramV1 can declare fixed-size local masters with `componentsV1` and place them as native instances. It uses the existing design system registry and a stable component ID across screen programs. A changed definition under the same ID is rejected. The verifier checks instance type, dimensions, editable child hierarchy and native master identity using the dynamic-page async API. Chart primitives, native grid, fixed overlays, rich text runs, nested instances, images inside masters and library imports remain outside the delivered Universal subset.
+
+API references: [Auto Layout sizing](https://developers.figma.com/docs/plugins/api/properties/nodes-layoutsizinghorizontal/), [Font loading](https://developers.figma.com/docs/plugins/api/properties/figma-loadfontasync/), [Prototype overflow](https://developers.figma.com/docs/plugins/api/properties/nodes-overflowdirection/).

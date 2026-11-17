@@ -29,6 +29,7 @@ import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
 import { utf8Bytes } from "../shared/generation-limits";
 import { planCanvasPlacements } from "./canvas-placement";
 import { placeTopLevelNode, readTopLevelCanvasObstacles } from "./figma-canvas-adapter";
+import { inspectProgramGeometry, verifyProgramInstanceMasters, PROGRAM_FINGERPRINT_KEY, PROGRAM_GEOMETRY_KEY, PROGRAM_TASK_KEY, type ProgramGeometryReport } from "./design-program-geometry";
 
 const STORAGE_PREFIX = "fad.figma-tools.v1";
 const REF_PLUGIN_KEY = "fad.tool.logical-ref.v1";
@@ -1315,6 +1316,7 @@ export function createFigmaToolExecutor(
       ref: string;
       status: "missing" | "stale" | "ambiguous" | "unavailable";
     }> = [];
+    let geometry: ProgramGeometryReport | undefined;
     for (const ref of new Set(message.refs)) {
       const matches = Object.entries(state.refs).filter(
         ([canonicalRef, entry]) => canonicalRef === ref || entry.alias === ref,
@@ -1335,8 +1337,27 @@ export function createFigmaToolExecutor(
       }
       try {
         const node = await resolveRef(state, canonicalRef!, pageId);
-        if (node.getPluginData(TASK_PLUGIN_KEY) !== message.taskId)
+        if (node.getPluginData(TASK_PLUGIN_KEY) !== message.taskId) {
           unresolvedRefs.push({ ref, status: "unavailable" });
+        } else if (message.geometry && message.refs.length === 1 && node.type === "FRAME") {
+          assertTaskPageScope(message.documentId, pageId);
+          const storedFingerprint = node.getPluginData(PROGRAM_FINGERPRINT_KEY);
+          const hasReceipt = Boolean(node.getPluginData(PROGRAM_GEOMETRY_KEY));
+          if ((storedFingerprint || message.geometry.requireReceipt) &&
+            (storedFingerprint !== message.geometry.programFingerprint || node.getPluginData(PROGRAM_TASK_KEY) !== message.taskId || !hasReceipt)) {
+            unresolvedRefs.push({ ref, status: "stale" });
+          } else {
+            const report = inspectProgramGeometry(node, {
+              taskId: message.taskId, pageId, requireOwnership: true, checkReceipt: hasReceipt,
+            });
+            const instanceFindings = await verifyProgramInstanceMasters(node);
+            assertTaskPageScope(message.documentId, pageId);
+            geometry = {
+              version: report.version, coverage: report.coverage, measuredNodes: report.measuredNodes,
+              durationMs: report.durationMs, findings: [...report.findings, ...instanceFindings].slice(0, 12),
+            };
+          }
+        }
       } catch (error) {
         const code = error instanceof ReferenceResolutionError ? error.code : "stale";
         const staleNode = code === "stale" ? await api.getNodeByIdAsync(entry.nodeId) : undefined;
@@ -1354,7 +1375,7 @@ export function createFigmaToolExecutor(
       }
     }
     assertTaskPageScope(message.documentId, pageId);
-    return { nodes, unresolvedRefs, truncated: owned.length > visibleNodes.length };
+    return { nodes, unresolvedRefs, truncated: owned.length > visibleNodes.length, ...(geometry ? { geometry } : {}) };
   };
 
   const focusTaskNativeNodes = async (

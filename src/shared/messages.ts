@@ -22,6 +22,25 @@ import { BrandKitStorageCommandSchema, BrandKitStorageResultSchema, PinnedBrandK
 import { DesignSkillStorageCommandSchema, DesignSkillStorageResultSchema } from "./design-skill";
 import { DesignProgramV1Schema } from "./design-program";
 import { DesignEngineSchema } from "./design-engine-preference";
+import { NATIVE_GEOMETRY_VERSION } from "./native-geometry";
+
+const GeometryRectSchema = z.object({
+  x: z.number().finite(), y: z.number().finite(),
+  width: z.number().finite(), height: z.number().finite(),
+}).strict();
+const NativeGeometryReportSchema = z.object({
+  version: z.literal(NATIVE_GEOMETRY_VERSION),
+  coverage: z.enum(["complete", "incomplete"]),
+  measuredNodes: z.number().int().min(0).max(300),
+  durationMs: z.number().int().nonnegative(),
+  findings: z.array(z.object({
+    code: z.string().regex(/^[a-z_]{1,80}$/u),
+    nodeId: z.string().min(1).max(100),
+    parentId: z.string().min(1).max(100).optional(),
+    expected: GeometryRectSchema.optional(),
+    observed: GeometryRectSchema.optional(),
+  }).strict()).max(12),
+}).strict();
 
 const RequestSchema = z.object({
   requestId: z.string().min(1).max(100),
@@ -218,6 +237,10 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       documentId: z.string().min(1).max(300),
       taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
       refs: z.array(z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u)).max(500),
+      geometry: z.object({
+        programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u),
+        requireReceipt: z.boolean(),
+      }).strict().optional(),
     })
     .strict(),
   z
@@ -426,6 +449,9 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       adoptionOperationIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u)).max(200).optional(),
       programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u).optional(),
       nativeNodeCount: z.number().int().nonnegative().max(300).optional(),
+      geometryVersion: z.literal(NATIVE_GEOMETRY_VERSION).optional(),
+      geometryRepairs: z.number().int().min(0).max(1).optional(),
+      geometryDurationMs: z.number().finite().nonnegative().optional(),
       errorCode: z.string().regex(/^[a-z_]{1,80}$/u).optional(),
       findings: z.array(z.object({ code: z.string().regex(/^[a-z0-9_-]{1,80}$/u), path: z.string().max(200), message: z.string().max(240), severity: z.enum(["error", "warning"]) }).strict()).max(20).optional(),
     })
@@ -443,6 +469,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       success: z.boolean(),
       taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
       nodes: z.array(TaskNativeNodeSchema).max(500).optional(),
+      geometry: NativeGeometryReportSchema.optional(),
       unresolvedRefs: z.array(TaskNativeUnresolvedRefSchema).max(500).optional(),
       truncated: z.boolean().optional(),
       toolStateDiagnostic: FigmaToolStateDiagnosticSchema.optional(),

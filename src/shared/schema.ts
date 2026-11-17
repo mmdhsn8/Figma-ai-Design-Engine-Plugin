@@ -22,7 +22,14 @@ export const DESIGN_SCHEMA_VERSION = "1.0.0";
 export const MAX_NESTING_DEPTH = 8;
 
 export type SizingMode = "fixed" | "hug" | "fill";
-export type AxisSizing = { width: SizingMode; height: SizingMode };
+export type AxisSizing = {
+  width: SizingMode;
+  height: SizingMode;
+  minWidth?: number;
+  maxWidth?: number;
+  minHeight?: number;
+  maxHeight?: number;
+};
 export interface DesignNodeMetadata {
   logicalRef?: string;
   pattern?: DesignPatternId;
@@ -34,6 +41,7 @@ export interface LayoutConstraints {
 
 export interface LayoutSpec {
   mode: "horizontal" | "vertical";
+  wrap?: boolean;
   gap?: number | TokenReference;
   padding?: {
     top?: number | TokenReference;
@@ -265,8 +273,14 @@ const sizingSchema = z
   .object({
     width: z.enum(["fixed", "hug", "fill"]),
     height: z.enum(["fixed", "hug", "fill"]),
+    minWidth: z.number().finite().min(1).max(20_000).optional(),
+    maxWidth: z.number().finite().min(1).max(20_000).optional(),
+    minHeight: z.number().finite().min(1).max(20_000).optional(),
+    maxHeight: z.number().finite().min(1).max(20_000).optional(),
   })
-  .strict();
+  .strict()
+  .refine(({ minWidth, maxWidth }) => minWidth === undefined || maxWidth === undefined || minWidth <= maxWidth, { path: ["maxWidth"], message: "Maximum width must be at least the minimum width." })
+  .refine(({ minHeight, maxHeight }) => minHeight === undefined || maxHeight === undefined || minHeight <= maxHeight, { path: ["maxHeight"], message: "Maximum height must be at least the minimum height." });
 const strokeSchema = z.union([
   z.object({ color: nodeColorSchema, width: strokeWidthSchema.optional() }).strict(),
   TokenReferenceSchema,
@@ -283,6 +297,7 @@ const cornerRadiiSchema = z
 export const LayoutSchema: z.ZodType<LayoutSpec> = z
   .object({
     mode: z.enum(["horizontal", "vertical"]),
+    wrap: z.boolean().optional(),
     gap: layoutNumberSchema.optional(),
     padding: z
       .object({
@@ -850,6 +865,8 @@ function validateSemantics(spec: DesignSpec): string[] {
   const componentById = new Map(components.map((component) => [component.id, component]));
   const ids = new Set<string>();
   const checkLayout = (layout: LayoutSpec | undefined, path: string) => {
+    if (layout?.wrap && layout.mode !== "horizontal")
+      errors.push(`${path}.wrap requires horizontal Auto Layout.`);
     if (layout?.counterAxisAlign === "baseline" && layout.mode !== "horizontal") {
       errors.push(`${path}.counterAxisAlign baseline is supported only for horizontal layouts.`);
     }
@@ -946,6 +963,8 @@ function validateSemantics(spec: DesignSpec): string[] {
 
       if (node.type === "frame") {
         checkLayout(node.layout, `${nodePath}.layout`);
+        if (node.layout?.wrap && sizing?.width === "hug")
+          errors.push(`${nodePath}.layout wrap requires a bounded width.`);
         checkNodes(node.children, node.layout, axisModes(node), depth + 1, `${nodePath}.children`);
       }
     }

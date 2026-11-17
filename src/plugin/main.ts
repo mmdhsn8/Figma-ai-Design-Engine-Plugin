@@ -203,6 +203,10 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         adoptionOperationIds: result.operationIds,
         programFingerprint: result.fingerprint,
         nativeNodeCount: result.registeredRefs,
+        geometryVersion: result.geometryVersion,
+        geometryRepairs: result.geometryRepairs,
+        geometryDurationMs: result.timingsMs.geometry,
+        ...(result.fontFallback ? { findings: [{ code: "native_font_fallback", path: "typography", message: "A requested font could not be used for this text. Figma loaded a fallback font.", severity: "warning" as const }] } : {}),
       });
     } catch (error) {
       const staleScope = error instanceof Error && error.message === "stale_document_scope";

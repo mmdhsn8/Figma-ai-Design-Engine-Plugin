@@ -55,13 +55,22 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
     name: node.name,
     width: node.width.value,
     height: node.height.value,
-    sizing: { width: sizing(node.width.mode), height: sizing(node.height.mode) },
+    sizing: {
+      width: sizing(node.width.mode), height: sizing(node.height.mode),
+      ...(node.width.min === undefined ? {} : { minWidth: node.width.min }),
+      ...(node.width.max === undefined ? {} : { maxWidth: node.width.max }),
+      ...(node.height.min === undefined ? {} : { minHeight: node.height.min }),
+      ...(node.height.max === undefined ? {} : { maxHeight: node.height.max }),
+    },
     logicalRef: `${program.id}.${screenId}.${node.id}`.slice(0, 120),
     ...(node.interaction === "button" || node.interaction === "navigation" ? { qualityRole: "button" as const } : node.interaction === "input" ? { qualityRole: "input" as const } : {}),
   };
   if (node.type === "container") {
     const children = node.children.map((child) => nodeToNative(child, program, screenId, direction, availableAssetIds));
-    if (direction === "rtl" && node.layout.axis === "row") children.reverse();
+    const rtlRow = direction === "rtl" && node.layout.axis === "row";
+    if (rtlRow) children.reverse();
+    const align = node.layout.align;
+    const primaryAxisAlign = rtlRow && (align === "start" || align === "end") ? (align === "start" ? "end" : "start") : align;
     return {
       ...common,
       type: "frame",
@@ -70,9 +79,10 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
       children,
       layout: {
         mode: node.layout.axis === "row" ? "horizontal" : "vertical",
+        ...(node.layout.wrap ? { wrap: true } : {}),
         gap: node.layout.gap,
         padding: node.layout.padding,
-        primaryAxisAlign: node.layout.align === "space-between" ? "space-between" : node.layout.align,
+        primaryAxisAlign,
         counterAxisAlign: safeCounterAlign(node.layout.crossAlign, node.children, node.layout.axis),
       },
     };
@@ -85,15 +95,17 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
           : node.textRole === "body" || node.textRole === "action" ? language?.bodySize : undefined;
     const headingRole = node.textRole === "display" || node.textRole === "title" || node.textRole === "heading";
     return {
-    ...common, type: "text", text: node.text, fontSize: roleSize ?? node.fontSize, color: resolveColor(node.color, program),
-    fontFamily: headingRole || node.weight === "bold" || node.weight === "semibold" ? program.tokens.headingFont : program.tokens.bodyFont,
-    fontStyle: node.weight === "bold" ? "Bold" : node.weight === "semibold" ? "Semi Bold" : node.weight === "medium" ? "Medium" : "Regular",
-    textAlign: node.align ?? (direction === "rtl" ? "right" : "left"), textAutoResize: "height",
+      ...common, type: "text", text: node.text, fontSize: roleSize ?? node.fontSize, color: resolveColor(node.color, program),
+      fontFamily: headingRole || node.weight === "bold" || node.weight === "semibold" ? program.tokens.headingFont : program.tokens.bodyFont,
+      fontStyle: node.weight === "bold" ? "Bold" : node.weight === "semibold" ? "Semi Bold" : node.weight === "medium" ? "Medium" : "Regular",
+      textAlign: node.align ?? (direction === "rtl" ? "right" : "left"),
+      textAutoResize: node.width.mode === "hug" && node.height.mode === "hug" ? "width-and-height" : "height",
     };
   }
   if (node.type === "rectangle") return { ...common, type: "rectangle", fill: resolveColor(node.fill, program), cornerRadius: node.cornerRadius ?? semanticRadius(node.semanticRole, program) ?? 0 };
   if (node.type === "ellipse") return { ...common, type: "ellipse", fill: resolveColor(node.fill, program) };
   if (node.type === "vector") return { ...common, type: "vector", pathData: node.pathData, fill: resolveColor(node.fill, program) };
+  if (node.type === "instance") return { type: "instance", name: common.name, sizing: common.sizing, logicalRef: common.logicalRef, componentId: node.componentId };
   if (node.asset.source === "user-approved-brand-kit" && node.asset.assetRef && availableAssetIds.has(node.asset.assetRef))
     return { ...common, type: "image", assetId: node.asset.assetRef, fit: "crop", alt: node.asset.label, qualityRole: "image" };
   const placeholderLabel = node.asset.source === "user-approved-brand-kit"
@@ -166,7 +178,15 @@ export function compileDesignProgram(value: unknown, options: { assets?: VisualA
     id: program.id,
     name: program.id,
     ...(assets.length ? { assets } : {}),
-    designSystem: designProgramTokens(program),
+    designSystem: {
+      ...designProgramTokens(program),
+      ...(program.componentsV1?.length ? { components: program.componentsV1.map(({ id, root }) => {
+        const frame = nodeToNative(root, program, `component-${id}`, program.locale.direction, new Set());
+        if (frame.type !== "frame") throw new Error("A local component must lower to a frame.");
+        return { type: "component" as const, id, key: id, name: frame.name, width: frame.width, height: frame.height,
+          background: frame.background, cornerRadius: frame.cornerRadius, children: frame.children, layout: frame.layout };
+      }) } : {}),
+    },
     screens,
   };
   const checked = parseMultiScreenValue(batchValue);

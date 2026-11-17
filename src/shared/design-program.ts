@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { DesignSystemTokensSchema } from "./design-system-schema.js";
 import { ProjectVisualLanguageV1Schema, ScreenCompositionV1Schema } from "./design-composition.js";
+import { GEOMETRY_EPSILON, minimumAxisExtent } from "./native-geometry.js";
+import { hasUnrenderableProgramText } from "./program-text.js";
 
 export const DESIGN_PROGRAM_VERSION = 1 as const;
 export const DESIGN_PROGRAM_LIMITS = {
@@ -44,6 +46,7 @@ const nodeBase = {
 const layoutSchema = z
   .object({
     axis: z.enum(["row", "column"]),
+    wrap: z.boolean().optional(),
     gap: z.number().finite().min(0).max(1_000).default(0),
     padding: z
       .object({ top: z.number().min(0).max(1_000).default(0), right: z.number().min(0).max(1_000).default(0), bottom: z.number().min(0).max(1_000).default(0), left: z.number().min(0).max(1_000).default(0) })
@@ -61,6 +64,7 @@ export const DesignProgramNodeSchema: z.ZodType<DesignProgramNode> = z.lazy(() =
     z.object({ ...nodeBase, type: z.literal("rectangle"), fill: colorSchema, cornerRadius: z.number().finite().min(0).max(500).optional() }).strict(),
     z.object({ ...nodeBase, type: z.literal("ellipse"), fill: colorSchema }).strict(),
     z.object({ ...nodeBase, type: z.literal("vector"), pathData: z.string().min(3).max(8_192), fill: colorSchema }).strict(),
+    z.object({ ...nodeBase, type: z.literal("instance"), componentId: idSchema }).strict(),
     z.object({ ...nodeBase, type: z.literal("image"), asset: z.object({ source: z.enum(["placeholder", "user-approved-brand-kit", "authorized-existing-file"]), label: z.string().trim().min(1).max(200), assetRef: z.string().trim().min(1).max(200).optional(), verified: z.boolean().optional(), authorized: z.boolean().optional() }).strict() }).strict(),
   ]) as z.ZodType<DesignProgramNode>,
 );
@@ -79,6 +83,7 @@ export type DesignProgramNode =
   | (DesignProgramNodeBase & { type: "rectangle"; fill: string; cornerRadius?: number })
   | (DesignProgramNodeBase & { type: "ellipse"; fill: string })
   | (DesignProgramNodeBase & { type: "vector"; pathData: string; fill: string })
+  | (DesignProgramNodeBase & { type: "instance"; componentId: string })
   | (DesignProgramNodeBase & { type: "image"; asset: { source: "placeholder" | "user-approved-brand-kit" | "authorized-existing-file"; label: string; assetRef?: string; verified?: boolean; authorized?: boolean } });
 
 const viewportSchema = z.discriminatedUnion("preset", [
@@ -104,6 +109,7 @@ export const DesignProgramV1Schema = z.object({
   requiredCapabilities: z.array(z.enum(["native-text", "auto-layout", "rtl", "vertical-scroll", "vector", "image", "component-reference", "variable-reference"])).max(20).default([]),
   tokens: z.object({ colors: z.record(z.string().regex(/^[a-z][a-z0-9.-]{0,39}$/u), z.string().regex(/^#[0-9a-fA-F]{6}$/u)).default({}), spacing: z.array(z.number().finite().min(0).max(1_000)).max(24).default([]), headingFont: z.string().trim().min(1).max(100).default("Inter"), bodyFont: z.string().trim().min(1).max(100).default("Inter") }).strict().default({ colors: {}, spacing: [], headingFont: "Inter", bodyFont: "Inter" }),
   references: z.array(referenceSchema).max(50).default([]),
+  componentsV1: z.array(z.object({ id: idSchema, root: DesignProgramNodeSchema }).strict()).max(12).optional(),
   screens: z.array(DesignProgramScreenV1Schema).min(1).max(DESIGN_PROGRAM_LIMITS.screens),
 }).strict();
 export type DesignProgramV1 = z.infer<typeof DesignProgramV1Schema>;
@@ -178,6 +184,25 @@ export function parseDesignProgram(value: unknown, options: { allowedBrandAssetI
   const ids = new Set<string>();
   const orders = new Set<number>();
   let nodeCount = 0;
+  const components = new Map<string, { width: number; height: number; descendants: number }>();
+  for (const { id, root } of program.componentsV1 ?? []) {
+    if (components.has(id) || root.type !== "container" || root.width.mode !== "fixed" || root.height.mode !== "fixed") {
+      findings.push({ code: "invalid_local_component", path: `componentsV1.${id}`, message: "Use a unique component ID and a fixed size container master.", severity: "error" });
+      continue;
+    }
+    let descendants = -1;
+    const ids = new Set<string>();
+    walkNodes(root, (node, depth) => {
+      descendants++;
+      if (ids.has(node.id) || node.type === "instance" || node.type === "image" || depth > DESIGN_PROGRAM_LIMITS.depth)
+        findings.push({ code: "invalid_local_component_node", path: `componentsV1.${id}.${node.id}`, message: "Use unique bounded native nodes without nested instances or image dependencies.", severity: "error" });
+      ids.add(node.id);
+      if (node.type === "text" && hasUnrenderableProgramText(node.text))
+        findings.push({ code: "invalid_native_text", path: `componentsV1.${id}.${node.id}`, message: "Text contains an invalid Unicode character or a directional override.", severity: "error" });
+    });
+    nodeCount += descendants + 1;
+    components.set(id, { width: root.width.value, height: root.height.value, descendants });
+  }
   for (const [screenIndex, screen] of program.screens.entries()) {
     if (ids.has(screen.id)) findings.push({ code: "duplicate_id", path: `screens.${screenIndex}.id`, message: `Duplicate id “${screen.id}”.`, severity: "error" });
     ids.add(screen.id);
@@ -186,25 +211,37 @@ export function parseDesignProgram(value: unknown, options: { allowedBrandAssetI
     const nodeIds = new Set<string>();
     walkNodes(screen.root, (node, depth) => {
       nodeCount++;
+      if (node.type === "text" && hasUnrenderableProgramText(node.text))
+        findings.push({ code: "invalid_native_text", path: `screens.${screen.id}.${node.id}`, message: "Text contains an invalid Unicode character or a directional override.", severity: "error" });
+      if (node.type === "instance") {
+        const component = components.get(node.componentId);
+        if (!component || node.width.mode !== "fixed" || node.height.mode !== "fixed" ||
+          node.width.value !== component.width || node.height.value !== component.height)
+          findings.push({ code: "invalid_local_instance", path: `screens.${screen.id}.root.${node.id}`, message: "Use a declared local component at its fixed master size.", severity: "error" });
+        else nodeCount += component.descendants;
+      }
       if (nodeIds.has(node.id)) findings.push({ code: "duplicate_id", path: `screens.${screen.id}.root.${node.id}`, message: `Duplicate node id “${node.id}”.`, severity: "error" });
       nodeIds.add(node.id);
       if (depth > DESIGN_PROGRAM_LIMITS.depth) findings.push({ code: "depth_limit", path: `screens.${screen.id}.root.${node.id}`, message: `Maximum tree depth is ${DESIGN_PROGRAM_LIMITS.depth}.`, severity: "error" });
       if (node.interaction !== "none" && (node.width.value < 44 || node.height.value < 44)) findings.push({ code: "touch_target_below_minimum", path: `screens.${screen.id}.root.${node.id}`, message: "Interactive native targets must be at least 44 × 44 px in this spike.", severity: "error" });
-      if (screen.compositionV1 && node.type === "container") {
+      if (node.type === "container" && node.layout.wrap && (node.layout.axis !== "row" || node.width.mode === "hug"))
+        findings.push({ code: "unsupported_layout_wrap", path: `screens.${screen.id}.root.${node.id}`, message: "Wrap requires a horizontal row with a bounded width.", severity: "error" });
+      if ((screen.compositionV1 || (node.type === "container" && node.layout.wrap)) && node.type === "container") {
         const horizontal = node.layout.axis === "row";
         const dimension = horizontal ? node.width : node.height;
         if (dimension.mode === "fixed" && node.children.length) {
           const padding = horizontal
             ? node.layout.padding.left + node.layout.padding.right
             : node.layout.padding.top + node.layout.padding.bottom;
-          const fixedChildren = node.children.filter((child) => child[horizontal ? "width" : "height"].mode === "fixed");
-          const required = fixedChildren.reduce((sum, child) => sum + child[horizontal ? "width" : "height"].value, 0)
-            + Math.max(0, node.children.length - 1) * node.layout.gap + padding;
-          if (required > dimension.value + 1)
-            findings.push({ code: "layout_axis_overflow", path: `screens.${screen.id}.root.${node.id}`, message: `Fixed children require ${Math.ceil(required)} px but the ${horizontal ? "width" : "height"} is ${Math.floor(dimension.value)} px.`, severity: "error" });
+          const sizes = node.children.map((child) => child[horizontal ? "width" : "height"]);
+          const required = node.layout.wrap
+            ? Math.max(...sizes.map((size) => minimumAxisExtent([size], 0, padding)))
+            : minimumAxisExtent(sizes, node.layout.gap, padding);
+          if (required > dimension.value + GEOMETRY_EPSILON)
+            findings.push({ code: "layout_axis_overflow", path: `screens.${screen.id}.root.${node.id}`, message: `Children require at least ${required} px but the ${horizontal ? "width" : "height"} is ${dimension.value} px.`, severity: "error" });
         }
       }
-      for (const value of node.type === "container" ? [node.background] : node.type === "text" ? [node.color] : node.type === "image" ? [] : [node.fill]) {
+      for (const value of node.type === "container" ? [node.background] : node.type === "text" ? [node.color] : node.type === "image" || node.type === "instance" ? [] : [node.fill]) {
         if (typeof value === "string" && value.startsWith("token:") && !(value.slice(6) in program.tokens.colors)) findings.push({ code: "missing_token", path: `screens.${screen.id}.root.${node.id}`, message: `Color token “${value.slice(6)}” is not defined.`, severity: "error" });
       }
       if (node.type === "image") {

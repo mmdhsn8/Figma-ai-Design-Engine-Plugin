@@ -13,6 +13,7 @@ import { resolveBrandKitTokens } from "../shared/brand-kit";
 import {
   DEFAULT_MAX_ROW_WIDTH,
   DEFAULT_MIN_CANVAS_GAP,
+  boundsIntersectWithGap,
   normalizePlacementSettings,
   planCanvasPlacements,
   type CanvasBounds,
@@ -57,6 +58,7 @@ import {
   readOwnedComponents,
 } from "./design-system/component-registry";
 import { inspectVariableCapability } from "./design-system/variable-adapter";
+import { hasArabicScript, PERSIAN_FONT_FAMILIES } from "../shared/program-text";
 
 export type RendererFigmaApi = Pick<
   PluginAPI,
@@ -142,6 +144,15 @@ export interface MultiScreenRenderResult {
 export interface MultiScreenRenderOptions {
   scrollMobileSections?: boolean;
   beforeScreen?: () => void;
+  prepareScreen?: (root: FrameNode, screenId: string) => void;
+  verifyScreen?: (root: FrameNode, screenId: string, reused: boolean, recovering?: boolean) => void;
+  canDiscardPendingScreen?: (root: FrameNode, screenId: string) => boolean;
+  canRecoverPendingScreen?: (root: FrameNode) => boolean;
+  markScreenBuilt?: (root: FrameNode, screenId: string) => void;
+  preserveSelection?: boolean;
+  verifyPlacement?: boolean;
+  requireComponentMatch?: boolean;
+  programText?: boolean;
   transaction?: GenerationTransaction;
   onSectionVisible?: (nodeId: string) => void;
   resume?: boolean;
@@ -430,19 +441,21 @@ async function resolveFonts(
   api: RendererFigmaApi,
   spec: ResolvedDesignSpec,
   typography: ReadonlyMap<string, { fontFamily: string; fontStyle: string }>,
+  programText = false,
 ): Promise<FontResolution> {
   const available = await api.listAvailableFontsAsync();
   const availableByKey = new Map(
     available.map((font) => [fontKey(font.fontName.family, font.fontName.style), font.fontName]),
   );
-  const requested = new Map<string, { family: string; style: string }>();
+  const requested = new Map<string, { family: string; style: string; arabic?: boolean }>();
   const preferredFallbacks = new Map<string, { family: string; style: string }>();
   for (const node of collectTextNodes(spec)) {
     const family = node.fontFamily ?? "Inter";
     const style = node.fontStyle ?? "Regular";
-    requested.set(fontKey(family, style), { family, style });
+    const arabic = programText && hasArabicScript(node.text);
+    const key = programFontKey(family, style, arabic);
+    requested.set(key, { family, style, arabic });
     if (node.fontFallback) {
-      const key = fontKey(family, style);
       const existing = preferredFallbacks.get(key);
       if (!existing || node.fontFallback.family === "Inter")
         preferredFallbacks.set(key, {
@@ -462,18 +475,25 @@ async function resolveFonts(
   const typographyFonts = new Map<string, FontName>();
   const selections: FontSelection[] = [];
   const warnings: string[] = [];
+  const loads = new Map<string, Promise<void>>();
   const fallback = availableByKey.get(fontKey("Inter", "Regular")) ?? {
     family: "Inter",
     style: "Regular",
   };
 
   for (const [key, request] of requested) {
-    const exact = availableByKey.get(key);
+    const exact = availableByKey.get(fontKey(request.family, request.style));
     const preferredFallback = preferredFallbacks.get(key);
     const preferred = preferredFallback
       ? availableByKey.get(fontKey(preferredFallback.family, preferredFallback.style))
       : undefined;
-    const candidates = [exact, preferred, fallback].filter(
+    const supportsArabic = (font?: FontName) => font && PERSIAN_FONT_FAMILIES.some((family) => family.toLowerCase() === font.family.toLowerCase());
+    const arabicFallbacks = request.arabic ? PERSIAN_FONT_FAMILIES.flatMap((family) => [
+      availableByKey.get(fontKey(family, request.style)), availableByKey.get(fontKey(family, "Regular")),
+    ]) : [];
+    // Preserve requested fonts with known script coverage. Other requests use a loadable script fallback.
+    const choices = request.arabic ? [supportsArabic(exact) ? exact : undefined, supportsArabic(preferred) ? preferred : undefined, ...arabicFallbacks] : [exact, preferred, fallback];
+    const candidates = choices.filter(
       (candidate, index, all): candidate is FontName =>
         Boolean(candidate) &&
         all.findIndex(
@@ -486,7 +506,13 @@ async function resolveFonts(
     let lastError: unknown;
     for (const candidate of candidates) {
       try {
-        await api.loadFontAsync(candidate);
+        const candidateKey = fontKey(candidate.family, candidate.style);
+        let load = loads.get(candidateKey);
+        if (!load) {
+          load = api.loadFontAsync(candidate);
+          loads.set(candidateKey, load);
+        }
+        await load;
         chosen = candidate;
         break;
       } catch (error) {
@@ -498,7 +524,7 @@ async function resolveFonts(
         `Figma could not load “${request.family} ${request.style}” or the configured Brand Kit/Inter fallback.`,
         { cause: lastError },
       );
-    const fellBack = fontKey(chosen.family, chosen.style) !== key;
+    const fellBack = fontKey(chosen.family, chosen.style) !== fontKey(request.family, request.style);
     fonts.set(key, chosen);
     for (const [token, typographyToken] of typography) {
       if (fontKey(typographyToken.fontFamily, typographyToken.fontStyle) === key) {
@@ -519,6 +545,10 @@ async function resolveFonts(
     }
   }
   return { fonts, typographyFonts, selections, warnings };
+}
+
+function programFontKey(family: string, style: string, arabic: boolean): string {
+  return arabic ? `${fontKey(family, style)}:arabic` : fontKey(family, style);
 }
 
 export function mapSizingMode(mode: SizingMode): "FIXED" | "HUG" | "FILL" {
@@ -599,6 +629,10 @@ function applyLayout(
   const mapping = mapLayoutSpec(layout);
   frame.resize(width, height);
   frame.layoutMode = mapping.mode;
+  if (layout.wrap) {
+    frame.layoutWrap = "WRAP";
+    frame.counterAxisSpacing = mapping.itemSpacing;
+  }
   frame.resize(width, height);
   frame.primaryAxisSizingMode = "FIXED";
   frame.counterAxisSizingMode = "FIXED";
@@ -628,6 +662,10 @@ function applyChildSizing(
 ): void {
   node.layoutSizingHorizontal = mapSizingMode(sizing.width);
   node.layoutSizingVertical = mapSizingMode(sizing.height);
+  if (sizing.minWidth !== undefined) node.minWidth = sizing.minWidth;
+  if (sizing.maxWidth !== undefined) node.maxWidth = sizing.maxWidth;
+  if (sizing.minHeight !== undefined) node.minHeight = sizing.minHeight;
+  if (sizing.maxHeight !== undefined) node.maxHeight = sizing.maxHeight;
   if (layout.counterAxisAlign === "stretch") node.layoutAlign = "STRETCH";
 }
 
@@ -636,10 +674,11 @@ function setTextTypography(
   text: TextNode,
   fonts: Map<string, FontName>,
   parentLayout?: ResolvedLayoutSpec,
+  programText = false,
 ): void {
   const family = node.fontFamily ?? "Inter";
   const style = node.fontStyle ?? "Regular";
-  const font = fonts.get(fontKey(family, style));
+  const font = fonts.get(programFontKey(family, style, programText && hasArabicScript(node.text)));
   if (!font) throw new DesignRenderError(`No resolved font for “${family} ${style}”.`);
 
   text.fontName = font;
@@ -760,6 +799,7 @@ interface BuildContext {
   assets: Map<string, VisualAsset>;
   imageHashes: Map<string, string>;
   warnings: string[];
+  programText?: boolean;
 }
 
 function buildFrameChildren(
@@ -825,7 +865,7 @@ function appendDesignNode(
     const text = api.createText();
     tracker.track(text, "texts");
     text.name = spec.name;
-    setTextTypography(spec, text, context.fonts, parentLayout);
+    setTextTypography(spec, text, context.fonts, parentLayout, context.programText);
     node = text;
   } else if (spec.type === "rectangle") {
     const rectangle = api.createRectangle();
@@ -915,6 +955,7 @@ function appendDesignNode(
       );
     const instance = component.createInstance();
     tracker.track(instance, "instances");
+    if (context.programText) instance.setPluginData("fad.design.native-master-id.v1", component.id);
     if (spec.name) instance.name = spec.name;
     node = instance;
   }
@@ -925,6 +966,7 @@ function appendDesignNode(
     node.setPluginData("fad.design.logical-ref", spec.logicalRef);
   if ("assetId" in spec && typeof spec.assetId === "string")
     node.setPluginData("fad.design.asset-id", spec.assetId);
+  if (spec.type === "instance") node.setPluginData("fad.design.component-id", spec.componentId);
   if ("pattern" in spec && spec.pattern) node.setPluginData("fad.design.pattern", spec.pattern);
   if ("qualityRole" in spec && spec.qualityRole)
     node.setPluginData("fad.design.quality-role", spec.qualityRole);
@@ -932,6 +974,11 @@ function appendDesignNode(
     node.setPluginData("fad.touch-target", spec.qualityRole);
   if (parentLayout) {
     applyChildSizing(node, effectiveSizing(spec, parentLayout), parentLayout);
+    if (context.programText && spec.type === "text" && node.type === "TEXT") {
+      node.textTruncation = "DISABLED";
+      node.textAutoResize = spec.textAutoResize === "width-and-height" ? "WIDTH_AND_HEIGHT" : "HEIGHT";
+      node.setPluginData("fad.design.program-text.v1", "1");
+    }
   } else {
     node.x = spec.x as number;
     node.y = spec.y as number;
@@ -1701,7 +1748,8 @@ export async function renderMultiScreenDesign(
         children: resolvedSpecs.flatMap((spec) => spec.document.children),
       },
     };
-    fontResolution = await resolveFonts(api, fontSpec, baseResolved.tables.typography);
+    fontResolution = await resolveFonts(api, fontSpec, baseResolved.tables.typography, options.programText);
+    options.beforeScreen?.();
 
     const designSystemId = batch.designSystem?.id ?? batch.id;
     const designSystemNamespace = batch.designSystem?.namespace;
@@ -1725,6 +1773,8 @@ export async function renderMultiScreenDesign(
       ) {
         componentReused.push(key);
       } else {
+        if (options.requireComponentMatch)
+          throw new DesignRenderError("The saved component master differs from this program. Use a new component ID.");
         componentSkipped.push(key);
         componentWarnings.push(
           `Component master “${key}” already exists with a different definition and was reused unchanged. Add a new stable key to preserve existing instances and manual edits.`,
@@ -1792,6 +1842,7 @@ export async function renderMultiScreenDesign(
       designSystemNamespace,
       ...assetPreparation,
       warnings: visualWarnings,
+      programText: options.programText,
     };
     if (newDefinitions.length && componentAreaItem) {
       componentArea = createComponentArea(
@@ -1864,6 +1915,7 @@ export async function renderMultiScreenDesign(
       options.beforeScreen?.();
       const screen = orderedScreens[index];
       let existingRoot: FrameNode | undefined;
+      let recoveringRoot: FrameNode | undefined;
       if (options.resume) {
         const existing = api.currentPage.findAll(
           (node) =>
@@ -1895,6 +1947,7 @@ export async function renderMultiScreenDesign(
           root.getPluginData("fad.generation.commit") === "complete"
         ) {
           if (options.verifyTouchTargets) verifyNativeTouchTargets(root);
+          options.verifyScreen?.(root, screen.id, true);
           successfulRoots.push(root);
           screenResults.push({
             id: screen.id,
@@ -1909,7 +1962,13 @@ export async function renderMultiScreenDesign(
           });
           continue;
         }
-        if (root?.getPluginData("fad.generation.commit") === "pending") root.remove();
+        if (root?.getPluginData("fad.generation.commit") === "pending") {
+          if (root.type === "FRAME" && options.canRecoverPendingScreen?.(root))
+            recoveringRoot = root;
+          else if (options.canDiscardPendingScreen && (root.type !== "FRAME" || !options.canDiscardPendingScreen(root, screen.id)))
+            throw new DesignRenderError("Pending native root ownership could not be confirmed for recovery.");
+          else root.remove();
+        }
         else if (root && !existingRoot)
           throw new DesignRenderError(
             "Existing generation frame has no completion marker; inspect it before resuming.",
@@ -2126,8 +2185,8 @@ export async function renderMultiScreenDesign(
         }
         if (transaction && transaction.sequence !== 0)
           throw new DesignRenderError("The first section must create the generation screen root.");
-        const frameName = uniqueName(api, displayName, frameNames, existingNames);
-        const root = createDocumentFrame(
+        const frameName = recoveringRoot?.name ?? uniqueName(api, displayName, frameNames, existingNames);
+        const root = recoveringRoot ?? createDocumentFrame(
           api,
           screenSpec,
           frameName,
@@ -2139,6 +2198,7 @@ export async function renderMultiScreenDesign(
                 frame.setPluginData(MULTI_SCREEN_BATCH_KEY, batch.id);
                 frame.setPluginData(MULTI_SCREEN_ID_KEY, screen.id);
                 frame.setPluginData("fad.generation.commit", "pending");
+                options.prepareScreen?.(frame, screen.id);
               }
             : undefined,
           transaction
@@ -2168,13 +2228,23 @@ export async function renderMultiScreenDesign(
             metadata: screen.metadata,
           }),
         );
-        if (styleBindings) await applyNativeStyleBindings(root, styleBindings);
+        if (!recoveringRoot) {
+          options.markScreenBuilt?.(root, screen.id);
+          if (styleBindings) await applyNativeStyleBindings(root, styleBindings);
+        }
+        options.beforeScreen?.();
         if (options.verifyTouchTargets) verifyNativeTouchTargets(root);
+        options.verifyScreen?.(root, screen.id, false, Boolean(recoveringRoot));
         const measuredBounds = getCanvasNodeBounds(root);
         let actualPlacement = plannedScreen;
+        const latestObstacles = options.verifyPlacement
+          ? readTopLevelCanvasObstacles(api.currentPage, new Set([root.id]))
+          : undefined;
+        const proposed = { ...plannedScreen, width: measuredBounds.width, height: measuredBounds.height };
         if (
           Math.abs(measuredBounds.width - screen.width) > 0.5 ||
-          Math.abs(measuredBounds.height - screen.height) > 0.5
+          Math.abs(measuredBounds.height - screen.height) > 0.5 ||
+          latestObstacles?.some((obstacle) => boundsIntersectWithGap(obstacle, proposed, placementSettings.gap))
         ) {
           const actualAndRemaining: PlacementItem[] = [
             { id: placementId, width: measuredBounds.width, height: measuredBounds.height },
@@ -2186,7 +2256,7 @@ export async function renderMultiScreenDesign(
           ];
           const replanned = planCanvasPlacements(
             actualAndRemaining,
-            readTopLevelCanvasObstacles(api.currentPage, new Set([root.id])),
+            latestObstacles ?? readTopLevelCanvasObstacles(api.currentPage, new Set([root.id])),
             placementSettings,
           );
           for (const placement of replanned) placementById.set(placement.id, placement);
@@ -2296,15 +2366,17 @@ export async function renderMultiScreenDesign(
         );
       }
       try {
-        api.currentPage.selection = previousSelection;
+        if (!options.preserveSelection) api.currentPage.selection = previousSelection;
       } catch {
         // Preserve the batch report if the original selection is no longer writable.
       }
     } else if (!transaction) {
       addDesignCounts(counts, sharedTracker.counts);
       try {
-        api.currentPage.selection = [successfulRoots[0]];
-        api.viewport.scrollAndZoomIntoView([successfulRoots[0]]);
+        if (!options.preserveSelection) {
+          api.currentPage.selection = [successfulRoots[0]];
+          api.viewport.scrollAndZoomIntoView([successfulRoots[0]]);
+        }
       } catch {
         warnings.push(
           "The screens were created, but Figma could not focus the first generated screen.",
@@ -2357,7 +2429,7 @@ export async function renderMultiScreenDesign(
       sharedTracker.cleanup();
       styleBindings?.rollback();
       try {
-        api.currentPage.selection = previousSelection;
+        if (!options.preserveSelection) api.currentPage.selection = previousSelection;
       } catch {
         // Keep the original failure as the actionable result.
       }
@@ -2376,7 +2448,7 @@ export async function renderMultiScreenDesign(
     if (attemptedCount < orderedScreens.length) markRemainingScreensFailed(attemptedCount, message);
     addDesignCounts(counts, sharedTracker.counts);
     try {
-      if (successfulRoots.length > 0) {
+      if (!options.preserveSelection && successfulRoots.length > 0) {
         api.currentPage.selection = [successfulRoots[0]];
         api.viewport.scrollAndZoomIntoView([successfulRoots[0]]);
       }

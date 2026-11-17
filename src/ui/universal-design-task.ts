@@ -234,6 +234,11 @@ function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", sc
     brief: purpose === "plan" ? task.prompt : undefined,
     context,
     pinned: pinnedContext(task),
+    ...(purpose === "compose" ? {
+      reusableLocalComponents: [...new Map(
+        (task.universalScreens ?? []).flatMap(({ program }) => program?.componentsV1 ?? []).map((definition) => [definition.id, definition]),
+      ).values()].filter((definition) => utf8Bytes(JSON.stringify(definition)) <= 1_500).slice(0, 6),
+    } : {}),
     instructions: routeInstruction,
     ...(task.validationFeedback ? { priorValidation: task.validationFeedback.slice(0, 3_000) } : {}),
   };
@@ -509,7 +514,11 @@ function verifyNativeReadback(
   const subtree = nativeSubtree(response.nodes, root.id);
   if (subtree.length !== screen.nativeNodeCount)
     fail("native_node_count_mismatch", "Native readback did not match the exact adopted subtree node count.");
-  const allowedTypes = new Set(["FRAME", "TEXT", "RECTANGLE", "ELLIPSE", "VECTOR", "COMPONENT"]);
+  if (!response.geometry || response.geometry.coverage !== "complete" || response.geometry.measuredNodes !== subtree.length)
+    fail("native_geometry_incomplete", "Figma could not measure the full task-owned screen geometry.");
+  if (response.geometry.findings.length)
+    fail("native_geometry_failed", "Figma detected a layout or ownership discrepancy. The saved screen remains unverified.");
+  const allowedTypes = new Set(["FRAME", "TEXT", "RECTANGLE", "ELLIPSE", "VECTOR", "COMPONENT", "INSTANCE"]);
   if (subtree.some((node) => !allowedTypes.has(node.type)))
     fail("native_node_type_unsupported", "The screen contains a node type outside the editable native types supported by this route.");
   if (!subtree.some((node) => node.type === "TEXT"))
@@ -571,9 +580,15 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       const input = requestInput(task, purpose, screen);
       const inputBytes = utf8Bytes(JSON.stringify(input));
       if (task.rounds >= 100) fail("model_round_limit", "The existing 100-round Chat task limit was reached before the route completed.");
+      if ((purpose === "plan" && metrics.planRequests >= 3) ||
+        (purpose === "compose" && metrics.programRequests >= 100) ||
+        (purpose === "repair" && metrics.repairRequests >= 10))
+        fail("model_request_limit", "The saved request budget for this stage is exhausted.");
       if (purpose === "plan") metrics.planRequests++;
       else if (purpose === "compose") metrics.programRequests++;
       else metrics.repairRequests++;
+      // A lost provider response consumes the attempt, but never commits a plan or native effect.
+      await save();
       const startedAt = now();
       let turn: AuthorizedChatTurn;
       try {
@@ -734,6 +749,17 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
   const plan = task.projectPlan!;
   const screens = task.universalScreens!;
   for (const screen of screens) {
+    if (!["program_saved", "rendering", "rendered", "verified"].includes(screen.status)) continue;
+    const parsed = parseDesignProgram(screen.program, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+    if (!parsed.success || parsed.fingerprint !== screen.fingerprint || parsed.data.screens.length !== 1 ||
+      parsed.data.screens[0]?.id !== screen.screenId)
+      fail("program_checkpoint_inconsistent", "The saved screen program failed its fingerprint or identity check. Existing native work was retained.");
+    if ((screen.status === "rendered" || screen.status === "verified") &&
+      (!screen.rootRef || !screen.nativeBatchId || !screen.nativeNodeCount ||
+        screen.adoptionOperationIds?.length !== screen.nativeNodeCount))
+      fail("native_checkpoint_inconsistent", "The saved checkpoint lacks complete native ownership evidence.");
+  }
+  for (const screen of screens) {
     check();
     if (screen.status === "verified") continue;
     const screenPlan = plan.screens.find(({ screenId }) => screenId === screen.screenId);
@@ -829,6 +855,9 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       const estimated = estimateNativeNodes(screen.program, task);
       if (alreadyVerifiedNodes + estimated > MAX_TASK_NATIVE_NODES)
         fail("native_capacity_exceeded", `This route allows at most ${MAX_TASK_NATIVE_NODES} adopted native nodes per task; the saved screen would exceed that bound. Earlier verified screens are retained.`);
+      if ((screen.renderAttempts ?? 0) >= 3)
+        fail("native_render_retry_limit", "The saved screen reached its native render retry limit. The canvas and checkpoint were retained.");
+      screen.renderAttempts = (screen.renderAttempts ?? 0) + 1;
       transition("UNIVERSAL_COMPOSING");
       screen.status = "rendering";
       screen.errorCode = "render_in_flight";
@@ -865,6 +894,14 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       screen.nativeBatchId = response.nativeBatchId;
       screen.adoptionOperationIds = response.adoptionOperationIds;
       screen.nativeNodeCount = response.nativeNodeCount;
+      screen.geometryVersion = response.geometryVersion;
+      if (response.geometryDurationMs !== undefined)
+        task.universalMetrics!.nativeGeometryMs = (task.universalMetrics!.nativeGeometryMs ?? 0) + response.geometryDurationMs;
+      if (response.geometryRepairs !== undefined)
+        task.universalMetrics!.nativeGeometryRepairs = (task.universalMetrics!.nativeGeometryRepairs ?? 0) + response.geometryRepairs;
+      const nativeWarnings = (response.findings ?? []).filter(({ severity }) => severity === "warning")
+        .map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }));
+      if (nativeWarnings.length) screen.findings = [...(screen.findings ?? []).slice(0, 11), ...nativeWarnings].slice(0, 12);
       delete screen.errorCode;
       task.universalMetrics!.firstNativeProgressMs ??= Math.max(0, now() - task.universalMetrics!.startedAtMs);
       await save();
@@ -873,7 +910,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     if (screen.status === "rendered") {
       deps.onPhase?.("verification");
       transition("UNIVERSAL_COMPOSING");
-      if (!screen.rootRef) fail("native_root_missing", "The rendered screen checkpoint has no verified root reference.");
+      if (!screen.rootRef || !screen.fingerprint) fail("native_root_missing", "The rendered screen checkpoint has no verified root reference or fingerprint.");
       deps.progress(`Universal design route v1 · reading back task-owned native screen ${stageIndex + 1}/${plan.screenCount}: ${screenPlan.name}…`);
       await deps.assertAuthorized();
       check();
@@ -883,8 +920,18 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         taskId: task.id,
         documentId: task.documentId,
         refs: [screen.rootRef],
+        geometry: { programFingerprint: screen.fingerprint, requireReceipt: screen.geometryVersion === 1 },
       });
       check();
+      if (inspection.geometry) {
+        task.universalMetrics!.nativeReadbackMs = (task.universalMetrics!.nativeReadbackMs ?? 0) + inspection.geometry.durationMs;
+        if (inspection.geometry.findings.length) {
+          screen.findings = inspection.geometry.findings.map(({ code, nodeId }) => ({
+            code, path: `native.${nodeId}`, message: "Figma reported a native geometry or ownership discrepancy.",
+          }));
+          await save();
+        }
+      }
       const verified = verifyNativeReadback(inspection, screen, plan);
       if (screens.some((other) => other !== screen && other.rootRef === screen.rootRef))
         fail("native_root_conflict", "Two planned screens resolve to the same task-owned native root.");
@@ -907,9 +954,10 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
   if (screens.some(({ status }) => status !== "verified") || task.stages.some(({ completed }) => !completed))
     fail("native_verification_incomplete", "Not every planned screen has task-owned native readback; completion was refused.");
   task.universalMetrics!.totalElapsedMs = Math.max(0, now() - task.universalMetrics!.startedAtMs);
+  const usedFallback = screens.some(({ findings }) => findings?.some(({ code }) => code === "native_font_fallback"));
   task.text = plan.locale.toLocaleLowerCase().startsWith("fa")
-    ? `مسیر طراحی همگانی v1: ${plan.screenCount} صفحهٔ قابل‌ویرایش در فیگما ساخته و از لایه‌های بومی همان task بازخوانی شد. ${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} لایهٔ بومی ثبت شد.${screens.some(({ findings }) => findings?.length) ? " هشدارهای پیش‌بررسی در checkpoint هر صفحه نگه‌داری شده‌اند." : ""}`
-    : `Universal design route v1: created and read back ${plan.screenCount} editable native Figma screens (${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} adopted layers).${screens.some(({ findings }) => findings?.length) ? " Preflight warnings are preserved in each screen checkpoint." : ""}`;
+    ? `مسیر طراحی همگانی v1: ${plan.screenCount} صفحهٔ قابل‌ویرایش در فیگما ساخته و از لایه‌های بومی همان task بازخوانی شد. ${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} لایهٔ بومی ثبت شد.${usedFallback ? " برای یکی از فونت‌های در دسترس نبود‌ه از فونت جایگزین استفاده شد." : ""}`
+    : `Universal design route v1: created and read back ${plan.screenCount} editable native Figma screens (${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} adopted layers).${usedFallback ? " Figma used a fallback for at least one requested font." : ""}`;
   task.pending = [];
   task.recent = [];
   task.status = "completed";

@@ -201,13 +201,13 @@ function programFor(input: Case, screenIndex: number, regionCount = 3): DesignPr
     width: screenIndex === 1 ? { mode: "fixed" as const, value: [92, 136, 80][index]! } : { mode: "fill" as const, value: width },
     height: { mode: "fixed" as const, value: index === 2 ? 88 : screenIndex === 2 && index === 0 ? 160 : 148 },
     background: index === 0 ? "token:surface" : index === 2 ? "token:raised-surface" : "token:surface",
-    layout: { axis: (screenIndex === 1 && index === 0 ? "row" : "column") as "row" | "column", gap: index === 0 ? 12 : 8, padding: { top: 12, right: 12, bottom: 12, left: 12 }, align: "start" as const, crossAlign: "stretch" as const },
-    children: [textNode(index)],
+    layout: { axis: "column" as const, gap: index === 0 ? 12 : 8, padding: { top: 12, right: 12, bottom: 12, left: 12 }, align: "start" as const, crossAlign: "stretch" as const },
+    children: [screenIndex === 1 ? { ...textNode(index), width: { mode: "fill", value: [68, 112, 56][index]!, min: 48 } } : textNode(index)],
   }));
   if (regionCount > 1 && screenIndex === 0) {
     children[1]!.children.push({ ...textNode(2), id: "copy-metric-detail", text: `${input.entities[0]} · ${input.goals[1 % input.goals.length]}`, semanticRole: "supporting-data" });
   } else if (regionCount > 1 && screenIndex === 1) {
-    children[0]!.children.push({ ...textNode(2), id: "copy-detail-meta", text: `Selected ${input.entities[0]}`, semanticRole: "record-metadata" });
+    children[0]!.children.push({ ...textNode(2), id: "copy-detail-meta", width: { mode: "fill", value: 68, min: 48 }, text: `Selected ${input.entities[0]}`, semanticRole: "record-metadata" });
   } else if (regionCount > 1) {
     children[1]!.children.push({ ...textNode(2), id: "copy-status-detail", text: `Next: ${input.goals[0]}`, semanticRole: "status-detail" });
     children[0]!.children.push({
@@ -342,10 +342,11 @@ function makeHarness(input: Case, options: {
   sparseConfirmation?: boolean;
   brandKit?: PinnedBrandKit;
   planLanguage?: ProjectVisualLanguageV1;
+  localComponent?: boolean;
 } = {}) {
   const task = taskFor(input);
   if (options.brandKit) task.brandKit = options.brandKit;
-  const mock = createMockApi();
+  const mock = createMockApi({ simulateFill: true });
   const sent: PluginToUIMessage[] = [];
   const executor = createFigmaToolExecutor(mock.api, (message) => sent.push(message));
   const checkpoints: ChatTask[] = [];
@@ -370,6 +371,23 @@ function makeHarness(input: Case, options: {
     if (lifecycle === "UNIVERSAL_COMPOSING") {
       const screenIndex = composed++;
       const program = programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
+      if (options.localComponent) {
+        const fixed = { mode: "fixed" as const, value: 48 };
+        const box = { width: fixed, height: fixed, interaction: "none" as const };
+        program.componentsV1 = [{
+          id: "project-mark",
+          root: {
+            ...box, id: "master", type: "container", name: "Project mark", semanticRole: "mark",
+            layout: { axis: "column", gap: 0, padding: { left: 0, right: 0, top: 0, bottom: 0 }, align: "start", crossAlign: "start" },
+            children: [{ ...box, id: "symbol", type: "ellipse", name: "Project symbol", semanticRole: "symbol", fill: "#2457A7" }],
+          },
+        }];
+        const root = program.screens[0]!.root;
+        if (root.type !== "container") throw new Error("Expected fixture container");
+        if (root.layout.axis === "column")
+          root.children.push({ ...box, id: "mark", type: "instance", name: "Project symbol instance", semanticRole: "symbol", componentId: "project-mark" });
+        else delete program.componentsV1;
+      }
       if (options.firstProgramViewportMismatch && screenIndex === 0) {
         program.screens[0]!.viewport = input.platform === "mobile"
           ? { preset: "desktop", width: 1440, height: 900 }
@@ -435,6 +453,9 @@ function makeHarness(input: Case, options: {
         adoptionOperationIds: rendered.operationIds,
         programFingerprint: rendered.fingerprint,
         nativeNodeCount: rendered.registeredRefs,
+        geometryVersion: rendered.geometryVersion,
+        geometryRepairs: rendered.geometryRepairs,
+        geometryDurationMs: rendered.timingsMs.geometry,
       };
     }),
     inspectProgram: vi.fn(async (request: Parameters<typeof executor>[0]) => {
@@ -449,6 +470,210 @@ function makeHarness(input: Case, options: {
 }
 
 describe("universal design Chat route", () => {
+  it("restarts a lost Companion planning turn from the persisted attempt without writing a native node", async () => {
+    const h = makeHarness(cases[0]!);
+    const original = h.model.getMockImplementation()!;
+    let interrupted = false;
+    h.model.mockImplementation(async (input, lifecycle) => {
+      if (lifecycle === "UNIVERSAL_PLANNING" && !interrupted) {
+        interrupted = true;
+        throw new Error("Simulated Companion disconnect");
+      }
+      return original(input, lifecycle);
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("Companion disconnect");
+    const saved = ChatTaskSchema.parse(h.checkpoints.at(-1));
+    expect(saved.universalMetrics?.planRequests).toBe(1);
+    expect(saved.projectPlan).toBeUndefined();
+    expect(h.mock.roots).toHaveLength(0);
+    await runChatTask(saved, h.deps);
+    expect(saved.status).toBe("completed");
+    expect(saved.universalMetrics?.planRequests).toBe(2);
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(3);
+  });
+
+  it("rejects a schema-valid but changed saved program before replay", async () => {
+    const h = makeHarness(cases[0]!);
+    h.deps.renderProgram.mockRejectedValueOnce(new Error("Simulated interruption"));
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("interruption");
+    const saved = ChatTaskSchema.parse(h.checkpoints.at(-1));
+    saved.universalScreens![0]!.program!.goal = "Different valid persisted content";
+    await expect(runChatTask(saved, h.deps)).rejects.toThrow("program_checkpoint_inconsistent");
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(1);
+    expect(h.mock.roots).toHaveLength(0);
+  });
+
+  it("revalidates a built pending root after a simulated plugin restart and keeps its native ID", async () => {
+    const h = makeHarness(cases[0]!);
+    const program = programFor(cases[0]!, 0);
+    const scope = { taskId: h.task.id, documentId: h.task.documentId, pageId: h.mock.page.id };
+    const interrupted = await renderDesignProgramLocal(h.mock.api, program, {
+      ...scope, executor: { registerRenderedGeneration: async () => { throw new Error("Interrupted before adoption"); } },
+    });
+    expect(interrupted.success).toBe(false);
+    const root = h.mock.roots.find((node) => node.getPluginData("fad.design.program-built.v1") === "1")!;
+    const nativeIds = h.mock.nodes.map(({ id }) => id);
+    root.setPluginData("fad.generation.commit", "pending");
+    root.setPluginData("fad.design.geometry-receipt.v1", "");
+    const executor = createFigmaToolExecutor(h.mock.api, () => undefined);
+    const recovered = await renderDesignProgramLocal(h.mock.api, program, { ...scope, executor });
+    expect(recovered).toMatchObject({ success: true, roots: [{ nodeId: root.id }] });
+    expect(h.mock.nodes.map(({ id }) => id)).toEqual(nativeIds);
+    expect(root.getPluginData("fad.generation.commit")).toBe("complete");
+  });
+
+  it("preserves mixed Persian and English editability and selects the Arabic fallback only for that text", async () => {
+    const mixed = "می\u200cخواهم ۱۲٫۵ USD";
+    const input: Case = { ...cases[0]!, screens: cases[0]!.screens.map((screen, index) => index === 0 ? { ...screen, name: mixed } : screen) };
+    const h = makeHarness(input);
+    await runChatTask(h.task, h.deps);
+    const texts = h.mock.nodes.filter((node) => node.type === "TEXT");
+    const persian = texts.find((node) => node.characters === mixed);
+    const english = texts.find((node) => node.characters === input.screens[0]!.purpose);
+    expect(persian).toMatchObject({ type: "TEXT", characters: mixed, textAutoResize: "HEIGHT", textAlignHorizontal: "RIGHT", fontName: { family: "Arial" } });
+    expect(english?.fontName).toMatchObject({ family: "Inter" });
+    const corrupted = programFor(input, 0);
+    const root = corrupted.screens[0]!.root;
+    if (root.type !== "container" || root.children[0]?.type !== "container" || root.children[0].children[0]?.type !== "text")
+      throw new Error("Missing test text node");
+    root.children[0].children[0].text += "\ufffd";
+    expect(parseDesignProgram(corrupted)).toMatchObject({ success: false, findings: expect.arrayContaining([expect.objectContaining({ code: "invalid_native_text" })]) });
+  });
+
+  it("stops before native construction when no Arabic-capable font can be loaded", async () => {
+    const h = makeHarness(cases[0]!);
+    h.mock.api.listAvailableFontsAsync = async () => [{ fontName: { family: "Inter", style: "Regular" } }];
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("native_render_incomplete");
+    expect(h.mock.roots).toHaveLength(0);
+  });
+
+  it("rejects fresh readback when an instance no longer resolves its original native master", async () => {
+    const h = makeHarness(cases[0]!, { localComponent: true });
+    const inspect = h.deps.inspectProgram.getMockImplementation()!;
+    h.deps.inspectProgram.mockImplementationOnce(async (request) => {
+      const instance = h.mock.nodes.find((node) => node.type === "INSTANCE")!;
+      instance.getMainComponentAsync = async () => null;
+      const result = await inspect(request);
+      expect(result.geometry?.findings).toContainEqual(expect.objectContaining({ code: "native_instance_master_mismatch" }));
+      return result;
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("native_geometry_failed");
+    expect(h.task.universalScreens?.[0]?.status).toBe("rendered");
+  });
+
+  it("uses the same native route for an unfamiliar three-screen community instrument library", async () => {
+    const h = makeHarness({
+      name: "community instrument library",
+      brief: "Design 3 desktop screens for a community instrument library: instrument catalog, loan inspection, and return intake.",
+      purpose: "Help volunteers lend instruments and record their condition on return.",
+      audience: "Instrument library volunteers and borrowers",
+      platform: "desktop",
+      locale: "en-US",
+      tags: ["community-lending"],
+      entities: ["instrument", "loan", "condition record"],
+      goals: ["Find an instrument", "Review a loan", "Intake a return"],
+      screens: [
+        { name: "Instrument catalog", role: "browse", purpose: "Find a lendable instrument." },
+        { name: "Loan inspection", role: "detail", purpose: "Review the instrument condition before loan." },
+        { name: "Return intake", role: "intake", purpose: "Record the condition of the returned instrument." },
+      ],
+    });
+    await runChatTask(h.task, h.deps);
+    const roots = h.task.universalScreens?.map(({ status, rootRef }) => ({ status, rootRef })) ?? [];
+    expect(roots).toHaveLength(3);
+    expect(roots.every(({ status, rootRef }) => status === "verified" && rootRef)).toBe(true);
+    expect(new Set(roots.map(({ rootRef }) => rootRef)).size).toBe(3);
+    expect(h.deps.execute).not.toHaveBeenCalled();
+  });
+
+  it("detects painted text overflow even when the editable text box fits", async () => {
+    const h = makeHarness(cases[0]!);
+    const inspect = h.deps.inspectProgram.getMockImplementation()!;
+    h.deps.inspectProgram.mockImplementationOnce(async (request) => {
+      const text = h.mock.nodes.find((node) => node.type === "TEXT")!;
+      const parent = text.parent as typeof text;
+      const frame = parent.absoluteBoundingBox!;
+      Object.defineProperty(text, "absoluteRenderBounds", {
+        value: { x: frame.x + 12, y: frame.y + 12, width: 32, height: frame.height - 6 },
+      });
+      const result = await inspect(request);
+      expect(result.geometry?.findings).toContainEqual(expect.objectContaining({ code: "native_text_render_overflow" }));
+      return result;
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("native_geometry_failed");
+  });
+
+  it("resumes a checkpoint after interrupted post-adoption verification without recreating its screen or master", async () => {
+    const h = makeHarness(cases[0]!, { localComponent: true });
+    h.deps.inspectProgram.mockRejectedValueOnce(new Error("Simulated verification interruption"));
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("verification interruption");
+    const previousRoot = h.mock.roots.find((node) => node.getPluginData("fad.generation.commit") === "complete");
+    expect(previousRoot).toBeDefined();
+    const saved = ChatTaskSchema.parse(structuredClone(h.task));
+    expect(saved.universalScreens?.[0]?.status).toBe("rendered");
+    await runChatTask(h.task, h.deps);
+    expect(h.task.status).toBe("completed");
+    expect(h.mock.roots.find((node) => node.id === previousRoot?.id)).toBe(previousRoot);
+    expect(h.mock.nodes.filter((node) => node.type === "COMPONENT" && !node.removed)).toHaveLength(1);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(3);
+  });
+
+  it("reuses a persisted program when interrupted before any native creation", async () => {
+    const h = makeHarness(cases[0]!);
+    h.deps.renderProgram.mockRejectedValueOnce(new Error("Simulated interruption before native creation"));
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("before native creation");
+    expect(h.mock.roots).toHaveLength(0);
+    const saved = ChatTaskSchema.parse(structuredClone(h.task));
+    expect(saved.universalScreens?.[0]).toMatchObject({ status: "rendering", program: expect.any(Object) });
+    await runChatTask(saved, h.deps);
+    expect(saved.status).toBe("completed");
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(3);
+    expect(h.lifecycles.filter((name) => name === "UNIVERSAL_COMPOSING")).toHaveLength(3);
+  });
+
+  it("reuses a task local component master across two native screen instances", async () => {
+    const h = makeHarness(cases[0]!, { localComponent: true });
+    await runChatTask(h.task, h.deps).catch((error: unknown) => {
+      throw new Error(JSON.stringify(h.task.universalScreens?.flatMap(({ findings }) => findings ?? [])), { cause: error });
+    });
+    expect(h.task.status).toBe("completed");
+    expect(h.mock.nodes.filter((node) => node.type === "COMPONENT" && !node.removed)).toHaveLength(1);
+    const instances = h.mock.nodes.filter((node) => node.type === "INSTANCE" && !node.removed);
+    expect(instances).toHaveLength(2);
+    expect(instances.every((node) => node.children[0]?.type === "ELLIPSE")).toBe(true);
+    expect(instances[0]?.getPluginData("fad.tool.logical-ref.v1")).not.toBe(instances[1]?.getPluginData("fad.tool.logical-ref.v1"));
+  });
+
+  it("keeps a rendered checkpoint unverified when fresh native readback finds horizontal bleed", async () => {
+    const h = makeHarness(cases[0]!);
+    const inspect = h.deps.inspectProgram.getMockImplementation()!;
+    h.deps.inspectProgram.mockImplementationOnce(async (request) => {
+      const text = h.mock.nodes.find((node) => node.type === "TEXT")!;
+      text.x += 20;
+      const result = await inspect(request);
+      expect(result.geometry?.findings).toContainEqual(expect.objectContaining({ code: "native_horizontal_overflow", nodeId: text.id }));
+      return result;
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("native_geometry_failed");
+    expect(h.task.universalScreens?.[0]).toMatchObject({ status: "rendered", geometryVersion: 1 });
+    expect(h.mock.nodes.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(1);
+  });
+
+  it("preserves the current selection and verifies a tall RTL body inside the fixed viewport", async () => {
+    const h = makeHarness(cases[0]!);
+    const selection = h.mock.api.createRectangle();
+    h.mock.api.currentPage.selection = [selection];
+    await runChatTask(h.task, h.deps);
+    const roots = h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete");
+    expect(roots).toHaveLength(3);
+    for (const root of roots) {
+      expect(root).toMatchObject({ width: 390, height: 844, clipsContent: true, overflowDirection: "VERTICAL" });
+      expect(root.children[0]!.height).toBeGreaterThan(1000);
+    }
+    expect(h.mock.api.currentPage.selection).toEqual([selection]);
+    expect(h.mock.nodes.find((node) => node.type === "TEXT")?.textAlignHorizontal).toBe("RIGHT");
+  });
+
   it("defaults every new Chat task to Universal, independent of prompt intent", () => {
     expect(DEFAULT_DESIGN_ENGINE).toBe("universal");
     expect(selectChatExecutionRoute()).toBe("universal-design-v1");
@@ -816,7 +1041,7 @@ describe("universal design Chat route", () => {
     const preflight = compileDesignProgram(program, { allowedBrandAssetIds: new Set([assetId]) });
     expect(preflight.success, JSON.stringify(preflight)).toBe(true);
 
-    const mock = createMockApi();
+    const mock = createMockApi({ simulateFill: true });
     const executor = createFigmaToolExecutor(mock.api, () => {});
     const rendered = await renderDesignProgramLocal(mock.api, program, {
       taskId: "chat-asset-test-0001",
