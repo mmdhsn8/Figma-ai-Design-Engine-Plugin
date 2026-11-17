@@ -64,7 +64,7 @@ export function inspectProgramGeometry(
   root: FrameNode,
   options: { taskId: string; pageId: string; expected?: ExpectedScreen; requireOwnership?: boolean; checkReceipt?: boolean },
 ): ProgramGeometryReport & { receipt: string } {
-  const started = performance.now();
+  const started = Date.now();
   const findings: ProgramGeometryFinding[] = [];
   const append = (finding: ProgramGeometryFinding) => {
     if (findings.length < 12) findings.push(finding);
@@ -226,7 +226,7 @@ export function inspectProgramGeometry(
   if (options.checkReceipt && root.getPluginData(PROGRAM_GEOMETRY_KEY) !== receipt)
     record("native_content_changed", root);
   return { version: NATIVE_GEOMETRY_VERSION, coverage: incomplete ? "incomplete" : "complete", measuredNodes,
-    durationMs: Math.max(0, Math.round(performance.now() - started)), findings, receipt };
+    durationMs: Math.max(0, Math.round(Date.now() - started)), findings, receipt };
 }
 
 /** One correction to the synthetic scroll body, driven by the measured native content extent. */

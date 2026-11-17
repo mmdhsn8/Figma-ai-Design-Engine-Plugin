@@ -50,15 +50,15 @@ export async function renderDesignProgramLocal(
   } catch {
     return { success: false, code: "stale_document_scope", findings: [{ code: "stale_document_scope", path: "documentId", message: "The active Figma document or page changed before native rendering.", severity: "error" }] };
   }
-  const parseStarted = performance.now();
+  const parseStarted = Date.now();
   const assets = scope.assets ?? [];
   const allowedBrandAssetIds = new Set(assets.map(({ id }) => id));
   const parsedProgram = parseDesignProgram(value, { allowedBrandAssetIds });
-  const parseMs = Math.max(0, performance.now() - parseStarted);
+  const parseMs = Math.max(0, Date.now() - parseStarted);
   if (!parsedProgram.success) return { success: false, code: "invalid_program", findings: parsedProgram.findings };
-  const compileStarted = performance.now();
+  const compileStarted = Date.now();
   const compiled = compileDesignProgram(value, { assets, allowedBrandAssetIds });
-  const compileMs = Math.max(0, performance.now() - compileStarted);
+  const compileMs = Math.max(0, Date.now() - compileStarted);
   if (!compiled.success) return { success: false, code: "compile_rejected", findings: compiled.findings };
   const semanticRoles = new Map(compiled.semanticRoles.map(({ logicalRef, role }) => [logicalRef, role]));
   const geometryFindings: ProgramGeometryFinding[] = [];
@@ -82,7 +82,7 @@ export async function renderDesignProgramLocal(
       if (owner && owner !== taskId)
         return { success: false, code: "ownership_conflict", findings: [{ code: "ownership_conflict", path: "screens", message: "The native batch already belongs to another task.", severity: "error" }] };
     }
-    const renderStarted = performance.now();
+    const renderStarted = Date.now();
     const rendered = await renderMultiScreenDesign(api, compiled.batch, {
       resume: true,
       preserveSelection: true,
@@ -135,7 +135,7 @@ export async function renderDesignProgramLocal(
       },
     });
     verifyScope();
-    const renderMs = Math.max(0, performance.now() - renderStarted);
+    const renderMs = Math.max(0, Date.now() - renderStarted);
     if (geometryFindings.length)
       return { success: false, code: "native_geometry_failed", findings: geometryFindings.slice(0, 12).map(({ code, nodeId, parentId }) => ({
         code, path: parentId ? `native.${parentId}.${nodeId}` : `native.${nodeId}`, message: "Native geometry or ownership differs from the saved program.", severity: "error",
@@ -193,7 +193,7 @@ export async function renderDesignProgramLocal(
     });
     if (collision.length)
       return { success: false, code: "reference_collision", findings: [{ code: "reference_collision", path: "screens", message: "A stable task ref already belongs to another native node.", severity: "error" }] };
-    const registrationStarted = performance.now();
+    const registrationStarted = Date.now();
     assertCurrentScope?.();
     if (activePageId(api) !== pageId) throw new Error("page_scope_changed");
     const registration = await executor.registerRenderedGeneration({
@@ -203,7 +203,7 @@ export async function renderDesignProgramLocal(
       batchId: rendered.batchId,
       roots: adoptionRoots,
     });
-    const registrationMs = Math.max(0, performance.now() - registrationStarted);
+    const registrationMs = Math.max(0, Date.now() - registrationStarted);
     if (registration.registeredRefs !== adoptionRoots.reduce((count, root) => count + root.nodes.length, 0))
       return { success: false, code: "incomplete_ownership_registration", findings: [{ code: "incomplete_ownership_registration", path: "screens", message: "The scoped tool executor did not register every verified renderer node.", severity: "error" }] };
     return {

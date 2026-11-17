@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { FIGMA_CLIENT_STORAGE_QUOTA_BYTES } from "./client-storage-limits.js";
-import { parseSafeSvg, inspectEmbeddedImage } from "./visual-assets.js";
+import { parseSafeSvg, inspectEmbeddedImage, embeddedImageBytes } from "./visual-assets.js";
 import { VisualAssetSchema, type VisualAsset } from "./visual-schema.js";
 import { BrandColorRoleSchema, type BrandColorRole } from "./brand-color-role.js";
 
@@ -14,10 +14,10 @@ export const BRAND_KIT_MAX_TOTAL_ASSET_BYTES = 1024 * 1024;
 export const BRAND_KIT_MAX_ARCHIVE_BYTES = 1024 * 1024;
 
 function decodeUtf8Base64(value: string): string {
-  const binary = atob(value);
-  const escaped = new Array<string>(binary.length);
-  for (let index = 0; index < binary.length; index++)
-    escaped[index] = `%${binary.charCodeAt(index).toString(16).padStart(2, "0")}`;
+  const bytes = embeddedImageBytes(value);
+  const escaped = new Array<string>(bytes.length);
+  for (let index = 0; index < bytes.length; index++)
+    escaped[index] = `%${bytes[index]!.toString(16).padStart(2, "0")}`;
   return decodeURIComponent(escaped.join(""));
 }
 
@@ -482,7 +482,7 @@ export function rejectPrototypeKeys(value: unknown, depth = 0): boolean {
 }
 
 export function brandAssetContentHash(base64: string): string {
-  const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+  const bytes = embeddedImageBytes(base64);
   let hash = 0x811c9dc5;
   for (const byte of bytes) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
   return hash.toString(16).padStart(8, "0");

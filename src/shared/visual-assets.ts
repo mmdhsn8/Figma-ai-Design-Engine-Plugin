@@ -27,6 +27,25 @@ function decodeBase64(value: string): Uint8Array | undefined {
   return bytes;
 }
 
+export function encodeBase64(bytes: Uint8Array): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let encoded = "";
+  for (let index = 0; index < bytes.length; index += 3) {
+    const first = bytes[index]!;
+    const hasSecond = index + 1 < bytes.length;
+    const hasThird = index + 2 < bytes.length;
+    const second = hasSecond ? bytes[index + 1]! : 0;
+    const third = hasThird ? bytes[index + 2]! : 0;
+    const word = (first << 16) | (second << 8) | third;
+    encoded +=
+      alphabet[(word >> 18) & 0x3f]! +
+      alphabet[(word >> 12) & 0x3f]! +
+      (hasSecond ? alphabet[(word >> 6) & 0x3f]! : "=") +
+      (hasThird ? alphabet[word & 0x3f]! : "=");
+  }
+  return encoded;
+}
+
 function readJpegDimensions(bytes: Uint8Array): { width: number; height: number } | undefined {
   if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return undefined;
   const sof = new Set([

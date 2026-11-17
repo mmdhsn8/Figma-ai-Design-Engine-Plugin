@@ -9,6 +9,7 @@ import { createDesignSections, generatedSectionLayoutFits } from "../src/shared/
 import {
   calculateTomanCart,
   composeStorefrontSection,
+  formatPersianInteger,
   isSampleStorefront,
 } from "../src/shared/storefront-layout";
 import {
@@ -20,6 +21,13 @@ import { auditVisualQuality } from "../src/shared/visual-quality";
 import { brief, storefrontPlan } from "./storefront-fixture";
 
 describe("deterministic Persian storefront", () => {
+  it("formats integer values deterministically without Intl", () => {
+    expect(formatPersianInteger(0)).toBe("۰");
+    expect(formatPersianInteger(1_234_567)).toBe("۱٬۲۳۴٬۵۶۷");
+    expect(formatPersianInteger(-1_234)).toBe("\u200e−۱٬۲۳۴");
+    expect(() => formatPersianInteger(1.5)).toThrow("Expected a safe integer.");
+  });
+
   it("prices exact integer toman and rejects invalid quantities and adjustments", () => {
     expect(
       calculateTomanCart(

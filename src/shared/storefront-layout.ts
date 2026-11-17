@@ -20,6 +20,15 @@ type Product = {
   description: string;
 };
 
+const PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹";
+
+export function formatPersianInteger(value: number): string {
+  if (!Number.isSafeInteger(value)) throw new RangeError("Expected a safe integer.");
+  const sign = value < 0 ? "\u200e−" : "";
+  const grouped = Math.abs(value).toString().replace(/\B(?=(\d{3})+(?!\d))/gu, "٬");
+  return `${sign}${grouped}`.replace(/[0-9]/gu, (digit) => PERSIAN_DIGITS[Number(digit)]!);
+}
+
 // Sample merchandise only. A shared catalog keeps prices and variants consistent across views.
 const catalog: readonly Product[] = [
   {
@@ -76,8 +85,7 @@ export function calculateTomanCart(
   return { lineTotals, subtotal, shipping, discount, total: subtotal + shipping - discount };
 }
 
-const persianNumber = new Intl.NumberFormat("fa-IR");
-const toman = (value: number) => `${persianNumber.format(value)} تومان`;
+const toman = (value: number) => `${formatPersianInteger(value)} تومان`;
 type Node = GeneratedDesignNode;
 const node = (fields: Partial<Node> & Pick<Node, "type" | "name" | "width" | "height">): Node => ({
   text: null,
@@ -317,7 +325,7 @@ function cart(width: number) {
           row(
             "کنترل تعداد",
             148,
-            [button("+", 44), text(persianNumber.format(quantity), 44), button("−", 44)],
+            [button("+", 44), text(formatPersianInteger(quantity), 44), button("−", 44)],
             { pattern: "quantity-control" },
           ),
           text(toman(balance.lineTotals[index]!), inner - 156, 13, true),

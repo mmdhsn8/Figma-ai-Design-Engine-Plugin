@@ -11,6 +11,7 @@
     "lint": "eslint . --max-warnings=0",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "pretest": "npm run build",
     "test": "vitest run",
     "qa:native-repair": "vitest run tests/native-repair-recovery.test.ts tests/native-visual-quality.test.ts --maxWorkers=1",
     "verify:phase5": "node scripts/verify-phase5-build.mjs",

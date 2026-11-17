@@ -3948,9 +3948,9 @@ export function createFigmaToolExecutor(
           },
         };
       }
-      const persistenceStarted = performance.now();
+      const persistenceStarted = Date.now();
       await saveState(state, pageId);
-      persistenceMs = Math.max(0, performance.now() - persistenceStarted);
+      persistenceMs = Math.max(0, Date.now() - persistenceStarted);
       assertTaskPageScope(parsed.documentId, pageId);
     } catch (error) {
       for (const write of pendingPluginWrites.reverse()) write.node.setPluginData(write.key, write.previous);

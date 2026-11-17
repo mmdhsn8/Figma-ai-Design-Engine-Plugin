@@ -72,9 +72,23 @@ const controllerBundle =
   pluginBundle.slice(0, uiStart) + pluginBundle.slice(uiEnd + uiEndMarker.length);
 assert.doesNotMatch(
   controllerBundle,
-  /\b(?:TextEncoder|TextDecoder|Buffer|structuredClone)\b|\bprocess\.|\bwindow\.|\bfetch\(/u,
+  /\b(?:Intl|performance|btoa|TextEncoder|TextDecoder|Buffer|structuredClone)\b|\bprocess\.|\bwindow\.|\bfetch\(/u,
   "Compiled Plugin Main must not depend on browser or Node-only globals.",
 );
+const guardedAtobUses = [...controllerBundle.matchAll(/\batob\(/gu)];
+assert.equal(
+  guardedAtobUses.length,
+  2,
+  "Unexpected base64 decoder references in the compiled plugin controller.",
+);
+for (const { index } of guardedAtobUses) {
+  const tryStart = controllerBundle.lastIndexOf("try{", index);
+  const catchBlock = controllerBundle.indexOf("}catch", index);
+  assert.ok(
+    tryStart >= 0 && catchBlock > index,
+    "Remaining third-party atob references must fail closed when the API is unavailable.",
+  );
+}
 assert.ok(
   pluginBundle.includes("fad.figma-tools.v1"),
   "Plugin bundle is missing the native tool executor.",

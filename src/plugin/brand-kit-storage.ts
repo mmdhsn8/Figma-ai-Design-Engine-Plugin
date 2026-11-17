@@ -18,7 +18,7 @@ import {
   type PinnedBrandKit,
 } from "../shared/brand-kit";
 import { visualAssetSize, type VisualAsset } from "../shared/visual-schema";
-import { embeddedImageBytes } from "../shared/visual-assets";
+import { embeddedImageBytes, encodeBase64 } from "../shared/visual-assets";
 import { utf8Bytes } from "../shared/generation-limits";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
 import { measureClientStorage, serializeClientStorage } from "./client-storage-budget";
@@ -440,12 +440,7 @@ function contentHash(bytes: Uint8Array): string {
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  for (let offset = 0; offset < bytes.length; offset += 0x8000)
-    binary += String.fromCharCode(
-      ...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)),
-    );
-  return btoa(binary);
+  return encodeBase64(bytes);
 }
 
 export async function resolvePinnedBrandVisualAssets(
