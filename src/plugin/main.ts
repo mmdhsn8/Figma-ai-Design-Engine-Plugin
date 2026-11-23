@@ -27,12 +27,22 @@ import { FW2_ENABLED } from "../shared/design-context-feature";
 import { createDesignContextController } from "./design-context-controller";
 import { prepareContextReuse } from "./design-context-reuse";
 import { FW5_VISUAL_QA_ENABLED } from "../shared/fw5-visual-qa-feature";
+import { fw7Telemetry } from "./fw7-runtime";
+import { fw7CorrelationHash } from "../shared/fw7-observability";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
 const COMPANION_RESTORE_TICKET_KEY = "companion-restore-ticket-v1";
 
-function send(message: PluginToUIMessage): void {
+function send(message: PluginToUIMessage, taskId?: string): void {
   figma.ui.postMessage(message);
+  const typed = message as PluginToUIMessage & { requestId?: string; taskId?: string; nativeRootNodeId?: string; success?: boolean; revision?: { hash: string; bytes: number } };
+  const id = taskId ?? typed.taskId;
+  const runId = id ?? typed.requestId ?? "plugin-unscoped";
+  if (["design-program-render-result", "task-native-inspection-result", "task-native-visual-capture-result", "task-native-visual-repair-result", "chat-task-result"].includes(message.type)) {
+    fw7Telemetry.record({ runId, ...(id ? { taskId: id } : {}), requestIdHash: fw7CorrelationHash(typed.requestId), rootNodeHash: fw7CorrelationHash(typed.nativeRootNodeId), boundary: "ui-plugin", kind: "bridge_response_sent", stage: message.type === "chat-task-result" ? "checkpoint" : "native", operation: message.type, result: typed.success === false ? "failed" : "received", ...(message.type === "chat-task-result" ? { checkpointRevisionHash: typed.revision?.hash, checkpointBytes: typed.revision?.bytes, counter: "checkpointAcksSent" as const } : { counter: "pluginResponsesSent" as const }) });
+    if (message.type === "chat-task-result")
+      fw7Telemetry.record({ runId, ...(id ? { taskId: id } : {}), requestIdHash: fw7CorrelationHash(typed.requestId), checkpointRevisionHash: typed.revision?.hash, checkpointBytes: typed.revision?.bytes, boundary: "checkpoint-owner", kind: "checkpoint_ack", stage: "checkpoint", operation: "chat-task-result", result: typed.success === false ? "failed" : "succeeded" });
+  }
 }
 
 function toolRequestId(raw: unknown): string | undefined {
@@ -142,7 +152,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       ? request.documentId : "";
     const postResult = (result: Extract<PluginToUIMessage, { type: "chat-task-result" }>) => {
       try {
-        send(result);
+        send(result, typeof request.task === "object" && request.task && "id" in request.task && typeof request.task.id === "string" ? request.task.id : undefined);
         traceCheckpoint("controller", "ack_posted", requestId, {
           success: result.success, code: result.errorCode, ...result.revision,
         });
@@ -166,6 +176,8 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         rejectCheckpoint("checkpoint_protocol_error", "Figma received an invalid checkpoint message. Reload the development plugin before retrying.");
         return;
       }
+      const taskId = checkpoint.data.type === "chat-task-save" ? checkpoint.data.task?.id : undefined;
+      fw7Telemetry.record({ runId: taskId ?? checkpoint.data.requestId, ...(taskId ? { taskId } : {}), requestIdHash: fw7CorrelationHash(checkpoint.data.requestId), boundary: "ui-plugin", kind: "bridge_request_received", stage: "checkpoint", operation: checkpoint.data.type, result: "received", counter: "pluginRequestsReceived" });
       postResult(await handleChatTaskStorage(figma, checkpoint.data, { prevalidated: true }));
     } catch {
       rejectCheckpoint("checkpoint_controller_failed", "Figma could not process the checkpoint request.");
@@ -180,6 +192,11 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       message: "The plugin received an invalid request. Reload the plugin and try again.",
     });
     return;
+  }
+  if (["design-program-render", "task-native-inspect", "task-native-visual-capture", "task-native-visual-repair"].includes(message.data.type)) {
+    const request = message.data as UIToPluginMessage & { requestId?: string; taskId?: string };
+    const runId = request.taskId ?? request.requestId ?? "plugin-unscoped";
+    fw7Telemetry.record({ runId, ...(request.taskId ? { taskId: request.taskId } : {}), requestIdHash: fw7CorrelationHash(request.requestId), boundary: "ui-plugin", kind: "bridge_request_received", stage: "native", operation: message.data.type, result: "received", counter: "pluginRequestsReceived" });
   }
   if (message.data.type === "design-context-read") {
     const result = await designContext.read(message.data);

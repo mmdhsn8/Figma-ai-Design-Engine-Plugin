@@ -6,6 +6,8 @@ import {
   checkpointRevision,
   traceCheckpoint,
 } from "../shared/chat-checkpoint-wire";
+import { fw7Telemetry } from "./fw7-runtime";
+import { fw7CorrelationHash } from "../shared/fw7-observability";
 
 const CHAT_TASK_WRITE_ACK_TIMEOUT_MS = 10_000;
 const CHAT_TASK_WRITE_RECONCILE_TIMEOUT_MS = 5_000;
@@ -42,6 +44,7 @@ export function chatTaskBridge(
     let lastMismatch = false;
     const trace = (event: string, details = {}) =>
       traceCheckpoint("ui", event, message.requestId, { ...expected, ...details });
+    const eventRunId = message.type === "chat-task-save" ? message.task?.id ?? message.requestId : message.requestId;
     const finish = () => {
       window.clearTimeout(deadline);
       window.clearTimeout(poll);
@@ -55,6 +58,9 @@ export function chatTaskBridge(
     const post = (request: typeof outbound | typeof message) => {
       try {
         parent.postMessage({ pluginMessage: request }, "*");
+        fw7Telemetry.record({ runId: eventRunId, taskId: message.type === "chat-task-save" ? message.task?.id : undefined, requestIdHash: fw7CorrelationHash(request.requestId), checkpointRevisionHash: expected?.hash, checkpointBytes: expected?.bytes, boundary: "ui-plugin", kind: "bridge_dispatch", stage: "checkpoint", operation: request.type, result: "started", counter: "uiPluginDispatches" });
+        if (request.type === "chat-task-save")
+          fw7Telemetry.record({ runId: eventRunId, taskId: message.type === "chat-task-save" ? message.task?.id : undefined, requestIdHash: fw7CorrelationHash(request.requestId), checkpointRevisionHash: expected?.hash, checkpointBytes: expected?.bytes, boundary: "ui-plugin", kind: "checkpoint_write_started", stage: "checkpoint", operation: "chat-task-save", result: "started" });
       } catch {
         fail("Figma could not transfer the checkpoint request.", "checkpoint_transport_failed");
       }
@@ -97,6 +103,7 @@ export function chatTaskBridge(
       const result = parsed.data;
       if (result.type !== "chat-task-result") return;
       const confirming = result.requestId === recoveryRequestId;
+      fw7Telemetry.record({ runId: eventRunId, taskId: message.type === "chat-task-save" ? message.task?.id : undefined, requestIdHash: fw7CorrelationHash(result.requestId), checkpointRevisionHash: result.revision?.hash, checkpointBytes: result.revision?.bytes, boundary: "ui-plugin", kind: "bridge_ack_received", stage: "checkpoint", operation: confirming ? "chat-task-confirm-read" : message.type, result: result.success ? "received" : "failed", counter: "uiPluginAcksReceived" });
       trace(confirming ? "confirm_received" : "ack_received", {
         receivedHash: result.revision?.hash,
         receivedBytes: result.revision?.bytes,
@@ -134,6 +141,7 @@ export function chatTaskBridge(
         return;
       }
       trace("confirmed");
+      fw7Telemetry.record({ runId: eventRunId, taskId: message.type === "chat-task-save" ? message.task?.id : undefined, requestIdHash: fw7CorrelationHash(result.requestId), checkpointRevisionHash: result.revision?.hash, checkpointBytes: result.revision?.bytes, boundary: "checkpoint-owner", kind: message.type === "chat-task-save" ? "checkpoint_ack" : "checkpoint_read_result", stage: "checkpoint", operation: message.type, result: "confirmed" });
       finish();
       resolve(confirming ? { ...result, requestId: message.requestId } : result);
     };

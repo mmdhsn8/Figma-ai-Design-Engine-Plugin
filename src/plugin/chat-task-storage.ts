@@ -8,6 +8,8 @@ import {
   checkpointRevision,
   traceCheckpoint,
 } from "../shared/chat-checkpoint-wire";
+import { fw7Telemetry } from "./fw7-runtime";
+import { fw7CorrelationHash } from "../shared/fw7-observability";
 
 const MAX_QUEUED_CHAT_TASK_STORAGE_OPERATIONS = 8;
 const MAX_CHAT_TASK_STORAGE_KEYS = 32;
@@ -150,6 +152,23 @@ async function performChatTaskStorage(
   let keyHash: string | undefined;
   const trace = (event: string, details = {}) =>
     traceCheckpoint("controller", event, message.requestId, { keyHash, ...details });
+  const taskId = message.type === "chat-task-save" ? message.task?.id : undefined;
+  const runId = taskId ?? message.requestId;
+  const storageCall = async <T>(operation: "read" | "write", invoke: () => Promise<T>, revision?: { hash: string; bytes: number }): Promise<T> => {
+    const startedAt = Date.now();
+    const kind = operation === "read" ? "checkpoint_read" : "checkpoint_write";
+    fw7Telemetry.record({ runId, ...(taskId ? { taskId } : {}), requestIdHash: fw7CorrelationHash(message.requestId), checkpointRevisionHash: revision?.hash, checkpointBytes: revision?.bytes, boundary: "checkpoint-owner", kind: `${kind}_started` as "checkpoint_read_started" | "checkpoint_write_started", stage: "checkpoint", operation: operation === "read" ? "client-storage-read" : "client-storage-write", result: "started", counter: operation === "read" ? "checkpointStorageReads" : "checkpointStorageWrites" });
+    try {
+      const value = await invoke();
+      const endedAt = Date.now();
+      fw7Telemetry.record({ runId, ...(taskId ? { taskId } : {}), requestIdHash: fw7CorrelationHash(message.requestId), checkpointRevisionHash: revision?.hash, checkpointBytes: revision?.bytes, boundary: "checkpoint-owner", kind: `${kind}_result` as "checkpoint_read_result" | "checkpoint_write_result", stage: "checkpoint", operation: operation === "read" ? "client-storage-read" : "client-storage-write", result: "succeeded", durationMs: Math.max(0, Math.round(endedAt - startedAt)) });
+      return value;
+    } catch (error) {
+      const endedAt = Date.now();
+      fw7Telemetry.record({ runId, ...(taskId ? { taskId } : {}), requestIdHash: fw7CorrelationHash(message.requestId), checkpointRevisionHash: revision?.hash, checkpointBytes: revision?.bytes, boundary: "checkpoint-owner", kind: `${kind}_result` as "checkpoint_read_result" | "checkpoint_write_result", stage: "checkpoint", operation: operation === "read" ? "client-storage-read" : "client-storage-write", result: "failed", reasonCode: "client_storage_error", durationMs: Math.max(0, Math.round(endedAt - startedAt)) });
+      throw error;
+    }
+  };
   try {
     let local = api.root.getPluginData("fad.document-id");
     if (!local) {
@@ -200,9 +219,9 @@ async function performChatTaskStorage(
           "A checkpoint write is still in progress. Wait for it to settle or reopen the plugin before resuming.",
         );
       trace("read_start");
-      task = await api.clientStorage.getAsync(key);
+      task = await storageCall("read", () => api.clientStorage.getAsync(key));
       if (task == null && message.chatId && !message.confirm) {
-        const legacy = await api.clientStorage.getAsync(legacyKey);
+        const legacy = await storageCall("read", () => api.clientStorage.getAsync(legacyKey));
         if (
           legacy &&
           typeof legacy === "object" &&
@@ -265,12 +284,12 @@ async function performChatTaskStorage(
           throw new Error("Page changed before writing the task checkpoint.");
         phase = "write";
         trace("write_start", revision);
-        if (message.chatId && parsedTask == null) await api.clientStorage.deleteAsync(key);
-        else await api.clientStorage.setAsync(key, JSON.parse(json));
+        if (message.chatId && parsedTask == null) await storageCall("write", () => api.clientStorage.deleteAsync(key), revision);
+        else await storageCall("write", () => api.clientStorage.setAsync(key, JSON.parse(json)), revision);
         trace("write_end", revision);
         phase = "read_back";
         trace("read_back_start", revision);
-        const actual = await api.clientStorage.getAsync(key);
+        const actual = await storageCall("read", () => api.clientStorage.getAsync(key), revision);
         const stored = checkpointJson(actual ?? null);
         trace("read_back_end", {
           ...checkpointRevision(stored),

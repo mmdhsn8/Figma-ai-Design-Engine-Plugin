@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "fw7-run-manifest-v1",
+  "runId": "REPLACE_WITH_REAL_RUN_ID",
+  "fixtureId": "F1",
+  "source": "LIVE_DESKTOP",
+  "runStatus": "UNSTARTED",
+  "startedAtUtc": "2026-11-23T00:00:00.000Z",
+  "expectedScreenCount": 1,
+  "buildIds": {
+    "ui": null,
+    "companion": null,
+    "plugin": null
+  },
+  "modelProviderSlug": null,
+  "liveAuthorization": "NOT_GRANTED",
+  "providerAuthorization": "NOT_GRANTED",
+  "authorizedFileLabel": null,
+  "authorizedPageLabel": null,
+  "fileIdHash": null,
+  "pageIdHash": null,
+  "featureFlags": {
+    "fw2": null,
+    "fw3": null,
+    "fw4": null,
+    "fw5": null,
+    "fw5b": null,
+    "fw7": true
+  },
+  "imageConsent": {
+    "capture": "NOT_GRANTED",
+    "externalTransmission": "NOT_GRANTED"
+  },
+  "notes": ["Template only. Replace placeholders with observed values before collection; this file is not run evidence."]
+}

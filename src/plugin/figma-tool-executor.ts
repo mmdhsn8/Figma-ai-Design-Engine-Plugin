@@ -34,6 +34,8 @@ import { CONTEXT_COMPONENT_KEY, NATIVE_MASTER_KEY } from "./design-context-reuse
 import { FW5_VISUAL_CAPTURE_LIMITS, VisualCaptureRequestV1Schema, VisualNativeRepairRequestV1Schema, planVisualCaptureScale, pngDimensions, type VisualCaptureReceiptV1, type VisualNativeRepairResultV1 } from "../shared/fw5-visual-qa";
 import { FW5_VISUAL_QA_ENABLED, FW5_VISUAL_REVIEW_MODE } from "../shared/fw5-visual-qa-feature";
 import { FW4_GEOMETRY_ENABLED, NativeLayoutExpectationV1Schema, type NativeLayoutExpectationV1 } from "../shared/fw4-geometry";
+import { fw7Telemetry } from "./fw7-runtime";
+import { fw7CorrelationHash } from "../shared/fw7-observability";
 
 const STORAGE_PREFIX = "fad.figma-tools.v1";
 const REF_PLUGIN_KEY = "fad.tool.logical-ref.v1";
@@ -1282,9 +1284,18 @@ export function createFigmaToolExecutor(
     if (!parsedRequest.success) throw new Error("visual_capture_request_invalid");
     const request = parsedRequest.data;
     const pageId = request.pageId;
-    const failed = (status: VisualCaptureReceiptV1["status"], diagnostic: VisualCaptureReceiptV1["diagnostic"], exportDurationMs = 0) => ({
-      receipt: makeVisualCaptureReceipt(request, pageId, status, diagnostic), exportDurationMs,
-    });
+    const captureStartedAt = Date.now();
+    fw7Telemetry.record({ runId: request.taskId, taskId: request.taskId, screenId: request.screenId,
+      requestIdHash: fw7CorrelationHash(message.requestId), rootNodeHash: fw7CorrelationHash(request.rootId),
+      boundary: "figma-api", kind: "visual_capture_started", stage: "native_capture", result: "started" });
+    const failed = (status: VisualCaptureReceiptV1["status"], diagnostic: VisualCaptureReceiptV1["diagnostic"], exportDurationMs = 0) => {
+      fw7Telemetry.record({ runId: request.taskId, taskId: request.taskId, screenId: request.screenId,
+        requestIdHash: fw7CorrelationHash(message.requestId), rootNodeHash: fw7CorrelationHash(request.rootId),
+        boundary: "figma-api", kind: "visual_capture_result", stage: "native_capture",
+        result: status === "CAPTURED" ? "succeeded" : diagnostic === "capture_cancelled" ? "cancelled" : "unverified",
+        durationMs: Math.max(0, Date.now() - captureStartedAt), reasonCode: diagnostic.toLowerCase().replace(/[^a-z0-9_.:-]/gu, "_").slice(0, 80) });
+      return { receipt: makeVisualCaptureReceipt(request, pageId, status, diagnostic), exportDurationMs };
+    };
     if (!FW5_VISUAL_QA_ENABLED) return failed("UNVERIFIED", "gate_disabled");
     if (cancelledVisualCaptures.has(message.requestId)) {
       cancelledVisualCaptures.delete(message.requestId);
@@ -1369,6 +1380,10 @@ export function createFigmaToolExecutor(
       let exportPromise: Promise<Uint8Array<ArrayBufferLike>> | undefined;
       try {
         const remainingMs = Math.max(1, Math.min(FW5_VISUAL_CAPTURE_LIMITS.timeoutMs, request.deadlineAtMs - Date.now()));
+        fw7Telemetry.record({ runId: request.taskId, taskId: request.taskId, screenId: request.screenId,
+          requestIdHash: fw7CorrelationHash(message.requestId), rootNodeHash: fw7CorrelationHash(request.rootId),
+          boundary: "figma-api", kind: "native_api_call", stage: "native_capture", operation: "exportAsync",
+          result: "started", counter: "figmaExportAsyncCalls" });
         exportPromise = Promise.resolve(resolved.exportAsync({ format: "PNG", constraint: { type: "SCALE", value: scale }, colorProfile: "SRGB" }));
         void exportPromise.then(() => { exportSettled = true; }, () => { exportSettled = true; });
         pngBytes = await withTimeout(exportPromise, "Visual PNG export", remainingMs);
@@ -1416,6 +1431,10 @@ export function createFigmaToolExecutor(
         fresh.recheckAllowed = false;
       }
       captureSucceeded = true;
+      fw7Telemetry.record({ runId: request.taskId, taskId: request.taskId, screenId: request.screenId,
+        requestIdHash: fw7CorrelationHash(message.requestId), rootNodeHash: fw7CorrelationHash(request.rootId),
+        boundary: "figma-api", kind: "visual_capture_result", stage: "native_capture", result: "succeeded",
+        durationMs: Math.max(0, Date.now() - captureStartedAt) });
       return { receipt, pngBytes: transferBytes, exportDurationMs };
     } catch (error) {
       const code = error instanceof ReferenceResolutionError ? "identity_mismatch" : "identity_mismatch";
@@ -1563,7 +1582,7 @@ export function createFigmaToolExecutor(
   };
   const activeVisualRepairPromises = new Map<string, Promise<VisualNativeRepairResultV1>>();
 
-  const inspectTaskNativeNodes = async (
+  const inspectTaskNativeNodesInner = async (
     message: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
   ) => {
     const pageId = api.currentPage.id;
@@ -1745,6 +1764,30 @@ export function createFigmaToolExecutor(
     const expectedRootStatus = !expectedId ? undefined : expected?.removed ? "removed"
       : !expected ? "missing" : expected.parent?.id !== pageId ? "unexpected_parent" : "present";
     return { nodes, unresolvedRefs, expectedRootStatus, ...(FW5_VISUAL_QA_ENABLED ? { nativePageId: pageId } : {}), truncated: owned.length > visibleNodes.length, ...(geometry ? { geometry } : {}) } as const;
+  };
+
+  const inspectTaskNativeNodes = async (
+    message: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
+  ) => {
+    const startedAt = Date.now();
+    fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId),
+      boundary: "figma-api", kind: "native_readback_started", stage: "task_native_inspect", result: "started",
+      counter: "nativeReadbackOperations" });
+    try {
+      const result = await inspectTaskNativeNodesInner(message);
+      const confirmed = result.expectedRootStatus === undefined || result.expectedRootStatus === "present";
+      fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId),
+        boundary: "figma-api", kind: "native_readback_result", stage: "task_native_inspect",
+        result: confirmed && result.unresolvedRefs.length === 0 ? "confirmed" : "unverified",
+        observedCount: result.nodes.length, durationMs: Math.max(0, Date.now() - startedAt),
+        reasonCode: !confirmed ? "expected_root_not_present" : result.unresolvedRefs.length ? "unresolved_refs" : undefined });
+      return result;
+    } catch (error) {
+      fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId),
+        boundary: "figma-api", kind: "native_readback_result", stage: "task_native_inspect", result: "failed",
+        durationMs: Math.max(0, Date.now() - startedAt), reasonCode: "inspection_failed" });
+      throw error;
+    }
   };
 
   const focusTaskNativeNodes = async (

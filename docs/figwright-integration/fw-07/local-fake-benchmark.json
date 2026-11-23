@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "fw7-local-fake-benchmark-v1",
+  "evidenceSource": "FAKE_RUNTIME",
+  "observedAtUtc": "2026-11-23T08:29:55.000Z",
+  "runner": "Vitest 5.0.5 / local Windows Node process",
+  "timingMethod": "One performance.now sample around renderDesignProgramLocal per screen count; report is harness time only.",
+  "fixtureMethod": "Clone the existing synthetic learning DesignProgramV1 fixture and prefix node IDs to exercise the production renderer/executor at 1, 3, and 10 screens. This is not FW-1 F1/F3/F10 acceptance and does not include Persian FH.",
+  "conditions": [
+    {
+      "diagnostics": "OFF",
+      "featureFlags": { "fw2": null, "fw3": null, "fw4": null, "fw5": null, "fw5b": null, "fw7": false },
+      "measurements": [
+        { "screenCount": 1, "verifiedRoots": 1, "createdNodes": 13, "rootIdHashes": ["5f2049b2b85fdd76"], "localHarnessMs": 98.2093, "counters": null },
+        { "screenCount": 3, "verifiedRoots": 3, "createdNodes": 39, "rootIdHashes": ["5f2049b2b85fdd76", "5c1e0662eecc9346", "5d2d127f6ce2c34b"], "localHarnessMs": 60.8794, "counters": null },
+        { "screenCount": 10, "verifiedRoots": 10, "createdNodes": 130, "rootIdHashes": ["5f2049b2b85fdd76", "5c1e0662eecc9346", "5d2d127f6ce2c34b", "5c2ad255af270df1", "eb25a3442165a920", "d836ce7cfd3c37e0", "41d3b7a631ecb842", "c2d6c150efa86d9c", "5bd1a1fdfbd997a9", "c6c9fba946fd1c9d"], "localHarnessMs": 172.0224, "counters": null }
+      ]
+    },
+    {
+      "diagnostics": "ON",
+      "featureFlags": { "fw2": null, "fw3": null, "fw4": null, "fw5": null, "fw5b": null, "fw7": true },
+      "measurements": [
+        { "screenCount": 1, "verifiedRoots": 1, "createdNodes": 13, "rootIdHashes": ["5f2049b2b85fdd76"], "localHarnessMs": 115.7417, "counters": { "uiPluginDispatches": null, "pluginRequestsReceived": 0, "pluginResponsesSent": 0, "uiPluginAcksReceived": null, "figmaCreateCalls": 15, "figmaObservedOperations": 72, "figmaAppendCalls": 14, "figmaResizeCalls": 22, "figmaMetadataWrites": null, "figmaRemovalCalls": 0, "figmaExportAsyncCalls": 0, "nativeReadbackOperations": 1, "checkpointStorageReads": 0, "checkpointStorageWrites": 0, "checkpointAcksSent": 0, "providerRequests": null, "providerRetries": null, "providerResponses": null, "authorizationRefreshes": null, "visualReviewRequests": null, "visualReviewResponses": null, "cancellations": null } },
+        { "screenCount": 3, "verifiedRoots": 3, "createdNodes": 39, "rootIdHashes": ["5f2049b2b85fdd76", "5c1e0662eecc9346", "5d2d127f6ce2c34b"], "localHarnessMs": 47.4367, "counters": { "uiPluginDispatches": null, "pluginRequestsReceived": 0, "pluginResponsesSent": 0, "uiPluginAcksReceived": null, "figmaCreateCalls": 45, "figmaObservedOperations": 216, "figmaAppendCalls": 42, "figmaResizeCalls": 66, "figmaMetadataWrites": null, "figmaRemovalCalls": 0, "figmaExportAsyncCalls": 0, "nativeReadbackOperations": 3, "checkpointStorageReads": 0, "checkpointStorageWrites": 0, "checkpointAcksSent": 0, "providerRequests": null, "providerRetries": null, "providerResponses": null, "authorizationRefreshes": null, "visualReviewRequests": null, "visualReviewResponses": null, "cancellations": null } },
+        { "screenCount": 10, "verifiedRoots": 10, "createdNodes": 130, "rootIdHashes": ["5f2049b2b85fdd76", "5c1e0662eecc9346", "5d2d127f6ce2c34b", "5c2ad255af270df1", "eb25a3442165a920", "d836ce7cfd3c37e0", "41d3b7a631ecb842", "c2d6c150efa86d9c", "5bd1a1fdfbd997a9", "c6c9fba946fd1c9d"], "localHarnessMs": 187.5985, "counters": { "uiPluginDispatches": null, "pluginRequestsReceived": 0, "pluginResponsesSent": 0, "uiPluginAcksReceived": null, "figmaCreateCalls": 150, "figmaObservedOperations": 720, "figmaAppendCalls": 140, "figmaResizeCalls": 220, "figmaMetadataWrites": null, "figmaRemovalCalls": 0, "figmaExportAsyncCalls": 0, "nativeReadbackOperations": 10, "checkpointStorageReads": 0, "checkpointStorageWrites": 0, "checkpointAcksSent": 0, "providerRequests": null, "providerRetries": null, "providerResponses": null, "authorizationRefreshes": null, "visualReviewRequests": null, "visualReviewResponses": null, "cancellations": null } }
+      ]
+    }
+  ],
+  "interpretation": {
+    "nativeTreeEquivalence": "OFF/ON verified roots, created-node counts, and mock root ID hashes matched at each size.",
+    "dispatchReduction": "NOT MEASURED; this harness directly calls the production renderer and does not exercise UI↔plugin dispatch.",
+    "figmaObservedOperations": "Count of explicit Figma API telemetry hooks in this renderer path; not an exhaustive API-call census.",
+    "localHarnessRuntime": "Single local fake-runtime sample per size; startup/JIT and host noise are included. No Desktop speed claim is made.",
+    "unknownCounters": "null means unobserved in that source/path; it is not zero.",
+    "liveEvidence": false
+  },
+  "commands": [
+    "$env:VITE_FW7_DIAGNOSTICS=$null; npx vitest run tests/fw7-production-instrumentation.test.ts --silent=false",
+    "$env:VITE_FW7_DIAGNOSTICS='fw7-diagnostics-v1'; npx vitest run tests/fw7-production-instrumentation.test.ts --silent=false"
+  ]
+}

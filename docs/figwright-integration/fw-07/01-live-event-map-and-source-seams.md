@@ -1,0 +1,18 @@
+# FW-7 — Event map and source seams
+
+Events are emitted by the component that already owns the measured action. UI, plugin, and Companion streams have independent sequence numbers and clock origins; combine by task/request IDs only. Do not subtract timestamps across process origins.
+
+| Boundary | Existing source seam | What is observed | What remains incomplete |
+|---|---|---|---|
+| UI task owner | `src/ui/universal-design-task.ts` (`runUniversalDesignTask`, native render/readback, Stop, completion) | Task transitions, per-screen request/result, observed root hashes, inspection outcomes | Does not instrument every chat/UI state transition |
+| UI ↔ plugin | `src/ui/design-program-bridge.ts`, `src/ui/task-native-bridge.ts`, `src/ui/chat-task-bridge.ts` | Actual instrumented `postMessage` dispatches and matching acknowledgements | Direct renderer fake harness bypasses this boundary; not every legacy message is counted |
+| Figma main | `src/plugin/main.ts` (`figma.ui.onmessage`, `send`) | Typed requests received and UI responses posted | A posted response is not itself proof that UI received it or that native work succeeded |
+| Native renderer | `src/plugin/design-program-spike.ts` (`renderDesignProgramLocal`) and `src/plugin/renderer.ts` callbacks | Selected renderer API operation callbacks, root attachment, program geometry readback | Not a complete census of all Figma API/property setter calls; logical operation callbacks can group property work |
+| Native executor | `src/plugin/figma-tool-executor.ts` (`captureTaskNativeRoot`, `inspectTaskNativeNodes`) | `exportAsync` calls, capture receipt outcomes, bounded task-native inspection | `nativeReadbackOperations` counts one inspection/convergence unit, not each getter |
+| Checkpoint owner | `src/ui/chat-task-bridge.ts`, `src/plugin/chat-task-storage.ts`, response path in `src/plugin/main.ts` | Existing clientStorage read/write attempts, bridge ack, revision hash/byte count | Fake renderer benchmark does not invoke checkpoint storage; only the existing store is used |
+| Companion provider | `src/companion/server.ts` (`/v1/models`, `/v1/smoke`, `/v1/chat`, `/v1/design`, `/v1/visual-review`) | Instrumented provider request starts/results, response headers/body or stream result, model slug, sanitized reason code; retry attempt is counted on `/v1/design` | OAuth discovery/JWKS/token plumbing is outside provider counts; `authorizationRefreshes` only sees same-session refresh during an active chat. `providerRetries` reflects design request retries only |
+| Diagnostic export | `src/companion/server.ts` (`GET /v1/diagnostics/fw7`) and runtime export hooks | Bounded in-memory event snapshots | Endpoint is absent (404) while Companion gate is off; no durable telemetry store is added |
+
+`figmaObservedOperations` increments for each emitted `native_api_call` event at the `figma-api` boundary. Its value is a count of these explicit hooks, not a claim that every native call was intercepted. `figmaMetadataWrites` remains null because plugin metadata storage is not comprehensively observed. In the local direct-render test, `uiPluginDispatches` is null rather than zero because no UI dispatch occurred inside that test path.
+
+The task ID is carried where the current contract exposes it. Request and native root IDs are reduced to a deterministic 64-bit non-cryptographic correlation hash. This is redaction for local correlation, not cryptographic anonymization; exports must still be treated as sensitive diagnostics. No prompt, layer text, PNG bytes, OAuth token, raw filename, or credential object is an event field.

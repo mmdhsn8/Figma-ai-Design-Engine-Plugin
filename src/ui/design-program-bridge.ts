@@ -5,6 +5,8 @@ import {
 } from "../shared/messages";
 import { FW2_FEATURE, ContextResultSchema, parseContextSnapshot, type ContextRead } from "../shared/design-context";
 import { requestedDesignContext } from "../shared/chat-generation";
+import { fw7Telemetry } from "./fw7-runtime";
+import { fw7CorrelationHash } from "../shared/fw7-observability";
 
 export type DesignProgramRenderRequest = Extract<UIToPluginMessage, { type: "design-program-render" }>;
 export type DesignProgramRenderResponse = Extract<PluginToUIMessage, { type: "design-program-render-result" }>;
@@ -84,6 +86,17 @@ export function renderDesignProgramBridge(
       }
       if (parsed.data.type !== "design-program-render-result") return;
       if (parsed.data.requestId !== request.requestId || parsed.data.taskId !== request.taskId) return;
+      fw7Telemetry.record({
+        runId: request.taskId, taskId: request.taskId, screenId: parsed.data.screenId ?? request.program.screens[0]?.id,
+        requestIdHash: fw7CorrelationHash(request.requestId), boundary: "ui-plugin", kind: "bridge_ack_received",
+        stage: "native_render", operation: "design-program-render-result", result: "received", counter: "uiPluginAcksReceived",
+      });
+      fw7Telemetry.record({
+        runId: request.taskId, taskId: request.taskId, screenId: parsed.data.screenId ?? request.program.screens[0]?.id,
+        requestIdHash: fw7CorrelationHash(request.requestId), boundary: "ui-plugin", kind: "native_render_result",
+        stage: "native_render", operation: "design-program-render", result: parsed.data.success ? "applied" : "failed",
+        ...(parsed.data.success ? { observedCount: parsed.data.nativeNodeCount } : { reasonCode: parsed.data.errorCode ?? "native_render_failed" }),
+      });
       finish();
       resolve(parsed.data);
     };
@@ -93,5 +106,10 @@ export function renderDesignProgramBridge(
     }, 60_000);
     window.addEventListener("message", receive);
     parent.postMessage({ pluginMessage: request }, "*");
+    fw7Telemetry.record({
+      runId: request.taskId, taskId: request.taskId, screenId: request.program.screens[0]?.id,
+      requestIdHash: fw7CorrelationHash(request.requestId), boundary: "ui-plugin", kind: "bridge_dispatch",
+      stage: "native_render", operation: "design-program-render", result: "started", counter: "uiPluginDispatches",
+    });
   });
 }

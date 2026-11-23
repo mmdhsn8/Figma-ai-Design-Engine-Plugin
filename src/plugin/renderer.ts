@@ -162,7 +162,12 @@ export interface MultiScreenRenderOptions {
   verifyTouchTargets?: boolean;
   gap?: number;
   maxRowWidth?: number;
+  onNativeApiCall?: (operation: string, screenId?: string) => void;
   onProgress?: (progress: MultiScreenProgress) => void;
+}
+
+function noteNativeApiCall(observer: MultiScreenRenderOptions["onNativeApiCall"], operation: string, screenId?: string): void {
+  observer?.(operation, screenId);
 }
 
 function verifyNativeTouchTargets(root: FrameNode): void {
@@ -238,7 +243,7 @@ interface Tracker {
   cleanup(): void;
 }
 
-function createTracker(): Tracker {
+function createTracker(onNativeApiCall?: MultiScreenRenderOptions["onNativeApiCall"]): Tracker {
   const nodes: SceneNode[] = [];
   const counts: DesignCounts = { frames: 0, texts: 0, rectangles: 0, components: 0, instances: 0 };
   return {
@@ -257,6 +262,7 @@ function createTracker(): Tracker {
     cleanup() {
       for (const node of [...nodes].reverse()) {
         try {
+          noteNativeApiCall(onNativeApiCall, "remove");
           node.remove();
         } catch {
           // A parent may already have removed this tracked child.
@@ -388,6 +394,7 @@ function prepareVisualAssets(
   api: RendererFigmaApi,
   assets: VisualAsset[] | undefined,
   nodeTrees: DesignNode[][],
+  onNativeApiCall?: MultiScreenRenderOptions["onNativeApiCall"],
 ): { assets: Map<string, VisualAsset>; imageHashes: Map<string, string> } {
   const assetMap = new Map((assets ?? []).map((asset) => [asset.id, asset]));
   const references = new Set<string>();
@@ -401,6 +408,7 @@ function prepareVisualAssets(
     let hash = hashesByBytes.get(asset.base64);
     if (!hash) {
       try {
+        noteNativeApiCall(onNativeApiCall, "create-image");
         hash = api.createImage(embeddedImageBytes(asset.base64)).hash;
       } catch (error) {
         throw new DesignRenderError(
@@ -628,14 +636,17 @@ function applyLayout(
   layout: ResolvedLayoutSpec,
   width: number,
   height: number,
+  onNativeApiCall?: MultiScreenRenderOptions["onNativeApiCall"],
 ): LayoutMapping {
   const mapping = mapLayoutSpec(layout);
+  noteNativeApiCall(onNativeApiCall, "resize");
   frame.resize(width, height);
   frame.layoutMode = mapping.mode;
   if (layout.wrap) {
     frame.layoutWrap = "WRAP";
     frame.counterAxisSpacing = mapping.itemSpacing;
   }
+  noteNativeApiCall(onNativeApiCall, "resize");
   frame.resize(width, height);
   frame.primaryAxisSizingMode = "FIXED";
   frame.counterAxisSizingMode = "FIXED";
@@ -678,6 +689,7 @@ function setTextTypography(
   fonts: Map<string, FontName>,
   parentLayout?: ResolvedLayoutSpec,
   programText = false,
+  onNativeApiCall?: MultiScreenRenderOptions["onNativeApiCall"],
 ): void {
   const family = node.fontFamily ?? "Inter";
   const style = node.fontStyle ?? "Regular";
@@ -713,8 +725,10 @@ function setTextTypography(
   } as const;
   text.textAutoResize = resizeModes[autoResize];
   if (node.width !== undefined || node.height !== undefined) {
+    noteNativeApiCall(onNativeApiCall, "resize");
     text.resize(node.width ?? text.width, node.height ?? text.height);
   }
+  noteNativeApiCall(onNativeApiCall, "text-configuration");
   setSolidFill(text, node.color);
   if (node.visual) {
     text.setPluginData(VISUAL_OVERRIDE_KEY, JSON.stringify(node.visual));
@@ -804,6 +818,8 @@ interface BuildContext {
   warnings: string[];
   programText?: boolean;
   contextRectangle?: MultiScreenRenderOptions["contextRectangle"];
+  onNativeApiCall?: MultiScreenRenderOptions["onNativeApiCall"];
+  screenId?: string;
 }
 
 function buildFrameChildren(
@@ -838,14 +854,17 @@ function populateSvgAsset(
   const offsetY = (height - scaledHeight) / 2;
   for (let index = 0; index < asset.paths.length; index++) {
     const path = asset.paths[index];
+    noteNativeApiCall(context.onNativeApiCall, "create-vector", context.screenId);
     const vector = context.api.createVector();
     context.tracker.track(vector, "vectors");
     vector.name = path.name ?? `${asset.name} path ${index + 1}`;
     vector.vectorPaths = [
       { windingRule: "NONZERO", data: scaleFigmaPathData(path.data, scale, scale) },
     ];
+    noteNativeApiCall(context.onNativeApiCall, "resize", context.screenId);
     vector.resize(scaledWidth, scaledHeight);
     vector.fills = [{ type: "SOLID", color: hexToRgb(path.fill) }];
+    noteNativeApiCall(context.onNativeApiCall, "append-child", context.screenId);
     frame.appendChild(vector);
     vector.x = offsetX;
     vector.y = offsetY;
@@ -866,10 +885,11 @@ function appendDesignNode(
   let svgFit: "fill" | "fit" | "crop" | "tile" | undefined;
 
   if (spec.type === "text") {
+    noteNativeApiCall(context.onNativeApiCall, "create-text", context.screenId);
     const text = api.createText();
     tracker.track(text, "texts");
     text.name = spec.name;
-    setTextTypography(spec, text, context.fonts, parentLayout, context.programText);
+    setTextTypography(spec, text, context.fonts, parentLayout, context.programText, context.onNativeApiCall);
     node = text;
   } else if (spec.type === "rectangle") {
     const reused = !spec.qualityRole && spec.sizing?.width === "fixed" && spec.sizing?.height === "fixed"
@@ -883,6 +903,7 @@ function appendDesignNode(
       instance.name = spec.name;
       node = instance;
     } else {
+      noteNativeApiCall(context.onNativeApiCall, "create-rectangle", context.screenId);
       const rectangle = api.createRectangle();
       tracker.track(rectangle, "rectangles");
       rectangle.name = spec.name;
@@ -890,9 +911,11 @@ function appendDesignNode(
       node = rectangle;
     }
   } else if (spec.type === "ellipse") {
+    noteNativeApiCall(context.onNativeApiCall, "create-ellipse", context.screenId);
     const ellipse = api.createEllipse();
     tracker.track(ellipse, "ellipses");
     ellipse.name = spec.name;
+    noteNativeApiCall(context.onNativeApiCall, "resize", context.screenId);
     ellipse.resize(spec.width, spec.height);
     setSolidFill(ellipse, spec.fill);
     if (spec.visual) {
@@ -902,10 +925,12 @@ function appendDesignNode(
     }
     node = ellipse;
   } else if (spec.type === "vector") {
+    noteNativeApiCall(context.onNativeApiCall, "create-vector", context.screenId);
     const vector = api.createVector();
     tracker.track(vector, "vectors");
     vector.name = spec.name;
     vector.vectorPaths = [{ windingRule: "NONZERO", data: spec.pathData }];
+    noteNativeApiCall(context.onNativeApiCall, "resize", context.screenId);
     vector.resize(spec.width, spec.height);
     setSolidFill(vector, spec.fill);
     if (spec.visual) {
@@ -921,9 +946,11 @@ function appendDesignNode(
         `Image node “${spec.name}” references missing asset “${spec.assetId}”.`,
       );
     if (asset.kind === "raster") {
+      noteNativeApiCall(context.onNativeApiCall, "create-rectangle", context.screenId);
       const rectangle = api.createRectangle();
       tracker.track(rectangle, "images");
       rectangle.name = spec.name;
+      noteNativeApiCall(context.onNativeApiCall, "resize", context.screenId);
       rectangle.resize(spec.width, spec.height);
       const imageHash = context.imageHashes.get(spec.assetId);
       if (!imageHash)
@@ -937,9 +964,11 @@ function appendDesignNode(
       }
       node = rectangle;
     } else {
+      noteNativeApiCall(context.onNativeApiCall, "create-frame", context.screenId);
       const frame = api.createFrame();
       tracker.track(frame, "frames");
       frame.name = spec.name;
+      noteNativeApiCall(context.onNativeApiCall, "resize", context.screenId);
       frame.resize(spec.width, spec.height);
       frame.fills = [];
       frame.clipsContent = true;
@@ -955,12 +984,14 @@ function appendDesignNode(
       node = frame;
     }
   } else if (spec.type === "frame") {
+    noteNativeApiCall(context.onNativeApiCall, "create-frame", context.screenId);
     const frame = api.createFrame();
     tracker.track(frame, "frames");
     frame.name = spec.name;
+    noteNativeApiCall(context.onNativeApiCall, "resize", context.screenId);
     frame.resize(spec.width, spec.height);
     setFrameProperties(frame, spec);
-    if (spec.layout) applyLayout(frame, spec.layout, spec.width, spec.height);
+    if (spec.layout) applyLayout(frame, spec.layout, spec.width, spec.height, context.onNativeApiCall);
     frameToPopulate = frame;
     node = frame;
   } else {
@@ -969,6 +1000,7 @@ function appendDesignNode(
       throw new DesignRenderError(
         `Component “${spec.componentId}” was not built before its instance.`,
       );
+    noteNativeApiCall(context.onNativeApiCall, "create-instance", context.screenId);
     const instance = component.createInstance();
     tracker.track(instance, "instances");
     if (context.programText) instance.setPluginData("fad.design.native-master-id.v1", component.id);
@@ -977,6 +1009,7 @@ function appendDesignNode(
   }
 
   beforeAppend?.(node);
+  noteNativeApiCall(context.onNativeApiCall, "append-child", context.screenId);
   parent.appendChild(node);
   if ("logicalRef" in spec && spec.logicalRef)
     node.setPluginData("fad.design.logical-ref", spec.logicalRef);
@@ -990,6 +1023,7 @@ function appendDesignNode(
     node.setPluginData("fad.touch-target", spec.qualityRole);
   if (parentLayout) {
     applyChildSizing(node, effectiveSizing(spec, parentLayout), parentLayout);
+    noteNativeApiCall(context.onNativeApiCall, "layout-configuration", context.screenId);
     if (context.programText && spec.type === "text" && node.type === "TEXT") {
       node.textTruncation = "DISABLED";
       node.textAutoResize = spec.textAutoResize === "width-and-height" ? "WIDTH_AND_HEIGHT" : "HEIGHT";
@@ -1021,16 +1055,20 @@ function createComponentDefinition(
   context: BuildContext,
   ownedByDesignSystem = false,
 ): ComponentNode {
+  noteNativeApiCall(context.onNativeApiCall, "create-frame", context.screenId);
   const frame = context.api.createFrame();
   context.tracker.track(frame, "frames");
   frame.name = name;
+  noteNativeApiCall(context.onNativeApiCall, "resize", context.screenId);
   frame.resize(definition.width, definition.height);
   setFrameProperties(frame, definition);
-  if (definition.layout) applyLayout(frame, definition.layout, definition.width, definition.height);
+  if (definition.layout) applyLayout(frame, definition.layout, definition.width, definition.height, context.onNativeApiCall);
+  noteNativeApiCall(context.onNativeApiCall, "append-child", context.screenId);
   area.appendChild(frame);
   for (const child of definition.children)
     appendDesignNode(frame, child, definition.layout, context);
 
+  noteNativeApiCall(context.onNativeApiCall, "create-component-from-node", context.screenId);
   const component = context.api.createComponentFromNode(frame);
   context.tracker.replace(frame, component, "frames", "components");
   applyChildSizing(component, definition.sizing ?? { width: "fixed", height: "fixed" }, {
@@ -1074,17 +1112,22 @@ function createDocumentFrame(
   onCreated?: (frame: FrameNode) => void,
   onChildCreated?: (node: LayoutChildNode, index: number) => void,
 ): FrameNode {
+  noteNativeApiCall(context.onNativeApiCall, "create-frame", context.screenId);
   const frame = api.createFrame();
   context.tracker.track(frame, "frames");
   onCreated?.(frame);
   frame.name = name;
+  noteNativeApiCall(context.onNativeApiCall, "resize", context.screenId);
   frame.resize(spec.document.width, spec.document.height);
   frame.x = position?.x ?? 0;
   frame.y = position?.y ?? 0;
   setSolidFill(frame, spec.document.background);
   if (spec.document.layout)
-    applyLayout(frame, spec.document.layout, spec.document.width, spec.document.height);
-  parent?.appendChild(frame);
+    applyLayout(frame, spec.document.layout, spec.document.width, spec.document.height, context.onNativeApiCall);
+  if (parent) {
+    noteNativeApiCall(context.onNativeApiCall, "append-child", context.screenId);
+    parent.appendChild(frame);
+  }
   for (const [index, child] of spec.document.children.entries()) {
     appendDesignNode(frame, child, spec.document.layout, context, (node) =>
       onChildCreated?.(node, index),
@@ -1098,10 +1141,13 @@ function createComponentArea(
   tracker: Tracker,
   name: string,
   width: number,
+  onNativeApiCall?: MultiScreenRenderOptions["onNativeApiCall"],
 ): FrameNode {
+  noteNativeApiCall(onNativeApiCall, "create-frame");
   const area = api.createFrame();
   tracker.track(area, "frames");
   area.name = name;
+  noteNativeApiCall(onNativeApiCall, "resize");
   area.resize(width, 160);
   setSolidFill(area, "#EFF6FF");
   applyLayout(
@@ -1115,6 +1161,7 @@ function createComponentArea(
     },
     width,
     160,
+    onNativeApiCall,
   );
   area.primaryAxisSizingMode = "AUTO";
   return area;
@@ -1709,7 +1756,7 @@ export async function renderMultiScreenDesign(
   const warnings: string[] = [];
   const counts = emptyDesignCounts();
   const previousSelection = [...api.currentPage.selection];
-  const sharedTracker = createTracker();
+  const sharedTracker = createTracker(options.onNativeApiCall);
   const successfulRoots: FrameNode[] = [];
   let styleBindings: StyleBindings | undefined;
   let fontResolution: FontResolution | undefined;
@@ -1829,7 +1876,7 @@ export async function renderMultiScreenDesign(
     const assetPreparation = prepareVisualAssets(api, batch.assets, [
       ...orderedScreens.map((screen) => screen.children),
       ...definitions.map((definition) => definition.children),
-    ]);
+    ], options.onNativeApiCall);
 
     if (batch.designSystem) {
       styleBindings = await createOrReuseNativeStyles(
@@ -1859,6 +1906,7 @@ export async function renderMultiScreenDesign(
       ...assetPreparation,
       warnings: visualWarnings,
       programText: options.programText,
+      onNativeApiCall: options.onNativeApiCall,
     };
     if (newDefinitions.length && componentAreaItem) {
       componentArea = createComponentArea(
@@ -1871,6 +1919,7 @@ export async function renderMultiScreenDesign(
           existingNames,
         ),
         componentAreaWidth,
+        options.onNativeApiCall,
       );
       componentArea.setPluginData(COMPONENT_AREA_BATCH_KEY, batch.id);
       for (const definition of newDefinitions) {
@@ -2006,12 +2055,13 @@ export async function renderMultiScreenDesign(
         screenName: screen.name,
         status: "started",
       });
-      const screenTracker = createTracker();
+      const screenTracker = createTracker(options.onNativeApiCall);
       const context: BuildContext = {
         ...componentContext,
         contextRectangle: options.contextRectangle,
         tracker: screenTracker,
         components,
+        screenId: screen.id,
       };
       const warningsBeforeScreen = styleBindings?.report.warnings.length ?? 0;
       let requiresReplan = false;

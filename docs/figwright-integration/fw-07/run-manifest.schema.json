@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fw7-run-manifest-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "runId", "fixtureId", "source", "runStatus", "startedAtUtc", "expectedScreenCount", "buildIds", "modelProviderSlug", "liveAuthorization", "providerAuthorization", "authorizedFileLabel", "authorizedPageLabel", "fileIdHash", "pageIdHash", "featureFlags", "imageConsent", "notes"],
+  "properties": {
+    "schemaVersion": { "const": "fw7-run-manifest-v1" },
+    "runId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$" },
+    "fixtureId": { "enum": ["F0", "F1", "F3", "F10", "FH", "FE"] },
+    "source": { "enum": ["LIVE_DESKTOP", "LOCAL_STUB", "FAKE_RUNTIME", "STATIC_ANALYSIS"] },
+    "runStatus": { "enum": ["UNSTARTED", "RUNNING", "PASS", "FAIL", "BLOCKED", "PARTIAL"] },
+    "startedAtUtc": { "type": "string", "format": "date-time" },
+    "expectedScreenCount": { "type": "integer", "minimum": 0, "maximum": 10 },
+    "buildIds": { "type": "object", "additionalProperties": false, "required": ["ui", "companion", "plugin"], "properties": { "ui": { "type": ["string", "null"], "maxLength": 100 }, "companion": { "type": ["string", "null"], "maxLength": 100 }, "plugin": { "type": ["string", "null"], "maxLength": 100 } } },
+    "modelProviderSlug": { "type": ["string", "null"], "maxLength": 200 },
+    "liveAuthorization": { "enum": ["NOT_GRANTED", "GRANTED"] },
+    "providerAuthorization": { "enum": ["NOT_REQUIRED", "NOT_GRANTED", "GRANTED"] },
+    "authorizedFileLabel": { "type": ["string", "null"], "maxLength": 80 },
+    "authorizedPageLabel": { "type": ["string", "null"], "maxLength": 80 },
+    "fileIdHash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{16,64}$" },
+    "pageIdHash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{16,64}$" },
+    "featureFlags": { "type": "object", "additionalProperties": false, "required": ["fw2", "fw3", "fw4", "fw5", "fw5b", "fw7"], "properties": { "fw2": { "type": ["boolean", "null"] }, "fw3": { "type": ["boolean", "null"] }, "fw4": { "type": ["boolean", "null"] }, "fw5": { "type": ["boolean", "null"] }, "fw5b": { "type": ["boolean", "null"] }, "fw7": { "type": ["boolean", "null"] } } },
+    "imageConsent": { "type": "object", "additionalProperties": false, "required": ["capture", "externalTransmission"], "properties": { "capture": { "enum": ["NOT_APPLICABLE", "NOT_GRANTED", "GRANTED"] }, "externalTransmission": { "enum": ["NOT_APPLICABLE", "NOT_GRANTED", "GRANTED"] } } },
+    "notes": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 240 } }
+  }
+}

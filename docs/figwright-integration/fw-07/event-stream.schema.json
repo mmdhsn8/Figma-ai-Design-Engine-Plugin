@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fw7-event-stream-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "snapshots"],
+  "properties": {
+    "schemaVersion": { "const": "fw7-event-stream-v1" },
+    "snapshots": { "type": "array", "items": { "$ref": "#/$defs/snapshot" } }
+  },
+  "$defs": {
+    "counter": { "type": ["integer", "null"], "minimum": 0, "maximum": 100000 },
+    "flags": { "type": "object", "additionalProperties": false, "required": ["fw2", "fw3", "fw4", "fw5", "fw5b", "fw7"], "properties": { "fw2": { "type": ["boolean", "null"] }, "fw3": { "type": ["boolean", "null"] }, "fw4": { "type": ["boolean", "null"] }, "fw5": { "type": ["boolean", "null"] }, "fw5b": { "type": ["boolean", "null"] }, "fw7": { "type": ["boolean", "null"] } } },
+    "event": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "runId", "sequence", "source", "boundary", "kind", "result", "stage", "monotonicMs", "wallClockMs", "timeOriginId"],
+      "properties": {
+        "schemaVersion": { "const": "fw7-event-v1" }, "runId": { "type": "string", "maxLength": 120 }, "sequence": { "type": "integer", "minimum": 1 },
+        "source": { "enum": ["ui", "companion", "plugin"] }, "boundary": { "enum": ["task-owner", "ui-plugin", "companion-provider", "figma-api", "checkpoint-owner", "visual-review"] },
+        "kind": { "enum": ["task_started", "task_stopped", "task_completed", "bridge_dispatch", "bridge_request_received", "bridge_response_sent", "bridge_ack_received", "native_render_started", "native_render_result", "native_root_attached", "native_readback_started", "native_readback_result", "native_api_call", "checkpoint_read_started", "checkpoint_read_result", "checkpoint_write_started", "checkpoint_write_result", "checkpoint_ack", "provider_request_started", "provider_request_result", "session_refresh", "visual_capture_started", "visual_capture_result", "visual_review_request_started", "visual_review_result", "visual_repair_result", "resume_reconcile", "cancellation"] }, "result": { "enum": ["started", "received", "applied", "confirmed", "succeeded", "failed", "unverified", "cancelled", "unknown"] },
+        "stage": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,48}$" }, "operation": { "type": "string", "maxLength": 65 }, "attempt": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "providerModel": { "type": "string", "maxLength": 200 }, "taskId": { "type": "string", "maxLength": 120 }, "taskGeneration": { "type": "string", "maxLength": 120 }, "screenId": { "type": "string", "maxLength": 80 },
+        "requestIdHash": { "type": "string", "pattern": "^[a-f0-9]{16}$" }, "rootNodeHash": { "type": "string", "pattern": "^[a-f0-9]{16}$" }, "checkpointRevisionHash": { "type": "string", "pattern": "^[a-f0-9]{16}$" },
+        "checkpointBytes": { "type": "integer", "minimum": 0, "maximum": 1048576 }, "observedCount": { "type": "integer", "minimum": 0, "maximum": 100000 }, "durationMs": { "type": "number", "minimum": 0 }, "reasonCode": { "type": "string", "maxLength": 80 },
+        "monotonicMs": { "type": ["number", "null"], "minimum": 0 }, "wallClockMs": { "type": "integer", "minimum": 0 }, "timeOriginId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,48}$" }
+      }
+    },
+    "snapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "source", "evidenceSource", "runId", "buildId", "timeOriginId", "featureFlags", "eventCount", "droppedEventCount", "events", "counters"],
+      "properties": {
+        "schemaVersion": { "const": "fw7-event-stream-v1" }, "source": { "enum": ["ui", "companion", "plugin"] }, "evidenceSource": { "const": "UNCLASSIFIED" }, "runId": { "type": "string", "maxLength": 120 }, "buildId": { "type": "string", "maxLength": 100 }, "timeOriginId": { "type": "string", "maxLength": 48 },
+        "featureFlags": { "$ref": "#/$defs/flags" }, "eventCount": { "type": "integer", "minimum": 0 }, "droppedEventCount": { "type": "integer", "minimum": 0 }, "events": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/event" } },
+        "counters": { "type": "object", "additionalProperties": false, "required": ["uiPluginDispatches", "pluginRequestsReceived", "pluginResponsesSent", "uiPluginAcksReceived", "figmaCreateCalls", "figmaObservedOperations", "figmaAppendCalls", "figmaResizeCalls", "figmaMetadataWrites", "figmaRemovalCalls", "figmaExportAsyncCalls", "nativeReadbackOperations", "checkpointStorageReads", "checkpointStorageWrites", "checkpointAcksSent", "providerRequests", "providerRetries", "providerResponses", "authorizationRefreshes", "visualReviewRequests", "visualReviewResponses", "cancellations"], "properties": { "uiPluginDispatches": { "$ref": "#/$defs/counter" }, "pluginRequestsReceived": { "$ref": "#/$defs/counter" }, "pluginResponsesSent": { "$ref": "#/$defs/counter" }, "uiPluginAcksReceived": { "$ref": "#/$defs/counter" }, "figmaCreateCalls": { "$ref": "#/$defs/counter" }, "figmaObservedOperations": { "$ref": "#/$defs/counter" }, "figmaAppendCalls": { "$ref": "#/$defs/counter" }, "figmaResizeCalls": { "$ref": "#/$defs/counter" }, "figmaMetadataWrites": { "$ref": "#/$defs/counter" }, "figmaRemovalCalls": { "$ref": "#/$defs/counter" }, "figmaExportAsyncCalls": { "$ref": "#/$defs/counter" }, "nativeReadbackOperations": { "$ref": "#/$defs/counter" }, "checkpointStorageReads": { "$ref": "#/$defs/counter" }, "checkpointStorageWrites": { "$ref": "#/$defs/counter" }, "checkpointAcksSent": { "$ref": "#/$defs/counter" }, "providerRequests": { "$ref": "#/$defs/counter" }, "providerRetries": { "$ref": "#/$defs/counter" }, "providerResponses": { "$ref": "#/$defs/counter" }, "authorizationRefreshes": { "$ref": "#/$defs/counter" }, "visualReviewRequests": { "$ref": "#/$defs/counter" }, "visualReviewResponses": { "$ref": "#/$defs/counter" }, "cancellations": { "$ref": "#/$defs/counter" } } }
+      }
+    }
+  }
+}

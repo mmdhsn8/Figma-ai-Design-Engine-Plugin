@@ -17,6 +17,7 @@ import {
   readCompletedResponse,
   type CompanionServerHandle,
 } from "../src/companion/server.js";
+import { FW7_DIAGNOSTICS_ENABLED, fw7Telemetry } from "../src/companion/fw7-runtime.js";
 import { createDraftStore, type DraftStore } from "../src/companion/draft-store.js";
 import { draftFixture } from "./generation-fixture";
 import { createMockApi } from "./figma-mock";
@@ -54,6 +55,26 @@ afterEach(async () => {
 });
 
 describe("loopback companion", () => {
+  it("exposes only sanitized FW-7 snapshots behind the explicit diagnostics gate", async () => {
+    const harness = await createHarness();
+    const consoleSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      if (FW7_DIAGNOSTICS_ENABLED) fw7Telemetry.record({ runId: "fw7-export-test", boundary: "task-owner", kind: "task_started", stage: "test", result: "started" });
+      const response = await request(harness.handle, "/v1/diagnostics/fw7", {});
+      if (!FW7_DIAGNOSTICS_ENABLED) {
+        expect(response.status).toBe(404);
+        return;
+      }
+      expect(response.status).toBe(200);
+      const exported = await response.json() as { schemaVersion: string; snapshots: Array<{ source: string; runId: string; events: Array<Record<string, unknown>> }> };
+      expect(exported.schemaVersion).toBe("fw7-event-stream-v1");
+      expect(exported.snapshots.find(({ runId }) => runId === "fw7-export-test")?.events[0]).toMatchObject({ kind: "task_started", source: "companion" });
+      expect(JSON.stringify(exported)).not.toMatch(/access-secret|rawPrompt|pngBase64/u);
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
   it("sends one consent-scoped PNG through Responses with strict structured output and no retries", async () => {
     const harness = await createHarness({ visualReviewOutput: { verdict: "pass", confidence: 0.92, reason: null, findings: [] } });
     const token = await authorizeAndDiscover(harness);

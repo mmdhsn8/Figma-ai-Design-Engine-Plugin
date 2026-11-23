@@ -47,6 +47,8 @@ import {
   type VisualCaptureReceiptV1,
   type VisualQaOutcomeV1,
 } from "../shared/fw5-visual-qa";
+import { fw7Telemetry } from "./fw7-runtime";
+import { fw7CorrelationHash } from "../shared/fw7-observability";
 
 type NativeInspection = Extract<PluginToUIMessage, { type: "task-native-inspection-result" }>;
 
@@ -901,6 +903,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
   const now = deps.now ?? Date.now;
   const monotonicNow = deps.monotonicNow ?? (() => performance.now());
   const runStartedAt = monotonicNow();
+  fw7Telemetry.record({ runId: task.id, taskId: task.id, boundary: "task-owner", kind: "task_started", stage: "universal", operation: "universal-design-v1", result: "started" });
   const screenRunStartedAt = new Map<string, number>();
   const freshVisualCaptureScreens = new Set<string>();
   let saveQueue = Promise.resolve();
@@ -1803,11 +1806,13 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       check();
       deps.progress(`Universal design route v1 · rendering editable native screen ${stageIndex + 1}/${plan.screenCount}: ${screenPlan.name}…`);
       const renderStarted = monotonicNow();
+      fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(renderRequestId), boundary: "task-owner", kind: "native_render_started", stage: "native_render", operation: "design-program-render", result: "started", observedCount: estimated });
       let response: DesignProgramRenderResponse;
       try {
         response = await deps.renderProgram(screen.program, renderRequestId, screen.nativeRootNodeId, contextTicket);
       } catch (error) {
         const durationMs = Math.max(0, Math.round(monotonicNow() - renderStarted));
+        fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(renderRequestId), boundary: "task-owner", kind: "native_render_result", stage: "native_render", operation: "design-program-render", result: deps.signal.aborted ? "cancelled" : "failed", durationMs, reasonCode: safeErrorCode(error) });
         screen.errorCode = safeErrorCode(error);
         task.universalMetrics!.nativeDurationMs += durationMs;
         recordTrace({ stageId: screen.screenId, stage: "native_render", event: "request_failed", outcome: "failed", nativeOperationId: renderRequestId, attempt: screen.renderAttempts, durationMs, code: safeErrorCode(error) });
@@ -1818,6 +1823,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       const renderDurationMs = Math.max(0, Math.round(monotonicNow() - renderStarted));
       task.universalMetrics!.nativeDurationMs += renderDurationMs;
       if (!response.success) {
+        fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(renderRequestId), rootNodeHash: fw7CorrelationHash(response.nativeRootNodeId), boundary: "task-owner", kind: "native_render_result", stage: "native_render", operation: "design-program-render", result: "failed", durationMs: renderDurationMs, reasonCode: response.errorCode ?? "native_render_failed" });
         screen.nativeRootNodeId ??= response.nativeRootNodeId;
         screen.errorCode = response.errorCode ?? "native_render_error";
         screen.findings = (response.findings ?? []).slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }));
@@ -1859,6 +1865,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       delete screen.errorCode;
       task.universalMetrics!.firstNativeProgressMs ??= Math.max(0, Math.round(monotonicNow() - runStartedAt));
       recordTrace({ stageId: screen.screenId, stage: "native_render", event: "render_acknowledged", outcome: "completed", nativeOperationId: renderRequestId, nativeBatchId: response.nativeBatchId, attempt: screen.renderAttempts, durationMs: renderDurationMs, nodeCount: response.nativeNodeCount, qaFindingCodes: nativeWarnings.map(({ code }) => code).slice(0, 8), qaCoverage: "complete" });
+      fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(renderRequestId), rootNodeHash: fw7CorrelationHash(response.nativeRootNodeId), boundary: "task-owner", kind: "native_render_result", stage: "native_render", operation: "design-program-render", result: "applied", durationMs: renderDurationMs, observedCount: response.nativeNodeCount });
       await save();
     }
 
@@ -1878,6 +1885,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       check();
       const inspectRequestId = `${task.id}_inspect_${screen.screenId}_${Math.random().toString(36).slice(2, 10)}`;
       const readbackStartedAt = monotonicNow();
+      fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(inspectRequestId), rootNodeHash: fw7CorrelationHash(screen.nativeRootNodeId), boundary: "task-owner", kind: "native_readback_started", stage: "native_readback", operation: "task-native-inspect", result: "started" });
       recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "request_started", outcome: "started", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId,
         ...(expectedLayout ? { code: FW4_GEOMETRY_FEATURE, nodeCount: expectedLayout.length } : {}) });
       let inspection: NativeInspection;
@@ -1893,6 +1901,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         });
       } catch (error) {
         const durationMs = Math.max(0, Math.round(monotonicNow() - readbackStartedAt));
+        fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(inspectRequestId), boundary: "task-owner", kind: "native_readback_result", stage: "native_readback", operation: "task-native-inspect", result: deps.signal.aborted ? "cancelled" : "failed", durationMs, reasonCode: safeErrorCode(error) });
         screen.errorCode = safeErrorCode(error);
         task.universalMetrics!.readbackRoundTripMs += durationMs;
         recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "request_failed", outcome: "failed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs, code: safeErrorCode(error), qaCoverage: "incomplete" });
@@ -1950,6 +1959,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         await save();
         throw error;
       }
+      fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(inspectRequestId), rootNodeHash: fw7CorrelationHash(screen.nativeRootNodeId), boundary: "task-owner", kind: "native_readback_result", stage: "native_readback", operation: "task-native-inspect", result: "confirmed", durationMs: readbackDurationMs, observedCount: verified.nodeCount });
       if (screens.some((other) => other !== screen && other.rootRef === screen.rootRef))
         fail("native_root_conflict", "Two planned screens resolve to the same task-owned native root.");
       let finalVerificationRequestId = inspectRequestId;
@@ -2299,6 +2309,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
   }
   await schedulerDone;
   } catch (error) {
+    if (deps.signal.aborted)
+      fw7Telemetry.record({ runId: task.id, taskId: task.id, boundary: "task-owner", kind: "task_stopped", stage: "universal", operation: "user-stop", result: "cancelled", reasonCode: "request_cancelled", counter: "cancellations" });
     schedulerFailure ??= error;
     await schedulerDone.catch(() => undefined);
     throw error;
@@ -2351,5 +2363,6 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
   const liveMetrics = task.universalMetrics;
   Object.assign(task, completionCheckpoint);
   if (liveMetrics) task.universalMetrics = liveMetrics;
+  fw7Telemetry.record({ runId: task.id, taskId: task.id, boundary: "task-owner", kind: "task_completed", stage: "universal", operation: "checkpoint-confirmed", result: "confirmed", observedCount: screens.length, durationMs: task.universalMetrics!.totalElapsedMs });
   recordTrace({ stageId: "task", stage: "task", event: "task_completed", outcome: "completed", durationMs: task.universalMetrics!.totalElapsedMs, nodeCount: task.universalMetrics!.acceptedScreenTimesMs.length });
 }

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fw7-collected-artifact-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "collectedAtUtc", "manifest", "report", "snapshots"],
+  "properties": {
+    "schemaVersion": { "const": "fw7-collected-artifact-v1" },
+    "collectedAtUtc": { "type": "string", "format": "date-time" },
+    "manifest": { "$ref": "run-manifest.schema.json" },
+    "report": {
+      "type": "object",
+      "required": ["schemaVersion", "runId", "fixtureId", "evidenceSource", "runStatus", "buildIds", "featureFlags", "snapshotCount", "eventCount", "sourcesSeen", "clockOrigins", "crossSourceClockSynchronization", "countersBySource", "durations", "limitations"],
+      "properties": {
+        "schemaVersion": { "const": "fw7-event-report-v1" },
+        "runId": { "type": "string" },
+        "fixtureId": { "enum": ["F0", "F1", "F3", "F10", "FH", "FE"] },
+        "evidenceSource": { "enum": ["LIVE_DESKTOP", "LOCAL_STUB", "FAKE_RUNTIME", "STATIC_ANALYSIS"] },
+        "runStatus": { "enum": ["UNSTARTED", "RUNNING", "PASS", "FAIL", "BLOCKED", "PARTIAL"] },
+        "buildIds": { "type": "object" },
+        "featureFlags": { "type": "object" },
+        "snapshotCount": { "type": "integer", "minimum": 0 },
+        "eventCount": { "type": "integer", "minimum": 0 },
+        "sourcesSeen": { "type": "array", "items": { "enum": ["ui", "companion", "plugin"] } },
+        "clockOrigins": { "type": "array", "items": { "type": "string" } },
+        "crossSourceClockSynchronization": { "type": "string" },
+        "countersBySource": { "type": "object" },
+        "durations": { "type": "array" },
+        "limitations": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "snapshots": { "type": "array", "items": { "$ref": "event-stream.schema.json#/$defs/snapshot" } }
+  }
+}

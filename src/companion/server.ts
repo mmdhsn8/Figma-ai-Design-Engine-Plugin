@@ -14,6 +14,8 @@ import {
   visualReviewCapability,
 } from "../shared/fw5-provider-visual-review.js";
 import { pngDimensions } from "../shared/fw5-visual-qa.js";
+import { FW7_DIAGNOSTICS_ENABLED, fw7Telemetry } from "./fw7-runtime.js";
+import { fw7CorrelationHash } from "../shared/fw7-observability.js";
 import type { DraftStore } from "./draft-store.js";
 import {
   DraftIdentitySchema,
@@ -633,6 +635,26 @@ export function createCompanionServer(options: CompanionServerOptions) {
     if (url.pathname === "/v1/health" && request.method === "GET") {
       response.setHeader("X-FAD-Draft-Scope", "generation-v1");
       sendJson(response, 200, { companion: "running" });
+      return;
+    }
+    if (url.pathname === "/v1/diagnostics/fw7" && request.method === "GET") {
+      if (!FW7_DIAGNOSTICS_ENABLED) {
+        sendJson(response, 404, { error: "not_found" });
+        return;
+      }
+      const exportHook = (globalThis as unknown as Record<string, unknown>).__FW7_EXPORT_DIAGNOSTICS__;
+      if (typeof exportHook !== "function") {
+        sendJson(response, 503, { error: "diagnostics_export_unavailable" });
+        return;
+      }
+      const runId = url.searchParams.get("runId") ?? undefined;
+      const exportText = (exportHook as (id?: string) => string)(runId);
+      const exportValue = JSON.parse(exportText) as { schemaVersion?: string; snapshots?: unknown[]; error?: string };
+      if (exportValue.error) {
+        sendJson(response, 413, { schemaVersion: exportValue.schemaVersion, error: exportValue.error });
+        return;
+      }
+      sendJson(response, 200, exportValue);
       return;
     }
     if (url.pathname === "/v1/pairing/attempt" && request.method === "POST") {
@@ -1468,15 +1490,29 @@ export function createCompanionServer(options: CompanionServerOptions) {
     };
     request.once("aborted", abortForClient);
     response.once("close", abortForClosedResponse);
+    const telemetryRunId = `fw7-${fw7CorrelationHash(`models:${Date.now()}:${Math.random()}`)}`;
+    const providerStartedAt = performance.now();
+    let providerBodyCompleted = false;
     try {
-      const result = await fetchWithTimeout(
-        `${RESPONSES_RESOURCE}/models`,
-        {
-          headers: { Authorization: `Bearer ${session.value.accessToken}` },
-        },
-        clientAbort.signal,
-      );
-      if (clientAbort.signal.aborted) return;
+      fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_started", stage: "model_catalog", result: "started", counter: "providerRequests" });
+      let result: Response;
+      try {
+        result = await fetchWithTimeout(
+          `${RESPONSES_RESOURCE}/models`,
+          {
+            headers: { Authorization: `Bearer ${session.value.accessToken}` },
+          },
+          clientAbort.signal,
+        );
+      } catch (error) {
+        fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_result", stage: "model_catalog_headers", result: clientAbort.signal.aborted ? "cancelled" : "failed", durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)), reasonCode: clientAbort.signal.aborted ? "caller_cancelled" : "transport_or_timeout" });
+        throw error;
+      }
+      fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_result", stage: "model_catalog_headers", result: result.ok ? "received" : "failed", counter: "providerResponses", durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)), reasonCode: result.ok ? undefined : `http_${result.status}` });
+      if (clientAbort.signal.aborted) {
+        fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_result", stage: "model_catalog_body", result: "cancelled", reasonCode: "caller_cancelled" });
+        return;
+      }
       if (liveSession !== session.value) {
         sendJson(response, 409, { error: "account_mismatch", status: status() });
         return;
@@ -1510,8 +1546,11 @@ export function createCompanionServer(options: CompanionServerOptions) {
             .slice(0, 100)
         : [];
       session.value.models = models;
+      providerBodyCompleted = true;
+      fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_result", stage: "model_catalog_body", result: "succeeded", durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)), observedCount: models.length });
       sendJson(response, 200, { models, status: status() });
     } catch (error) {
+      if (!providerBodyCompleted && !clientAbort.signal.aborted) fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_result", stage: "model_catalog_body", result: "failed", reasonCode: "model_catalog_processing_failed" });
       if (clientAbort.signal.aborted) return;
       if (liveSession !== session.value) {
         sendJson(response, 409, { error: "account_mismatch", status: status() });
@@ -1548,6 +1587,10 @@ export function createCompanionServer(options: CompanionServerOptions) {
     };
     request.once("aborted", abortForClient);
     response.once("close", abortForClosedResponse);
+    const telemetryRunId = `fw7-${fw7CorrelationHash(`smoke:${body.value.model}:${Date.now()}:${Math.random()}`)}`;
+    let providerStartedAt = 0;
+    let providerRequestStarted = false;
+    let providerStreamCompleted = false;
     try {
       const session = await getAuthorizedSession();
       if (!session.ok) {
@@ -1570,9 +1613,15 @@ export function createCompanionServer(options: CompanionServerOptions) {
       safeMessage = undefined;
       const contextTool = CHAT_FUNCTION_TOOLS.find(({ name }) => name === "get_document_context");
       if (!contextTool) throw new Error("chat_tool_probe_unavailable");
-      const result = await fetchWithTimeout(
-        `${RESPONSES_RESOURCE}/responses`,
-        {
+      const model = body.value.model;
+      providerStartedAt = performance.now();
+      providerRequestStarted = true;
+      fw7Telemetry.record({ runId: telemetryRunId, providerModel: sanitizeDiagnosticModel(model), boundary: "companion-provider", kind: "provider_request_started", stage: "model_smoke", result: "started", attempt: 1, counter: "providerRequests" });
+      let result: Response;
+      try {
+        result = await fetchWithTimeout(
+          `${RESPONSES_RESOURCE}/responses`,
+          {
           method: "POST",
           headers: {
             Authorization: `Bearer ${session.value.accessToken}`,
@@ -1587,9 +1636,14 @@ export function createCompanionServer(options: CompanionServerOptions) {
             store: false,
             stream: true,
           }),
-        },
-        clientAbort.signal,
-      );
+          },
+          clientAbort.signal,
+        );
+      } catch (error) {
+        fw7Telemetry.record({ runId: telemetryRunId, providerModel: sanitizeDiagnosticModel(model), boundary: "companion-provider", kind: "provider_request_result", stage: "model_smoke_headers", result: clientAbort.signal.aborted ? "cancelled" : "failed", durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)), reasonCode: clientAbort.signal.aborted ? "caller_cancelled" : "transport_or_timeout" });
+        throw error;
+      }
+      fw7Telemetry.record({ runId: telemetryRunId, providerModel: sanitizeDiagnosticModel(model), boundary: "companion-provider", kind: "provider_request_result", stage: "model_smoke_headers", result: result.ok ? "received" : "failed", counter: "providerResponses", durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)), reasonCode: result.ok ? undefined : `http_${result.status}` });
       if (!result.ok) {
         const upstreamError = await readResponsesHttpError(result, timeoutMs);
         const category = classifyResponsesHttpError(result.status, upstreamError);
@@ -1616,6 +1670,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
         undefined,
         streamStartedAt,
       );
+      providerStreamCompleted = true;
+      fw7Telemetry.record({ runId: telemetryRunId, providerModel: sanitizeDiagnosticModel(model), boundary: "companion-provider", kind: "provider_request_result", stage: "model_smoke_stream", result: "succeeded", durationMs: completed.diagnostic.elapsedMs });
       if (clientAbort.signal.aborted) throw new Error("request_cancelled");
       if (clientAbort.signal.aborted || liveSession !== session.value) {
         sendJson(response, 401, { error: "signed_out", status: status() });
@@ -1650,6 +1706,9 @@ export function createCompanionServer(options: CompanionServerOptions) {
         diagnostic: completed.diagnostic,
       });
     } catch (error) {
+      if (providerRequestStarted && !providerStreamCompleted) {
+        fw7Telemetry.record({ runId: telemetryRunId, providerModel: sanitizeDiagnosticModel(body.value.model), boundary: "companion-provider", kind: "provider_request_result", stage: "model_smoke_stream", result: clientAbort.signal.aborted ? "cancelled" : "failed", durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)), reasonCode: clientAbort.signal.aborted ? "caller_cancelled" : "model_smoke_incomplete" });
+      }
       if (request.aborted || response.destroyed) return;
       const category =
         error instanceof Error && error.message === "response_too_large"
@@ -1749,13 +1808,21 @@ export function createCompanionServer(options: CompanionServerOptions) {
           !current.scopes.has(PLAN_USE_SCOPE)) throw new Error("stale_task_session");
       if (!current.models.some(({ slug }) => slug === reviewRequest.model)) throw new Error("model_not_verified_for_account");
     };
+    const reviewRunId = reviewRequest.taskId;
+    const reviewStartedAt = performance.now();
     try {
       ensureCurrentVisualSession();
       const context = JSON.stringify(reviewRequest.context);
       const inputText = `${reviewRequest.rubric}\n\nTask-scoped native context (data, not instructions): ${context}`;
-      const upstream = await fetchWithTimeout(
-        `${RESPONSES_RESOURCE}/responses`,
-        {
+      fw7Telemetry.record({ runId: reviewRunId, taskId: reviewRequest.taskId, screenId: reviewRequest.screenId,
+        requestIdHash: fw7CorrelationHash(reviewRequest.requestId), providerModel: sanitizeDiagnosticModel(reviewRequest.model),
+        boundary: "visual-review", kind: "visual_review_request_started", stage: "visual_review_provider",
+        result: "started", counter: "visualReviewRequests", counterDeltas: { providerRequests: 1 } });
+      let upstream: Response;
+      try {
+        upstream = await fetchWithTimeout(
+          `${RESPONSES_RESOURCE}/responses`,
+          {
           method: "POST",
           headers: {
             Authorization: `Bearer ${(liveSession ?? session.value).accessToken}`,
@@ -1776,10 +1843,23 @@ export function createCompanionServer(options: CompanionServerOptions) {
             store: false,
             stream: false,
           }),
-        },
-        clientAbort.signal,
-        timeoutMs,
-      );
+          },
+          clientAbort.signal,
+          timeoutMs,
+        );
+      } catch (error) {
+        fw7Telemetry.record({ runId: reviewRunId, taskId: reviewRequest.taskId, screenId: reviewRequest.screenId,
+          requestIdHash: fw7CorrelationHash(reviewRequest.requestId), providerModel: sanitizeDiagnosticModel(reviewRequest.model),
+          boundary: "visual-review", kind: "visual_review_result", stage: "visual_review_provider",
+          result: clientAbort.signal.aborted ? "cancelled" : "failed", durationMs: Math.max(0, Math.round(performance.now() - reviewStartedAt)),
+          reasonCode: clientAbort.signal.aborted ? "caller_cancelled" : "transport_or_timeout" });
+        throw error;
+      }
+      fw7Telemetry.record({ runId: reviewRunId, taskId: reviewRequest.taskId, screenId: reviewRequest.screenId,
+        requestIdHash: fw7CorrelationHash(reviewRequest.requestId), providerModel: sanitizeDiagnosticModel(reviewRequest.model),
+        boundary: "visual-review", kind: "provider_request_result", stage: "visual_review_provider_headers",
+        result: upstream.ok ? "received" : "failed", counter: "providerResponses",
+        durationMs: Math.max(0, Math.round(performance.now() - reviewStartedAt)), reasonCode: upstream.ok ? undefined : `http_${upstream.status}` });
       ensureCurrentVisualSession();
       if (!upstream.ok) {
         const upstreamError = await readResponsesHttpError(upstream, timeoutMs);
@@ -1822,7 +1902,15 @@ export function createCompanionServer(options: CompanionServerOptions) {
         capability: visualReviewCapability({ authorized: true, consented: true, model: reviewRequest.model, observed: "supported" }),
         response: reviewResult.data,
       });
+      fw7Telemetry.record({ runId: reviewRunId, taskId: reviewRequest.taskId, screenId: reviewRequest.screenId,
+        requestIdHash: fw7CorrelationHash(reviewRequest.requestId), providerModel: sanitizeDiagnosticModel(reviewRequest.model),
+        boundary: "visual-review", kind: "visual_review_result", stage: "visual_review_provider",
+        result: "succeeded", counter: "visualReviewResponses", durationMs: Math.max(0, Math.round(performance.now() - reviewStartedAt)) });
     } catch (error) {
+      if (!response.writableEnded && !clientAbort.signal.aborted) fw7Telemetry.record({ runId: reviewRunId, taskId: reviewRequest.taskId,
+        screenId: reviewRequest.screenId, requestIdHash: fw7CorrelationHash(reviewRequest.requestId), providerModel: sanitizeDiagnosticModel(reviewRequest.model),
+        boundary: "visual-review", kind: "visual_review_result", stage: "visual_review_provider", result: "failed",
+        durationMs: Math.max(0, Math.round(performance.now() - reviewStartedAt)), reasonCode: "review_or_validation_failed" });
       if (clientAbort.signal.aborted || (error instanceof Error && error.message === "request_cancelled")) return;
       if (!response.writableEnded) {
         const category = error instanceof RequestTimeoutError || (error instanceof Error && error.message === "request_timed_out")
@@ -1948,6 +2036,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
     }
     const universalScreenRequest = UNIVERSAL_SCREEN_REQUEST_ID.test(correlatedId);
     const taskId = universalScreenRequest ? correlatedId.split("_p6_screen-")[0] : undefined;
+    const providerRunId = taskId ?? `fw7-${fw7CorrelationHash(correlatedId)}`;
     const activeRequests = [...activeChatControllers.keys()];
     const hasLegacyOrNonScreenChat = activeRequests.some((activeId) => !UNIVERSAL_SCREEN_REQUEST_ID.test(activeId));
     const chatCapacityExceeded = activeChatControllers.has(correlatedId) || (universalScreenRequest
@@ -1984,6 +2073,10 @@ export function createCompanionServer(options: CompanionServerOptions) {
     let streamedText = "";
     let requestStartedAt: number | undefined;
     let requestStartedAtMs: number | undefined;
+    let providerStartedAt: number | undefined;
+    let providerHeadersReceived = false;
+    let providerHttpSucceeded = false;
+    let providerStreamReported = false;
     try {
       const session = await getAuthorizedSession();
       if (!session.ok) {
@@ -2006,6 +2099,17 @@ export function createCompanionServer(options: CompanionServerOptions) {
         if (!origin) {
           if (!loggedRefresh && current !== session.value) {
             loggedRefresh = true;
+            fw7Telemetry.record({
+              runId: providerRunId,
+              ...(taskId ? { taskId } : {}),
+              requestIdHash: fw7CorrelationHash(correlatedId),
+              providerModel: sanitizeDiagnosticModel(model),
+              boundary: "companion-provider",
+              kind: "session_refresh",
+              stage: "chat_authorization",
+              result: "succeeded",
+              counter: "authorizationRefreshes",
+            });
             console.info("[FAD_CHAT_CANCEL] " + JSON.stringify({
               actor: "companion", event: "same_session_refresh", atMs: now(),
               taskId, requestId: correlatedId, lifecycle,
@@ -2050,9 +2154,16 @@ export function createCompanionServer(options: CompanionServerOptions) {
       const deadline = requestStartedAt + streamOverallTimeoutMs;
       const headerTimeoutKind: TimeoutKind =
         streamOverallTimeoutMs <= timeoutMs ? "overall" : "headers";
-      const upstream = await fetchWithTimeout(
-        `${RESPONSES_RESOURCE}/responses`,
-        {
+      providerStartedAt = performance.now();
+      fw7Telemetry.record({ runId: providerRunId, ...(taskId ? { taskId } : {}),
+        requestIdHash: fw7CorrelationHash(correlatedId), providerModel: sanitizeDiagnosticModel(model),
+        boundary: "companion-provider", kind: "provider_request_started", stage: "chat_provider", result: "started",
+        counter: "providerRequests" });
+      let upstream: Response;
+      try {
+        upstream = await fetchWithTimeout(
+          `${RESPONSES_RESOURCE}/responses`,
+          {
           method: "POST",
           headers: {
             Authorization: `Bearer ${session.value.accessToken}`,
@@ -2068,11 +2179,25 @@ export function createCompanionServer(options: CompanionServerOptions) {
             store: false,
             stream: true,
           }),
-        },
-        clientAbort.signal,
-        Math.min(timeoutMs, streamOverallTimeoutMs),
-        headerTimeoutKind,
-      );
+          },
+          clientAbort.signal,
+          Math.min(timeoutMs, streamOverallTimeoutMs),
+          headerTimeoutKind,
+        );
+      } catch (error) {
+        fw7Telemetry.record({ runId: providerRunId, ...(taskId ? { taskId } : {}), requestIdHash: fw7CorrelationHash(correlatedId),
+          providerModel: sanitizeDiagnosticModel(model), boundary: "companion-provider", kind: "provider_request_result",
+          stage: "chat_provider", result: clientAbort.signal.aborted ? "cancelled" : "failed",
+          durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)),
+          reasonCode: clientAbort.signal.aborted ? "caller_cancelled" : "transport_or_timeout" });
+        throw error;
+      }
+      providerHeadersReceived = true;
+      providerHttpSucceeded = upstream.ok;
+      fw7Telemetry.record({ runId: providerRunId, ...(taskId ? { taskId } : {}), requestIdHash: fw7CorrelationHash(correlatedId),
+        providerModel: sanitizeDiagnosticModel(model), boundary: "companion-provider", kind: "provider_request_result",
+        stage: "chat_provider_headers", result: upstream.ok ? "received" : "failed", counter: "providerResponses",
+        durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)), reasonCode: upstream.ok ? undefined : `http_${upstream.status}` });
       if (!upstream.ok) {
         const upstreamError = await readResponsesHttpError(upstream, timeoutMs);
         const category = classifyResponsesHttpError(upstream.status, upstreamError);
@@ -2138,6 +2263,10 @@ export function createCompanionServer(options: CompanionServerOptions) {
         correlatedId,
         requestStartedAtMs,
       );
+      fw7Telemetry.record({ runId: providerRunId, ...(taskId ? { taskId } : {}), requestIdHash: fw7CorrelationHash(correlatedId),
+        providerModel: sanitizeDiagnosticModel(model), boundary: "companion-provider", kind: "provider_request_result",
+        stage: "chat_provider_stream", result: "succeeded", durationMs: completed.diagnostic.elapsedMs });
+      providerStreamReported = true;
       checkChatScope(completed.diagnostic);
       const timing = {
         upstreamHeadersMs: completed.diagnostic.headersMs,
@@ -2287,6 +2416,13 @@ export function createCompanionServer(options: CompanionServerOptions) {
       }
       response.end();
     } catch (error) {
+      if (providerStartedAt !== undefined && providerHeadersReceived && providerHttpSucceeded && !providerStreamReported) {
+        fw7Telemetry.record({ runId: providerRunId, ...(taskId ? { taskId } : {}), requestIdHash: fw7CorrelationHash(correlatedId),
+          providerModel: sanitizeDiagnosticModel(model), boundary: "companion-provider", kind: "provider_request_result",
+          stage: "chat_provider_stream", result: clientAbort.signal.aborted ? "cancelled" : "failed",
+          durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)),
+          reasonCode: clientAbort.signal.aborted ? "caller_cancelled" : "provider_stream_incomplete" });
+      }
       if (request.aborted || response.destroyed) {
         const diagnostic =
           error instanceof ResponsesStreamError
@@ -2722,21 +2858,52 @@ export function createCompanionServer(options: CompanionServerOptions) {
             store: false,
             stream: true,
       };
-      const sendDesignRequest = (body: object) =>
-        fetchWithTimeout(
-          `${RESPONSES_RESOURCE}/responses`,
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${session.value.accessToken}`,
-              "Content-Type": "application/json",
+      const providerRequestId = body.value.requestId as string;
+      const providerModel = body.value.model as string;
+      const providerTaskId = UNIVERSAL_SCREEN_REQUEST_ID.test(providerRequestId)
+        ? providerRequestId.split("_p6_screen-")[0]
+        : undefined;
+      const providerScreenId = plan.screens.length === 1 ? plan.screens[0]?.id : undefined;
+      const sendDesignRequest = (providerPayload: object) =>
+        {
+          const requestAttempt = previousAttempts + (functionOutput ? 2 : 1);
+          const startedAt = performance.now();
+          const runId = providerTaskId ?? `fw7-${fw7CorrelationHash(providerRequestId)}`;
+          fw7Telemetry.record({ runId, ...(providerTaskId ? { taskId: providerTaskId } : {}), ...(providerScreenId ? { screenId: providerScreenId } : {}),
+            requestIdHash: fw7CorrelationHash(providerRequestId), providerModel: sanitizeDiagnosticModel(providerModel),
+            boundary: "companion-provider", kind: "provider_request_started", stage: "design_provider", result: "started",
+            attempt: Math.min(10, requestAttempt), counter: "providerRequests",
+            ...(requestAttempt > 1 ? { counterDeltas: { providerRetries: 1 } } : {}) });
+          return fetchWithTimeout(
+            `${RESPONSES_RESOURCE}/responses`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${session.value.accessToken}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(providerPayload),
             },
-            body: JSON.stringify(body),
-          },
-          clientAbort.signal,
-          Math.min(timeoutMs, Math.max(1, Math.ceil(generationDeadline - performance.now()))),
-          generationDeadline - performance.now() < timeoutMs ? "overall" : "headers",
-        );
+            clientAbort.signal,
+            Math.min(timeoutMs, Math.max(1, Math.ceil(generationDeadline - performance.now()))),
+            generationDeadline - performance.now() < timeoutMs ? "overall" : "headers",
+          ).then((result) => {
+            fw7Telemetry.record({ runId, ...(providerTaskId ? { taskId: providerTaskId } : {}), ...(providerScreenId ? { screenId: providerScreenId } : {}),
+              requestIdHash: fw7CorrelationHash(providerRequestId), providerModel: sanitizeDiagnosticModel(providerModel),
+              boundary: "companion-provider", kind: "provider_request_result", stage: "design_provider_headers",
+              result: result.ok ? "received" : "failed", counter: "providerResponses",
+              durationMs: Math.max(0, Math.round(performance.now() - startedAt)), reasonCode: result.ok ? undefined : `http_${result.status}` });
+            return result;
+          }, (error: unknown) => {
+            fw7Telemetry.record({ runId, ...(providerTaskId ? { taskId: providerTaskId } : {}), ...(providerScreenId ? { screenId: providerScreenId } : {}),
+              requestIdHash: fw7CorrelationHash(providerRequestId), providerModel: sanitizeDiagnosticModel(providerModel),
+              boundary: "companion-provider", kind: "provider_request_result", stage: "design_provider_headers",
+              result: clientAbort.signal.aborted ? "cancelled" : "failed",
+              durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+              reasonCode: clientAbort.signal.aborted ? "caller_cancelled" : "transport_or_timeout" });
+            throw error;
+          });
+        };
       let functionOutput = false;
       let result = await sendDesignRequest(payload);
       let upstreamError = result.ok ? undefined : await readResponsesHttpError(result, timeoutMs);
@@ -2833,6 +3000,11 @@ export function createCompanionServer(options: CompanionServerOptions) {
             };
           },
         );
+        fw7Telemetry.record({ runId: providerTaskId ?? `fw7-${fw7CorrelationHash(body.value.requestId)}`,
+          ...(providerTaskId ? { taskId: providerTaskId } : {}), ...(providerScreenId ? { screenId: providerScreenId } : {}),
+          requestIdHash: fw7CorrelationHash(body.value.requestId), providerModel: sanitizeDiagnosticModel(body.value.model),
+          boundary: "companion-provider", kind: "provider_request_result", stage: "design_provider_stream",
+          result: "succeeded", durationMs: completed.diagnostic.elapsedMs });
         designProgress = {
           requestId: body.value.requestId,
           startedAt: generationStartedAt,
@@ -2862,6 +3034,12 @@ export function createCompanionServer(options: CompanionServerOptions) {
           await outputFile.writeFile(pendingSpool, { encoding: "utf8" });
         }
       } catch (error) {
+        fw7Telemetry.record({ runId: providerTaskId ?? `fw7-${fw7CorrelationHash(body.value.requestId)}`,
+          ...(providerTaskId ? { taskId: providerTaskId } : {}), ...(providerScreenId ? { screenId: providerScreenId } : {}),
+          requestIdHash: fw7CorrelationHash(body.value.requestId), providerModel: sanitizeDiagnosticModel(body.value.model),
+          boundary: "companion-provider", kind: "provider_request_result", stage: "design_provider_stream",
+          result: clientAbort.signal.aborted ? "cancelled" : "failed",
+          reasonCode: clientAbort.signal.aborted ? "caller_cancelled" : isRetryableStreamInterruption(error) ? "stream_interrupted" : "stream_incomplete" });
         if (isRetryableStreamInterruption(error)) {
           let retries = generationStreamRetries.get(body.value.requestId);
           if (!retries) {

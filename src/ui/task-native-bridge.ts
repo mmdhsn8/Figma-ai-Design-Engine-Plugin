@@ -3,6 +3,8 @@ import {
   type PluginToUIMessage,
   type UIToPluginMessage,
 } from "../shared/messages";
+import { fw7Telemetry } from "./fw7-runtime";
+import { fw7CorrelationHash } from "../shared/fw7-observability";
 
 type Request = Extract<UIToPluginMessage, { type: "task-native-inspect" | "task-native-focus" }>;
 type VisualCaptureRequest = Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>;
@@ -26,20 +28,25 @@ export function taskNativeBridge(message: Request): Promise<Response> {
       if (!parsed.success) return;
       if (parsed.data.type === "protocol-error") {
         if (parsed.data.requestId !== message.requestId) return;
+        fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "bridge_ack_received", stage: "native_inspection", operation: "protocol-error", result: "failed", reasonCode: "protocol_error", counter: "uiPluginAcksReceived" });
         finish();
         reject(new Error(parsed.data.message));
         return;
       }
-      if (
-        parsed.data.type !== "task-native-inspection-result" &&
-        parsed.data.type !== "task-native-focus-result"
-      )
-        return;
-      if (parsed.data.requestId !== message.requestId) return;
-      finish();
-      if (!parsed.data.success)
-        reject(new Error(parsed.data.error ?? "The task-owned native layers could not be read."));
-      else resolve(parsed.data);
+      if (message.type === "task-native-inspect") {
+        if (parsed.data.type !== "task-native-inspection-result" || parsed.data.requestId !== message.requestId) return;
+        fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "bridge_ack_received", stage: "native_readback", operation: parsed.data.type, result: "received", counter: "uiPluginAcksReceived" });
+        finish();
+        fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "native_readback_result", stage: "native_readback", operation: "task-native-inspect", result: parsed.data.success ? parsed.data.geometry?.coverage === "complete" ? "confirmed" : "unverified" : "failed", observedCount: parsed.data.success ? parsed.data.nodes?.length ?? 0 : undefined, reasonCode: !parsed.data.success ? "native_readback_failed" : parsed.data.geometry?.coverage !== "complete" ? "readback_coverage_incomplete" : undefined });
+        if (!parsed.data.success) reject(new Error(parsed.data.error ?? "The task-owned native layers could not be read."));
+        else resolve(parsed.data);
+      } else {
+        if (parsed.data.type !== "task-native-focus-result" || parsed.data.requestId !== message.requestId) return;
+        fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "bridge_ack_received", stage: "native_focus", operation: parsed.data.type, result: "received", counter: "uiPluginAcksReceived" });
+        finish();
+        if (!parsed.data.success) reject(new Error(parsed.data.error ?? "The task-owned nodes could not be focused."));
+        else resolve(parsed.data);
+      }
     };
     const timer = window.setTimeout(() => {
       finish();
@@ -47,6 +54,7 @@ export function taskNativeBridge(message: Request): Promise<Response> {
     }, 15_000);
     window.addEventListener("message", receive);
     parent.postMessage({ pluginMessage: message }, "*");
+    fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "bridge_dispatch", stage: message.type === "task-native-inspect" ? "native_readback" : "native_focus", operation: message.type, result: "started", counter: "uiPluginDispatches" });
   });
 }
 
@@ -57,6 +65,8 @@ export function taskNativeVisualCaptureBridge(message: VisualCaptureRequest, sig
       try {
         parent.postMessage({ pluginMessage: { type: "task-native-visual-capture-cancel", requestId: message.requestId,
           taskId: message.visualCapture.taskId, captureNonce: message.visualCapture.captureNonce } }, "*");
+        fw7Telemetry.record({ runId: message.visualCapture.taskId, taskId: message.visualCapture.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "bridge_dispatch", stage: "visual_capture", operation: "task-native-visual-capture-cancel", result: "cancelled", counter: "uiPluginDispatches" });
+        fw7Telemetry.record({ runId: message.visualCapture.taskId, taskId: message.visualCapture.taskId, boundary: "task-owner", kind: "cancellation", stage: "visual_capture", operation: "exportAsync", result: "cancelled", reasonCode: "capture_cancelled", counter: "cancellations" });
       } catch { /* The plugin may already be closed; the UI task remains the commit authority. */ }
     };
     const finish = () => {
@@ -75,6 +85,8 @@ export function taskNativeVisualCaptureBridge(message: VisualCaptureRequest, sig
       if (event.source !== parent) return;
       const parsed = PluginToUISchema.safeParse(event.data?.pluginMessage);
       if (!parsed.success || parsed.data.type !== "task-native-visual-capture-result" || parsed.data.requestId !== message.requestId) return;
+      fw7Telemetry.record({ runId: message.visualCapture.taskId, taskId: message.visualCapture.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "bridge_ack_received", stage: "visual_capture", operation: "task-native-visual-capture-result", result: "received", counter: "uiPluginAcksReceived" });
+      fw7Telemetry.record({ runId: message.visualCapture.taskId, taskId: message.visualCapture.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "figma-api", kind: "visual_capture_result", stage: "visual_capture", operation: "exportAsync", result: parsed.data.success ? "succeeded" : "failed", durationMs: parsed.data.exportDurationMs, reasonCode: parsed.data.success ? undefined : parsed.data.receipt?.diagnostic });
       finish();
       if (parsed.data.taskId !== message.visualCapture.taskId) {
         reject(Object.assign(new Error("Visual capture response task identity did not match its request."), { code: "visual_capture_identity_mismatch" }));
@@ -90,7 +102,7 @@ export function taskNativeVisualCaptureBridge(message: VisualCaptureRequest, sig
     if (signal.aborted) { window.clearTimeout(timer); reject(Object.assign(new Error("Visual capture was cancelled before dispatch."), { code: "visual_capture_cancelled" })); return; }
     signal.addEventListener("abort", cancel, { once: true });
     window.addEventListener("message", receive);
-    try { parent.postMessage({ pluginMessage: message }, "*"); }
+    try { parent.postMessage({ pluginMessage: message }, "*"); fw7Telemetry.record({ runId: message.visualCapture.taskId, taskId: message.visualCapture.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "visual_capture_started", stage: "visual_capture", operation: "task-native-visual-capture", result: "started", counter: "uiPluginDispatches" }); }
     catch {
       finish();
       reject(Object.assign(new Error("Figma did not accept the bounded visual capture request."), { code: "visual_capture_unavailable" }));
@@ -103,7 +115,7 @@ export function taskNativeVisualRepairBridge(message: VisualRepairRequest, signa
   return new Promise((resolve, reject) => {
     let settled = false;
     const postCancel = () => {
-      try { parent.postMessage({ pluginMessage: { type: "task-native-visual-repair-cancel", requestId: message.request.requestId, taskId: message.request.taskId } }, "*"); }
+      try { parent.postMessage({ pluginMessage: { type: "task-native-visual-repair-cancel", requestId: message.request.requestId, taskId: message.request.taskId } }, "*"); fw7Telemetry.record({ runId: message.request.taskId, taskId: message.request.taskId, requestIdHash: fw7CorrelationHash(message.request.requestId), boundary: "ui-plugin", kind: "bridge_dispatch", stage: "visual_repair", operation: "task-native-visual-repair-cancel", result: "cancelled", counter: "uiPluginDispatches" }); }
       catch { /* Plugin closure cannot change the task owner's stopped state. */ }
     };
     const finish = () => {
@@ -122,6 +134,8 @@ export function taskNativeVisualRepairBridge(message: VisualRepairRequest, signa
       if (event.source !== parent) return;
       const parsed = PluginToUISchema.safeParse(event.data?.pluginMessage);
       if (!parsed.success || parsed.data.type !== "task-native-visual-repair-result" || parsed.data.result.requestId !== message.request.requestId) return;
+      fw7Telemetry.record({ runId: message.request.taskId, taskId: message.request.taskId, requestIdHash: fw7CorrelationHash(message.request.requestId), boundary: "ui-plugin", kind: "bridge_ack_received", stage: "visual_repair", operation: "task-native-visual-repair-result", result: "received", counter: "uiPluginAcksReceived" });
+      fw7Telemetry.record({ runId: message.request.taskId, taskId: message.request.taskId, requestIdHash: fw7CorrelationHash(message.request.requestId), boundary: "figma-api", kind: "visual_repair_result", stage: "visual_repair", operation: "task-native-visual-repair", result: parsed.data.result.status === "APPLIED" ? "applied" : "failed", reasonCode: parsed.data.result.status === "REJECTED" ? "repair_rejected" : undefined });
       finish();
       const result = parsed.data.result;
       if (result.taskId !== message.request.taskId || result.screenId !== message.request.screenId ||
@@ -143,7 +157,7 @@ export function taskNativeVisualRepairBridge(message: VisualRepairRequest, signa
     }
     signal.addEventListener("abort", cancel, { once: true });
     window.addEventListener("message", receive);
-    try { parent.postMessage({ pluginMessage: message }, "*"); }
+    try { parent.postMessage({ pluginMessage: message }, "*"); fw7Telemetry.record({ runId: message.request.taskId, taskId: message.request.taskId, requestIdHash: fw7CorrelationHash(message.request.requestId), boundary: "ui-plugin", kind: "bridge_dispatch", stage: "visual_repair", operation: "task-native-visual-repair", result: "started", counter: "uiPluginDispatches" }); }
     catch {
       finish();
       reject(Object.assign(new Error("Figma did not accept the bounded visual repair request."), { code: "visual_repair_unavailable" }));

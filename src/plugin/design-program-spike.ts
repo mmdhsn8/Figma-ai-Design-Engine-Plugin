@@ -8,6 +8,8 @@ import { NATIVE_GEOMETRY_VERSION } from "../shared/native-geometry";
 import { CONTEXT_COMPONENT_KEY, NATIVE_MASTER_KEY, type ContextReuseFinding, type prepareContextReuse } from "./design-context-reuse";
 import { FW4_GEOMETRY_ENABLED, FW4_GEOMETRY_FEATURE, projectNativeLayoutExpectations } from "../shared/fw4-geometry";
 import { FW5_VISUAL_QA_ENABLED, FW5_VISUAL_REVIEW_MODE } from "../shared/fw5-visual-qa-feature";
+import { fw7Telemetry } from "./fw7-runtime";
+import { fw7CorrelationHash } from "../shared/fw7-observability";
 
 const TASK_KEY = "fad.tool.task-id.v1";
 const TOOL_REF_KEY = "fad.tool.logical-ref.v1";
@@ -150,6 +152,17 @@ export async function renderDesignProgramLocal(
       requireComponentMatch: true,
       preserveFailedProgramNodes: true,
       programText: true,
+      onNativeApiCall: (operation, screenId) => {
+        const counter = operation.startsWith("create-") ? "figmaCreateCalls"
+          : operation === "append-child" ? "figmaAppendCalls"
+            : operation === "resize" ? "figmaResizeCalls"
+              : operation === "remove" ? "figmaRemovalCalls" : undefined;
+        fw7Telemetry.record({
+          runId: taskId, taskId, screenId,
+          boundary: "figma-api", kind: "native_api_call", stage: "native_render", operation,
+          result: "started", ...(counter ? { counter } : {}),
+        });
+      },
       contextRectangle: grounding?.instantiateRectangle,
       bindContextFills: grounding && (async (root) => { linkedFills += await grounding.bindFills(root, verifyScope); }),
       beforeScreen: verifyScope,
@@ -158,6 +171,10 @@ export async function renderDesignProgramLocal(
         root.setPluginData(PROGRAM_FINGERPRINT_KEY, compiled.fingerprint);
         confirmedRootId = root.id;
         scope.rootReceipt?.write(root.id);
+        if (root.parent?.id === pageId) {
+          fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_root_attached",
+            stage: "native_render", result: "applied", rootNodeHash: fw7CorrelationHash(root.id) });
+        }
         trace("root_created", { screenId, nodeId: root.id, parentId: root.parent?.id });
       },
       markScreenBuilt: (root, screenId) => {
@@ -188,9 +205,15 @@ export async function renderDesignProgramLocal(
         if (FW4_GEOMETRY_ENABLED)
           trace("fw4_layout_expectation", { screenId, rootNodeId: root.id, gate: FW4_GEOMETRY_FEATURE,
             phase: "compiled-program-preflight", expectedNodeCount: native.children.length });
+        fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_started",
+          stage: "program_geometry", result: "started", rootNodeHash: fw7CorrelationHash(root.id), counter: "nativeReadbackOperations" });
         let report = inspectProgramGeometry(root, options);
         geometryReadbacks++;
         geometryMs += report.durationMs;
+        fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_result",
+          stage: "program_geometry", result: report.coverage === "complete" && report.findings.length === 0 ? "confirmed" : "unverified",
+          rootNodeHash: fw7CorrelationHash(root.id), observedCount: report.measuredNodes,
+          reasonCode: report.coverage !== "complete" ? "coverage_incomplete" : report.findings.length ? "geometry_findings" : undefined });
         if (FW4_GEOMETRY_ENABLED)
           trace("fw4_geometry_readback", { screenId, rootNodeId: root.id, gate: FW4_GEOMETRY_FEATURE,
             phase: "native-readback-after-render", coverage: report.coverage,
@@ -200,9 +223,15 @@ export async function renderDesignProgramLocal(
           report.findings.every(({ code, parentId }) => code === "native_vertical_overflow" && parentId === body?.id) &&
           fitProgramScrollBody(root)) {
           geometryRepairs++;
+          fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_started",
+            stage: "program_geometry_recheck", result: "started", rootNodeHash: fw7CorrelationHash(root.id), counter: "nativeReadbackOperations" });
           report = inspectProgramGeometry(root, options);
           geometryReadbacks++;
           geometryMs += report.durationMs;
+          fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_result",
+            stage: "program_geometry_recheck", result: report.coverage === "complete" && report.findings.length === 0 ? "confirmed" : "unverified",
+            rootNodeHash: fw7CorrelationHash(root.id), observedCount: report.measuredNodes,
+            reasonCode: report.coverage !== "complete" ? "coverage_incomplete" : report.findings.length ? "geometry_findings" : undefined });
         }
         if (FW4_GEOMETRY_ENABLED) {
           const convergence = convergeProgramLayoutSizing(root, {
@@ -216,6 +245,9 @@ export async function renderDesignProgramLocal(
           geometryRepairs += convergence.repaired;
           geometryReadbacks += convergence.readbacks;
           geometryMs += report.durationMs;
+          if (convergence.readbacks > 0) fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_result",
+            stage: "fw4_convergence_readbacks", result: report.coverage === "complete" && report.findings.length === 0 ? "confirmed" : "unverified",
+            rootNodeHash: fw7CorrelationHash(root.id), observedCount: convergence.readbacks, counter: "nativeReadbackOperations", counterDelta: convergence.readbacks });
           trace("fw4_geometry_convergence", { screenId, rootNodeId: root.id, gate: FW4_GEOMETRY_FEATURE,
             phase: convergence.repaired ? "native-readback-after-convergence" : "native-readback-no-convergence",
             attemptedNodes: convergence.attempts, repairedNodes: convergence.repaired,
