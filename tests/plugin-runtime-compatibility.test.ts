@@ -5,6 +5,7 @@ import { brandAssetContentHash } from "../src/shared/brand-kit";
 import { encodeBase64, embeddedImageBytes } from "../src/shared/visual-assets";
 import { ChatTaskSchema } from "../src/shared/chat-task";
 import { checkpointJson, checkpointRevision } from "../src/shared/chat-checkpoint-wire";
+import { FW2_FEATURE } from "../src/shared/design-context";
 
 const pluginBundle = readFileSync(new URL("../dist/plugin.js", import.meta.url), "utf8");
 
@@ -33,6 +34,8 @@ describe("Figma main sandbox runtime compatibility", () => {
       currentPage: page,
       root,
       fileKey: "file-1",
+      mode: "default",
+      editorType: "figma",
       on: vi.fn(),
       clientStorage: {
         getAsync: vi.fn(async (key: string) => {
@@ -49,7 +52,7 @@ describe("Figma main sandbox runtime compatibility", () => {
     const sandbox = {
       figma,
       Intl: undefined,
-      console: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      console: { log: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     };
 
     expect(runInNewContext("typeof Intl", sandbox)).toBe("undefined");
@@ -59,6 +62,17 @@ describe("Figma main sandbox runtime compatibility", () => {
     const request = (message: unknown) =>
       (figma.ui.onmessage as (value: unknown) => Promise<void>)(message);
     const result = () => figma.ui.postMessage.mock.lastCall?.[0];
+    await request({
+      type: "design-context-read", requestId: "vm-context-01", feature: FW2_FEATURE,
+      taskId: "task-vm-01", documentId: "file-1-page-1", intent: "create",
+      prompt: "Create a screen. Use the selection as design context.", scope: "selection",
+    });
+    expect(result()).toMatchObject(process.env.VITE_FW2_CONTEXT === FW2_FEATURE
+      ? { success: true, snapshot: { nodes: [], resources: [], scope: "selection" } }
+      : { success: false, code: "UNSUPPORTED" });
+    expect(page.setPluginData).not.toHaveBeenCalled();
+    expect(root.setPluginData).not.toHaveBeenCalled();
+    expect(storage.size).toBe(0);
     const task = ChatTaskSchema.parse({
       version: 1,
       id: "task-vm-01",

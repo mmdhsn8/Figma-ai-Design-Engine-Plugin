@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { MAX_SECTION_BYTES } from "../src/shared/generation-limits";
 import {
   CompanionClientError,
+  type CompanionStatus,
   disconnectLocalSession,
   discoverAuthorizedModels,
   discoverAuthorizedModelCatalog,
@@ -15,10 +16,136 @@ import {
   restoreLocalSession,
   requestLocalPairing,
   runSmokeRequest,
+  reviewAuthorizedVisual,
   streamAuthorizedChat,
 } from "../src/ui/companion-client";
+import { ONE_PIXEL_PNG } from "./visual-fixtures";
+import { FW5_VISUAL_REVIEW_RUBRIC } from "../src/shared/fw5-provider-visual-review";
+import type { VisualReviewGrantV1, VisualReviewRequestV1 } from "../src/shared/fw5-visual-qa";
+import { createFW5VisualReviewAdapter } from "../src/ui/fw5-visual-review-adapter";
+import type { ChatTask } from "../src/shared/chat-task";
 
 describe("Figma UI companion client", () => {
+  it("builds a one-image scoped request and maps only typed, correlated provider issues", async () => {
+    const image = new Uint8Array(Buffer.from(ONE_PIXEL_PNG, "base64"));
+    const review: VisualReviewRequestV1 = {
+      version: 1,
+      requestId: "fw5_review_capture_01",
+      taskId: "task-fw5-review-001",
+      taskGeneration: "generation-task-fw5-review-001",
+      screenId: "screen-01",
+      documentId: "document-1",
+      pageId: "page-1",
+      rootId: "review-root-1",
+      programFingerprint: "dpv1-0123456789abcdef",
+      readbackRevision: "v1-01234567",
+      receiptId: "fw5-capture-receipt-01",
+      imageRevision: 1,
+      viewport: { width: 390, height: 844 },
+      scrollIntent: "none",
+      nodes: [{ nodeId: "review-root-1", type: "FRAME", bounds: { x: 0, y: 0, width: 390, height: 844 }, visible: true }],
+      program: { programId: "review-program", programRevision: 1, screenId: "screen-01", viewport: { width: 390, height: 844 }, language: "en", direction: "ltr", scrollIntent: "none", nodes: [] },
+      pngBytes: image,
+    };
+    const grant: VisualReviewGrantV1 = {
+      version: 1, authorized: true, recipient: "authorized-image-provider", authorizationId: "fw5_review_auth_01",
+      taskId: review.taskId, taskGeneration: review.taskGeneration, screenId: review.screenId, documentId: review.documentId,
+      pageId: review.pageId, rootId: review.rootId, programFingerprint: review.programFingerprint,
+      readbackRevision: review.readbackRevision, receiptId: review.receiptId, imageRevision: 1,
+      provider: "openai-responses", model: "account-model", sessionId: "0123456789abcdef", accountScope: "a".repeat(64), consentImageCount: 1,
+    };
+    let transport: Record<string, unknown> | undefined;
+    const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+      expect(input).toBe("http://localhost:1455/v1/visual-review");
+      transport = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return Response.json({
+        version: 1,
+        requestId: review.requestId,
+        model: "account-model",
+        capability: { status: "supported", provenance: "provider_result", model: "account-model" },
+        response: {
+          verdict: "findings", confidence: 0.91,
+          findings: [{ issueCode: "text_clipped", severity: "warning", confidence: 0.9,
+            imageLocation: { x: 0.1, y: 0.2, width: 0.3, height: 0.1 }, matchedNativeNodeId: "review-root-1",
+            nodePath: "frame", evidence: "Text appears clipped at the lower edge.", proposedAction: "none", recheckRequired: true }],
+        },
+      });
+    });
+    const result = await reviewAuthorizedVisual("paired-local-token", review, grant, fetcher);
+    expect(result).toMatchObject({ kind: "vision", verdict: "findings", taskId: review.taskId, rootId: review.rootId,
+      findings: [{ nodeId: "review-root-1", evidence: "Text appears clipped at the lower edge.", imageLocation: { x: 0.1 }, safeToAutoRepair: false }] });
+    expect(transport).toMatchObject({ provider: "openai-responses", consentImageCount: 1, contentType: "image/png", rubric: FW5_VISUAL_REVIEW_RUBRIC, byteLength: image.byteLength });
+    expect(transport?.pngBase64).toBe(ONE_PIXEL_PNG);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("requires affirmative one-image consent and revalidates task, model, session, and root around transport", async () => {
+    const image = new Uint8Array(Buffer.from(ONE_PIXEL_PNG, "base64"));
+    const request = {
+      version: 1 as const, requestId: "fw5_review_capture_01", taskId: "task-fw5-review-001", taskGeneration: "generation-task-fw5-review-001",
+      screenId: "screen-01" as const, documentId: "document-1", pageId: "page-1", rootId: "review-root-1",
+      programFingerprint: "dpv1-0123456789abcdef", readbackRevision: "v1-01234567", receiptId: "fw5-capture-receipt-01",
+      imageRevision: 1 as const, viewport: { width: 390, height: 844 }, scrollIntent: "none" as const,
+      nodes: [{ nodeId: "review-root-1", type: "FRAME" as const, bounds: { x: 0, y: 0, width: 390, height: 844 }, visible: true }],
+      program: { programId: "review-program", programRevision: 1, screenId: "screen-01" as const, viewport: { width: 390, height: 844 },
+        language: "en", direction: "ltr" as const, scrollIntent: "none" as const, nodes: [] },
+      pngBytes: image,
+    } satisfies VisualReviewRequestV1;
+    const identity = {
+      taskId: request.taskId, taskGeneration: request.taskGeneration, imageRevision: 1 as const, screenId: request.screenId,
+      documentId: request.documentId, pageId: request.pageId, rootId: request.rootId, programFingerprint: request.programFingerprint,
+      readbackRevision: request.readbackRevision, receiptId: request.receiptId,
+    };
+    const task = {
+      id: request.taskId, documentId: request.documentId,
+      universalScreens: [{ screenId: request.screenId, status: "rendered", rootRef: "review-root-ref", nativeRootNodeId: request.rootId,
+        nativePageId: request.pageId, fingerprint: request.programFingerprint }],
+    } as unknown as ChatTask;
+    const status = {
+      companion: "connected", auth: "ready", authLabel: "Ready", planUseAuthorized: true, modelCount: 1,
+      sessionId: "0123456789abcdef", accountScope: "a".repeat(64),
+    } satisfies CompanionStatus;
+    const prompts: string[] = [];
+    let inspections = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({
+      version: 1, requestId: request.requestId, model: "account-model",
+      capability: { status: "supported", provenance: "provider_result", model: "account-model" },
+      response: { verdict: "pass", confidence: 0.92, findings: [] },
+    }));
+    const adapter = createFW5VisualReviewAdapter({
+      enabled: true, mode: "review+bounded-repair", token: "paired-local-token", model: "account-model",
+      models: [{ slug: "account-model", displayName: "Account Model" }],
+      session: { sessionId: status.sessionId!, accountScope: status.accountScope! },
+      task, assertCurrent: vi.fn(), getStatus: async () => status,
+      inspectRoot: async () => {
+        inspections++;
+        return {
+          type: "task-native-inspection-result", success: true, taskId: request.taskId, nativePageId: request.pageId,
+          expectedRootStatus: "present", geometry: { receipt: request.readbackRevision },
+          nodes: [{ ref: "review-root-ref", id: request.rootId, parentId: undefined }],
+        } as unknown as Extract<import("../src/shared/messages").PluginToUIMessage, { type: "task-native-inspection-result" }>;
+      },
+      confirm: (message) => { prompts.push(message); return true; },
+      fetcher,
+    });
+    const grant = await adapter.authorize(identity);
+    expect(grant).toMatchObject({ provider: "openai-responses", model: "account-model", consentImageCount: 1, imageRevision: 1 });
+    expect(prompts[0]).toContain("capability for this account/model is unknown");
+    expect(prompts[0]).toContain("the initial screenshot");
+    const result = await adapter.reviewer!.review(request, grant!, new AbortController().signal);
+    expect(result).toMatchObject({ verdict: "pass", rootId: request.rootId });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(inspections).toBe(2);
+
+    const denied = createFW5VisualReviewAdapter({
+      enabled: true, mode: "review", token: "paired-local-token", model: "account-model", models: [{ slug: "account-model", displayName: "Account Model" }],
+      session: { sessionId: status.sessionId!, accountScope: status.accountScope! }, task, assertCurrent: vi.fn(), getStatus: async () => status,
+      inspectRoot: async () => { throw new Error("No transmission follows denied consent."); }, confirm: () => false, fetcher,
+    });
+    await expect(denied.authorize(identity)).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("discovers the local companion and starts approval without exposing a terminal code", async () => {
     const healthFetcher = vi.fn<typeof fetch>(async () => Response.json({ companion: "running" }));
     expect(await getCompanionHealth(healthFetcher)).toBe(true);

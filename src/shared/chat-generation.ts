@@ -779,6 +779,23 @@ export function greetingReply(prompt: string): string | undefined {
   return undefined;
 }
 
+export function requestedDesignContext(prompt: string, intent: "create" | "edit") {
+  if (!isExplicitCanvasRequest(prompt) || (intent === "create" && !isClearCreateRequest(prompt)) ||
+    (intent === "edit" && isClearCreateRequest(prompt))) return;
+  const selected = intent === "edit"
+    ? /\b(?:selection|selected (?:screens?|frames?|layers?|nodes?|subtree|components?|elements?))\b|انتخاب‌شده|انتخاب شده|محدودهٔ انتخاب/iu.test(prompt)
+    : /\b(?:use|reuse|read|inspect|match|using|based on|follow)\b[^.!?\r\n]{0,70}\b(?:selection|selected (?:screens?|frames?|layers?|nodes?|subtree|components?|elements?))\b|از\s+(?:سبک\s+|طراحی\s+|محدوده[ٔ‌ی ]+\s*)?(?:انتخاب|فریم انتخاب‌شده)[^.!؟\r\n]{0,100}(?:استفاده|پیروی|الگو)/iu.test(prompt);
+  const page = intent === "create" && /\b(?:use|reuse|read|inspect|match|using|based on|follow)\b[^.!?\r\n]{0,70}\b(?:current|this) page\b|از\s+(?:سبک\s+|طراحی\s+)?صفحه[ٔ‌ی ]+(?:فعلی|کنونی)[^.!؟\r\n]{0,100}(?:استفاده|پیروی|الگو)/iu.test(prompt);
+  if ((!selected && !page) ||
+    /\b(?:ignore|without|don't use|do not use)\s+(?:the\s+)?(?:selection|current page|selected)\b/iu.test(prompt)) return;
+  return {
+    scope: selected ? /\bselected subtree\b/iu.test(prompt) ? "selected-subtree" as const : "selection" as const : "page" as const,
+    reuse: intent === "create" && /\breuse\b|استفاده[ٔ‌ی ]+مجدد|بازاستفاده/iu.test(prompt) &&
+      !/\b(?:not|never|no|don't|without)\s+(?:\w+\s+){0,2}reuse\b|استفاده[ٔ‌ی ]+مجدد\s+نکن|بازاستفاده\s+نکن/iu.test(prompt),
+    catalog: !selected && page && /\b(?:include|read|use)\s+(?:the\s+)?(?:file-local|file local|file's local)\s+(?:design system|styles|variables|tokens)\b|منابع طراحی محلی فایل/iu.test(prompt),
+  };
+}
+
 export function parseChatGenerationIntent(prompt: string): ParsedChatGenerationIntent {
   const normalized = prompt.trim().toLocaleLowerCase();
   if (!isClearCreateRequest(normalized)) return { kind: "not_a_handoff" };

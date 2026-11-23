@@ -1,0 +1,18 @@
+{
+  "fixtureId": "FH",
+  "locale": "en-US",
+  "direction": "LTR",
+  "viewport": "1440x900",
+  "projectDomain": "ocean specimen archive",
+  "requestedScreenCount": 1,
+  "screenRoles": ["accession-overview"],
+  "assetPolicy": "Synthetic scientific content; use only authorized assets or clearly labeled placeholders.",
+  "brief": "Design one English LTR desktop screen (1440×900 viewport) for an ocean specimen archive: accession record overview with provenance timeline, conservation status, identification metadata and related loan records. Use coherent native components and realistic synthetic scientific content; no storefront, learning dashboard, or booking flow.",
+  "expected": {
+    "semanticCompleteness": true,
+    "aestheticHierarchy": true,
+    "styleConsistency": true,
+    "adaptability": true,
+    "domainSpecificComposerAdded": false
+  }
+}

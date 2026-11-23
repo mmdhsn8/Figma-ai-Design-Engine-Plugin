@@ -1,0 +1,1761 @@
+{
+  "schemaVersion": 1,
+  "runAt": "2026-11-22T08:25:47.260Z",
+  "featureGate": {
+    "variable": "VITE_FW4_GEOMETRY",
+    "enabledValue": "fw4-geometry-v1",
+    "default": "off"
+  },
+  "runtime": "LOCAL_FAKE_FIGMA_RUNTIME",
+  "variants": [
+    "gate_off",
+    "gate_on"
+  ],
+  "scenarios": [
+    {
+      "scenario": "F1",
+      "screenCount": 1,
+      "injectedFault": null,
+      "path": "gate_off",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 1,
+          "return": 1
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 1,
+        "nativeReadbackRequests": 1,
+        "nativeReadbackAcknowledgements": 1,
+        "geometryReadbacks": 3,
+        "geometryRepairs": 0,
+        "figmaApiFunctionCalls": {
+          "findAll": 44,
+          "listAvailableFontsAsync": 2,
+          "loadFontAsync": 4,
+          "getLocalPaintStylesAsync": 2,
+          "getLocalTextStylesAsync": 2,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 5,
+          "createText": 7,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 2
+        },
+        "figmaApiFunctionCallTotal": 80,
+        "nativeNodeMethodCalls": 1629,
+        "nativeMutationMethodCalls": 206,
+        "layoutPropertyWrites": 57,
+        "attachedNodes": 15,
+        "createdNodes": 15,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {},
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 1,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 4318,
+        "taskReadbackPayloadBytes": 319,
+        "taskReadbackPayloadBytesWithExpectations": 2841,
+        "localHarnessMs": 71.29459999999972,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F1",
+      "screenCount": 1,
+      "injectedFault": "mock-resets-previous-sibling-sizing-on-append",
+      "path": "gate_off",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 1,
+          "return": 1
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 1,
+        "nativeReadbackRequests": 1,
+        "nativeReadbackAcknowledgements": 1,
+        "geometryReadbacks": 3,
+        "geometryRepairs": 0,
+        "figmaApiFunctionCalls": {
+          "findAll": 44,
+          "listAvailableFontsAsync": 2,
+          "loadFontAsync": 4,
+          "getLocalPaintStylesAsync": 2,
+          "getLocalTextStylesAsync": 2,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 5,
+          "createText": 7,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 2
+        },
+        "figmaApiFunctionCallTotal": 80,
+        "nativeNodeMethodCalls": 1646,
+        "nativeMutationMethodCalls": 206,
+        "layoutPropertyWrites": 134,
+        "attachedNodes": 15,
+        "createdNodes": 15,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {
+          "native_layout_sizing_mismatch": 5
+        },
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 1,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 4318,
+        "taskReadbackPayloadBytes": 319,
+        "taskReadbackPayloadBytesWithExpectations": 2841,
+        "localHarnessMs": 22.41469999999981,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F3",
+      "screenCount": 3,
+      "injectedFault": null,
+      "path": "gate_off",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 3,
+          "return": 3
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 3,
+        "nativeReadbackRequests": 3,
+        "nativeReadbackAcknowledgements": 3,
+        "geometryReadbacks": 9,
+        "geometryRepairs": 0,
+        "figmaApiFunctionCalls": {
+          "findAll": 150,
+          "listAvailableFontsAsync": 6,
+          "loadFontAsync": 12,
+          "getLocalPaintStylesAsync": 6,
+          "getLocalTextStylesAsync": 6,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 15,
+          "createText": 36,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 6
+        },
+        "figmaApiFunctionCallTotal": 249,
+        "nativeNodeMethodCalls": 8865,
+        "nativeMutationMethodCalls": 717,
+        "layoutPropertyWrites": 219,
+        "attachedNodes": 54,
+        "createdNodes": 54,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:28"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:46"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {},
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 3,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 15801,
+        "taskReadbackPayloadBytes": 963,
+        "taskReadbackPayloadBytesWithExpectations": 10593,
+        "localHarnessMs": 55.52300000000014,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        },
+        {
+          "screenId": "screen-02",
+          "nodeId": "mock:28",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        },
+        {
+          "screenId": "screen-03",
+          "nodeId": "mock:46",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F3",
+      "screenCount": 3,
+      "injectedFault": "mock-resets-previous-sibling-sizing-on-append",
+      "path": "gate_off",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 3,
+          "return": 3
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 3,
+        "nativeReadbackRequests": 3,
+        "nativeReadbackAcknowledgements": 3,
+        "geometryReadbacks": 9,
+        "geometryRepairs": 0,
+        "figmaApiFunctionCalls": {
+          "findAll": 150,
+          "listAvailableFontsAsync": 6,
+          "loadFontAsync": 12,
+          "getLocalPaintStylesAsync": 6,
+          "getLocalTextStylesAsync": 6,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 15,
+          "createText": 36,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 6
+        },
+        "figmaApiFunctionCallTotal": 249,
+        "nativeNodeMethodCalls": 8961,
+        "nativeMutationMethodCalls": 717,
+        "layoutPropertyWrites": 567,
+        "attachedNodes": 54,
+        "createdNodes": 54,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:28"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:46"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {
+          "native_layout_sizing_mismatch": 27
+        },
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 3,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 15801,
+        "taskReadbackPayloadBytes": 963,
+        "taskReadbackPayloadBytesWithExpectations": 10593,
+        "localHarnessMs": 58.7186999999999,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        },
+        {
+          "screenId": "screen-02",
+          "nodeId": "mock:28",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        },
+        {
+          "screenId": "screen-03",
+          "nodeId": "mock:46",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F10",
+      "screenCount": 10,
+      "injectedFault": null,
+      "path": "gate_off",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 10,
+          "return": 10
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 10,
+        "nativeReadbackRequests": 10,
+        "nativeReadbackAcknowledgements": 10,
+        "geometryReadbacks": 30,
+        "geometryRepairs": 0,
+        "figmaApiFunctionCalls": {
+          "findAll": 440,
+          "listAvailableFontsAsync": 20,
+          "loadFontAsync": 40,
+          "getLocalPaintStylesAsync": 20,
+          "getLocalTextStylesAsync": 20,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 50,
+          "createText": 70,
+          "createRectangle": 30,
+          "getNodeByIdAsync": 20
+        },
+        "figmaApiFunctionCallTotal": 719,
+        "nativeNodeMethodCalls": 45585,
+        "nativeMutationMethodCalls": 1898,
+        "layoutPropertyWrites": 570,
+        "attachedNodes": 150,
+        "createdNodes": 150,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:25"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:40"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:55"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:70"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:85"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:100"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:115"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:130"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:145"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {},
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 10,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 43511,
+        "taskReadbackPayloadBytes": 3354,
+        "taskReadbackPayloadBytesWithExpectations": 32354,
+        "localHarnessMs": 144.9343999999992,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-02",
+          "nodeId": "mock:25",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-03",
+          "nodeId": "mock:40",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-04",
+          "nodeId": "mock:55",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-05",
+          "nodeId": "mock:70",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-06",
+          "nodeId": "mock:85",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-07",
+          "nodeId": "mock:100",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-08",
+          "nodeId": "mock:115",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-09",
+          "nodeId": "mock:130",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-10",
+          "nodeId": "mock:145",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F10",
+      "screenCount": 10,
+      "injectedFault": "mock-resets-previous-sibling-sizing-on-append",
+      "path": "gate_off",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 10,
+          "return": 10
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 10,
+        "nativeReadbackRequests": 10,
+        "nativeReadbackAcknowledgements": 10,
+        "geometryReadbacks": 30,
+        "geometryRepairs": 0,
+        "figmaApiFunctionCalls": {
+          "findAll": 440,
+          "listAvailableFontsAsync": 20,
+          "loadFontAsync": 40,
+          "getLocalPaintStylesAsync": 20,
+          "getLocalTextStylesAsync": 20,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 50,
+          "createText": 70,
+          "createRectangle": 30,
+          "getNodeByIdAsync": 20
+        },
+        "figmaApiFunctionCallTotal": 719,
+        "nativeNodeMethodCalls": 45755,
+        "nativeMutationMethodCalls": 1898,
+        "layoutPropertyWrites": 1340,
+        "attachedNodes": 150,
+        "createdNodes": 150,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:25"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:40"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:55"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:70"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:85"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:100"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:115"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:130"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:145"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {
+          "native_layout_sizing_mismatch": 50
+        },
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 10,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 43511,
+        "taskReadbackPayloadBytes": 3354,
+        "taskReadbackPayloadBytesWithExpectations": 32354,
+        "localHarnessMs": 144.93519999999944,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-02",
+          "nodeId": "mock:25",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-03",
+          "nodeId": "mock:40",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-04",
+          "nodeId": "mock:55",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-05",
+          "nodeId": "mock:70",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-06",
+          "nodeId": "mock:85",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-07",
+          "nodeId": "mock:100",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-08",
+          "nodeId": "mock:115",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-09",
+          "nodeId": "mock:130",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-10",
+          "nodeId": "mock:145",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F1",
+      "screenCount": 1,
+      "injectedFault": null,
+      "path": "gate_on",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 1,
+          "return": 1
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 1,
+        "nativeReadbackRequests": 1,
+        "nativeReadbackAcknowledgements": 1,
+        "geometryReadbacks": 3,
+        "geometryRepairs": 0,
+        "figmaApiFunctionCalls": {
+          "findAll": 44,
+          "listAvailableFontsAsync": 2,
+          "loadFontAsync": 4,
+          "getLocalPaintStylesAsync": 2,
+          "getLocalTextStylesAsync": 2,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 5,
+          "createText": 7,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 2
+        },
+        "figmaApiFunctionCallTotal": 80,
+        "nativeNodeMethodCalls": 1643,
+        "nativeMutationMethodCalls": 206,
+        "layoutPropertyWrites": 57,
+        "attachedNodes": 15,
+        "createdNodes": 15,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {},
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 1,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 4318,
+        "taskReadbackPayloadBytes": 2841,
+        "taskReadbackPayloadBytesWithExpectations": 2841,
+        "localHarnessMs": 56.70010000000002,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F1",
+      "screenCount": 1,
+      "injectedFault": "mock-resets-previous-sibling-sizing-on-append",
+      "path": "gate_on",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 1,
+          "return": 1
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 1,
+        "nativeReadbackRequests": 1,
+        "nativeReadbackAcknowledgements": 1,
+        "geometryReadbacks": 4,
+        "geometryRepairs": 5,
+        "figmaApiFunctionCalls": {
+          "findAll": 44,
+          "listAvailableFontsAsync": 2,
+          "loadFontAsync": 4,
+          "getLocalPaintStylesAsync": 2,
+          "getLocalTextStylesAsync": 2,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 5,
+          "createText": 7,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 2
+        },
+        "figmaApiFunctionCallTotal": 80,
+        "nativeNodeMethodCalls": 1763,
+        "nativeMutationMethodCalls": 206,
+        "layoutPropertyWrites": 140,
+        "attachedNodes": 15,
+        "createdNodes": 15,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {},
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 1,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 4318,
+        "taskReadbackPayloadBytes": 2841,
+        "taskReadbackPayloadBytesWithExpectations": 2841,
+        "localHarnessMs": 11.532900000000154,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F3",
+      "screenCount": 3,
+      "injectedFault": null,
+      "path": "gate_on",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 3,
+          "return": 3
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 3,
+        "nativeReadbackRequests": 3,
+        "nativeReadbackAcknowledgements": 3,
+        "geometryReadbacks": 9,
+        "geometryRepairs": 0,
+        "figmaApiFunctionCalls": {
+          "findAll": 150,
+          "listAvailableFontsAsync": 6,
+          "loadFontAsync": 12,
+          "getLocalPaintStylesAsync": 6,
+          "getLocalTextStylesAsync": 6,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 15,
+          "createText": 36,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 6
+        },
+        "figmaApiFunctionCallTotal": 249,
+        "nativeNodeMethodCalls": 8916,
+        "nativeMutationMethodCalls": 717,
+        "layoutPropertyWrites": 219,
+        "attachedNodes": 54,
+        "createdNodes": 54,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:28"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:46"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {},
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 3,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 15801,
+        "taskReadbackPayloadBytes": 10593,
+        "taskReadbackPayloadBytesWithExpectations": 10593,
+        "localHarnessMs": 70.27449999999953,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        },
+        {
+          "screenId": "screen-02",
+          "nodeId": "mock:28",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        },
+        {
+          "screenId": "screen-03",
+          "nodeId": "mock:46",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F3",
+      "screenCount": 3,
+      "injectedFault": "mock-resets-previous-sibling-sizing-on-append",
+      "path": "gate_on",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 3,
+          "return": 3
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 3,
+        "nativeReadbackRequests": 3,
+        "nativeReadbackAcknowledgements": 3,
+        "geometryReadbacks": 12,
+        "geometryRepairs": 27,
+        "figmaApiFunctionCalls": {
+          "findAll": 150,
+          "listAvailableFontsAsync": 6,
+          "loadFontAsync": 12,
+          "getLocalPaintStylesAsync": 6,
+          "getLocalTextStylesAsync": 6,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 15,
+          "createText": 36,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 6
+        },
+        "figmaApiFunctionCallTotal": 249,
+        "nativeNodeMethodCalls": 9402,
+        "nativeMutationMethodCalls": 717,
+        "layoutPropertyWrites": 597,
+        "attachedNodes": 54,
+        "createdNodes": 54,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:28"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:46"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {},
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 3,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 15801,
+        "taskReadbackPayloadBytes": 10593,
+        "taskReadbackPayloadBytesWithExpectations": 10593,
+        "localHarnessMs": 79.30599999999959,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        },
+        {
+          "screenId": "screen-02",
+          "nodeId": "mock:28",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        },
+        {
+          "screenId": "screen-03",
+          "nodeId": "mock:46",
+          "attachedNodes": 18,
+          "createdNodes": 18
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F10",
+      "screenCount": 10,
+      "injectedFault": null,
+      "path": "gate_on",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 10,
+          "return": 10
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 10,
+        "nativeReadbackRequests": 10,
+        "nativeReadbackAcknowledgements": 10,
+        "geometryReadbacks": 30,
+        "geometryRepairs": 0,
+        "figmaApiFunctionCalls": {
+          "findAll": 440,
+          "listAvailableFontsAsync": 20,
+          "loadFontAsync": 40,
+          "getLocalPaintStylesAsync": 20,
+          "getLocalTextStylesAsync": 20,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 50,
+          "createText": 70,
+          "createRectangle": 30,
+          "getNodeByIdAsync": 20
+        },
+        "figmaApiFunctionCallTotal": 719,
+        "nativeNodeMethodCalls": 45725,
+        "nativeMutationMethodCalls": 1898,
+        "layoutPropertyWrites": 570,
+        "attachedNodes": 150,
+        "createdNodes": 150,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:25"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:40"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:55"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:70"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:85"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:100"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:115"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:130"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:145"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {},
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 10,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 43511,
+        "taskReadbackPayloadBytes": 32354,
+        "taskReadbackPayloadBytesWithExpectations": 32354,
+        "localHarnessMs": 192.69150000000081,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-02",
+          "nodeId": "mock:25",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-03",
+          "nodeId": "mock:40",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-04",
+          "nodeId": "mock:55",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-05",
+          "nodeId": "mock:70",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-06",
+          "nodeId": "mock:85",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-07",
+          "nodeId": "mock:100",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-08",
+          "nodeId": "mock:115",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-09",
+          "nodeId": "mock:130",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-10",
+          "nodeId": "mock:145",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    },
+    {
+      "scenario": "F10",
+      "screenCount": 10,
+      "injectedFault": "mock-resets-previous-sibling-sizing-on-append",
+      "path": "gate_on",
+      "evidence": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "measurements": {
+        "uiToPluginDispatches": null,
+        "directProductionRendererInvocations": {
+          "request": 10,
+          "return": 10
+        },
+        "bridgeAcknowledgements": null,
+        "rendererReturnAcknowledgements": 10,
+        "nativeReadbackRequests": 10,
+        "nativeReadbackAcknowledgements": 10,
+        "geometryReadbacks": 40,
+        "geometryRepairs": 50,
+        "figmaApiFunctionCalls": {
+          "findAll": 440,
+          "listAvailableFontsAsync": 20,
+          "loadFontAsync": 40,
+          "getLocalPaintStylesAsync": 20,
+          "getLocalTextStylesAsync": 20,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 50,
+          "createText": 70,
+          "createRectangle": 30,
+          "getNodeByIdAsync": 20
+        },
+        "figmaApiFunctionCallTotal": 719,
+        "nativeNodeMethodCalls": 46925,
+        "nativeMutationMethodCalls": 1898,
+        "layoutPropertyWrites": 1400,
+        "attachedNodes": 150,
+        "createdNodes": 150,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:25"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:40"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:55"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:70"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:85"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:100"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:115"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:130"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:145"
+          }
+        ],
+        "findingsFromPostRunLayoutProbe": {},
+        "findingsFromTaskNativeReadback": {},
+        "errors": 0,
+        "skips": 0,
+        "rendererReplayAttempts": 10,
+        "rendererReplayStable": true,
+        "replayAddedNodes": 0,
+        "peakInFlightWrites": 1,
+        "renderPayloadBytes": 43511,
+        "taskReadbackPayloadBytes": 32354,
+        "taskReadbackPayloadBytesWithExpectations": 32354,
+        "localHarnessMs": 138.33770000000004,
+        "checkpoints": "The UI ChatTask checkpoint owner is not invoked by this plugin-side local harness."
+      },
+      "roots": [
+        {
+          "screenId": "screen-01",
+          "nodeId": "mock:10",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-02",
+          "nodeId": "mock:25",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-03",
+          "nodeId": "mock:40",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-04",
+          "nodeId": "mock:55",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-05",
+          "nodeId": "mock:70",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-06",
+          "nodeId": "mock:85",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-07",
+          "nodeId": "mock:100",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-08",
+          "nodeId": "mock:115",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-09",
+          "nodeId": "mock:130",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        },
+        {
+          "screenId": "screen-10",
+          "nodeId": "mock:145",
+          "attachedNodes": 15,
+          "createdNodes": 15
+        }
+      ],
+      "stageOrder": [
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack",
+        "program-loaded-from-synthetic-fixture",
+        "render-request",
+        "native-root-created-or-reused",
+        "renderer-readback",
+        "adoption-ack",
+        "task-native-readback-request",
+        "native-readback-ack"
+      ],
+      "limitations": [
+        "Direct calls to renderDesignProgramLocal are counted; actual UI bridge messages and bridge acknowledgements are not observed.",
+        "Figma API calls are observed through the repository fake runtime, not Figma Desktop.",
+        "The append-reflow fault is deterministic fault injection, not evidence that Desktop Figma exhibits this exact reset.",
+        "Elapsed time is local JavaScript harness time only; it is not Desktop rendering latency or user-perceived speed.",
+        "The post-run probe counts sizing findings only and does not replace full visual QA or screenshot inspection."
+      ]
+    }
+  ],
+  "evidenceNotes": [
+    "This is a deterministic local harness; no Figma Desktop file, provider, OAuth session, or model was used.",
+    "Renderer function invocations are counted. UI bridge messages and acknowledgements are not observed in this harness.",
+    "Figma API calls and node mutations are counted on the fake runtime. UI ChatTask checkpoint operations are not invoked.",
+    "Each scenario runs both without injection and with a mock that resets earlier sibling sizing after append. The latter is a fault test, not a claim about Desktop behavior.",
+    "Local JavaScript execution time is not Figma Desktop render latency or perceived speed."
+  ]
+}

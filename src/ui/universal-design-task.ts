@@ -2,7 +2,7 @@ import { DesignProgramV1Schema, parseDesignProgram, type DesignProgramV1 } from 
 import { compileDesignProgram } from "../shared/design-program-adapter";
 import { auditDesignProgramContrast, normalizeDesignProgramContrast } from "../shared/design-program-quality";
 import { ChatFunctionCallSchema, MAX_CHAT_PROVIDER_INPUT_BYTES, UNIVERSAL_CONTEXT_PREFIX, type ChatFunctionCall, type ChatLifecycleState, type ChatInputItem } from "../shared/chat-tools";
-import { isClearCreateRequest, isExplicitCanvasRequest, parseChatGenerationIntent } from "../shared/chat-generation";
+import { isClearCreateRequest, isExplicitCanvasRequest, parseChatGenerationIntent, requestedDesignContext } from "../shared/chat-generation";
 import { resolveBrandKitTokens } from "../shared/brand-kit";
 import { CHAT_TASK_MAX_BYTES, CHAT_TASK_MAX_VALIDATION_CORRECTIONS, ChatTaskSchema, type ChatTask } from "../shared/chat-task";
 import { utf8Bytes } from "../shared/generation-limits";
@@ -23,7 +23,30 @@ import {
   type UniversalScreenCheckpoint,
 } from "../shared/universal-design";
 import type { AuthorizedChatTurn } from "./companion-client";
-import type { DesignProgramRenderResponse } from "./design-program-bridge";
+import type { ContextResponse, DesignProgramRenderResponse } from "./design-program-bridge";
+import { CONTEXT_PRECEDENCE, plannerDesignContext, type ContextTicket } from "../shared/design-context";
+import { FW4_GEOMETRY_ENABLED, FW4_GEOMETRY_FEATURE, projectNativeLayoutExpectations } from "../shared/fw4-geometry";
+import { FW5_VISUAL_QA_ENABLED, FW5_VISUAL_REVIEW_MODE } from "../shared/fw5-visual-qa-feature";
+import {
+  FW5_VISUAL_CAPTURE_LIMITS,
+  runVisualReviewerV1,
+  VisualCaptureReceiptV1Schema,
+  VisualCaptureTransportV1Schema,
+  VisualQaOutcomeV1Schema,
+  VisualNativeRepairResultV1Schema,
+  pngDimensions,
+  visualContentDigest,
+  visualFindingId,
+  VisualRepairProposalV1Schema,
+  type VisualReviewGrantV1,
+  type VisualReviewRequestV1,
+  type VisualReviewResponseV1,
+  type VisualRepairProposalV1,
+  type VisualReviewerV1,
+  type VisualCaptureRequestV1,
+  type VisualCaptureReceiptV1,
+  type VisualQaOutcomeV1,
+} from "../shared/fw5-visual-qa";
 
 type NativeInspection = Extract<PluginToUIMessage, { type: "task-native-inspection-result" }>;
 
@@ -32,8 +55,13 @@ export type UniversalDesignDependencies = {
   save(task: ChatTask): Promise<void>;
   progress(message: string): void;
   assertAuthorized(): Promise<void>;
-  renderProgram(program: DesignProgramV1, requestId: string, expectedRootNodeId?: string): Promise<DesignProgramRenderResponse>;
+  renderProgram(program: DesignProgramV1, requestId: string, expectedRootNodeId?: string, contextTicket?: ContextTicket): Promise<DesignProgramRenderResponse>;
+  readContext?(): Promise<ContextResponse | undefined>;
   inspectProgram(request: Extract<UIToPluginMessage, { type: "task-native-inspect" }>): Promise<NativeInspection>;
+  captureVisual?(request: Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>, signal: AbortSignal): Promise<Extract<PluginToUIMessage, { type: "task-native-visual-capture-result" }>>;
+  repairVisual?(request: Extract<UIToPluginMessage, { type: "task-native-visual-repair" }>, signal: AbortSignal): Promise<Extract<PluginToUIMessage, { type: "task-native-visual-repair-result" }>>;
+  visualReviewer?: VisualReviewerV1;
+  authorizeVisualReview?(identity: Omit<VisualReviewGrantV1, "version" | "authorized" | "authorizationId" | "recipient">): Promise<unknown | undefined>;
   signal: AbortSignal;
   now?: () => number;
   monotonicNow?: () => number;
@@ -215,7 +243,7 @@ function finalizePlan(plan: ProjectPlanV1, task: ChatTask): { plan: ProjectPlanV
   return { plan: pinnedPlan, fingerprint: projectPlanFingerprint(pinnedPlan) };
 }
 
-function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", screen?: UniversalScreenCheckpoint, validationFeedback?: string): ChatInputItem[] {
+function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", screen?: UniversalScreenCheckpoint, validationFeedback?: string, local?: ReturnType<typeof plannerDesignContext>): ChatInputItem[] {
   const plan = task.projectPlan;
   const screenPlan = screen && plan?.screens.find(({ screenId }) => screenId === screen.screenId);
   if (purpose !== "plan" && (!plan || !screen || !screenPlan))
@@ -251,14 +279,25 @@ function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", sc
     instructions: routeInstruction,
     ...((validationFeedback ?? task.validationFeedback) ? { priorValidation: (validationFeedback ?? task.validationFeedback)!.slice(0, 3_000) } : {}),
   };
+  const history = inputHistory(task);
   const input: ChatInputItem[] = [
-    ...inputHistory(task),
+    ...history,
     { role: "user", content: UNIVERSAL_CONTEXT_PREFIX[purpose] + JSON.stringify(payload) },
   ];
   const bytes = utf8Bytes(JSON.stringify(input));
   if (bytes > MAX_CHAT_PROVIDER_INPUT_BYTES)
     fail("request_too_large", `The bounded ${purpose} request is ${bytes} bytes; its limit is ${MAX_CHAT_PROVIDER_INPUT_BYTES}. Trim prior chat context or pinned guidance and retry.`);
-  return input;
+  if (!local || purpose === "repair") return input;
+  const grounded: ChatInputItem[] = [...history, {
+    role: "user",
+    content: UNIVERSAL_CONTEXT_PREFIX[purpose] + JSON.stringify({
+      ...payload,
+      context: { ...context, readScope: "Only the explicitly approved Figma scope was sampled, read-only." },
+      localDesignContext: local,
+      contextPolicy: CONTEXT_PRECEDENCE + " Only exact compatible decorative shapes and single solid-color links may be reused natively. Never change a planned color, text or geometry merely to force reuse.",
+    }),
+  }];
+  return utf8Bytes(JSON.stringify(grounded)) <= MAX_CHAT_PROVIDER_INPUT_BYTES ? grounded : input;
 }
 
 function stageCandidates(plan: ProjectPlanV1) {
@@ -345,6 +384,15 @@ function safeErrorCode(error: unknown): string {
         : undefined
     : undefined;
   return candidate && /^[A-Za-z0-9_.:-]{1,100}$/u.test(candidate) ? candidate : "provider_or_host_error";
+}
+
+function visualReviewFailureStatus(reason: string | undefined): VisualQaOutcomeV1["visualReview"] {
+  if (reason === "VISUAL_REVIEW_CONSENT_REQUIRED") return "VISUAL_REVIEW_CONSENT_REQUIRED";
+  if (reason === "visual_review_unsupported_capability") return "VISUAL_REVIEW_UNSUPPORTED";
+  if (reason === "visual_review_authorization_required" || reason === "visual_review_model_unavailable") return "VISUAL_REVIEW_AUTHORIZATION_REQUIRED";
+  if (reason === "visual_review_timed_out") return "VISUAL_REVIEW_INCONCLUSIVE";
+  if (reason === "visual_review_temporarily_unavailable") return "VISUAL_REVIEW_TEMPORARILY_UNAVAILABLE";
+  return "VISUAL_REVIEW_UNAVAILABLE";
 }
 
 function cancellationOrigin(error: unknown, signal: AbortSignal) {
@@ -566,10 +614,179 @@ function nativeSubtree(nodes: NonNullable<NativeInspection["nodes"]>, rootId: st
   return [...ids].map((id) => byId.get(id)).filter((node): node is NonNullable<typeof node> => Boolean(node));
 }
 
+function createVisualReviewRequest(input: {
+  task: ChatTask;
+  screen: UniversalScreenCheckpoint;
+  screenPlan: ProjectPlanV1["screens"][number];
+  inspection: NativeInspection;
+  receipt: VisualCaptureReceiptV1;
+  pngBytes: Uint8Array<ArrayBuffer>;
+  attempt: 1 | 2;
+}): VisualReviewRequestV1 {
+  const { task, screen, screenPlan, inspection, receipt, pngBytes, attempt } = input;
+  const program = screen.program;
+  const plannedScreen = program?.screens.find(({ id }) => id === screen.screenId);
+  if (!program || !plannedScreen || !inspection.nodes || !screen.nativeRootNodeId)
+    throw new Error("review_context_missing");
+  const native = nativeSubtree(inspection.nodes, screen.nativeRootNodeId);
+  if (native.length > 80) throw new Error("review_native_context_limit");
+  const nativeById = new Map(native.map((node) => [node.id, node]));
+  const root = nativeById.get(screen.nativeRootNodeId);
+  if (!root) throw new Error("review_root_missing");
+  const nativeBounds = (node: NonNullable<NativeInspection["nodes"]>[number]) => {
+    let x = 0;
+    let y = 0;
+    let current: typeof node | undefined = node;
+    const visited = new Set<string>();
+    while (current && current.id !== root.id && visited.size < 16 && !visited.has(current.id)) {
+      visited.add(current.id);
+      x += current.x;
+      y += current.y;
+      current = current.parentId ? nativeById.get(current.parentId) : undefined;
+    }
+    if (node.id !== root.id && current?.id !== root.id) throw new Error("review_native_parent_chain_invalid");
+    return { x, y, width: node.width, height: node.height };
+  };
+  const programNodes: Array<{
+    nodeId: string;
+    parentNodeId?: string;
+    type: "container" | "text" | "rectangle" | "ellipse" | "vector" | "instance" | "image";
+    semanticRole: string;
+    width: { mode: "FIXED" | "HUG" | "FILL"; value: number };
+    height: { mode: "FIXED" | "HUG" | "FILL"; value: number };
+    textLength?: number;
+    fontSize?: number;
+  }> = [];
+  const visit = (node: typeof plannedScreen.root, parentNodeId?: string) => {
+    programNodes.push({
+      nodeId: node.id,
+      ...(parentNodeId ? { parentNodeId } : {}),
+      type: node.type,
+      semanticRole: node.semanticRole,
+      width: { mode: node.width.mode.toUpperCase() as "FIXED" | "HUG" | "FILL", value: node.width.value },
+      height: { mode: node.height.mode.toUpperCase() as "FIXED" | "HUG" | "FILL", value: node.height.value },
+      ...(node.type === "text" ? { textLength: node.text.length, fontSize: node.fontSize } : {}),
+    });
+    if (node.type === "container") node.children.forEach((child) => visit(child, node.id));
+  };
+  visit(plannedScreen.root);
+  if (programNodes.length > 80) throw new Error("review_program_context_limit");
+  return {
+    version: 1,
+    requestId: `${receipt.receiptId.slice(4)}_review`,
+    taskId: task.id,
+    taskGeneration: task.generationLink?.generationId ?? `generation-${task.universalManifest?.fingerprint ?? task.id}`,
+    screenId: screen.screenId as VisualReviewRequestV1["screenId"],
+    documentId: task.documentId,
+    pageId: receipt.pageId,
+    rootId: receipt.rootId,
+    programFingerprint: receipt.programFingerprint,
+    readbackRevision: receipt.readbackRevision,
+    receiptId: receipt.receiptId,
+    imageRevision: attempt,
+    viewport: { width: screenPlan.viewport.width, height: screenPlan.viewport.height },
+    scrollIntent: plannedScreen.scroll,
+    nodes: native.map((node) => ({
+      nodeId: node.id,
+      ...(node.parentId ? { parentId: node.parentId } : {}),
+      ...(node.logicalRef ? { logicalRef: node.logicalRef } : {}),
+      ...(node.semanticRole ? { semanticRole: node.semanticRole } : {}),
+      type: node.type as "FRAME" | "TEXT" | "RECTANGLE" | "ELLIPSE" | "VECTOR" | "COMPONENT" | "INSTANCE",
+      bounds: nativeBounds(node),
+      visible: node.visible,
+      ...(node.clipsContent !== undefined ? { clipsContent: node.clipsContent } : {}),
+      ...(node.overflowDirection ? { overflowDirection: node.overflowDirection } : {}),
+      ...(node.textLength !== undefined ? { textLength: node.textLength } : {}),
+      ...(node.fontFamily ? { fontFamily: node.fontFamily } : {}),
+      ...(node.fontSize !== undefined ? { fontSize: node.fontSize } : {}),
+      ...(node.layoutSizingHorizontal ? { layoutSizingHorizontal: node.layoutSizingHorizontal } : {}),
+      ...(node.layoutSizingVertical ? { layoutSizingVertical: node.layoutSizingVertical } : {}),
+      ...(node.textAutoResize ? { textAutoResize: node.textAutoResize } : {}),
+    })),
+    program: {
+      programId: program.id,
+      programRevision: program.revision,
+      screenId: screen.screenId as VisualReviewRequestV1["screenId"],
+      viewport: { width: screenPlan.viewport.width, height: screenPlan.viewport.height },
+      language: program.locale.language,
+      direction: program.locale.direction,
+      scrollIntent: plannedScreen.scroll,
+      nodes: programNodes,
+    },
+    pngBytes,
+  };
+}
+
+async function captureVisualAttempt(input: {
+  deps: UniversalDesignDependencies;
+  task: ChatTask;
+  screen: UniversalScreenCheckpoint;
+  pageId: string;
+  readbackRevision: string;
+  attempt: 1 | 2;
+  previousReceiptId?: string;
+}): Promise<{ receipt: VisualCaptureReceiptV1; pngBytes?: Uint8Array<ArrayBuffer>; exportMs: number; failureReason?: string }> {
+  const { deps, task, screen, pageId, readbackRevision, attempt, previousReceiptId } = input;
+  const requestId = `${task.id}_fw5_${screen.screenId}_${screen.renderAttempts ?? 1}_a${attempt}`;
+  const request: VisualCaptureRequestV1 = {
+    version: 1, taskId: task.id, screenId: screen.screenId as VisualCaptureRequestV1["screenId"],
+    authorizedDocumentScope: { documentId: task.documentId, pageId, rootId: screen.nativeRootNodeId! },
+    pageId, rootId: screen.nativeRootNodeId!, programFingerprint: screen.fingerprint!, readbackRevision,
+    captureAttempt: attempt, ...(previousReceiptId ? { previousReceiptId } : {}),
+    maxPixelWidth: FW5_VISUAL_CAPTURE_LIMITS.maxPixelWidth,
+    maxPixelHeight: FW5_VISUAL_CAPTURE_LIMITS.maxPixelHeight,
+    maxBytes: FW5_VISUAL_CAPTURE_LIMITS.maxBytes,
+    deadlineAtMs: Date.now() + FW5_VISUAL_CAPTURE_LIMITS.timeoutMs,
+    captureNonce: requestId,
+  };
+  const makeFailure = (status: "CAPTURE_FAILED" | "UNVERIFIED", diagnostic: VisualCaptureReceiptV1["diagnostic"]) => VisualCaptureReceiptV1Schema.parse({
+    version: 1, status, receiptId: `fw5-${requestId}`, taskId: task.id,
+    screenId: screen.screenId, documentId: task.documentId, pageId, rootId: screen.nativeRootNodeId!,
+    programFingerprint: screen.fingerprint!, readbackRevision, mime: "image/png", width: 0, height: 0,
+    byteLength: 0, capturedAtMs: Date.now(), exportScale: 1, captureAttempt: attempt,
+    ...(previousReceiptId ? { previousReceiptId } : {}), diagnostic,
+  });
+  const startedAt = performance.now();
+  try {
+    if (!deps.captureVisual) throw Object.assign(new Error("Visual capture bridge is unavailable."), { code: "visual_capture_transport_unavailable" });
+    const response = await deps.captureVisual({
+      type: "task-native-visual-capture", requestId, rootRef: screen.rootRef!, visualCapture: request,
+      ...(FW4_GEOMETRY_ENABLED ? { expectedLayout: projectNativeLayoutExpectations(screen.program!, screen.screenId) } : {}),
+    }, deps.signal);
+    if (deps.signal.aborted) throw Object.assign(new Error("Visual capture cancelled."), { code: "visual_capture_cancelled" });
+    const exportMs = response.exportDurationMs ?? Math.max(0, Math.round(performance.now() - startedAt));
+    const rawReceipt = response.success ? response.visualCapture?.receipt : response.receipt;
+    const identityMatches = response.requestId === requestId && response.taskId === task.id && rawReceipt?.taskId === task.id &&
+      rawReceipt.screenId === screen.screenId && rawReceipt.documentId === task.documentId && rawReceipt.pageId === pageId &&
+      rawReceipt.rootId === screen.nativeRootNodeId && rawReceipt.programFingerprint === screen.fingerprint &&
+      rawReceipt.readbackRevision === readbackRevision && rawReceipt.captureAttempt === attempt &&
+      rawReceipt.previousReceiptId === previousReceiptId;
+    if (!identityMatches) return { receipt: makeFailure("UNVERIFIED", "identity_mismatch"), exportMs, failureReason: "visual_capture_receipt_identity_mismatch" };
+    if (!response.success) {
+      const receipt = VisualCaptureReceiptV1Schema.safeParse(response.receipt);
+      return { receipt: receipt.success ? receipt.data : makeFailure("CAPTURE_FAILED", "capture_transport_unavailable"), exportMs,
+        failureReason: receipt.success ? receipt.data.diagnostic : "visual_capture_receipt_invalid" };
+    }
+    const transport = VisualCaptureTransportV1Schema.safeParse(response.visualCapture);
+    const dimensions = transport.success ? pngDimensions(transport.data.pngBytes) : undefined;
+    if (!transport.success || !dimensions || dimensions.width !== rawReceipt!.width || dimensions.height !== rawReceipt!.height ||
+        transport.data.pngBytes.byteLength !== rawReceipt!.byteLength || rawReceipt!.status !== "CAPTURED")
+      return { receipt: makeFailure("CAPTURE_FAILED", "capture_transport_unavailable"), exportMs, failureReason: "visual_capture_transport_invalid" };
+    const receipt = VisualCaptureReceiptV1Schema.parse({ ...rawReceipt, contentDigest: visualContentDigest(transport.data.pngBytes) });
+    return { receipt, pngBytes: transport.data.pngBytes, exportMs };
+  } catch (error) {
+    if (deps.signal.aborted) throw error;
+    const exportMs = Math.max(0, Math.round(performance.now() - startedAt));
+    const failureReason = safeErrorCode(error);
+    return { receipt: makeFailure("CAPTURE_FAILED", failureReason.includes("timeout") ? "capture_deadline_exceeded" : "capture_transport_unavailable"), exportMs, failureReason };
+  }
+}
+
 function verifyNativeReadback(
   response: NativeInspection,
   screen: UniversalScreenCheckpoint,
   plan: ProjectPlanV1,
+  allowOneSizingMismatch = false,
 ): { nodeCount: number; findings: string[] } {
   if (response.expectedRootStatus === "removed")
     fail("native_root_removed", "Figma reported that the acknowledged native root was removed.");
@@ -599,7 +816,12 @@ function verifyNativeReadback(
     fail("native_node_count_mismatch", "Native readback did not match the exact adopted subtree node count.");
   if (!response.geometry || response.geometry.coverage !== "complete" || response.geometry.measuredNodes !== subtree.length)
     fail("native_geometry_incomplete", "Figma could not measure the full task-owned screen geometry.");
-  if (response.geometry.findings.length)
+  const oneSizingMismatch = response.geometry.findings.length === 1 &&
+    response.geometry.findings[0]?.code === "native_layout_sizing_mismatch" &&
+    Boolean(response.geometry.findings[0]?.nodeId && response.geometry.findings[0]?.parentId &&
+      response.geometry.findings[0]?.logicalRef && response.geometry.findings[0]?.expectedLayout &&
+      response.geometry.findings[0]?.observedLayout);
+  if (response.geometry.findings.length && !(allowOneSizingMismatch && oneSizingMismatch))
     fail("native_geometry_failed", "Figma detected a layout or ownership discrepancy. The saved screen remains unverified.");
   const allowedTypes = new Set(["FRAME", "TEXT", "RECTANGLE", "ELLIPSE", "VECTOR", "COMPONENT", "INSTANCE"]);
   if (subtree.some((node) => !allowedTypes.has(node.type)))
@@ -610,11 +832,77 @@ function verifyNativeReadback(
   return { nodeCount: subtree.length, findings: warnings };
 }
 
+function buildVisualQaOutcome(input: {
+  taskId: string;
+  screenId: string;
+  fingerprint: string;
+  rootId: string;
+  pageId: string;
+  readbackRevision?: string;
+  nativeGeometry: VisualQaOutcomeV1["nativeGeometry"];
+  designProgramConsistency: VisualQaOutcomeV1["designProgramConsistency"];
+  captureReceipt?: VisualCaptureReceiptV1;
+  nativeFindingCodes?: string[];
+  failureReason?: string;
+  exportMs?: number;
+  nativeReadbackMs?: number;
+}): VisualQaOutcomeV1 {
+  const findings = (input.nativeFindingCodes ?? []).slice(0, 12).map((code) => ({
+    findingId: visualFindingId("native_geometry_finding", input.rootId, code),
+    taskId: input.taskId,
+    screenId: input.screenId as VisualReviewRequestV1["screenId"],
+    issueCode: "native_geometry_finding" as const,
+    source: "native-rule" as const,
+    evidenceSource: "native-readback" as const,
+    severity: "error" as const,
+    evidenceRef: `native-readback:${code}`,
+    nodeId: input.rootId,
+    uncertain: false,
+    safeToAutoRepair: false,
+    suggestedRepairCategory: "none" as const,
+  }));
+  const receipt = input.captureReceipt;
+  const captureStatus = receipt?.status ?? "UNVERIFIED";
+  const status: VisualQaOutcomeV1["status"] = findings.length
+    ? "FINDINGS"
+    : captureStatus === "CAPTURE_FAILED" ? "CAPTURE_FAILED" : captureStatus === "CAPTURED" ? "REVIEW_UNAVAILABLE" : "UNVERIFIED";
+  const repairReason = FW5_VISUAL_REVIEW_MODE === "capture-only" ? "capture_only_policy" : "reviewer_unavailable";
+  return VisualQaOutcomeV1Schema.parse({
+    version: 1,
+    status,
+    taskId: input.taskId,
+    screenId: input.screenId,
+    programFingerprint: input.fingerprint,
+    rootId: input.rootId,
+    pageId: input.pageId,
+    ...(input.readbackRevision ? { readbackRevision: input.readbackRevision } : {}),
+    nativeGeometry: input.nativeGeometry,
+    designProgramConsistency: input.designProgramConsistency,
+    visualCapture: receipt?.status === "CAPTURED" ? "CAPTURED" : receipt?.status === "CAPTURE_FAILED" ? "CAPTURE_FAILED" : "UNVERIFIED",
+    visualReview: "VISUAL_REVIEW_UNAVAILABLE",
+    reviewMode: FW5_VISUAL_REVIEW_MODE,
+    ...(receipt ? { afterReceiptId: receipt.receiptId, captureReceipt: receipt } : {}),
+    findingCounts: { nativeRule: findings.length, pixelReview: 0, human: 0 },
+    repair: { status: "REPAIR_BLOCKED", attempts: 0, reason: repairReason },
+    findings,
+    diagnostics: {
+      ...(receipt?.byteLength ? { payloadBytes: receipt.byteLength } : {}),
+      ...(input.exportMs !== undefined ? { exportMs: Math.round(input.exportMs) } : {}),
+      ...(input.nativeReadbackMs !== undefined ? { nativeReadbackMs: Math.round(input.nativeReadbackMs) } : {}),
+      reviewerCalls: 0,
+      repairAttempts: 0,
+      repairMethods: [],
+      ...(input.failureReason ? { failureReason: input.failureReason.slice(0, 100) } : {}),
+    },
+  });
+}
+
 export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesignDependencies): Promise<void> {
   const now = deps.now ?? Date.now;
   const monotonicNow = deps.monotonicNow ?? (() => performance.now());
   const runStartedAt = monotonicNow();
   const screenRunStartedAt = new Map<string, number>();
+  const freshVisualCaptureScreens = new Set<string>();
   let saveQueue = Promise.resolve();
   let saveFailure: { error: unknown } | undefined;
   let taskStateQueue = Promise.resolve();
@@ -686,6 +974,20 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
   if (!isExplicitCanvasRequest(task.prompt) || !isClearCreateRequest(task.prompt))
     fail("canvas_intent_not_authorized", "The original message does not request an editable Canvas design.");
   if (!task.model) fail("model_not_pinned", "The Chat task has no pinned account-visible model.");
+  let localContext: ReturnType<typeof plannerDesignContext>;
+  let contextTicket: ContextTicket | undefined;
+  const approval = requestedDesignContext(task.prompt, "create");
+  if (approval && deps.readContext && !task.projectPlan && !task.pending.length) {
+    check();
+    await deps.assertAuthorized();
+    check();
+    const result = await deps.readContext();
+    check();
+    if (result?.success) {
+      localContext = plannerDesignContext(result.snapshot);
+      if (localContext && approval.reuse) contextTicket = { requestId: result.requestId, digest: result.snapshot.digest };
+    } else if (result) deps.progress(`Scoped design context unavailable (${result.code}); continuing without it.`);
+  }
   const importingIntentTiming = !task.universalMetrics;
   if (importingIntentTiming) {
     const intentRounds = task.modelRoundTrace.filter((round) => round.lifecycle === "UNIVERSAL_CLASSIFY");
@@ -745,7 +1047,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       check();
       await deps.assertAuthorized();
       transition(lifecycle);
-      const input = requestInput(task, purpose, screen);
+      const input = requestInput(task, purpose, screen, undefined, localContext);
       const inputBytes = utf8Bytes(JSON.stringify(input));
       if (task.rounds >= 100) fail("model_round_limit", "The existing 100-round Chat task limit was reached before the route completed.");
       if ((purpose === "plan" && metrics.planRequests >= 3) ||
@@ -878,7 +1180,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
           fail("screen_repair_request_limit", `The bounded repair request limit for ${screen.screenId} is exhausted.`);
         const attempt = purpose === "compose" ? screen.composeAttempts + 1 : screen.repairDispatches + 1;
         const requestId = `${task.id}_p6_${screen.screenId}_${purpose === "compose" ? "c" : "r"}${attempt}`;
-        const input = requestInput(task, purpose, screen, screen.schemaFeedback);
+        const input = requestInput(task, purpose, screen, screen.schemaFeedback, localContext);
         const inputBytes = utf8Bytes(JSON.stringify(input));
         if (inputBytes > MAX_CHAT_PROVIDER_INPUT_BYTES)
           fail("request_too_large", `The bounded ${purpose} request for ${screen.screenId} exceeds its ${MAX_CHAT_PROVIDER_INPUT_BYTES}-byte input limit.`);
@@ -1502,7 +1804,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       const renderStarted = monotonicNow();
       let response: DesignProgramRenderResponse;
       try {
-        response = await deps.renderProgram(screen.program, renderRequestId, screen.nativeRootNodeId);
+        response = await deps.renderProgram(screen.program, renderRequestId, screen.nativeRootNodeId, contextTicket);
       } catch (error) {
         const durationMs = Math.max(0, Math.round(monotonicNow() - renderStarted));
         screen.errorCode = safeErrorCode(error);
@@ -1544,6 +1846,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       screen.adoptionOperationIds = response.adoptionOperationIds;
       screen.nativeNodeCount = response.nativeNodeCount;
       screen.geometryVersion = response.geometryVersion;
+      if (FW5_VISUAL_QA_ENABLED && response.visualCaptureEligible === true)
+        freshVisualCaptureScreens.add(screen.screenId);
       if (response.geometryDurationMs !== undefined)
         task.universalMetrics!.nativeGeometryMs = (task.universalMetrics!.nativeGeometryMs ?? 0) + response.geometryDurationMs;
       if (response.geometryRepairs !== undefined)
@@ -1561,12 +1865,20 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       deps.onPhase?.("verification");
       transition("UNIVERSAL_COMPOSING");
       if (!screen.rootRef || !screen.fingerprint) fail("native_root_missing", "The rendered screen checkpoint has no verified root reference or fingerprint.");
+      if (FW4_GEOMETRY_ENABLED && !screen.program)
+        fail("fw4_layout_expectation_missing", "The saved screen program is unavailable for FW-4 native sizing readback.");
+      const expectedLayout = FW4_GEOMETRY_ENABLED
+        ? projectNativeLayoutExpectations(screen.program!, screen.screenId)
+        : undefined;
+      if (FW4_GEOMETRY_ENABLED && !expectedLayout?.length)
+        fail("fw4_layout_expectation_missing", "The saved screen has no bounded layout expectations for FW-4 native readback.");
       deps.progress(`Universal design route v1 · reading back task-owned native screen ${stageIndex + 1}/${plan.screenCount}: ${screenPlan.name}…`);
       await deps.assertAuthorized();
       check();
       const inspectRequestId = `${task.id}_inspect_${screen.screenId}_${Math.random().toString(36).slice(2, 10)}`;
       const readbackStartedAt = monotonicNow();
-      recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "request_started", outcome: "started", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId });
+      recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "request_started", outcome: "started", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId,
+        ...(expectedLayout ? { code: FW4_GEOMETRY_FEATURE, nodeCount: expectedLayout.length } : {}) });
       let inspection: NativeInspection;
       try {
         inspection = await deps.inspectProgram({
@@ -1575,7 +1887,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         taskId: task.id,
         documentId: task.documentId,
         refs: [screen.rootRef],
-        geometry: { programFingerprint: screen.fingerprint, requireReceipt: screen.geometryVersion === 1, expectedRootNodeId: screen.nativeRootNodeId },
+        geometry: { programFingerprint: screen.fingerprint, requireReceipt: screen.geometryVersion === 1,
+          expectedRootNodeId: screen.nativeRootNodeId, ...(expectedLayout ? { expectedLayout } : {}) },
         });
       } catch (error) {
         const durationMs = Math.max(0, Math.round(monotonicNow() - readbackStartedAt));
@@ -1589,7 +1902,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       const readbackDurationMs = Math.max(0, Math.round(monotonicNow() - readbackStartedAt));
       task.universalMetrics!.readbackRoundTripMs += readbackDurationMs;
       const readbackFindingCodes = inspection.geometry?.findings.map(({ code }) => code).slice(0, 8) ?? [];
-      recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "readback_completed", outcome: inspection.geometry?.coverage === "complete" ? "completed" : "failed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs: readbackDurationMs, nodeCount: inspection.geometry?.measuredNodes, qaFindingCodes: readbackFindingCodes, qaCoverage: inspection.geometry?.coverage === "complete" ? "complete" : "incomplete" });
+      recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "readback_completed", outcome: inspection.geometry?.coverage === "complete" ? "completed" : "failed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs: readbackDurationMs, nodeCount: inspection.geometry?.measuredNodes, qaFindingCodes: readbackFindingCodes, qaCoverage: inspection.geometry?.coverage === "complete" ? "complete" : "incomplete",
+        ...(expectedLayout ? { code: FW4_GEOMETRY_FEATURE } : {}) });
       if (inspection.geometry) {
         task.universalMetrics!.nativeReadbackMs = (task.universalMetrics!.nativeReadbackMs ?? 0) + inspection.geometry.durationMs;
         if (inspection.geometry.findings.length) {
@@ -1600,16 +1914,371 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         }
       }
       let verified: ReturnType<typeof verifyNativeReadback>;
+      const pendingSizingMismatch = FW5_VISUAL_QA_ENABLED && FW5_VISUAL_REVIEW_MODE === "review+bounded-repair" && FW4_GEOMETRY_ENABLED &&
+        inspection.geometry?.coverage === "complete" && inspection.geometry.findings.length === 1 &&
+        inspection.geometry.findings[0]?.code === "native_layout_sizing_mismatch" &&
+        Boolean(inspection.geometry.findings[0]?.nodeId && inspection.geometry.findings[0]?.parentId &&
+          inspection.geometry.findings[0]?.logicalRef && inspection.geometry.findings[0]?.expectedLayout &&
+          inspection.geometry.findings[0]?.observedLayout)
+        ? inspection.geometry.findings[0]
+        : undefined;
       try {
-        verified = verifyNativeReadback(inspection, screen, plan);
+        verified = verifyNativeReadback(inspection, screen, plan, Boolean(pendingSizingMismatch));
       } catch (error) {
         screen.errorCode = safeErrorCode(error).replace(/[^a-z0-9_]/giu, "_").toLocaleLowerCase().slice(0, 80);
+        if (FW5_VISUAL_QA_ENABLED && inspection.nativePageId && screen.nativeRootNodeId && screen.fingerprint) {
+          const findingCodes = [...new Set([
+            ...readbackFindingCodes,
+            ...(inspection.unresolvedRefs ?? []).map(({ status }) => `native_ref_${status}`),
+            ...(inspection.geometry?.coverage === "incomplete" ? ["native_geometry_incomplete"] : []),
+            ...(screen.findings ?? []).map(({ code }) => code),
+          ])].slice(0, 12);
+          screen.nativePageId = inspection.nativePageId;
+          screen.visualQa = buildVisualQaOutcome({
+            taskId: task.id, screenId: screen.screenId, fingerprint: screen.fingerprint,
+            rootId: screen.nativeRootNodeId, pageId: inspection.nativePageId,
+            readbackRevision: inspection.geometry?.receipt,
+            nativeGeometry: inspection.geometry?.coverage === "complete" && !readbackFindingCodes.length ? "PASS" : findingCodes.length ? "FINDINGS" : "UNVERIFIED",
+            designProgramConsistency: "UNVERIFIED",
+            nativeFindingCodes: findingCodes,
+            failureReason: screen.errorCode,
+            nativeReadbackMs: inspection.geometry?.durationMs ?? readbackDurationMs,
+          });
+        }
         recordTrace({ stageId: screen.screenId, stage: "verification", event: "request_failed", outcome: "failed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs: readbackDurationMs, qaFindingCodes: [...new Set([...readbackFindingCodes, ...(screen.findings ?? []).map(({ code }) => code)])].slice(0, 8), qaCoverage: "incomplete", code: screen.errorCode });
         await save();
         throw error;
       }
       if (screens.some((other) => other !== screen && other.rootRef === screen.rootRef))
         fail("native_root_conflict", "Two planned screens resolve to the same task-owned native root.");
+      let finalVerificationRequestId = inspectRequestId;
+      let finalVerificationDurationMs = readbackDurationMs;
+      if (FW5_VISUAL_QA_ENABLED) {
+        screen.nativePageId = inspection.nativePageId;
+        const root = inspection.nodes?.find(({ ref }) => ref === screen.rootRef);
+        const pageId = inspection.nativePageId;
+        const readbackRevision = inspection.geometry?.receipt;
+        const readbackIdentityComplete = Boolean(pageId && root && readbackRevision);
+        const captureEligible = freshVisualCaptureScreens.has(screen.screenId);
+        let capture = undefined as Awaited<ReturnType<typeof captureVisualAttempt>> | undefined;
+        if (!pageId || !root || !readbackRevision) {
+          capture = { receipt: VisualCaptureReceiptV1Schema.parse({
+            version: 1, status: "UNVERIFIED", receiptId: `fw5-${task.id}_${screen.screenId}_r${screen.renderAttempts ?? 1}`,
+            taskId: task.id, screenId: screen.screenId, documentId: task.documentId, pageId: pageId ?? "unavailable",
+            rootId: screen.nativeRootNodeId!, programFingerprint: screen.fingerprint!, readbackRevision: readbackRevision ?? "v1-00000000",
+            mime: "image/png", width: 0, height: 0, byteLength: 0, capturedAtMs: Date.now(), exportScale: 1,
+            captureAttempt: 1, diagnostic: "readback_stale",
+          }), exportMs: 0, failureReason: "visual_capture_readback_identity_incomplete" };
+        } else if (!captureEligible) {
+          capture = { receipt: VisualCaptureReceiptV1Schema.parse({
+            version: 1, status: "UNVERIFIED", receiptId: `fw5-${task.id}_${screen.screenId}_r${screen.renderAttempts ?? 1}`,
+            taskId: task.id, screenId: screen.screenId, documentId: task.documentId, pageId,
+            rootId: screen.nativeRootNodeId!, programFingerprint: screen.fingerprint!, readbackRevision,
+            mime: "image/png", width: 0, height: 0, byteLength: 0, capturedAtMs: Date.now(), exportScale: 1,
+            captureAttempt: 1, diagnostic: "root_reused_or_recovered",
+          }), exportMs: 0, failureReason: "root_reused_or_recovered" };
+        } else {
+          const requestId = `${task.id}_fw5_${screen.screenId}_${screen.renderAttempts ?? 1}_a1`;
+          recordTrace({ stageId: screen.screenId, stage: "visual_capture", event: "request_started", outcome: "started", nativeOperationId: requestId, nativeBatchId: screen.nativeBatchId, attempt: 1 });
+          capture = await captureVisualAttempt({ deps, task, screen, pageId, readbackRevision, attempt: 1 });
+          check();
+          freshVisualCaptureScreens.delete(screen.screenId);
+          recordTrace({ stageId: screen.screenId, stage: "visual_capture", event: capture.receipt.status === "CAPTURED" ? "request_completed" : "request_failed", outcome: capture.receipt.status === "CAPTURED" ? "completed" : "failed", nativeOperationId: requestId, nativeBatchId: screen.nativeBatchId, durationMs: capture.exportMs, outputBytes: capture.receipt.byteLength, code: capture.receipt.diagnostic });
+        }
+        const receipt = capture?.receipt;
+        let pngBytesForReview = capture?.pngBytes;
+        let exportMs = capture?.exportMs ?? 0;
+        const failureReason = capture?.failureReason;
+        let reviewResponse: VisualReviewResponseV1 | undefined;
+        let reviewStatus: VisualQaOutcomeV1["visualReview"] = "VISUAL_REVIEW_UNAVAILABLE";
+        let reviewFailureReason: string | undefined;
+        let reviewerDurationMs = 0;
+        let reviewerCalls = 0;
+        const reviewCapturedImage = async (reviewInspection: NativeInspection, reviewReceipt: VisualCaptureReceiptV1,
+          reviewBytes: Uint8Array<ArrayBuffer>, attempt: 1 | 2) => {
+          if (!deps.visualReviewer || !deps.authorizeVisualReview)
+            return { response: undefined, failureReason: "reviewer_or_explicit_authorization_unavailable", durationMs: 0 };
+          const reviewStartedAt = monotonicNow();
+          try {
+            const request = createVisualReviewRequest({ task, screen, screenPlan, inspection: reviewInspection, receipt: reviewReceipt, pngBytes: reviewBytes, attempt });
+            const grant = await deps.authorizeVisualReview({ taskId: request.taskId, screenId: request.screenId,
+              taskGeneration: request.taskGeneration, imageRevision: request.imageRevision,
+              documentId: request.documentId, pageId: request.pageId, rootId: request.rootId,
+              programFingerprint: request.programFingerprint, readbackRevision: request.readbackRevision, receiptId: request.receiptId });
+            check();
+            if (!grant) return { response: undefined, failureReason: "VISUAL_REVIEW_CONSENT_REQUIRED", durationMs: Math.max(0, Math.round(monotonicNow() - reviewStartedAt)) };
+            reviewerCalls++;
+            recordTrace({ stageId: screen.screenId, stage: "visual_review", event: "request_started", outcome: "started", nativeOperationId: request.requestId, nativeBatchId: screen.nativeBatchId, attempt });
+            const response = await runVisualReviewerV1(deps.visualReviewer, request, grant, deps.signal);
+            check();
+            recordTrace({ stageId: screen.screenId, stage: "visual_review", event: "request_completed", outcome: response.verdict === "inconclusive" ? "failed" : "completed", nativeOperationId: response.requestId, nativeBatchId: screen.nativeBatchId, attempt, durationMs: Math.max(0, Math.round(monotonicNow() - reviewStartedAt)), qaFindingCodes: response.findings.map(({ issueCode }) => issueCode).slice(0, 8), qaCoverage: response.verdict === "inconclusive" ? "incomplete" : "complete" });
+            return { response, durationMs: Math.max(0, Math.round(monotonicNow() - reviewStartedAt)) };
+          } catch (error) {
+            check();
+            const issues = error && typeof error === "object" && "issues" in error ? (error as { issues?: unknown }).issues : undefined;
+            const safeIssuePaths = Array.isArray(issues) ? issues.slice(0, 4).map((issue: unknown) => {
+              if (!issue || typeof issue !== "object") return "unknown";
+              const path = "path" in issue && Array.isArray(issue.path) ? issue.path.map((part: unknown) => String(part).replace(/[^A-Za-z0-9_-]/gu, "").slice(0, 32)).join(".") : "unknown";
+              const code = "code" in issue && typeof issue.code === "string" ? issue.code.replace(/[^A-Za-z0-9_-]/gu, "").slice(0, 32) : "invalid";
+              const keys = "keys" in issue && Array.isArray(issue.keys) ? issue.keys.map((key: unknown) => String(key).replace(/[^A-Za-z0-9_-]/gu, "").slice(0, 32)).join("+") : "";
+              return `${code}:${path}:${keys}`;
+            }).join(",") : "";
+            const category = safeErrorCode(error);
+            const reason = category === "unsupported_capability" ? "visual_review_unsupported_capability"
+              : category === "authorization_required" || category === "plan_use_scope_missing" || category === "session_expired" ? "visual_review_authorization_required"
+                : category === "model_not_verified_for_account" ? "visual_review_model_unavailable"
+                  : category === "request_timed_out" || error instanceof Error && /timed out/iu.test(error.message) ? "visual_review_timed_out"
+                    : category === "service_unavailable" || category === "responses_transport_error" || category === "connection_failed" ? "visual_review_temporarily_unavailable"
+                      : safeIssuePaths ? `visual_review_schema_invalid:${safeIssuePaths}` : "visual_review_invalid_or_failed";
+            return { response: undefined, failureReason: reason, durationMs: Math.max(0, Math.round(monotonicNow() - reviewStartedAt)) };
+          }
+        };
+        if (receipt?.status === "CAPTURED" && pngBytesForReview && FW5_VISUAL_REVIEW_MODE !== "capture-only") {
+          try {
+            const reviewed = await reviewCapturedImage(inspection, receipt, pngBytesForReview, 1);
+            reviewResponse = reviewed.response;
+            reviewFailureReason = reviewed.failureReason;
+            reviewerDurationMs += reviewed.durationMs;
+            reviewStatus = reviewResponse ? reviewResponse.verdict === "inconclusive" ? "VISUAL_REVIEW_INCONCLUSIVE" : "REVIEWED"
+              : reviewFailureReason?.startsWith("visual_review_schema_invalid") ? "VISUAL_REVIEW_FAILED" : visualReviewFailureStatus(reviewFailureReason);
+          } finally {
+            pngBytesForReview.fill(0);
+            pngBytesForReview = undefined;
+          }
+        }
+        if (pngBytesForReview) { pngBytesForReview.fill(0); pngBytesForReview = undefined; }
+        const baseVisualQa = buildVisualQaOutcome({
+          taskId: task.id, screenId: screen.screenId, fingerprint: screen.fingerprint!, rootId: screen.nativeRootNodeId!, pageId: pageId ?? "unavailable",
+          readbackRevision, nativeGeometry: pendingSizingMismatch ? "FINDINGS" : readbackIdentityComplete ? "PASS" : "UNVERIFIED",
+          designProgramConsistency: pendingSizingMismatch ? "FINDINGS" : readbackIdentityComplete ? "PASS" : "UNVERIFIED", captureReceipt: receipt,
+          nativeFindingCodes: [],
+          failureReason: failureReason ?? reviewFailureReason, exportMs, nativeReadbackMs: inspection.geometry?.durationMs ?? readbackDurationMs,
+        });
+        let finalInspection = inspection;
+        let finalReceipt = receipt;
+        let finalReviewStatus = reviewStatus;
+        let finalReviewFailure = reviewFailureReason;
+        let finalQaStatus: VisualQaOutcomeV1["status"] = reviewResponse
+          ? reviewResponse.verdict === "inconclusive" ? "REVIEW_INCONCLUSIVE"
+            : reviewResponse.verdict === "findings" ? "ISSUES_DETECTED"
+              : baseVisualQa.nativeGeometry === "PASS" && baseVisualQa.designProgramConsistency === "PASS" ? "VISUAL_QA_PASSED" : "UNVERIFIED"
+          : receipt?.status === "CAPTURED" ? "REVIEW_UNAVAILABLE" : baseVisualQa.status;
+        let repair: VisualQaOutcomeV1["repair"] = reviewResponse?.verdict === "findings"
+          ? { status: "REPAIR_BLOCKED", attempts: 0, reason: FW5_VISUAL_REVIEW_MODE === "review+bounded-repair" ? "no_safe_proposal" : "capture_only_policy" }
+          : { status: "NOT_REQUIRED", attempts: 0, reason: "none" };
+        let recheckReviewResponse: VisualReviewResponseV1 | undefined;
+        let afterReceiptId: string | undefined;
+        let finalNativeGeometry: VisualQaOutcomeV1["nativeGeometry"] = pendingSizingMismatch ? "FINDINGS" : baseVisualQa.nativeGeometry;
+        let finalProgramConsistency: VisualQaOutcomeV1["designProgramConsistency"] = pendingSizingMismatch ? "FINDINGS" : baseVisualQa.designProgramConsistency;
+        let finalReadbackMs = readbackDurationMs;
+        let blockForUnresolvedNativeMismatch = false;
+        let repairFindingId: string | undefined;
+        let repairProposal: VisualRepairProposalV1 | undefined;
+
+        if (pendingSizingMismatch) {
+          const expectedLayoutValue = (property: "layoutSizingHorizontal" | "layoutSizingVertical") => property === "layoutSizingHorizontal"
+            ? pendingSizingMismatch.expectedLayout!.horizontalSizing : pendingSizingMismatch.expectedLayout!.verticalSizing;
+          const observedLayoutValue = (property: "layoutSizingHorizontal" | "layoutSizingVertical") => property === "layoutSizingHorizontal"
+            ? pendingSizingMismatch.observedLayout!.horizontalSizing : pendingSizingMismatch.observedLayout!.verticalSizing;
+          const repairCandidates = reviewResponse?.verdict === "findings" && reviewResponse.confidence >= 0.85
+            ? reviewResponse.findings.filter((finding) => {
+                const action = finding.proposedAction;
+                if (!action || finding.issueCode !== "native_layout_sizing_mismatch" || finding.nodeId !== pendingSizingMismatch.nodeId ||
+                    finding.source !== "pixel-review" || finding.evidenceSource !== "image+native-readback" ||
+                    finding.evidenceRef !== `capture:${receipt?.receiptId}` || finding.uncertain || (finding.confidence ?? 0) < 0.85 ||
+                    !finding.safeToAutoRepair || finding.suggestedRepairCategory !== "layout-sizing") return false;
+                const nativeTarget = inspection.nodes?.find(({ id }) => id === pendingSizingMismatch.nodeId);
+                const expectedParent = inspection.nodes?.find(({ id }) => id === pendingSizingMismatch.parentId);
+                return nativeTarget?.type === "FRAME" && nativeTarget.parentId === pendingSizingMismatch.parentId &&
+                  nativeTarget.logicalRef === pendingSizingMismatch.logicalRef && nativeTarget[ action.property ] === action.expectedValue &&
+                  expectedParent?.layoutMode !== undefined && expectedParent.layoutMode !== "NONE" &&
+                  action.expectedValue === observedLayoutValue(action.property) && action.proposedValue === expectedLayoutValue(action.property);
+              })
+            : [];
+          let repairBlockReason: VisualQaOutcomeV1["repair"]["reason"] = !FW4_GEOMETRY_ENABLED ? "fw4_gate_off"
+            : !reviewResponse || reviewFailureReason ? "reviewer_unavailable" : "no_safe_proposal";
+          if (repairCandidates.length === 1 && receipt?.status === "CAPTURED") {
+            const finding = repairCandidates[0]!;
+            repairFindingId = finding.findingId;
+            const action = finding.proposedAction!;
+            const proposalId = `fw5-repair-${task.id}_${screen.screenId}_${screen.renderAttempts ?? 1}`;
+            const proposal = VisualRepairProposalV1Schema.parse({
+              version: 1, proposalId, taskId: task.id, screenId: screen.screenId, pageId: pageId!, rootId: screen.nativeRootNodeId!,
+              programFingerprint: screen.fingerprint!, readbackRevision: receipt.readbackRevision, captureReceiptId: receipt.receiptId,
+              findingId: finding.findingId, targetNodeId: pendingSizingMismatch.nodeId!, expectedParentId: pendingSizingMismatch.parentId!,
+              targetType: "FRAME", property: action.property, expectedValue: action.expectedValue,
+              proposedValue: action.proposedValue, source: "fw4-sizing-convergence",
+            });
+            repairProposal = proposal;
+            if (!deps.repairVisual) {
+              repairBlockReason = "repair_executor_unavailable";
+            } else {
+              repair = { status: "REPAIR_BLOCKED", attempts: 1, reason: "fresh_root_required", method: "fw4-sizing-convergence" };
+              recordTrace({ stageId: screen.screenId, stage: "visual_repair", event: "request_started", outcome: "started", nativeOperationId: proposalId, nativeBatchId: screen.nativeBatchId, attempt: 1, nodeCount: 1 });
+              let repairResult: ReturnType<typeof VisualNativeRepairResultV1Schema.parse> | undefined;
+              try {
+                check();
+                const response = await deps.repairVisual({ type: "task-native-visual-repair", request: {
+                  version: 1, requestId: proposalId, taskId: task.id, screenId: screen.screenId as VisualReviewRequestV1["screenId"],
+                  documentId: task.documentId, pageId: pageId!, rootId: screen.nativeRootNodeId!, rootRef: screen.rootRef!,
+                  programFingerprint: screen.fingerprint!, captureReceiptId: receipt.receiptId,
+                  deadlineAtMs: Date.now() + FW5_VISUAL_CAPTURE_LIMITS.timeoutMs, proposal,
+                } }, deps.signal);
+                check();
+                if (response.type === "task-native-visual-repair-result") {
+                  const parsedResult = VisualNativeRepairResultV1Schema.safeParse(response.result);
+                  if (parsedResult.success && parsedResult.data.requestId === proposalId && parsedResult.data.taskId === task.id &&
+                      parsedResult.data.screenId === screen.screenId && parsedResult.data.rootId === screen.nativeRootNodeId &&
+                      parsedResult.data.captureReceiptId === receipt.receiptId) repairResult = parsedResult.data;
+                }
+              } catch (error) {
+                check();
+                repairBlockReason = safeErrorCode(error) === "visual_repair_cancelled" ? "stop_or_stale_task" : "repair_executor_unavailable";
+              }
+              if (repairResult?.status === "APPLIED" && repairResult.reason === "none" &&
+                  repairResult.targetNodeId === proposal.targetNodeId && repairResult.property === proposal.property &&
+                  repairResult.readbackRevision && repairResult.readbackRevision !== receipt.readbackRevision) {
+                repair = { status: "APPLIED", attempts: 1, reason: "none", method: "fw4-sizing-convergence" };
+                finalNativeGeometry = "PASS";
+                finalProgramConsistency = "PASS";
+                finalQaStatus = "RECHECK_PENDING";
+                finalReviewFailure = undefined;
+                screen.visualQa = VisualQaOutcomeV1Schema.parse({
+                  ...baseVisualQa, status: "RECHECK_PENDING", nativeGeometry: "FINDINGS", designProgramConsistency: "FINDINGS",
+                  beforeReceiptId: receipt.receiptId, visualReview: reviewStatus, repair,
+                  findings: [...baseVisualQa.findings, ...(reviewResponse?.findings ?? [])].slice(0, 20),
+                  findingCounts: { nativeRule: 1, pixelReview: reviewResponse?.kind === "vision" ? reviewResponse.findings.length : 0,
+                    human: reviewResponse?.kind === "human" ? reviewResponse.findings.length : 0 },
+                  diagnostics: { ...baseVisualQa.diagnostics, reviewerCalls, reviewerDurationMs, repairAttempts: 1, repairMethods: [proposal.property] },
+                });
+                check();
+                await save();
+                try {
+                  const recheckRequestId = `${task.id}_inspect_${screen.screenId}_recheck`;
+                  const recheckStarted = monotonicNow();
+                  recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "request_started", outcome: "started", nativeOperationId: recheckRequestId, nativeBatchId: screen.nativeBatchId, attempt: 2, code: FW4_GEOMETRY_FEATURE });
+                  const recheck = await deps.inspectProgram({ type: "task-native-inspect", requestId: recheckRequestId, taskId: task.id,
+                    documentId: task.documentId, refs: [screen.rootRef!], geometry: { programFingerprint: screen.fingerprint!, requireReceipt: true,
+                      expectedRootNodeId: screen.nativeRootNodeId, ...(expectedLayout ? { expectedLayout } : {}) } });
+                  check();
+                  const durationMs = Math.max(0, Math.round(monotonicNow() - recheckStarted));
+                  task.universalMetrics!.readbackRoundTripMs += durationMs;
+                  if (!recheck.success || recheck.taskId !== task.id || recheck.nativePageId !== pageId || recheck.expectedRootStatus !== "present" ||
+                      recheck.geometry?.receipt !== repairResult.readbackRevision || recheck.nodes?.find(({ ref }) => ref === screen.rootRef)?.id !== screen.nativeRootNodeId)
+                    fail("visual_repair_readback_identity_mismatch", "The repaired screen did not return the original task-owned root and fresh geometry receipt.");
+                  verified = verifyNativeReadback(recheck, screen, plan);
+                  finalInspection = recheck;
+                  finalReadbackMs = durationMs;
+                  finalVerificationRequestId = recheckRequestId;
+                  finalVerificationDurationMs = durationMs;
+                  task.universalMetrics!.nativeReadbackMs = (task.universalMetrics!.nativeReadbackMs ?? 0) + (recheck.geometry?.durationMs ?? durationMs);
+                  recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "readback_completed", outcome: "completed", nativeOperationId: recheckRequestId, nativeBatchId: screen.nativeBatchId, durationMs, nodeCount: verified.nodeCount, qaCoverage: "complete", attempt: 2 });
+
+                  const secondCaptureRequestId = `${task.id}_fw5_${screen.screenId}_${screen.renderAttempts ?? 1}_a2`;
+                  recordTrace({ stageId: screen.screenId, stage: "visual_capture", event: "request_started", outcome: "started", nativeOperationId: secondCaptureRequestId, nativeBatchId: screen.nativeBatchId, attempt: 2 });
+                  const secondCapture = await captureVisualAttempt({ deps, task, screen, pageId: pageId!, readbackRevision: repairResult.readbackRevision,
+                    attempt: 2, previousReceiptId: receipt.receiptId });
+                  check();
+                  exportMs += secondCapture.exportMs;
+                  finalReceipt = secondCapture.receipt;
+                  afterReceiptId = secondCapture.receipt.receiptId;
+                  if (secondCapture.receipt.status !== "CAPTURED" || !secondCapture.pngBytes) {
+                    repair = { status: "RECHECK_FAILED", attempts: 1, reason: "recheck_unavailable", method: "fw4-sizing-convergence" };
+                    finalQaStatus = "RECHECK_FAILED";
+                    finalReviewFailure = secondCapture.failureReason ?? secondCapture.receipt.diagnostic;
+                    finalReviewStatus = "VISUAL_REVIEW_UNAVAILABLE";
+                  } else {
+                    try {
+                      const secondReview = await reviewCapturedImage(recheck, secondCapture.receipt, secondCapture.pngBytes, 2);
+                      recheckReviewResponse = secondReview.response;
+                      reviewerDurationMs += secondReview.durationMs;
+                      finalReviewFailure = secondReview.failureReason;
+                      finalReviewStatus = recheckReviewResponse ? recheckReviewResponse.verdict === "inconclusive" ? "VISUAL_REVIEW_INCONCLUSIVE" : "REVIEWED"
+                        : finalReviewFailure?.startsWith("visual_review_schema_invalid") ? "VISUAL_REVIEW_FAILED" : visualReviewFailureStatus(finalReviewFailure);
+                      if (!recheckReviewResponse || recheckReviewResponse.verdict === "inconclusive") {
+                        repair = { status: "RECHECK_FAILED", attempts: 1, reason: "recheck_unavailable", method: "fw4-sizing-convergence" };
+                        finalQaStatus = "RECHECK_FAILED";
+                      } else {
+                        const unresolvedOriginalFindings = (reviewResponse?.findings ?? [])
+                          .filter((finding) => finding.findingId !== repairFindingId);
+                        finalQaStatus = recheckReviewResponse.verdict === "pass" && unresolvedOriginalFindings.length === 0
+                          ? "VISUAL_QA_PASSED" : "ISSUES_DETECTED";
+                      }
+                    } finally {
+                      secondCapture.pngBytes.fill(0);
+                    }
+                  }
+                } catch (error) {
+                  if (deps.signal.aborted) throw error;
+                  repair = { status: "RECHECK_FAILED", attempts: 1, reason: "readback_failed", method: "fw4-sizing-convergence" };
+                  finalQaStatus = "RECHECK_FAILED";
+                  finalReviewFailure = safeErrorCode(error);
+                  finalReadbackMs = Math.max(0, Math.round(monotonicNow() - readbackStartedAt));
+                  blockForUnresolvedNativeMismatch = true;
+                  finalNativeGeometry = "UNVERIFIED";
+                  finalProgramConsistency = "UNVERIFIED";
+                }
+              } else {
+                repairBlockReason = repairResult?.reason === "mode_disabled" || repairResult?.reason === "gate_disabled" ? "fw4_gate_off"
+                  : repairResult?.reason === "cancelled" ? "stop_or_stale_task"
+                    : repairResult?.reason === "readback_failed" ? "readback_failed"
+                      : repairResult?.reason === "correction_failed" ? "correction_failed"
+                        : repairResult ? "stale_readback" : repairBlockReason;
+              }
+            }
+          }
+          if (repair.status !== "APPLIED" && repair.status !== "RECHECK_FAILED") {
+            repair = { status: "REPAIR_BLOCKED", attempts: repair.attempts, reason: repairBlockReason,
+              ...(repair.attempts ? { method: "fw4-sizing-convergence" as const } : {}) };
+            finalQaStatus = "REPAIR_BLOCKED";
+            finalReviewFailure ??= repairBlockReason;
+            blockForUnresolvedNativeMismatch = true;
+          }
+        }
+
+        const nativeRepairFinding = pendingSizingMismatch ? {
+          findingId: visualFindingId("native_layout_sizing_mismatch", screen.nativeRootNodeId!, pendingSizingMismatch.nodeId),
+          taskId: task.id, screenId: screen.screenId as VisualReviewRequestV1["screenId"], issueCode: "native_layout_sizing_mismatch" as const,
+          source: "native-rule" as const, evidenceSource: "native-readback" as const, severity: "error" as const,
+          evidenceRef: `native-readback:${pendingSizingMismatch.logicalRef}`, nodeId: pendingSizingMismatch.nodeId,
+          uncertain: false, safeToAutoRepair: false, suggestedRepairCategory: "none" as const,
+          ...(repairProposal && repair.status !== "REPAIR_BLOCKED" ? { resolution: "repaired" as const } : {}),
+        } : undefined;
+        const firstReviewFindings = (reviewResponse?.findings ?? []).map((finding) => ({
+          ...finding,
+          ...(repairFindingId && finding.findingId === repairFindingId && repair.status !== "REPAIR_BLOCKED" ? { resolution: "repaired" as const } : {}),
+          ...(repairFindingId && finding.findingId !== repairFindingId && repair.status !== "REPAIR_BLOCKED" ? { resolution: "unrepaired" as const } : {}),
+        }));
+        const secondFindings = (recheckReviewResponse?.findings ?? []).map((finding) => ({ ...finding, resolution: "unrepaired" as const }));
+        const combinedFindings = [...secondFindings, ...baseVisualQa.findings, ...(nativeRepairFinding ? [nativeRepairFinding] : []), ...firstReviewFindings]
+          .filter((finding, index, all) => all.findIndex(({ findingId }) => findingId === finding.findingId) === index).slice(0, 20);
+        const reviewFindings = [...firstReviewFindings, ...secondFindings];
+        screen.visualQa = VisualQaOutcomeV1Schema.parse({
+          ...baseVisualQa,
+          status: finalQaStatus,
+          ...(finalReceipt ? { afterReceiptId: afterReceiptId ?? finalReceipt.receiptId, captureReceipt: finalReceipt } : {}),
+          ...(repair.attempts > 0 && receipt ? { beforeReceiptId: receipt.receiptId } : {}),
+          readbackRevision: finalInspection.geometry?.receipt ?? readbackRevision,
+          nativeGeometry: finalNativeGeometry,
+          designProgramConsistency: finalProgramConsistency,
+          visualCapture: finalReceipt?.status ?? baseVisualQa.visualCapture,
+          visualReview: finalReviewStatus,
+          findings: combinedFindings,
+          findingCounts: { nativeRule: pendingSizingMismatch && repair.status !== "APPLIED" ? 1 : baseVisualQa.findingCounts.nativeRule,
+            pixelReview: Math.min(20, reviewFindings.filter(({ source }) => source === "pixel-review").length),
+            human: Math.min(20, reviewFindings.filter(({ source }) => source === "human").length) },
+          repair,
+          diagnostics: { ...baseVisualQa.diagnostics, payloadBytes: finalReceipt?.byteLength ?? 0, exportMs,
+            nativeReadbackMs: finalReadbackMs, reviewerCalls, reviewerDurationMs, repairAttempts: repair.attempts,
+            repairMethods: repair.attempts && repairProposal ? [repairProposal.property] : [], ...(finalReviewFailure ? { failureReason: finalReviewFailure.slice(0, 100) } : {}) },
+        });
+        if (blockForUnresolvedNativeMismatch) {
+          check();
+          await save();
+          fail(repair.status === "RECHECK_FAILED" ? "visual_repair_recheck_failed" : "visual_repair_blocked",
+            "The original task-owned root remains attached, but FW-4 sizing could not be safely repaired and verified. Inspect or recover this root before resuming.");
+        }
+      }
       screen.status = "verified";
       screen.verifiedNodeCount = verified.nodeCount;
       stage.completed = true;
@@ -1620,7 +2289,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         elapsedMs: Math.max(0, Math.round(monotonicNow() - (screenRunStartedAt.get(screen.screenId) ?? runStartedAt))),
       });
       task.universalMetrics!.firstVerifiedScreenMs ??= Math.max(0, Math.round(monotonicNow() - runStartedAt));
-      recordTrace({ stageId: screen.screenId, stage: "verification", event: "readback_completed", outcome: "completed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs: readbackDurationMs, nodeCount: verified.nodeCount, qaFindingCodes: verified.findings.slice(0, 8), qaCoverage: "complete" });
+      recordTrace({ stageId: screen.screenId, stage: "verification", event: "readback_completed", outcome: "completed", nativeOperationId: finalVerificationRequestId, nativeBatchId: screen.nativeBatchId, durationMs: finalVerificationDurationMs, nodeCount: verified.nodeCount, qaFindingCodes: verified.findings.slice(0, 8), qaCoverage: "complete" });
       task.universalMetrics!.acceptedScreenTimesMs = [...new Map(task.universalMetrics!.acceptedScreenTimesMs.map((entry) => [entry.screenId, entry])).values()];
       transition("UNIVERSAL_COMPOSING");
       await save();
@@ -1640,9 +2309,30 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     fail("native_verification_incomplete", "Not every planned screen has task-owned native readback; completion was refused.");
   task.universalMetrics!.totalElapsedMs = Math.max(0, Math.round(monotonicNow() - runStartedAt));
   const usedFallback = screens.some(({ findings }) => findings?.some(({ code }) => code === "native_font_fallback"));
+  const visualQaDetails = screens.map(({ screenId, visualQa }) => {
+    const receipt = visualQa?.captureReceipt;
+    return `${screenId}:${visualQa?.visualCapture === "CAPTURED" && receipt ? `${receipt.width}×${receipt.height}px` : "capture-unavailable"}`;
+  }).join(", ");
+  const visualQaSummary = FW5_VISUAL_QA_ENABLED
+    ? screens.every(({ visualQa }) => visualQa?.status === "VISUAL_QA_PASSED")
+      ? plan.locale.toLocaleLowerCase().startsWith("fa")
+        ? ` بازبینی بصری مجاز برای PNGهای محدود (${visualQaDetails}) بدون یافتهٔ مسدودکننده پایان یافت.`
+        : ` Authorized visual review completed for bounded PNG evidence (${visualQaDetails}) without blocking findings.`
+      : screens.some(({ visualQa }) => visualQa?.visualReview === "REVIEWED" && visualQa.status === "ISSUES_DETECTED")
+        ? plan.locale.toLocaleLowerCase().startsWith("fa")
+          ? ` بازبین مجاز در PNGهای محدود (${visualQaDetails}) یافته‌هایی ثبت کرد؛ کیفیت بصری تأیید نشد و لایه‌های بومی حفظ شدند.`
+          : ` The authorized reviewer found issues in bounded PNG evidence (${visualQaDetails}); visual QA did not pass and native layers were retained.`
+        : screens.every(({ visualQa }) => visualQa?.visualCapture === "CAPTURED")
+          ? plan.locale.toLocaleLowerCase().startsWith("fa")
+            ? ` شواهد PNG محدود (${visualQaDetails}) ثبت شد؛ بازبین بصری یا مجوز صریح در دسترس نیست و کیفیت بصری تأییدنشده است.`
+            : ` Bounded PNG evidence (${visualQaDetails}) was captured; no authorized visual reviewer is available, so visual quality remains unverified.`
+          : plan.locale.toLocaleLowerCase().startsWith("fa")
+            ? ` بازبینی بصری کامل نشد (${visualQaDetails})؛ کیفیت بصری تأییدنشده است و لایه‌های بومی حفظ شده‌اند.`
+            : ` Visual review did not complete (${visualQaDetails}); visual quality remains unverified and native layers are retained.`
+    : "";
   task.text = plan.locale.toLocaleLowerCase().startsWith("fa")
-    ? `مسیر طراحی همگانی v1: ${plan.screenCount} صفحهٔ قابل‌ویرایش در فیگما ساخته و از لایه‌های بومی همان task بازخوانی شد. ${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} لایهٔ بومی ثبت شد.${usedFallback ? " برای یکی از فونت‌های در دسترس نبود‌ه از فونت جایگزین استفاده شد." : ""}`
-    : `Universal design route v1: created and read back ${plan.screenCount} editable native Figma screens (${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} adopted layers).${usedFallback ? " Figma used a fallback for at least one requested font." : ""}`;
+    ? `مسیر طراحی همگانی v1: ${plan.screenCount} صفحهٔ قابل‌ویرایش در فیگما ساخته و از لایه‌های بومی همان task بازخوانی شد. ${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} لایهٔ بومی ثبت شد.${usedFallback ? " برای یکی از فونت‌های در دسترس نبود‌ه از فونت جایگزین استفاده شد." : ""}${visualQaSummary}`
+    : `Universal design route v1: created and read back ${plan.screenCount} editable native Figma screens (${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} adopted layers).${usedFallback ? " Figma used a fallback for at least one requested font." : ""}${visualQaSummary}`;
   task.pending = [];
   task.recent = [];
   task.status = "completed";

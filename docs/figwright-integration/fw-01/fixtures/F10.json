@@ -1,0 +1,40 @@
+{
+  "fixtureId": "F10",
+  "locale": "fa-IR",
+  "direction": "RTL",
+  "viewport": "390x844",
+  "projectDomain": "residential building management",
+  "requestedScreenCount": 10,
+  "screenRoles": [
+    "dashboard",
+    "charges-debts",
+    "payment-details",
+    "announcements",
+    "announcement-details",
+    "maintenance-request",
+    "maintenance-tracking",
+    "facility-booking",
+    "resident-survey",
+    "profile-settings"
+  ],
+  "assetPolicy": "Synthetic content; use only authorized assets or clearly labeled placeholders.",
+  "brief": "Design ten coordinated Persian RTL 390×844 mobile screens for a residential-building management app named «هم‌ساختمان»: (1) Dashboard, (2) Charges & Debts, (3) Payment Details, (4) Announcements, (5) Announcement Details, (6) Submit Maintenance Request, (7) Maintenance Tracking, (8) Facility Booking, (9) Resident Survey, and (10) Profile & Settings. Use meaningful sample data, appropriate navigation, coherent shared design tokens and native editable Figma layers. Include distinct information architecture for each page, vertical scrolling when needed, and no duplicate or unrelated changes. Render all ten screens with a single user design request.",
+  "expected": {
+    "rootOrder": [
+      "dashboard",
+      "charges-debts",
+      "payment-details",
+      "announcements",
+      "announcement-details",
+      "maintenance-request",
+      "maintenance-tracking",
+      "facility-booking",
+      "resident-survey",
+      "profile-settings"
+    ],
+    "uniqueTaskOwnedRoots": 10,
+    "singleUserDesignRequest": true,
+    "duplicateOrUnrelatedChanges": false,
+    "completeNativeAndVisualQA": true
+  }
+}

@@ -29,7 +29,11 @@ import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
 import { utf8Bytes } from "../shared/generation-limits";
 import { planCanvasPlacements } from "./canvas-placement";
 import { placeTopLevelNode, readTopLevelCanvasObstacles } from "./figma-canvas-adapter";
-import { inspectProgramGeometry, verifyProgramInstanceMasters, PROGRAM_FINGERPRINT_KEY, PROGRAM_GEOMETRY_KEY, PROGRAM_TASK_KEY, type ProgramGeometryReport } from "./design-program-geometry";
+import { canonicalProgramGeometryReceipt, inspectProgramGeometry, verifyProgramInstanceMasters, PROGRAM_FINGERPRINT_KEY, PROGRAM_GEOMETRY_KEY, PROGRAM_TASK_KEY, type ProgramGeometryFinding, type ProgramGeometryReport } from "./design-program-geometry";
+import { CONTEXT_COMPONENT_KEY, NATIVE_MASTER_KEY } from "./design-context-reuse";
+import { FW5_VISUAL_CAPTURE_LIMITS, VisualCaptureRequestV1Schema, VisualNativeRepairRequestV1Schema, planVisualCaptureScale, pngDimensions, type VisualCaptureReceiptV1, type VisualNativeRepairResultV1 } from "../shared/fw5-visual-qa";
+import { FW5_VISUAL_QA_ENABLED, FW5_VISUAL_REVIEW_MODE } from "../shared/fw5-visual-qa-feature";
+import { FW4_GEOMETRY_ENABLED, NativeLayoutExpectationV1Schema, type NativeLayoutExpectationV1 } from "../shared/fw4-geometry";
 
 const STORAGE_PREFIX = "fad.figma-tools.v1";
 const REF_PLUGIN_KEY = "fad.tool.logical-ref.v1";
@@ -52,12 +56,18 @@ const NativeGenerationAdoptionSchema = z.object({
   roots: z.array(z.object({
     screenId: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,79}$/u),
     rootNodeId: z.string().min(1).max(100),
+    freshlyCreated: z.boolean().optional(),
+    expectedLayout: z.array(NativeLayoutExpectationV1Schema).max(301).optional(),
     nodes: z.array(z.object({
       nodeId: z.string().min(1).max(100),
       ref: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u),
       semanticRole: z.string().trim().min(1).max(60),
     }).strict()).min(1).max(300),
-  }).strict()).min(1).max(10),
+  }).strict().superRefine((root, context) => {
+    const refs = root.expectedLayout?.map(({ logicalRef }) => logicalRef) ?? [];
+    if (new Set(refs).size !== refs.length)
+      context.addIssue({ code: "custom", path: ["expectedLayout"], message: "Native sizing expectations must have unique logical references." });
+  })).min(1).max(10),
 }).strict();
 const ReferenceCandidateSchema = z
   .object({
@@ -258,7 +268,7 @@ type StoredOperationResult = NonNullable<StoredState["operations"][string]["resu
 type ToolStateDiagnostic = z.infer<typeof FigmaToolStateDiagnosticSchema>;
 export type NativeGenerationAdoption = z.infer<typeof NativeGenerationAdoptionSchema>;
 export type FigmaToolExecutor = ((message: Extract<UIToPluginMessage, {
-  type: "tool-execute" | "tool-cancel" | "tool-pause" | "tool-delete-consent" | "task-native-inspect" | "task-native-focus";
+  type: "tool-execute" | "tool-cancel" | "tool-pause" | "tool-delete-consent" | "task-native-inspect" | "task-native-focus" | "task-native-visual-capture" | "task-native-visual-capture-cancel" | "task-native-visual-repair" | "task-native-visual-repair-cancel";
 }>) => Promise<void>) & {
   registerRenderedGeneration(request: NativeGenerationAdoption): Promise<{ registeredRefs: number; persistenceMs: number; operationIds: string[] }>;
 };
@@ -1121,6 +1131,15 @@ export function createFigmaToolExecutor(
   let queue: Promise<void> = Promise.resolve();
   let pendingBatches = 0;
   const cancellation = new Map<string, { cancelled: boolean; pauseRequested: boolean }>();
+  const cancelledVisualCaptures = new Set<string>();
+  const cancelledVisualRepairs = new Set<string>();
+  const activeVisualCaptureRequests = new Set<string>();
+  const freshVisualCaptureRoots = new Map<string, {
+    taskId: string; screenId: string; documentId: string; pageId: string; batchId: string; fingerprint: string; expiresAtMs: number;
+    captureAttempts: number; repairUsed: boolean; recheckAllowed: boolean; captureReceiptId?: string; readbackRevision?: string;
+    repairableSizing?: ProgramGeometryFinding[];
+    expectedLayout?: NativeLayoutExpectationV1[];
+  }>();
   const deleteConsents = new Map<string, { token: string; ref: string; expiresAt: number }>();
   const startedOperations: number[] = [];
   let pendingStateWrite: Promise<void> | undefined;
@@ -1212,6 +1231,338 @@ export function createFigmaToolExecutor(
       );
   };
 
+  const makeVisualCaptureReceipt = (
+    request: z.infer<typeof VisualCaptureRequestV1Schema>,
+    pageId: string,
+    status: VisualCaptureReceiptV1["status"],
+    diagnostic: VisualCaptureReceiptV1["diagnostic"],
+    values: { width?: number; height?: number; byteLength?: number; exportScale?: number; node?: FrameNode } = {},
+  ): VisualCaptureReceiptV1 => ({
+    version: 1,
+    status,
+    receiptId: `fw5-${request.captureNonce}`,
+    taskId: request.taskId,
+    screenId: request.screenId,
+    documentId: request.authorizedDocumentScope.documentId,
+    pageId,
+    rootId: request.rootId,
+    programFingerprint: request.programFingerprint,
+    readbackRevision: request.readbackRevision,
+    mime: "image/png",
+    width: values.width ?? 0,
+    height: values.height ?? 0,
+    byteLength: values.byteLength ?? 0,
+    capturedAtMs: Date.now(),
+    exportScale: values.exportScale ?? 1,
+    captureAttempt: request.captureAttempt,
+    ...(request.previousReceiptId ? { previousReceiptId: request.previousReceiptId } : {}),
+    ...(values.node?.absoluteBoundingBox ? { frameBounds: {
+      x: values.node.absoluteBoundingBox.x, y: values.node.absoluteBoundingBox.y,
+      width: values.node.absoluteBoundingBox.width, height: values.node.absoluteBoundingBox.height,
+    } } : {}),
+    ...(values.node ? {
+      clipsContent: values.node.clipsContent,
+      overflowDirection: values.node.overflowDirection,
+      scrollIntent: values.node.overflowDirection === "VERTICAL" ? "vertical" as const
+        : values.node.overflowDirection === "HORIZONTAL" ? "horizontal" as const
+          : values.node.overflowDirection === "BOTH" ? "both" as const
+            : values.node.clipsContent ? "unknown" as const : "none" as const,
+      ...(values.node.clipsContent && values.node.absoluteBoundingBox ? { visibleBounds: {
+        x: values.node.absoluteBoundingBox.x, y: values.node.absoluteBoundingBox.y,
+        width: values.node.absoluteBoundingBox.width, height: values.node.absoluteBoundingBox.height,
+      } } : {}),
+    } : {}),
+    diagnostic,
+  });
+
+  const captureTaskNativeRoot = async (
+    message: Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>,
+  ) => {
+    const parsedRequest = VisualCaptureRequestV1Schema.safeParse(message.visualCapture);
+    if (!parsedRequest.success) throw new Error("visual_capture_request_invalid");
+    const request = parsedRequest.data;
+    const pageId = request.pageId;
+    const failed = (status: VisualCaptureReceiptV1["status"], diagnostic: VisualCaptureReceiptV1["diagnostic"], exportDurationMs = 0) => ({
+      receipt: makeVisualCaptureReceipt(request, pageId, status, diagnostic), exportDurationMs,
+    });
+    if (!FW5_VISUAL_QA_ENABLED) return failed("UNVERIFIED", "gate_disabled");
+    if (cancelledVisualCaptures.has(message.requestId)) {
+      cancelledVisualCaptures.delete(message.requestId);
+      return failed("UNVERIFIED", "capture_cancelled");
+    }
+    if (request.deadlineAtMs <= Date.now() || request.deadlineAtMs > Date.now() + FW5_VISUAL_CAPTURE_LIMITS.bridgeTimeoutMs)
+      return failed("CAPTURE_FAILED", "capture_deadline_exceeded");
+    if (activeVisualRepairPromises.size > 0)
+      return failed("UNVERIFIED", "capture_in_flight_limit");
+    if (activeVisualCaptureRequests.size >= FW5_VISUAL_CAPTURE_LIMITS.maxInFlight)
+      return failed("UNVERIFIED", "capture_in_flight_limit");
+    activeVisualCaptureRequests.add(message.requestId);
+    let deferCaptureSlotRelease = false;
+    let captureConsumedRootId: string | undefined;
+    let captureSucceeded = false;
+
+    try {
+      assertTaskPageScope(request.authorizedDocumentScope.documentId, pageId);
+      if (cancelledVisualCaptures.has(message.requestId)) return failed("UNVERIFIED", "capture_cancelled");
+      const fresh = freshVisualCaptureRoots.get(request.rootId);
+      if (!fresh || fresh.taskId !== request.taskId || fresh.screenId !== request.screenId ||
+          fresh.documentId !== request.authorizedDocumentScope.documentId || fresh.pageId !== pageId ||
+          fresh.fingerprint !== request.programFingerprint || fresh.expiresAtMs < Date.now())
+        return failed("UNVERIFIED", "root_reused_or_recovered");
+      const allowedFirstCapture = request.captureAttempt === 1 && fresh.captureAttempts === 0 && request.previousReceiptId === undefined;
+      const allowedRecheck = request.captureAttempt === 2 && fresh.captureAttempts === 1 && fresh.repairUsed && fresh.recheckAllowed &&
+        request.previousReceiptId === fresh.captureReceiptId && request.readbackRevision === fresh.readbackRevision;
+      if (!allowedFirstCapture && !allowedRecheck)
+        return failed("UNVERIFIED", "root_reused_or_recovered");
+
+      const state = await loadState(pageId, true);
+      assertTaskPageScope(request.authorizedDocumentScope.documentId, pageId);
+      if (cancelledVisualCaptures.has(message.requestId)) return failed("UNVERIFIED", "capture_cancelled");
+      const entry = state.refs[message.rootRef];
+      if (!entry || entry.nodeId !== request.rootId || entry.pageId !== pageId || entry.taskId !== request.taskId || entry.alias !== message.rootRef)
+        return failed("UNVERIFIED", "identity_mismatch");
+      const resolved = await resolveRef(state, message.rootRef, pageId);
+      assertTaskPageScope(request.authorizedDocumentScope.documentId, pageId);
+      if (cancelledVisualCaptures.has(message.requestId)) return failed("UNVERIFIED", "capture_cancelled");
+      if (resolved.id !== request.rootId || resolved.type !== "FRAME" || resolved.removed || resolved.parent?.type !== "PAGE" ||
+          resolved.parent.id !== pageId || !belongsToPage(resolved, api.currentPage) ||
+          resolved.getPluginData(TASK_PLUGIN_KEY) !== request.taskId ||
+          resolved.getPluginData(PROGRAM_TASK_KEY) !== request.taskId ||
+          resolved.getPluginData(PROGRAM_FINGERPRINT_KEY) !== request.programFingerprint ||
+          resolved.getPluginData("fad.multi-screen.screen-id") !== request.screenId ||
+          resolved.getPluginData("fad.multi-screen.batch-id") !== fresh.batchId ||
+          canonicalProgramGeometryReceipt(resolved.getPluginData(PROGRAM_GEOMETRY_KEY)) !== canonicalProgramGeometryReceipt(request.readbackRevision))
+        return failed("UNVERIFIED", "identity_mismatch");
+      if (typeof resolved.exportAsync !== "function") return failed("CAPTURE_FAILED", "export_unsupported");
+
+      if (message.expectedLayout && JSON.stringify(message.expectedLayout) !== JSON.stringify(fresh.expectedLayout))
+        return failed("UNVERIFIED", "readback_stale");
+
+      const inspectOptions = {
+        taskId: request.taskId,
+        pageId,
+        requireOwnership: true,
+        checkReceipt: true,
+        ...(fresh.expectedLayout?.length ? { expectedLayout: fresh.expectedLayout, verifyLayoutSizing: true } : {}),
+      };
+      const before = inspectProgramGeometry(resolved, inspectOptions);
+      const instanceFindings = await verifyProgramInstanceMasters(resolved);
+      const safeSizingFindings = FW4_GEOMETRY_ENABLED && FW5_VISUAL_REVIEW_MODE === "review+bounded-repair" &&
+        before.findings.length === 1 && before.findings[0]?.code === "native_layout_sizing_mismatch";
+      assertTaskPageScope(request.authorizedDocumentScope.documentId, pageId);
+      if (cancelledVisualCaptures.has(message.requestId)) return failed("UNVERIFIED", "capture_cancelled");
+      if (canonicalProgramGeometryReceipt(before.receipt) !== canonicalProgramGeometryReceipt(request.readbackRevision) || before.coverage !== "complete" || (before.findings.length > 0 && !safeSizingFindings) || instanceFindings.length)
+        return failed("UNVERIFIED", "readback_stale");
+
+      const scale = planVisualCaptureScale(resolved.width, resolved.height, {
+        ...FW5_VISUAL_CAPTURE_LIMITS,
+        maxPixelWidth: request.maxPixelWidth,
+        maxPixelHeight: request.maxPixelHeight,
+      });
+      if (scale === undefined) return failed("CAPTURE_FAILED", "capture_limit_exceeded");
+      fresh.captureAttempts = request.captureAttempt;
+      if (request.captureAttempt === 2) fresh.recheckAllowed = false;
+      captureConsumedRootId = request.rootId;
+      const exportStartedAt = Date.now();
+      let pngBytes: Uint8Array<ArrayBufferLike>;
+      let exportSettled = false;
+      let exportPromise: Promise<Uint8Array<ArrayBufferLike>> | undefined;
+      try {
+        const remainingMs = Math.max(1, Math.min(FW5_VISUAL_CAPTURE_LIMITS.timeoutMs, request.deadlineAtMs - Date.now()));
+        exportPromise = Promise.resolve(resolved.exportAsync({ format: "PNG", constraint: { type: "SCALE", value: scale }, colorProfile: "SRGB" }));
+        void exportPromise.then(() => { exportSettled = true; }, () => { exportSettled = true; });
+        pngBytes = await withTimeout(exportPromise, "Visual PNG export", remainingMs);
+      } catch {
+        if (!exportSettled && exportPromise) {
+          deferCaptureSlotRelease = true;
+          void exportPromise.then(
+            () => activeVisualCaptureRequests.delete(message.requestId),
+            () => activeVisualCaptureRequests.delete(message.requestId),
+          );
+        }
+        return failed("CAPTURE_FAILED", Date.now() >= request.deadlineAtMs ? "capture_deadline_exceeded" : "export_failed", Math.max(0, Date.now() - exportStartedAt));
+      }
+      const exportDurationMs = Math.max(0, Date.now() - exportStartedAt);
+      if (cancelledVisualCaptures.has(message.requestId)) return failed("UNVERIFIED", "capture_cancelled", exportDurationMs);
+      if (Date.now() > request.deadlineAtMs) return failed("CAPTURE_FAILED", "capture_deadline_exceeded", exportDurationMs);
+      if (!(pngBytes instanceof Uint8Array) || pngBytes.byteLength === 0) return failed("CAPTURE_FAILED", "empty_png", exportDurationMs);
+      if (pngBytes.byteLength > request.maxBytes) return failed("CAPTURE_FAILED", "capture_limit_exceeded", exportDurationMs);
+      const dimensions = pngDimensions(pngBytes);
+      if (!dimensions) return failed("CAPTURE_FAILED", "invalid_png", exportDurationMs);
+      if (dimensions.width > request.maxPixelWidth || dimensions.height > request.maxPixelHeight ||
+          dimensions.width * dimensions.height > FW5_VISUAL_CAPTURE_LIMITS.maxPixels)
+        return failed("CAPTURE_FAILED", "capture_limit_exceeded", exportDurationMs);
+      if (!(pngBytes.buffer instanceof ArrayBuffer))
+        return failed("CAPTURE_FAILED", "export_unsupported", exportDurationMs);
+      const transferBytes = new Uint8Array(pngBytes.buffer, pngBytes.byteOffset, pngBytes.byteLength);
+
+      assertTaskPageScope(request.authorizedDocumentScope.documentId, pageId);
+      if (resolved.removed || resolved.parent?.type !== "PAGE" || resolved.parent.id !== pageId ||
+          resolved.getPluginData(TASK_PLUGIN_KEY) !== request.taskId ||
+          resolved.getPluginData(PROGRAM_FINGERPRINT_KEY) !== request.programFingerprint)
+        return failed("UNVERIFIED", "identity_mismatch", exportDurationMs);
+      const after = inspectProgramGeometry(resolved, inspectOptions);
+      const afterSafeSizingFindings = FW4_GEOMETRY_ENABLED && FW5_VISUAL_REVIEW_MODE === "review+bounded-repair" &&
+        after.findings.length === 1 && after.findings[0]?.code === "native_layout_sizing_mismatch";
+      if (canonicalProgramGeometryReceipt(after.receipt) !== canonicalProgramGeometryReceipt(request.readbackRevision) || after.coverage !== "complete" || (after.findings.length > 0 && !afterSafeSizingFindings))
+        return failed("UNVERIFIED", "readback_stale", exportDurationMs);
+      const receipt = makeVisualCaptureReceipt(request, pageId, "CAPTURED", "none", {
+        width: dimensions.width, height: dimensions.height, byteLength: pngBytes.byteLength, exportScale: scale, node: resolved,
+      });
+      if (request.captureAttempt === 1) {
+        fresh.captureReceiptId = receipt.receiptId;
+        fresh.readbackRevision = request.readbackRevision;
+        fresh.repairableSizing = safeSizingFindings ? before.findings : [];
+        fresh.recheckAllowed = false;
+      }
+      captureSucceeded = true;
+      return { receipt, pngBytes: transferBytes, exportDurationMs };
+    } catch (error) {
+      const code = error instanceof ReferenceResolutionError ? "identity_mismatch" : "identity_mismatch";
+      return failed("UNVERIFIED", code);
+    } finally {
+      cancelledVisualCaptures.delete(message.requestId);
+      if (!captureSucceeded && request.captureAttempt === 1 && captureConsumedRootId)
+        freshVisualCaptureRoots.delete(captureConsumedRootId);
+      if (!deferCaptureSlotRelease) activeVisualCaptureRequests.delete(message.requestId);
+    }
+  };
+  const activeVisualCapturePromises = new Map<string, ReturnType<typeof captureTaskNativeRoot>>();
+
+  const repairTaskNativeSizing = async (
+    requestInput: unknown,
+  ): Promise<VisualNativeRepairResultV1> => {
+    const parsed = VisualNativeRepairRequestV1Schema.safeParse(requestInput);
+    if (!parsed.success) throw new Error("visual_repair_request_invalid");
+    const request = parsed.data;
+    const { proposal } = request;
+    const reject = (reason: VisualNativeRepairResultV1["reason"]): VisualNativeRepairResultV1 => ({
+      version: 1, requestId: request.requestId, taskId: request.taskId, screenId: request.screenId,
+      rootId: request.rootId, captureReceiptId: request.captureReceiptId, status: "REJECTED", reason,
+    });
+    if (!FW5_VISUAL_QA_ENABLED) return reject("gate_disabled");
+    if (FW5_VISUAL_REVIEW_MODE !== "review+bounded-repair" || !FW4_GEOMETRY_ENABLED) return reject("mode_disabled");
+    if (request.deadlineAtMs <= Date.now() || request.deadlineAtMs > Date.now() + FW5_VISUAL_CAPTURE_LIMITS.bridgeTimeoutMs)
+      return reject("stale_readback");
+    if (cancelledVisualRepairs.has(request.requestId)) return reject("cancelled");
+
+    const fresh = freshVisualCaptureRoots.get(request.rootId);
+    if (!fresh || fresh.taskId !== request.taskId || fresh.screenId !== request.screenId ||
+        fresh.documentId !== request.documentId || fresh.pageId !== request.pageId ||
+        fresh.fingerprint !== request.programFingerprint || fresh.expiresAtMs < Date.now())
+      return reject("root_not_fresh");
+    if (fresh.captureAttempts !== 1 || fresh.repairUsed || fresh.recheckAllowed ||
+        fresh.captureReceiptId !== request.captureReceiptId || fresh.readbackRevision !== proposal.readbackRevision)
+      return reject(fresh.repairUsed ? "repair_already_used" : "stale_readback");
+    if (!fresh.expectedLayout || fresh.repairableSizing?.length !== 1) return reject("unsupported_repair");
+
+    try {
+      assertTaskPageScope(request.documentId, request.pageId);
+      const state = await loadState(request.pageId, true);
+      assertTaskPageScope(request.documentId, request.pageId);
+      if (cancelledVisualRepairs.has(request.requestId)) return reject("cancelled");
+      const rootEntry = state.refs[request.rootRef];
+      if (!rootEntry || rootEntry.nodeId !== request.rootId || rootEntry.pageId !== request.pageId ||
+          rootEntry.taskId !== request.taskId || rootEntry.alias !== request.rootRef)
+        return reject("identity_mismatch");
+      const root = await resolveRef(state, request.rootRef, request.pageId);
+      assertTaskPageScope(request.documentId, request.pageId);
+      if (cancelledVisualRepairs.has(request.requestId)) return reject("cancelled");
+      if (root.id !== request.rootId || root.type !== "FRAME" || root.removed || root.parent?.type !== "PAGE" ||
+          root.parent.id !== request.pageId || !belongsToPage(root, api.currentPage) ||
+          root.getPluginData(TASK_PLUGIN_KEY) !== request.taskId ||
+          root.getPluginData(PROGRAM_TASK_KEY) !== request.taskId ||
+          root.getPluginData(PROGRAM_FINGERPRINT_KEY) !== request.programFingerprint ||
+          root.getPluginData("fad.multi-screen.screen-id") !== request.screenId ||
+          root.getPluginData("fad.multi-screen.batch-id") !== fresh.batchId ||
+          canonicalProgramGeometryReceipt(root.getPluginData(PROGRAM_GEOMETRY_KEY)) !== canonicalProgramGeometryReceipt(proposal.readbackRevision))
+        return reject("identity_mismatch");
+
+      const precondition = fresh.repairableSizing[0]!;
+      const expectation = fresh.expectedLayout.find(({ logicalRef }) => logicalRef === precondition.logicalRef);
+      if (precondition.code !== "native_layout_sizing_mismatch" || !precondition.nodeId || !precondition.parentId ||
+          !precondition.logicalRef || !precondition.expectedLayout || !precondition.observedLayout || !expectation ||
+          precondition.nodeId !== proposal.targetNodeId || precondition.parentId !== proposal.expectedParentId ||
+          proposal.targetType !== "FRAME" || proposal.source !== "fw4-sizing-convergence")
+        return reject("unsupported_repair");
+      const expectedPropertyValue = proposal.property === "layoutSizingHorizontal"
+        ? precondition.expectedLayout.horizontalSizing : precondition.expectedLayout.verticalSizing;
+      const observedPropertyValue = proposal.property === "layoutSizingHorizontal"
+        ? precondition.observedLayout.horizontalSizing : precondition.observedLayout.verticalSizing;
+      const programPropertyValue = proposal.property === "layoutSizingHorizontal"
+        ? expectation.horizontalSizing : expectation.verticalSizing;
+      if (proposal.expectedValue !== observedPropertyValue || proposal.proposedValue !== expectedPropertyValue ||
+          proposal.proposedValue !== programPropertyValue || proposal.expectedValue === proposal.proposedValue)
+        return reject("stale_readback");
+
+      const target = await api.getNodeByIdAsync(proposal.targetNodeId);
+      assertTaskPageScope(request.documentId, request.pageId);
+      if (cancelledVisualRepairs.has(request.requestId)) return reject("cancelled");
+      if (!target || target.removed || target.type !== "FRAME" || target.id !== precondition.nodeId ||
+          target.parent?.id !== proposal.expectedParentId || target.getPluginData(TASK_PLUGIN_KEY) !== request.taskId ||
+          target.getPluginData("fad.design.logical-ref") !== precondition.logicalRef ||
+          target.getPluginData(CONTEXT_COMPONENT_KEY) === "1" || Boolean(target.getPluginData(NATIVE_MASTER_KEY)))
+        return reject("identity_mismatch");
+      let descendant: BaseNode | null = target;
+      let depth = 0;
+      while (descendant && descendant.id !== root.id && depth++ < 16) descendant = descendant.parent;
+      if (descendant?.id !== root.id) return reject("identity_mismatch");
+      const parent = target.parent;
+      if (!parent || !("layoutMode" in parent) || parent.layoutMode === "NONE" ||
+          parent.getPluginData("fad.design.logical-ref") !== expectation.parentLogicalRef ||
+          ("layoutPositioning" in target && target.layoutPositioning === "ABSOLUTE"))
+        return reject("unsupported_repair");
+      const currentValue = proposal.property === "layoutSizingHorizontal"
+        ? target.layoutSizingHorizontal : target.layoutSizingVertical;
+      if (currentValue !== proposal.expectedValue) return reject("stale_readback");
+      const beforeWrite = inspectProgramGeometry(root, {
+        taskId: request.taskId, pageId: request.pageId, requireOwnership: true, checkReceipt: true,
+        expectedLayout: fresh.expectedLayout, verifyLayoutSizing: true,
+      });
+      if (beforeWrite.coverage !== "complete" || beforeWrite.receipt !== proposal.readbackRevision ||
+          beforeWrite.findings.length !== 1 || beforeWrite.findings[0]?.code !== precondition.code ||
+          beforeWrite.findings[0]?.nodeId !== target.id)
+        return reject("stale_readback");
+      if (request.deadlineAtMs <= Date.now()) return reject("stale_readback");
+
+      // Fence duplicate requests before the only native property mutation.
+      fresh.repairUsed = true;
+      if (cancelledVisualRepairs.has(request.requestId)) return reject("cancelled");
+      try {
+        if (proposal.property === "layoutSizingHorizontal") target.layoutSizingHorizontal = proposal.proposedValue;
+        else target.layoutSizingVertical = proposal.proposedValue;
+      } catch {
+        return reject("correction_failed");
+      }
+      if (target.removed || root.removed || target.parent?.id !== proposal.expectedParentId || root.parent?.id !== request.pageId)
+        return reject("identity_mismatch");
+      const instanceFindings = await verifyProgramInstanceMasters(root);
+      assertTaskPageScope(request.documentId, request.pageId);
+      if (cancelledVisualRepairs.has(request.requestId)) return reject("cancelled");
+      if (target.removed || root.removed || target.parent?.id !== proposal.expectedParentId || root.parent?.id !== request.pageId)
+        return reject("identity_mismatch");
+      const report = inspectProgramGeometry(root, {
+        taskId: request.taskId, pageId: request.pageId, requireOwnership: true,
+        expectedLayout: fresh.expectedLayout, verifyLayoutSizing: true,
+      });
+      if (report.coverage !== "complete" || report.findings.length > 0 || instanceFindings.length > 0 ||
+          (proposal.property === "layoutSizingHorizontal" ? target.layoutSizingHorizontal : target.layoutSizingVertical) !== proposal.proposedValue)
+        return reject("readback_failed");
+      root.setPluginData(PROGRAM_GEOMETRY_KEY, report.receipt);
+      fresh.readbackRevision = report.receipt;
+      fresh.recheckAllowed = true;
+      fresh.repairableSizing = [];
+      return {
+        version: 1, requestId: request.requestId, taskId: request.taskId, screenId: request.screenId,
+        rootId: request.rootId, captureReceiptId: request.captureReceiptId, status: "APPLIED", reason: "none",
+        readbackRevision: report.receipt, targetNodeId: target.id, property: proposal.property,
+      };
+    } catch {
+      return reject(cancelledVisualRepairs.has(request.requestId) ? "cancelled" : "identity_mismatch");
+    }
+  };
+  const activeVisualRepairPromises = new Map<string, Promise<VisualNativeRepairResultV1>>();
+
   const inspectTaskNativeNodes = async (
     message: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
   ) => {
@@ -1276,6 +1627,8 @@ export function createFigmaToolExecutor(
         refEntry.taskId === message.taskId
           ? { ref: refEntry.alias ?? savedRef }
           : {}),
+        ...(node.getPluginData("fad.design.logical-ref") ? { logicalRef: node.getPluginData("fad.design.logical-ref").slice(0, 120) } : {}),
+        ...(node.getPluginData("fad.design.semantic-role") ? { semanticRole: node.getPluginData("fad.design.semantic-role").slice(0, 60) } : {}),
         name: node.name.slice(0, 100),
         type: node.type,
         x: node.x,
@@ -1283,6 +1636,16 @@ export function createFigmaToolExecutor(
         width: node.width,
         height: node.height,
         visible: node.visible,
+        ...("layoutSizingHorizontal" in node && ["FIXED", "HUG", "FILL"].includes(String(node.layoutSizingHorizontal))
+          ? { layoutSizingHorizontal: String(node.layoutSizingHorizontal) as "FIXED" | "HUG" | "FILL" } : {}),
+        ...("layoutSizingVertical" in node && ["FIXED", "HUG", "FILL"].includes(String(node.layoutSizingVertical))
+          ? { layoutSizingVertical: String(node.layoutSizingVertical) as "FIXED" | "HUG" | "FILL" } : {}),
+        ...(node.type === "TEXT" ? {
+          ...(node.textAutoResize === "HEIGHT" || node.textAutoResize === "WIDTH_AND_HEIGHT" ? { textAutoResize: node.textAutoResize } : {}),
+          textLength: Math.min(10_000, node.characters.length),
+          ...(typeof node.fontSize === "number" && Number.isFinite(node.fontSize) && node.fontSize > 0 ? { fontSize: Math.min(256, node.fontSize) } : {}),
+          ...(typeof node.fontName === "object" && node.fontName.family ? { fontFamily: node.fontName.family.slice(0, 100) } : {}),
+        } : {}),
         ...(hasLayout
           ? {
               layoutMode: frame.layoutMode,
@@ -1316,7 +1679,7 @@ export function createFigmaToolExecutor(
       ref: string;
       status: "missing" | "stale" | "ambiguous" | "unavailable";
     }> = [];
-    let geometry: ProgramGeometryReport | undefined;
+    let geometry: (ProgramGeometryReport & { receipt: string }) | undefined;
     for (const ref of new Set(message.refs)) {
       const matches = Object.entries(state.refs).filter(
         ([canonicalRef, entry]) => canonicalRef === ref || entry.alias === ref,
@@ -1349,12 +1712,13 @@ export function createFigmaToolExecutor(
           } else {
             const report = inspectProgramGeometry(node, {
               taskId: message.taskId, pageId, requireOwnership: true, checkReceipt: hasReceipt,
+              ...(message.geometry.expectedLayout ? { expectedLayout: message.geometry.expectedLayout } : {}),
             });
             const instanceFindings = await verifyProgramInstanceMasters(node);
             assertTaskPageScope(message.documentId, pageId);
             geometry = {
               version: report.version, coverage: report.coverage, measuredNodes: report.measuredNodes,
-              durationMs: report.durationMs, findings: [...report.findings, ...instanceFindings].slice(0, 12),
+              durationMs: report.durationMs, receipt: report.receipt, findings: [...report.findings, ...instanceFindings].slice(0, 12),
             };
           }
         }
@@ -1380,7 +1744,7 @@ export function createFigmaToolExecutor(
     assertTaskPageScope(message.documentId, pageId);
     const expectedRootStatus = !expectedId ? undefined : expected?.removed ? "removed"
       : !expected ? "missing" : expected.parent?.id !== pageId ? "unexpected_parent" : "present";
-    return { nodes, unresolvedRefs, expectedRootStatus, truncated: owned.length > visibleNodes.length, ...(geometry ? { geometry } : {}) } as const;
+    return { nodes, unresolvedRefs, expectedRootStatus, ...(FW5_VISUAL_QA_ENABLED ? { nativePageId: pageId } : {}), truncated: owned.length > visibleNodes.length, ...(geometry ? { geometry } : {}) } as const;
   };
 
   const focusTaskNativeNodes = async (
@@ -3710,7 +4074,11 @@ export function createFigmaToolExecutor(
           | "tool-pause"
           | "tool-delete-consent"
           | "task-native-inspect"
-          | "task-native-focus";
+          | "task-native-focus"
+          | "task-native-visual-capture"
+          | "task-native-visual-capture-cancel"
+          | "task-native-visual-repair"
+          | "task-native-visual-repair-cancel";
       }
     >,
   ): Promise<void> => {
@@ -3767,6 +4135,73 @@ export function createFigmaToolExecutor(
             : "The task layer could not be focused."
           ).slice(0, 500),
         });
+      }
+      return;
+    }
+    if (message.type === "task-native-visual-capture-cancel") {
+      cancelledVisualCaptures.add(message.requestId);
+      while (cancelledVisualCaptures.size > 32)
+        cancelledVisualCaptures.delete(cancelledVisualCaptures.values().next().value!);
+      return;
+    }
+    if (message.type === "task-native-visual-repair-cancel") {
+      cancelledVisualRepairs.add(message.requestId);
+      while (cancelledVisualRepairs.size > 32)
+        cancelledVisualRepairs.delete(cancelledVisualRepairs.values().next().value!);
+      return;
+    }
+    if (message.type === "task-native-visual-repair") {
+      let pending = activeVisualRepairPromises.get(message.request.requestId);
+      if (!pending) {
+        if (activeVisualRepairPromises.size >= FW5_VISUAL_CAPTURE_LIMITS.maxInFlight || activeVisualCaptureRequests.size > 0) {
+          send({ type: "task-native-visual-repair-result", result: {
+            version: 1, requestId: message.request.requestId, taskId: message.request.taskId,
+            screenId: message.request.screenId, rootId: message.request.rootId,
+            captureReceiptId: message.request.captureReceiptId, status: "REJECTED", reason: "repair_in_flight_limit",
+          } });
+          return;
+        }
+        pending = queue.then(() => repairTaskNativeSizing(message.request)).finally(() => {
+          activeVisualRepairPromises.delete(message.request.requestId);
+          cancelledVisualRepairs.delete(message.request.requestId);
+        });
+        activeVisualRepairPromises.set(message.request.requestId, pending);
+        queue = pending.then(() => undefined, () => undefined);
+      }
+      const result = await pending.catch(() => ({
+        version: 1 as const, requestId: message.request.requestId, taskId: message.request.taskId,
+        screenId: message.request.screenId, rootId: message.request.rootId,
+        captureReceiptId: message.request.captureReceiptId, status: "REJECTED" as const,
+        reason: "identity_mismatch" as const,
+      }));
+      send({ type: "task-native-visual-repair-result", result });
+      return;
+    }
+    if (message.type === "task-native-visual-capture") {
+      try {
+        let pending = activeVisualCapturePromises.get(message.requestId);
+        if (!pending) {
+          pending = captureTaskNativeRoot(message);
+          activeVisualCapturePromises.set(message.requestId, pending);
+        }
+        const result = await pending;
+        const success = Boolean("pngBytes" in result && result.receipt.status === "CAPTURED");
+        send({
+          type: "task-native-visual-capture-result",
+          requestId: message.requestId,
+          taskId: message.visualCapture.taskId,
+          success,
+          ...(success && "pngBytes" in result
+            ? { visualCapture: { receipt: result.receipt, pngBytes: result.pngBytes }, exportDurationMs: result.exportDurationMs }
+            : { receipt: result.receipt, exportDurationMs: result.exportDurationMs }),
+        });
+        if (activeVisualCapturePromises.get(message.requestId) === pending)
+          activeVisualCapturePromises.delete(message.requestId);
+      } catch {
+        const request = message.visualCapture;
+        const receipt = makeVisualCaptureReceipt(request, request.pageId, "CAPTURE_FAILED", "export_failed");
+        send({ type: "task-native-visual-capture-result", requestId: message.requestId, taskId: request.taskId, success: false, receipt });
+        activeVisualCapturePromises.delete(message.requestId);
       }
       return;
     }
@@ -3970,6 +4405,29 @@ export function createFigmaToolExecutor(
       for (const write of pendingPluginWrites.reverse()) write.node.setPluginData(write.key, write.previous);
       for (const ref of changedRefs) delete state.refs[ref];
       throw error;
+    }
+    if (FW5_VISUAL_QA_ENABLED) {
+      for (const expected of parsed.roots) {
+        if (expected.freshlyCreated !== true) {
+          freshVisualCaptureRoots.delete(expected.rootNodeId);
+          continue;
+        }
+        const root = await api.getNodeByIdAsync(expected.rootNodeId);
+        assertTaskPageScope(parsed.documentId, pageId);
+        if (!root || root.removed || root.type !== "FRAME" || root.parent?.type !== "PAGE" || root.parent.id !== pageId ||
+            root.getPluginData(TASK_PLUGIN_KEY) !== parsed.taskId ||
+            root.getPluginData("fad.multi-screen.screen-id") !== expected.screenId ||
+            root.getPluginData("fad.multi-screen.batch-id") !== parsed.batchId ||
+            !root.getPluginData(PROGRAM_FINGERPRINT_KEY)) continue;
+        freshVisualCaptureRoots.set(expected.rootNodeId, {
+          taskId: parsed.taskId, screenId: expected.screenId, documentId: parsed.documentId,
+          pageId, batchId: parsed.batchId, fingerprint: root.getPluginData(PROGRAM_FINGERPRINT_KEY), expiresAtMs: Date.now() + 60_000,
+          captureAttempts: 0, repairUsed: false, recheckAllowed: false,
+          ...(expected.expectedLayout ? { expectedLayout: expected.expectedLayout } : {}),
+        });
+      }
+      while (freshVisualCaptureRoots.size > 20)
+        freshVisualCaptureRoots.delete(freshVisualCaptureRoots.keys().next().value!);
     }
     return { registeredRefs: claims.length, persistenceMs, operationIds };
   };

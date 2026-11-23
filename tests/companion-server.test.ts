@@ -29,6 +29,8 @@ import type { PluginToUIMessage } from "../src/shared/messages";
 import { UIToPluginSchema, PluginToUISchema } from "../src/shared/messages";
 import { FigmaToolBatchSchema } from "../src/shared/figma-tools";
 import { UNIVERSAL_CONTEXT_PREFIX } from "../src/shared/chat-tools";
+import { ONE_PIXEL_PNG } from "./visual-fixtures";
+import { FW5_VISUAL_REVIEW_RUBRIC } from "../src/shared/fw5-provider-visual-review";
 
 const discovery: OidcDiscovery = {
   issuer: OIDC_ISSUER,
@@ -52,6 +54,91 @@ afterEach(async () => {
 });
 
 describe("loopback companion", () => {
+  it("sends one consent-scoped PNG through Responses with strict structured output and no retries", async () => {
+    const harness = await createHarness({ visualReviewOutput: { verdict: "pass", confidence: 0.92, reason: null, findings: [] } });
+    const token = await authorizeAndDiscover(harness);
+    const status = await (await request(harness.handle, "/v1/status", { token })).json() as { sessionId: string; accountScope: string };
+    const response = await request(harness.handle, "/v1/visual-review", { token, body: visualReviewFixture({
+      sessionId: status.sessionId,
+      accountScope: status.accountScope,
+    }) });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { capability: { status: string; provenance: string }; response: { verdict: string } };
+    expect(body).toMatchObject({ capability: { status: "supported", provenance: "provider_result" }, response: { verdict: "pass" } });
+    expect(harness.responsesCallCount).toBe(1);
+    const upstream = JSON.parse(harness.responsesRequest!.body) as Record<string, unknown>;
+    expect(upstream).toMatchObject({ model: "account-model", store: false, stream: false,
+      text: { format: { type: "json_schema", name: "fw5_visual_review_v1", strict: true } } });
+    expect(upstream).not.toHaveProperty("tools");
+    const input = upstream.input as Array<{ content: Array<Record<string, unknown>> }>;
+    expect(input[0]?.content[0]).toMatchObject({ type: "input_text" });
+    expect(input[0]?.content[1]).toMatchObject({ type: "input_image", image_url: `data:image/png;base64,${ONE_PIXEL_PNG}` });
+    expect(new Headers(harness.responsesRequest!.headers).get("authorization")).toBe("Bearer access-secret");
+  });
+
+  it("maps the plan-sharing unsupported image capability without retrying or changing routes", async () => {
+    const harness = await createHarness({ responsesHttpError: { status: 400, body: { error: { code: "subscription_sharing_unsupported_capability" } } } });
+    const token = await authorizeAndDiscover(harness);
+    const status = await (await request(harness.handle, "/v1/status", { token })).json() as { sessionId: string; accountScope: string };
+    const response = await request(harness.handle, "/v1/visual-review", { token, body: visualReviewFixture({ sessionId: status.sessionId, accountScope: status.accountScope }) });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "unsupported_capability", capability: { status: "unsupported", provenance: "provider_result" } });
+    expect(harness.responsesCallCount).toBe(1);
+  });
+
+  it("rejects malformed image bytes and stale session identity before calling Responses", async () => {
+    const harness = await createHarness();
+    const token = await authorizeAndDiscover(harness);
+    const status = await (await request(harness.handle, "/v1/status", { token })).json() as { sessionId: string; accountScope: string };
+    const malformed = visualReviewFixture({ sessionId: status.sessionId, accountScope: status.accountScope, pngBase64: "bm90LXBuZw==", byteLength: 7 });
+    const malformedResponse = await request(harness.handle, "/v1/visual-review", { token, body: malformed });
+    expect(malformedResponse.status).toBe(400);
+    expect(harness.responsesCallCount).toBe(0);
+    const staleResponse = await request(harness.handle, "/v1/visual-review", { token, body: visualReviewFixture({ sessionId: "stale-session-identity", accountScope: status.accountScope }) });
+    expect(staleResponse.status).toBe(409);
+    expect(harness.responsesCallCount).toBe(0);
+  });
+
+  it("requires granted plan scope and an account-listed model for a visual request", async () => {
+    const deniedHarness = await createHarness({ scope: "openid profile" });
+    const deniedToken = await deniedHarness.pair();
+    await request(deniedHarness.handle, "/v1/auth/start", { token: deniedToken, body: {} });
+    await completeLogin(deniedHarness);
+    const deniedStatus = await (await request(deniedHarness.handle, "/v1/status", { token: deniedToken })).json() as { sessionId: string; accountScope: string };
+    const denied = await request(deniedHarness.handle, "/v1/visual-review", { token: deniedToken, body: visualReviewFixture({ sessionId: deniedStatus.sessionId, accountScope: deniedStatus.accountScope }) });
+    expect(denied.status).toBe(403);
+    expect(deniedHarness.responsesCallCount).toBe(0);
+
+    const listedHarness = await createHarness();
+    const token = await authorizeAndDiscover(listedHarness);
+    const status = await (await request(listedHarness.handle, "/v1/status", { token })).json() as { sessionId: string; accountScope: string };
+    const unlisted = await request(listedHarness.handle, "/v1/visual-review", { token, body: { ...visualReviewFixture({ sessionId: status.sessionId, accountScope: status.accountScope }), model: "hidden-model" } });
+    expect(unlisted.status).toBe(400);
+    expect(await unlisted.json()).toMatchObject({ error: "model_not_verified_for_account" });
+    expect(listedHarness.responsesCallCount).toBe(0);
+  });
+
+  it("accepts a same-account token refresh and cancels an in-flight image response on Stop", async () => {
+    const refreshed = await createHarness({ refresh: true, expiresIn: 2 });
+    const token = await authorizeAndDiscover(refreshed);
+    const status = await (await request(refreshed.handle, "/v1/status", { token })).json() as { sessionId: string; accountScope: string };
+    const review = await request(refreshed.handle, "/v1/visual-review", { token, body: visualReviewFixture({ sessionId: status.sessionId, accountScope: status.accountScope }) });
+    expect(review.status).toBe(200);
+    expect(refreshed.refreshRequest).toContain("grant_type=refresh_token");
+    expect(new Headers(refreshed.responsesRequest!.headers).get("authorization")).toBe("Bearer access-rotated");
+
+    const stalled = await createHarness({ stalledStream: true });
+    const stalledToken = await authorizeAndDiscover(stalled);
+    const stalledStatus = await (await request(stalled.handle, "/v1/status", { token: stalledToken })).json() as { sessionId: string; accountScope: string };
+    const abort = new AbortController();
+    const pending = request(stalled.handle, "/v1/visual-review", { token: stalledToken, body: visualReviewFixture({ sessionId: stalledStatus.sessionId, accountScope: stalledStatus.accountScope }), signal: abort.signal });
+    await stalled.waitForResponseStream();
+    abort.abort("user_stop");
+    await expect(pending).rejects.toBeDefined();
+    await vi.waitFor(() => expect(stalled.wasResponseStreamCancelled()).toBe(true));
+    expect(stalled.responsesCallCount).toBe(1);
+  });
+
   it.each(["headers", "stream"] as const)("keeps the first screen alive during %s while its sibling refreshes the same OAuth session", async (phase) => {
     const harness = await createHarness({ refresh: true, expiresIn: 120 });
     const token = await authorizeAndDiscover(harness);
@@ -3931,6 +4018,7 @@ async function createHarness(
     };
     responseChunks?: string[];
     responsesHttpError?: { status: number; body: unknown };
+    visualReviewOutput?: unknown;
     responsesFetchFailure?: boolean;
     accountModel?: string;
     requestTimeoutMs?: number;
@@ -4062,6 +4150,7 @@ async function createHarness(
         tools?: unknown;
         tool_choice?: unknown;
         input?: unknown[];
+        stream?: boolean;
       };
       if (options.responsesFetchFailure) throw new TypeError("private transport failure text");
       const chatHeaderGate = Array.isArray(responsePayload.tools) && responsePayload.tool_choice === "auto"
@@ -4127,6 +4216,10 @@ async function createHarness(
         return Response.json(options.responsesHttpError.body, {
           status: options.responsesHttpError.status,
         });
+      }
+      if (responsePayload.stream === false) {
+        const outputText = JSON.stringify(options.visualReviewOutput ?? { verdict: "pass", confidence: 0.92, reason: null, findings: [] });
+        return Response.json({ status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: outputText }] }] });
       }
       if (options.usageFailure || nextResponsesUsageFailure) {
         nextResponsesUsageFailure = false;
@@ -4453,6 +4546,47 @@ async function request(
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     ...(options.signal ? { signal: options.signal } : {}),
   });
+}
+
+function visualReviewFixture(overrides: {
+  sessionId?: string;
+  accountScope?: string;
+  pngBase64?: string;
+  byteLength?: number;
+}) {
+  const pngBase64 = overrides.pngBase64 ?? ONE_PIXEL_PNG;
+  return {
+    version: 1,
+    requestId: "fw5_review_request_0001",
+    taskId: "task-fw5-visual-001",
+    taskGeneration: "generation-task-fw5-visual-001",
+    screenId: "screen-01",
+    documentId: "document-fixture",
+    pageId: "page-fixture",
+    rootId: "fw5-root-fixture",
+    programFingerprint: "dpv1-0123456789abcdef",
+    readbackRevision: "v1-01234567",
+    receiptId: "fw5-capture-fixture-0001",
+    imageRevision: 1,
+    provider: "openai-responses",
+    model: "account-model",
+    sessionId: overrides.sessionId ?? "0123456789abcdef",
+    accountScope: overrides.accountScope ?? "a".repeat(64),
+    consentAuthorizationId: "fw5_review_auth_0001",
+    consentImageCount: 1,
+    contentType: "image/png",
+    width: 1,
+    height: 1,
+    byteLength: overrides.byteLength ?? Buffer.from(pngBase64, "base64").length,
+    pngBase64,
+    rubric: FW5_VISUAL_REVIEW_RUBRIC,
+    context: {
+      viewport: { width: 390, height: 844 },
+      scrollIntent: "none",
+      nodes: [{ nodeId: "fw5-root-fixture", type: "FRAME", bounds: { x: 0, y: 0, width: 390, height: 844 }, visible: true }],
+      program: { programId: "fw5-fixture", programRevision: 1, screenId: "screen-01", viewport: { width: 390, height: 844 }, language: "en", direction: "ltr", scrollIntent: "none", nodes: [] },
+    },
+  };
 }
 
 async function beginPairing(

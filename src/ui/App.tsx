@@ -42,10 +42,13 @@ import {
 } from "../shared/chat-task";
 import { runChatTask, chatTaskInput } from "./chat-task";
 import { chatHistoryBridge, chatTaskBridge } from "./chat-task-bridge";
-import { renderDesignProgramBridge } from "./design-program-bridge";
+import { readDesignContextBridge, renderDesignProgramBridge, taskContextRequest } from "./design-program-bridge";
+import { FW2_ENABLED } from "../shared/design-context-feature";
+import { FW5_VISUAL_QA_ENABLED, FW5_VISUAL_REVIEW_MODE } from "../shared/fw5-visual-qa-feature";
 import { designEnginePreferenceBridge } from "./design-engine-preference-bridge";
 import { selectChatExecutionRoute } from "./universal-design-route";
-import { taskNativeBridge } from "./task-native-bridge";
+import { createFW5VisualReviewAdapter } from "./fw5-visual-review-adapter";
+import { taskNativeBridge, taskNativeVisualCaptureBridge, taskNativeVisualRepairBridge } from "./task-native-bridge";
 import { ChatHistoryView } from "./chat-history-view";
 import { ChatDeleteDialog } from "./chat-delete-dialog";
 import { HomeDashboard } from "./home-dashboard";
@@ -1111,6 +1114,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   useEffect(() => {
     const handleMessage = (event: MessageEvent<unknown>) => {
       const raw = (event.data as { pluginMessage?: unknown } | null)?.pluginMessage;
+      if (raw && typeof raw === "object" && "type" in raw && raw.type === "design-context-result")
+        return; // Correlated and bounded by the scoped bridge.
       const result = PluginToUISchema.safeParse(raw);
       if (!result.success) {
         if (
@@ -1134,7 +1139,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         message.type === "chat-history-result" ||
         message.type === "task-native-inspection-result" ||
         message.type === "task-native-focus-result" ||
-        message.type === "design-program-render-result"
+        message.type === "design-program-render-result" ||
+        message.type === "design-context-result"
       )
         return;
       if (message.type === "tool-progress") {
@@ -1208,6 +1214,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         setNotice({ tone: "error", title: message.message });
         return;
       }
+      if (message.type === "task-native-visual-capture-result" || message.type === "task-native-visual-repair-result")
+        return;
       if (message.requestId !== currentRequest.current) return;
 
       if (message.type === "multi-screen-progress") {
@@ -2261,6 +2269,33 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       if (!executionModel)
         throw new Error("Choose an account-visible model before resuming this task.");
       task.model = executionModel;
+      const fw5VisualReview = createFW5VisualReviewAdapter({
+        enabled: FW5_VISUAL_QA_ENABLED,
+        mode: FW5_VISUAL_REVIEW_MODE,
+        token: companionToken,
+        model: executionModel,
+        models: companionModels,
+        session: { sessionId: session.sessionId, accountScope: session.accountScope },
+        task,
+        assertCurrent: checkChatSession,
+        getStatus: () => getCompanionStatus(companionToken),
+        inspectRoot: async (scope) => {
+          checkChatSession();
+          const result = await taskNativeBridge({
+            type: "task-native-inspect",
+            requestId: nextRequestId(),
+            taskId: scope.taskId,
+            documentId: scope.documentId,
+            refs: [scope.rootRef],
+            geometry: { programFingerprint: scope.programFingerprint, requireReceipt: true, expectedRootNodeId: scope.rootId },
+          });
+          checkChatSession();
+          if (result.type !== "task-native-inspection-result") throw new CompanionClientError("response_invalid");
+          return result;
+        },
+        confirm: (message) => window.confirm(message),
+        fetcher: fetch,
+      });
       setChatRetryMessageId(null);
       setChatPendingTool(true);
       setChatMessages((messages) =>
@@ -2317,7 +2352,15 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           )
             throw staleSession();
         },
-        renderProgram: async (program, requestId, expectedRootNodeId) => {
+        readContext: FW2_ENABLED ? async (intent, target) => {
+          checkChatSession();
+          const request = taskContextRequest(task, intent, nextRequestId(), target);
+          if (!request) return;
+          const response = await readDesignContextBridge(request, controller.signal);
+          checkChatSession();
+          return response;
+        } : undefined,
+        renderProgram: async (program, requestId, expectedRootNodeId, contextTicket) => {
           checkChatSession();
           const response = await renderDesignProgramBridge({
             type: "design-program-render",
@@ -2326,6 +2369,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             documentId: task.documentId,
             brandKit: task.brandKit,
             expectedRootNodeId,
+            contextTicket,
             program,
           });
           checkChatSession();
@@ -2339,6 +2383,20 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             throw new Error("Figma returned an unexpected response for the universal screen readback.");
           return response;
         },
+        captureVisual: async (request, signal) => {
+          checkChatSession();
+          const response = await taskNativeVisualCaptureBridge(request, signal);
+          checkChatSession();
+          return response;
+        },
+        repairVisual: async (request, signal) => {
+          checkChatSession();
+          const response = await taskNativeVisualRepairBridge(request, signal);
+          checkChatSession();
+          return response;
+        },
+        visualReviewer: fw5VisualReview.reviewer,
+        authorizeVisualReview: fw5VisualReview.authorize,
         model: (input, lifecycle, requestId, requestSignal) =>
           streamAuthorizedChat(
             companionToken,

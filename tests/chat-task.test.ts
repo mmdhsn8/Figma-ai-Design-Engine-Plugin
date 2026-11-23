@@ -43,6 +43,9 @@ import { validateDraftSection, type DraftManifest } from "../src/shared/generati
 import { prepareGeneratedDesign } from "../src/ui/design-generation";
 import { sectionDesignFixture } from "./generation-fixture";
 import { createMockApi, type MockNode } from "./figma-mock";
+import { createDesignContextController } from "../src/plugin/design-context-controller";
+import { EDIT_CONTEXT_PREFIX } from "../src/shared/design-context";
+import { taskContextRequest } from "../src/ui/design-program-bridge";
 import {
   DesignSkillRevisionSchema,
   parseSkillMarkdown,
@@ -1830,8 +1833,19 @@ describe("progressive conversational canvas tasks", () => {
     const current = task();
     delete current.intent;
     if (executionRoute) current.executionRoute = executionRoute;
+    current.prompt = "Edit the selected frame named Charm Home.";
+    const { api } = createMockApi();
+    Object.assign(api.currentPage, { id: "page:charm" });
+    const selected = api.createFrame();
+    Object.assign(selected, { id: "node-charm-home" });
+    api.currentPage.selection = [selected];
+    const controller = createDesignContextController(api, true, () => current.documentId);
+    const readContext = vi.fn(async (intent: "create" | "edit", target?: { nodeId: string; pageId: string }) => {
+      const request = taskContextRequest(current, intent, "edit-context-0001", target);
+      return request && controller.read(request);
+    });
 
-    await runChatTask(current, h.deps);
+    await runChatTask(current, { ...h.deps, readContext });
     expect(current.intent).toBe("edit");
     expect(current.designName).toBe("Charm");
     expect(h.batches.flat().map(({ action }) => action.tool)).toEqual([
@@ -1844,6 +1858,17 @@ describe("progressive conversational canvas tasks", () => {
       nodeId: "node-charm-home",
     });
     expect(h.lifecycles).toEqual([firstLifecycle, "EDIT_PLANNING", "PLAN_SAVED"]);
+    const scoped = h.deps.model.mock.calls[1]?.[0].find((item) =>
+      "content" in item && item.content.startsWith(EDIT_CONTEXT_PREFIX));
+    if (executionRoute) {
+      expect(readContext).toHaveBeenCalledExactlyOnceWith("edit", { nodeId: selected.id, pageId: "page:charm" });
+      expect(scoped).toBeDefined();
+      expect(JSON.parse((scoped as { content: string }).content.slice(EDIT_CONTEXT_PREFIX.length)).context.nodes)
+        .toMatchObject([{ id: selected.id }]);
+    } else {
+      expect(readContext).not.toHaveBeenCalled();
+      expect(scoped).toBeUndefined();
+    }
     expect(current.failure?.code).toBe("native_execution_blocked");
     expect(current.ledger.some(({ call }) => call.action.tool === "create_frame")).toBe(false);
   });

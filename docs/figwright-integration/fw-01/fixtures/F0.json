@@ -1,0 +1,17 @@
+{
+  "fixtureId": "F0",
+  "locale": "en + fa",
+  "viewport": "existing Chat surface",
+  "projectDomain": "safety and intent routing",
+  "requestedScreenCount": 0,
+  "screenRoles": [],
+  "messages": ["hi", "سلام"],
+  "expected": {
+    "conversationalReply": true,
+    "canvasTasks": 0,
+    "designPrograms": 0,
+    "nativeWrites": 0,
+    "unwantedTaskCheckpoints": 0,
+    "unrelatedSelectionAndContentChanged": false
+  }
+}

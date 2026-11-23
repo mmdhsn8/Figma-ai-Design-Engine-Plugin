@@ -6,6 +6,7 @@ import type {
   SizingMode,
 } from "../shared/schema";
 import { orderComponentDefinitions, parseDesignValue } from "../shared/schema";
+import { CONTEXT_COMPONENT_KEY, NATIVE_MASTER_KEY } from "./design-context-reuse";
 import type { FontSelection } from "../shared/messages";
 import type { GenerationTransaction } from "../shared/generation-transaction";
 import type { DesignPlan } from "../shared/design-generation";
@@ -153,6 +154,8 @@ export interface MultiScreenRenderOptions {
   verifyPlacement?: boolean;
   requireComponentMatch?: boolean;
   programText?: boolean;
+  contextRectangle?: (spec: ResolvedRectangleNodeSpec) => { instance: InstanceNode; masterId: string } | undefined;
+  bindContextFills?: (root: FrameNode) => Promise<void>;
   transaction?: GenerationTransaction;
   onSectionVisible?: (nodeId: string) => void;
   resume?: boolean;
@@ -800,6 +803,7 @@ interface BuildContext {
   imageHashes: Map<string, string>;
   warnings: string[];
   programText?: boolean;
+  contextRectangle?: MultiScreenRenderOptions["contextRectangle"];
 }
 
 function buildFrameChildren(
@@ -868,11 +872,23 @@ function appendDesignNode(
     setTextTypography(spec, text, context.fonts, parentLayout, context.programText);
     node = text;
   } else if (spec.type === "rectangle") {
-    const rectangle = api.createRectangle();
-    tracker.track(rectangle, "rectangles");
-    rectangle.name = spec.name;
-    setRectangleProperties(rectangle, spec);
-    node = rectangle;
+    const reused = !spec.qualityRole && spec.sizing?.width === "fixed" && spec.sizing?.height === "fixed"
+      ? context.contextRectangle?.(spec) : undefined;
+    if (reused) {
+      const { instance, masterId } = reused;
+      tracker.track(instance, "instances");
+      if (instance.type !== "INSTANCE") throw new DesignRenderError("The contextual instance could not be verified.");
+      instance.setPluginData(CONTEXT_COMPONENT_KEY, "1");
+      instance.setPluginData(NATIVE_MASTER_KEY, masterId);
+      instance.name = spec.name;
+      node = instance;
+    } else {
+      const rectangle = api.createRectangle();
+      tracker.track(rectangle, "rectangles");
+      rectangle.name = spec.name;
+      setRectangleProperties(rectangle, spec);
+      node = rectangle;
+    }
   } else if (spec.type === "ellipse") {
     const ellipse = api.createEllipse();
     tracker.track(ellipse, "ellipses");
@@ -1993,6 +2009,7 @@ export async function renderMultiScreenDesign(
       const screenTracker = createTracker();
       const context: BuildContext = {
         ...componentContext,
+        contextRectangle: options.contextRectangle,
         tracker: screenTracker,
         components,
       };
@@ -2227,8 +2244,10 @@ export async function renderMultiScreenDesign(
           }),
         );
         if (!recoveringRoot) {
+          if (options.bindContextFills && styleBindings) await applyNativeStyleBindings(root, styleBindings);
+          if (options.bindContextFills) await options.bindContextFills(root);
           options.markScreenBuilt?.(root, screen.id);
-          if (styleBindings) await applyNativeStyleBindings(root, styleBindings);
+          if (!options.bindContextFills && styleBindings) await applyNativeStyleBindings(root, styleBindings);
         }
         options.beforeScreen?.();
         if (options.verifyTouchTargets) verifyNativeTouchTargets(root);

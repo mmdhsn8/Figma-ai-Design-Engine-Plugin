@@ -8,6 +8,16 @@ import type { DesignSection } from "../shared/design-generation";
 import type { PinnedBrandKit } from "../shared/brand-kit";
 import { designSkillsForPrompt, type PinnedDesignSkill } from "../shared/design-skill";
 import { MAX_SECTION_BYTES } from "../shared/generation-limits";
+import { CompanionVisualReviewRequestV1Schema, CompanionVisualReviewResponseV1Schema, FW5_VISUAL_REVIEW_RUBRIC } from "../shared/fw5-provider-visual-review";
+import {
+  FW5_VISUAL_CAPTURE_LIMITS,
+  VisualReviewResponseV1Schema,
+  pngDimensions,
+  visualFindingId,
+  type VisualReviewGrantV1,
+  type VisualReviewRequestV1,
+  type VisualReviewResponseV1,
+} from "../shared/fw5-visual-qa";
 import {
   ChatFunctionCallValidationIssueSchema,
   ChatFunctionCallSchema,
@@ -220,6 +230,9 @@ export type CompanionErrorCategory =
   | "client_id_mismatch"
   | "plan_use_scope_missing"
   | "plan_use_not_admitted"
+  | "authorization_required"
+  | "consent_required"
+  | "visual_review_request_invalid"
   | "account_not_eligible"
   | "unsupported_capability"
   | "route_not_supported"
@@ -448,6 +461,114 @@ export async function runSmokeRequest(
     ...(body.data.status ? { status: body.data.status } : {}),
     ...(body.data.diagnostic ? { diagnostic: body.data.diagnostic } : {}),
   };
+}
+
+export async function reviewAuthorizedVisual(
+  token: string,
+  review: VisualReviewRequestV1,
+  grant: VisualReviewGrantV1,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<VisualReviewResponseV1> {
+  const dimensions = pngDimensions(review.pngBytes);
+  if (!dimensions || review.pngBytes.byteLength > FW5_VISUAL_CAPTURE_LIMITS.maxBytes ||
+      dimensions.width > FW5_VISUAL_CAPTURE_LIMITS.maxPixelWidth || dimensions.height > FW5_VISUAL_CAPTURE_LIMITS.maxPixelHeight ||
+      dimensions.width * dimensions.height > FW5_VISUAL_CAPTURE_LIMITS.maxPixels)
+    throw new CompanionClientError("visual_review_request_invalid");
+  if (grant.provider !== "openai-responses" || !grant.model || !grant.sessionId || !grant.accountScope ||
+      grant.taskGeneration !== review.taskGeneration || grant.imageRevision !== review.imageRevision || grant.consentImageCount !== 1)
+    throw new CompanionClientError("authorization_required");
+  const pngBase64 = bytesToBase64(review.pngBytes);
+  const transport = CompanionVisualReviewRequestV1Schema.parse({
+    version: 1,
+    requestId: review.requestId,
+    taskId: review.taskId,
+    taskGeneration: review.taskGeneration,
+    screenId: review.screenId,
+    documentId: review.documentId,
+    pageId: review.pageId,
+    rootId: review.rootId,
+    programFingerprint: review.programFingerprint,
+    readbackRevision: review.readbackRevision,
+    receiptId: review.receiptId,
+    imageRevision: review.imageRevision,
+    provider: grant.provider,
+    model: grant.model,
+    sessionId: grant.sessionId,
+    accountScope: grant.accountScope,
+    consentAuthorizationId: grant.authorizationId,
+    consentImageCount: grant.consentImageCount,
+    contentType: "image/png",
+    width: dimensions.width,
+    height: dimensions.height,
+    byteLength: review.pngBytes.byteLength,
+    pngBase64,
+    rubric: FW5_VISUAL_REVIEW_RUBRIC,
+    context: {
+      viewport: review.viewport,
+      scrollIntent: review.scrollIntent,
+      nodes: review.nodes,
+      program: review.program,
+    },
+  });
+  const envelope = CompanionVisualReviewResponseV1Schema.safeParse(
+    await request("/v1/visual-review", token, transport, fetcher, signal, FW5_VISUAL_CAPTURE_LIMITS.timeoutMs),
+  );
+  if (!envelope.success || envelope.data.requestId !== review.requestId || envelope.data.model !== grant.model ||
+      envelope.data.capability.status !== "supported")
+    throw new CompanionClientError("response_invalid");
+  const nodes = new Set(review.nodes.map(({ nodeId }) => nodeId));
+  const response = VisualReviewResponseV1Schema.parse({
+    version: 1,
+    requestId: review.requestId,
+    receiptId: review.receiptId,
+    taskId: review.taskId,
+    screenId: review.screenId,
+    rootId: review.rootId,
+    programFingerprint: review.programFingerprint,
+    readbackRevision: review.readbackRevision,
+    kind: "vision",
+    verdict: envelope.data.response.verdict,
+    confidence: envelope.data.response.confidence,
+    ...(envelope.data.response.reason ? { reason: envelope.data.response.reason } : {}),
+    findings: envelope.data.response.findings.map((finding, index) => {
+      const nodeId = finding.matchedNativeNodeId && nodes.has(finding.matchedNativeNodeId) ? finding.matchedNativeNodeId : undefined;
+      const boundedSizing = finding.proposedAction === "fw4-sizing" && nodeId && finding.property && finding.expectedValue && finding.proposedValue;
+      return {
+        findingId: visualFindingId(finding.issueCode, review.rootId, `${nodeId ?? "unmatched"}-${index}`),
+        taskId: review.taskId,
+        screenId: review.screenId,
+        issueCode: finding.issueCode,
+        source: "pixel-review" as const,
+        evidenceSource: boundedSizing ? "image+native-readback" as const : "image" as const,
+        severity: finding.severity,
+        evidenceRef: `capture:${review.receiptId}`,
+        evidence: finding.evidence,
+        ...(nodeId ? { nodeId, ...(finding.nodePath ? { nodePath: finding.nodePath } : {}) } : {}),
+        imageLocation: finding.imageLocation,
+        recheckRequired: finding.recheckRequired,
+        confidence: finding.confidence,
+        uncertain: finding.confidence < 0.85 || !nodeId,
+        safeToAutoRepair: Boolean(boundedSizing),
+        suggestedRepairCategory: boundedSizing ? "layout-sizing" as const : "none" as const,
+        ...(boundedSizing ? { proposedAction: {
+          kind: "fw4-sizing" as const,
+          targetNodeId: nodeId!,
+          property: finding.property!,
+          expectedValue: finding.expectedValue!,
+          proposedValue: finding.proposedValue!,
+        } } : { unrepairableReason: "insufficient_evidence" as const }),
+      };
+    }),
+  });
+  return response;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000)
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)));
+  return btoa(binary);
 }
 
 export async function generateAuthorizedDesign(
@@ -1095,6 +1216,9 @@ function mapError(value: string): CompanionErrorCategory {
     "client_id_mismatch",
     "plan_use_scope_missing",
     "plan_use_not_admitted",
+    "authorization_required",
+    "consent_required",
+    "visual_review_request_invalid",
     "account_not_eligible",
     "unsupported_capability",
     "route_not_supported",

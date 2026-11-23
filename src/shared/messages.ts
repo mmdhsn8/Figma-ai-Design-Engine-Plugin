@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { ChatTaskSchema } from "./chat-task";
+import { ContextCancelSchema, ContextReadSchema, ContextResultSchema, ContextTicketSchema } from "./design-context";
 import { DraftIdentitySchema, DraftManifestSchema } from "./generation-draft";
 import { GenerationTransactionSchema } from "./generation-transaction";
 import {
@@ -23,6 +24,8 @@ import { DesignSkillStorageCommandSchema, DesignSkillStorageResultSchema } from 
 import { DesignProgramV1Schema } from "./design-program";
 import { DesignEngineSchema } from "./design-engine-preference";
 import { NATIVE_GEOMETRY_VERSION } from "./native-geometry";
+import { FW4_GEOMETRY_NODE_LIMIT } from "./fw4-geometry";
+import { VisualCaptureRequestV1Schema, VisualCaptureReceiptV1Schema, VisualCaptureTransportV1Schema, VisualNativeRepairRequestV1Schema, VisualNativeRepairResultV1Schema } from "./fw5-visual-qa";
 
 const CheckpointRevisionSchema = z.object({
   hash: z.string().regex(/^[a-f0-9]{16}$/u),
@@ -57,17 +60,33 @@ const GeometryRectSchema = z.object({
   x: z.number().finite(), y: z.number().finite(),
   width: z.number().finite(), height: z.number().finite(),
 }).strict();
+const NativeLayoutSnapshotSchema = z.object({
+  horizontalSizing: z.string().max(30),
+  verticalSizing: z.string().max(30),
+  textAutoResize: z.string().max(30).optional(),
+}).strict();
+const NativeLayoutExpectationSchema = z.object({
+  logicalRef: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u),
+  parentLogicalRef: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u),
+  horizontalSizing: z.enum(["FIXED", "HUG", "FILL"]),
+  verticalSizing: z.enum(["FIXED", "HUG", "FILL"]),
+  textAutoResize: z.enum(["HEIGHT", "WIDTH_AND_HEIGHT"]).optional(),
+}).strict();
 const NativeGeometryReportSchema = z.object({
   version: z.literal(NATIVE_GEOMETRY_VERSION),
   coverage: z.enum(["complete", "incomplete"]),
   measuredNodes: z.number().int().min(0).max(300),
   durationMs: z.number().int().nonnegative(),
+  receipt: z.string().regex(/^v1-[a-f0-9]{1,8}$/u).optional(),
   findings: z.array(z.object({
     code: z.string().regex(/^[a-z_]{1,80}$/u),
     nodeId: z.string().min(1).max(100),
     parentId: z.string().min(1).max(100).optional(),
+    logicalRef: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,119}$/u).optional(),
     expected: GeometryRectSchema.optional(),
     observed: GeometryRectSchema.optional(),
+    expectedLayout: NativeLayoutSnapshotSchema.optional(),
+    observedLayout: NativeLayoutSnapshotSchema.optional(),
   }).strict()).max(12),
 }).strict();
 
@@ -160,6 +179,8 @@ const TaskNativeNodeSchema = z
       .string()
       .regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u)
       .optional(),
+    logicalRef: z.string().min(1).max(120).optional(),
+    semanticRole: z.string().min(1).max(60).optional(),
     name: z.string().max(100),
     type: z.string().min(1).max(40),
     x: z.number().finite(),
@@ -182,6 +203,12 @@ const TaskNativeNodeSchema = z
       .optional(),
     primaryAxisSizingMode: z.string().max(20).optional(),
     counterAxisSizingMode: z.string().max(20).optional(),
+    layoutSizingHorizontal: z.enum(["FIXED", "HUG", "FILL"]).optional(),
+    layoutSizingVertical: z.enum(["FIXED", "HUG", "FILL"]).optional(),
+    textAutoResize: z.enum(["HEIGHT", "WIDTH_AND_HEIGHT"]).optional(),
+    textLength: z.number().int().nonnegative().max(10_000).optional(),
+    fontFamily: z.string().min(1).max(100).optional(),
+    fontSize: z.number().finite().positive().max(256).optional(),
   })
   .strict();
 
@@ -214,6 +241,8 @@ const MultiScreenRenderResultSchema = z
   .strict();
 
 export const UIToPluginSchema = z.discriminatedUnion("type", [
+  ContextReadSchema,
+  ContextCancelSchema,
   z
     .object({
       type: z.literal("design-skills-storage"),
@@ -238,6 +267,7 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       documentId: z.string().min(1).max(300),
       brandKit: PinnedBrandKitSchema.optional(),
       expectedRootNodeId: z.string().min(1).max(100).optional(),
+      contextTicket: ContextTicketSchema.optional(),
       program: DesignProgramV1Schema,
     })
     .strict()
@@ -256,7 +286,12 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
         programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u),
         requireReceipt: z.boolean(),
         expectedRootNodeId: z.string().min(1).max(100).optional(),
-      }).strict().optional(),
+        expectedLayout: z.array(NativeLayoutExpectationSchema).max(FW4_GEOMETRY_NODE_LIMIT).optional(),
+      }).strict().superRefine((geometry, context) => {
+        const refs = geometry.expectedLayout?.map(({ logicalRef }) => logicalRef) ?? [];
+        if (new Set(refs).size !== refs.length)
+          context.addIssue({ code: "custom", path: ["expectedLayout"], message: "Native layout expectations must have unique logical references." });
+      }).optional(),
     })
     .strict(),
   z
@@ -269,6 +304,40 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       mode: z.enum(["select", "zoom"]),
     })
     .strict(),
+  z.object({
+    type: z.literal("task-native-visual-capture"),
+    requestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+    rootRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u),
+    visualCapture: VisualCaptureRequestV1Schema,
+    expectedLayout: z.array(NativeLayoutExpectationSchema).max(FW4_GEOMETRY_NODE_LIMIT).optional(),
+  }).strict().superRefine((request, context) => {
+    if (request.requestId !== request.visualCapture.captureNonce)
+      context.addIssue({ code: "custom", path: ["visualCapture", "captureNonce"], message: "Capture nonce must equal its bridge request identity." });
+    const refs = request.expectedLayout?.map(({ logicalRef }) => logicalRef) ?? [];
+    if (new Set(refs).size !== refs.length)
+      context.addIssue({ code: "custom", path: ["expectedLayout"], message: "Capture layout expectations must have unique logical references." });
+  }),
+  z.object({
+    type: z.literal("task-native-visual-capture-cancel"),
+    requestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+    taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+    captureNonce: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+  }).strict().superRefine((request, context) => {
+    if (request.requestId !== request.captureNonce)
+      context.addIssue({ code: "custom", path: ["captureNonce"], message: "Capture cancellation must match the bridge request identity." });
+  }),
+  z.object({
+    type: z.literal("task-native-visual-repair"),
+    request: VisualNativeRepairRequestV1Schema,
+  }).strict().superRefine((message, context) => {
+    if (message.request.requestId !== message.request.proposal.proposalId)
+      context.addIssue({ code: "custom", path: ["request", "requestId"], message: "Repair request identity must match its proposal." });
+  }),
+  z.object({
+    type: z.literal("task-native-visual-repair-cancel"),
+    requestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+    taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+  }).strict(),
   z
     .object({ type: z.literal("chat-history-load"), requestId: z.string().min(1).max(100) })
     .strict(),
@@ -394,6 +463,7 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
 ]);
 
 export const PluginToUISchema = z.discriminatedUnion("type", [
+  ContextResultSchema,
   DesignSkillStorageResultSchema,
   BrandKitStorageResultSchema,
   z
@@ -467,6 +537,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       adoptionOperationIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u)).max(200).optional(),
       programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u).optional(),
       nativeNodeCount: z.number().int().nonnegative().max(300).optional(),
+      visualCaptureEligible: z.boolean().optional(),
       geometryVersion: z.literal(NATIVE_GEOMETRY_VERSION).optional(),
       geometryRepairs: z.number().int().min(0).max(1).optional(),
       geometryDurationMs: z.number().finite().nonnegative().optional(),
@@ -488,6 +559,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
       nodes: z.array(TaskNativeNodeSchema).max(500).optional(),
       geometry: NativeGeometryReportSchema.optional(),
+      nativePageId: z.string().min(1).max(200).optional(),
       expectedRootStatus: z.enum(["present", "unexpected_parent", "missing", "removed"]).optional(),
       unresolvedRefs: z.array(TaskNativeUnresolvedRefSchema).max(500).optional(),
       truncated: z.boolean().optional(),
@@ -495,6 +567,28 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       error: z.string().max(500).optional(),
     })
     .strict(),
+  z.object({
+    type: z.literal("task-native-visual-capture-result"),
+    requestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+    taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+    success: z.boolean(),
+    visualCapture: VisualCaptureTransportV1Schema.optional(),
+    receipt: VisualCaptureReceiptV1Schema.optional(),
+    exportDurationMs: z.number().int().nonnegative().max(86_400_000).optional(),
+  }).strict().superRefine((result, context) => {
+    if (result.success && (!result.visualCapture || result.visualCapture.receipt.status !== "CAPTURED"))
+      context.addIssue({ code: "custom", path: ["visualCapture"], message: "Successful capture requires bounded PNG bytes and a captured receipt." });
+    if (!result.success && (!result.receipt || result.receipt.status === "CAPTURED" || result.visualCapture))
+      context.addIssue({ code: "custom", path: ["receipt"], message: "Failed capture requires a non-captured receipt and no PNG bytes." });
+    if (result.visualCapture && result.taskId !== result.visualCapture.receipt.taskId)
+      context.addIssue({ code: "custom", path: ["taskId"], message: "Capture result task identity must match its receipt." });
+    if (result.receipt && result.taskId !== result.receipt.taskId)
+      context.addIssue({ code: "custom", path: ["taskId"], message: "Capture failure task identity must match its receipt." });
+  }),
+  z.object({
+    type: z.literal("task-native-visual-repair-result"),
+    result: VisualNativeRepairResultV1Schema,
+  }).strict(),
   z
     .object({
       type: z.literal("task-native-focus-result"),

@@ -9,6 +9,7 @@ import { DesignProgramV1Schema, UniversalDesignProgramV1Schema } from "./design-
 import { ProjectPlanDraftSchema } from "./universal-design.js";
 import { ProjectVisualLanguageV1Schema } from "./design-composition.js";
 import { utf8Bytes } from "./generation-limits.js";
+import { boundedContextShape, CONTEXT_PRECEDENCE, EDIT_CONTEXT_PREFIX, PlannerDesignContextSchema, contextFits } from "./design-context.js";
 
 export const CHAT_TOOL_NAMES = [
   "classify_canvas_intent",
@@ -376,6 +377,25 @@ const UniversalContextItemSchema = z.object({
   role: z.literal("user"),
   content: z.string().max(MAX_CHAT_PROVIDER_INPUT_BYTES),
 }).strict();
+const EditDesignContextSchema = z.strictObject({ context: PlannerDesignContextSchema, policy: z.literal(CONTEXT_PRECEDENCE) });
+
+function validGrounding(content: string, prefix: string, edit: boolean): boolean {
+  try {
+    const value: unknown = JSON.parse(content.slice(prefix.length));
+    if (edit) {
+      if (!value || typeof value !== "object" || !("context" in value) || !boundedContextShape(value.context)) return false;
+      const parsed = EditDesignContextSchema.safeParse(value);
+      return parsed.success && contextFits(parsed.data.context) && parsed.data.context.scope !== "page" &&
+        parsed.data.context.roots.length === 1;
+    }
+    if (!value || typeof value !== "object" || !("localDesignContext" in value)) return true;
+    if (!boundedContextShape(value.localDesignContext)) return false;
+    const context = PlannerDesignContextSchema.safeParse(value.localDesignContext);
+    return context.success && contextFits(context.data);
+  } catch {
+    return !edit && !content.includes('"localDesignContext"');
+  }
+}
 
 function invalidChatRecord(record: Record<string, unknown> | undefined, generated: boolean): string {
   if (record?.type === "function_call" || record?.type === "function_call_output") {
@@ -411,12 +431,17 @@ export function validateChatRequestInput(input: unknown[], lifecycle: ChatLifecy
     const record = isRecord(item) ? item : undefined;
     const generated = prefix !== undefined && record?.role === "user" &&
       typeof record.content === "string" && record.content.startsWith(prefix);
+    const scopedEdit = lifecycle === "EDIT_PLANNING" && record?.role === "user" &&
+      typeof record.content === "string" && record.content.startsWith(EDIT_CONTEXT_PREFIX);
     const parsed = generated
       ? UniversalContextItemSchema.safeParse(item)
       : ChatInputItemSchema.safeParse(item);
     if (parsed.success) {
       if (generated && "content" in parsed.data && utf8Bytes(parsed.data.content) > MAX_CHAT_PROVIDER_INPUT_BYTES)
         issues.push(`Record ${index + 1}: generated Universal context exceeds its UTF-8 byte limit.`);
+      else if ((generated || scopedEdit) && "content" in parsed.data &&
+        !validGrounding(parsed.data.content, scopedEdit ? EDIT_CONTEXT_PREFIX : prefix!, scopedEdit))
+        issues.push(`Record ${index + 1}: invalid scoped design context.`);
       else data.push(parsed.data);
       continue;
     }

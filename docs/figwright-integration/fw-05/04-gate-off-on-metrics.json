@@ -1,0 +1,1746 @@
+{
+  "schemaVersion": 1,
+  "runAt": "2026-11-23T05:35:47.016Z",
+  "featureGate": {
+    "variable": "VITE_FW5_VISUAL_QA",
+    "enabledValue": "fw5-visual-qa-v1",
+    "default": "off"
+  },
+  "runtime": "LOCAL_FAKE_FIGMA_RUNTIME",
+  "variants": [
+    {
+      "gate": "OFF",
+      "schemaVersion": 1,
+      "featureGate": {
+        "variable": "VITE_FW5_VISUAL_QA",
+        "enabledValue": "fw5-visual-qa-v1",
+        "default": "off"
+      },
+      "runtime": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "fixtures": [
+        "F0 greeting/no native task",
+        "F1 synthetic learning dashboard",
+        "F3 synthetic booking flow",
+        "F10 Persian building-management adaptation"
+      ],
+      "scenarios": [
+        {
+          "scenario": "F0",
+          "screenCount": 0,
+          "gate": "OFF",
+          "execution": "ROUTE_EXCLUDED_NOT_MEASURED",
+          "measured": null,
+          "routeExpectation": {
+            "rendererInvocations": 0,
+            "nativeReadbackRequests": 0,
+            "nativePngExportCalls": 0,
+            "taskCheckpointOperations": 0
+          },
+          "outcomes": [],
+          "paritySnapshot": [],
+          "limitations": [
+            "F0 counters are not measured by this plugin-side harness. Existing F0 greeting-route tests prove the task is answered without model planning or native operations; because FW-5 is only entered by a Universal design task, this route never injects a capture callback."
+          ]
+        },
+        {
+          "scenario": "F1",
+          "screenCount": 1,
+          "gate": "OFF",
+          "execution": "LOCAL_FAKE_FIGMA_RUNTIME",
+          "measured": {
+            "uiToPluginExecutorDispatches": 1,
+            "actualUIBridgeMessagesObserved": false,
+            "pluginAcknowledgements": 1,
+            "rendererInvocations": 1,
+            "nativeReadbackRequests": 1,
+            "nativeReadbackAcknowledgements": 1,
+            "nativePngExportCalls": 0,
+            "figmaApiOperations": {
+              "currentPage.findAll": 23,
+              "listAvailableFontsAsync": 1,
+              "loadFontAsync": 2,
+              "getLocalPaintStylesAsync": 1,
+              "getLocalTextStylesAsync": 1,
+              "createPaintStyle": 5,
+              "createTextStyle": 4,
+              "createFrame": 5,
+              "createText": 7,
+              "createRectangle": 3,
+              "getNodeByIdAsync": 2
+            },
+            "figmaApiOperationTotal": 54,
+            "nativeNodeMethodCalls": 1029,
+            "attachedNodes": 15,
+            "createdNodes": 15,
+            "nativeRootIds": [
+              {
+                "screenId": "screen-01",
+                "nodeId": "mock:10",
+                "parentId": "page:current"
+              }
+            ],
+            "nativeReadbackConfirmed": 1,
+            "nativeReadbackResponsePayloadBytesJsonEstimate": 8985,
+            "captureReceiptMetadataPayloadBytesJsonEstimate": 0,
+            "screenshotResponseBytes": 0,
+            "requestPayloadBytesJsonEstimate": 317,
+            "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+            "checkpointWrites": null,
+            "checkpointReadbacks": null,
+            "peakInFlightOperations": 1,
+            "errors": 0,
+            "retries": 0,
+            "localHarnessMs": 57.059
+          },
+          "roots": [
+            {
+              "screenId": "screen-01",
+              "nodeId": "mock:10",
+              "parentId": "page:current",
+              "nodeCount": 15
+            }
+          ],
+          "captures": [],
+          "stageOrder": [
+            "screen-01:render",
+            "screen-01:native-root-attached",
+            "screen-01:native-readback-confirmed"
+          ],
+          "outcomes": [
+            {
+              "screenId": "screen-01",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            }
+          ],
+          "paritySnapshot": [
+            {
+              "screenId": "screen-01",
+              "parentId": "page:current",
+              "nodeCount": 15
+            }
+          ],
+          "limitations": [
+            "The renderer function and executor are invoked directly in a deterministic harness; this does not measure serialized UI bridge messages or Figma Desktop latency.",
+            "The one-pixel PNG is synthetic fake-runtime output; it is not screenshot evidence from Figma or a visual-quality judgement.",
+            "The harness does not invoke the ChatTask checkpoint owner; checkpoint write/readback counts are null and covered only by task integration tests.",
+            "No reviewer/provider calls, OAuth calls, network access, or real document mutations occur."
+          ]
+        },
+        {
+          "scenario": "F3",
+          "screenCount": 3,
+          "gate": "OFF",
+          "execution": "LOCAL_FAKE_FIGMA_RUNTIME",
+          "measured": {
+            "uiToPluginExecutorDispatches": 3,
+            "actualUIBridgeMessagesObserved": false,
+            "pluginAcknowledgements": 3,
+            "rendererInvocations": 3,
+            "nativeReadbackRequests": 3,
+            "nativeReadbackAcknowledgements": 3,
+            "nativePngExportCalls": 0,
+            "figmaApiOperations": {
+              "currentPage.findAll": 78,
+              "listAvailableFontsAsync": 3,
+              "loadFontAsync": 6,
+              "getLocalPaintStylesAsync": 3,
+              "getLocalTextStylesAsync": 3,
+              "createPaintStyle": 5,
+              "createTextStyle": 4,
+              "createFrame": 15,
+              "createText": 36,
+              "createRectangle": 3,
+              "getNodeByIdAsync": 6
+            },
+            "figmaApiOperationTotal": 162,
+            "nativeNodeMethodCalls": 5577,
+            "attachedNodes": 54,
+            "createdNodes": 54,
+            "nativeRootIds": [
+              {
+                "screenId": "screen-01",
+                "nodeId": "mock:10",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-02",
+                "nodeId": "mock:28",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-03",
+                "nodeId": "mock:46",
+                "parentId": "page:current"
+              }
+            ],
+            "nativeReadbackConfirmed": 3,
+            "nativeReadbackResponsePayloadBytesJsonEstimate": 64529,
+            "captureReceiptMetadataPayloadBytesJsonEstimate": 0,
+            "screenshotResponseBytes": 0,
+            "requestPayloadBytesJsonEstimate": 957,
+            "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+            "checkpointWrites": null,
+            "checkpointReadbacks": null,
+            "peakInFlightOperations": 1,
+            "errors": 0,
+            "retries": 0,
+            "localHarnessMs": 73.291
+          },
+          "roots": [
+            {
+              "screenId": "screen-01",
+              "nodeId": "mock:10",
+              "parentId": "page:current",
+              "nodeCount": 18
+            },
+            {
+              "screenId": "screen-02",
+              "nodeId": "mock:28",
+              "parentId": "page:current",
+              "nodeCount": 18
+            },
+            {
+              "screenId": "screen-03",
+              "nodeId": "mock:46",
+              "parentId": "page:current",
+              "nodeCount": 18
+            }
+          ],
+          "captures": [],
+          "stageOrder": [
+            "screen-01:render",
+            "screen-01:native-root-attached",
+            "screen-01:native-readback-confirmed",
+            "screen-02:render",
+            "screen-02:native-root-attached",
+            "screen-02:native-readback-confirmed",
+            "screen-03:render",
+            "screen-03:native-root-attached",
+            "screen-03:native-readback-confirmed"
+          ],
+          "outcomes": [
+            {
+              "screenId": "screen-01",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-02",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-03",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            }
+          ],
+          "paritySnapshot": [
+            {
+              "screenId": "screen-01",
+              "parentId": "page:current",
+              "nodeCount": 18
+            },
+            {
+              "screenId": "screen-02",
+              "parentId": "page:current",
+              "nodeCount": 18
+            },
+            {
+              "screenId": "screen-03",
+              "parentId": "page:current",
+              "nodeCount": 18
+            }
+          ],
+          "limitations": [
+            "The renderer function and executor are invoked directly in a deterministic harness; this does not measure serialized UI bridge messages or Figma Desktop latency.",
+            "The one-pixel PNG is synthetic fake-runtime output; it is not screenshot evidence from Figma or a visual-quality judgement.",
+            "The harness does not invoke the ChatTask checkpoint owner; checkpoint write/readback counts are null and covered only by task integration tests.",
+            "No reviewer/provider calls, OAuth calls, network access, or real document mutations occur."
+          ]
+        },
+        {
+          "scenario": "F10",
+          "screenCount": 10,
+          "gate": "OFF",
+          "execution": "LOCAL_FAKE_FIGMA_RUNTIME",
+          "measured": {
+            "uiToPluginExecutorDispatches": 10,
+            "actualUIBridgeMessagesObserved": false,
+            "pluginAcknowledgements": 10,
+            "rendererInvocations": 10,
+            "nativeReadbackRequests": 10,
+            "nativeReadbackAcknowledgements": 10,
+            "nativePngExportCalls": 0,
+            "figmaApiOperations": {
+              "currentPage.findAll": 230,
+              "listAvailableFontsAsync": 10,
+              "loadFontAsync": 20,
+              "getLocalPaintStylesAsync": 10,
+              "getLocalTextStylesAsync": 10,
+              "createPaintStyle": 5,
+              "createTextStyle": 4,
+              "createFrame": 50,
+              "createText": 70,
+              "createRectangle": 30,
+              "getNodeByIdAsync": 20
+            },
+            "figmaApiOperationTotal": 459,
+            "nativeNodeMethodCalls": 29325,
+            "attachedNodes": 150,
+            "createdNodes": 150,
+            "nativeRootIds": [
+              {
+                "screenId": "screen-01",
+                "nodeId": "mock:10",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-02",
+                "nodeId": "mock:25",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-03",
+                "nodeId": "mock:40",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-04",
+                "nodeId": "mock:55",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-05",
+                "nodeId": "mock:70",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-06",
+                "nodeId": "mock:85",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-07",
+                "nodeId": "mock:100",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-08",
+                "nodeId": "mock:115",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-09",
+                "nodeId": "mock:130",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-10",
+                "nodeId": "mock:145",
+                "parentId": "page:current"
+              }
+            ],
+            "nativeReadbackConfirmed": 10,
+            "nativeReadbackResponsePayloadBytesJsonEstimate": 498664,
+            "captureReceiptMetadataPayloadBytesJsonEstimate": 0,
+            "screenshotResponseBytes": 0,
+            "requestPayloadBytesJsonEstimate": 3333,
+            "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+            "checkpointWrites": null,
+            "checkpointReadbacks": null,
+            "peakInFlightOperations": 1,
+            "errors": 0,
+            "retries": 0,
+            "localHarnessMs": 141.403
+          },
+          "roots": [
+            {
+              "screenId": "screen-01",
+              "nodeId": "mock:10",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-02",
+              "nodeId": "mock:25",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-03",
+              "nodeId": "mock:40",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-04",
+              "nodeId": "mock:55",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-05",
+              "nodeId": "mock:70",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-06",
+              "nodeId": "mock:85",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-07",
+              "nodeId": "mock:100",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-08",
+              "nodeId": "mock:115",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-09",
+              "nodeId": "mock:130",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-10",
+              "nodeId": "mock:145",
+              "parentId": "page:current",
+              "nodeCount": 15
+            }
+          ],
+          "captures": [],
+          "stageOrder": [
+            "screen-01:render",
+            "screen-01:native-root-attached",
+            "screen-01:native-readback-confirmed",
+            "screen-02:render",
+            "screen-02:native-root-attached",
+            "screen-02:native-readback-confirmed",
+            "screen-03:render",
+            "screen-03:native-root-attached",
+            "screen-03:native-readback-confirmed",
+            "screen-04:render",
+            "screen-04:native-root-attached",
+            "screen-04:native-readback-confirmed",
+            "screen-05:render",
+            "screen-05:native-root-attached",
+            "screen-05:native-readback-confirmed",
+            "screen-06:render",
+            "screen-06:native-root-attached",
+            "screen-06:native-readback-confirmed",
+            "screen-07:render",
+            "screen-07:native-root-attached",
+            "screen-07:native-readback-confirmed",
+            "screen-08:render",
+            "screen-08:native-root-attached",
+            "screen-08:native-readback-confirmed",
+            "screen-09:render",
+            "screen-09:native-root-attached",
+            "screen-09:native-readback-confirmed",
+            "screen-10:render",
+            "screen-10:native-root-attached",
+            "screen-10:native-readback-confirmed"
+          ],
+          "outcomes": [
+            {
+              "screenId": "screen-01",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-02",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-03",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-04",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-05",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-06",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-07",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-08",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-09",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-10",
+              "visualCapture": "NOT_REQUESTED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            }
+          ],
+          "paritySnapshot": [
+            {
+              "screenId": "screen-01",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-02",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-03",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-04",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-05",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-06",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-07",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-08",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-09",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-10",
+              "parentId": "page:current",
+              "nodeCount": 15
+            }
+          ],
+          "limitations": [
+            "The renderer function and executor are invoked directly in a deterministic harness; this does not measure serialized UI bridge messages or Figma Desktop latency.",
+            "The one-pixel PNG is synthetic fake-runtime output; it is not screenshot evidence from Figma or a visual-quality judgement.",
+            "The harness does not invoke the ChatTask checkpoint owner; checkpoint write/readback counts are null and covered only by task integration tests.",
+            "No reviewer/provider calls, OAuth calls, network access, or real document mutations occur."
+          ]
+        }
+      ]
+    },
+    {
+      "gate": "ON",
+      "schemaVersion": 1,
+      "featureGate": {
+        "variable": "VITE_FW5_VISUAL_QA",
+        "enabledValue": "fw5-visual-qa-v1",
+        "default": "off"
+      },
+      "runtime": "LOCAL_FAKE_FIGMA_RUNTIME",
+      "fixtures": [
+        "F0 greeting/no native task",
+        "F1 synthetic learning dashboard",
+        "F3 synthetic booking flow",
+        "F10 Persian building-management adaptation"
+      ],
+      "scenarios": [
+        {
+          "scenario": "F0",
+          "screenCount": 0,
+          "gate": "ON",
+          "execution": "ROUTE_EXCLUDED_NOT_MEASURED",
+          "measured": null,
+          "routeExpectation": {
+            "rendererInvocations": 0,
+            "nativeReadbackRequests": 0,
+            "nativePngExportCalls": 0,
+            "taskCheckpointOperations": 0
+          },
+          "outcomes": [],
+          "paritySnapshot": [],
+          "limitations": [
+            "F0 counters are not measured by this plugin-side harness. Existing F0 greeting-route tests prove the task is answered without model planning or native operations; because FW-5 is only entered by a Universal design task, this route never injects a capture callback."
+          ]
+        },
+        {
+          "scenario": "F1",
+          "screenCount": 1,
+          "gate": "ON",
+          "execution": "LOCAL_FAKE_FIGMA_RUNTIME",
+          "measured": {
+            "uiToPluginExecutorDispatches": 2,
+            "actualUIBridgeMessagesObserved": false,
+            "pluginAcknowledgements": 2,
+            "rendererInvocations": 1,
+            "nativeReadbackRequests": 1,
+            "nativeReadbackAcknowledgements": 1,
+            "nativePngExportCalls": 1,
+            "figmaApiOperations": {
+              "currentPage.findAll": 24,
+              "listAvailableFontsAsync": 1,
+              "loadFontAsync": 2,
+              "getLocalPaintStylesAsync": 1,
+              "getLocalTextStylesAsync": 1,
+              "createPaintStyle": 5,
+              "createTextStyle": 4,
+              "createFrame": 5,
+              "createText": 7,
+              "createRectangle": 3,
+              "getNodeByIdAsync": 4
+            },
+            "figmaApiOperationTotal": 57,
+            "nativeNodeMethodCalls": 1256,
+            "attachedNodes": 15,
+            "createdNodes": 15,
+            "nativeRootIds": [
+              {
+                "screenId": "screen-01",
+                "nodeId": "mock:10",
+                "parentId": "page:current"
+              }
+            ],
+            "nativeReadbackConfirmed": 1,
+            "nativeReadbackResponsePayloadBytesJsonEstimate": 9013,
+            "captureReceiptMetadataPayloadBytesJsonEstimate": 810,
+            "screenshotResponseBytes": 70,
+            "requestPayloadBytesJsonEstimate": 935,
+            "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+            "checkpointWrites": null,
+            "checkpointReadbacks": null,
+            "peakInFlightOperations": 1,
+            "errors": 0,
+            "retries": 0,
+            "localHarnessMs": 58.363
+          },
+          "roots": [
+            {
+              "screenId": "screen-01",
+              "nodeId": "mock:10",
+              "parentId": "page:current",
+              "nodeCount": 15
+            }
+          ],
+          "captures": [
+            {
+              "screenId": "screen-01",
+              "receiptId": "fw5-fw5-bench-f1-on_capture_screen-01_1",
+              "rootId": "mock:10",
+              "pageId": "page:current",
+              "readbackRevision": "v1-ce0b8ac4",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            }
+          ],
+          "stageOrder": [
+            "screen-01:render",
+            "screen-01:native-root-attached",
+            "screen-01:native-readback-confirmed",
+            "screen-01:png-exported"
+          ],
+          "outcomes": [
+            {
+              "screenId": "screen-01",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            }
+          ],
+          "paritySnapshot": [
+            {
+              "screenId": "screen-01",
+              "parentId": "page:current",
+              "nodeCount": 15
+            }
+          ],
+          "limitations": [
+            "The renderer function and executor are invoked directly in a deterministic harness; this does not measure serialized UI bridge messages or Figma Desktop latency.",
+            "The one-pixel PNG is synthetic fake-runtime output; it is not screenshot evidence from Figma or a visual-quality judgement.",
+            "The harness does not invoke the ChatTask checkpoint owner; checkpoint write/readback counts are null and covered only by task integration tests.",
+            "No reviewer/provider calls, OAuth calls, network access, or real document mutations occur."
+          ]
+        },
+        {
+          "scenario": "F3",
+          "screenCount": 3,
+          "gate": "ON",
+          "execution": "LOCAL_FAKE_FIGMA_RUNTIME",
+          "measured": {
+            "uiToPluginExecutorDispatches": 6,
+            "actualUIBridgeMessagesObserved": false,
+            "pluginAcknowledgements": 6,
+            "rendererInvocations": 3,
+            "nativeReadbackRequests": 3,
+            "nativeReadbackAcknowledgements": 3,
+            "nativePngExportCalls": 3,
+            "figmaApiOperations": {
+              "currentPage.findAll": 81,
+              "listAvailableFontsAsync": 3,
+              "loadFontAsync": 6,
+              "getLocalPaintStylesAsync": 3,
+              "getLocalTextStylesAsync": 3,
+              "createPaintStyle": 5,
+              "createTextStyle": 4,
+              "createFrame": 15,
+              "createText": 36,
+              "createRectangle": 3,
+              "getNodeByIdAsync": 12
+            },
+            "figmaApiOperationTotal": 171,
+            "nativeNodeMethodCalls": 6459,
+            "attachedNodes": 54,
+            "createdNodes": 54,
+            "nativeRootIds": [
+              {
+                "screenId": "screen-01",
+                "nodeId": "mock:10",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-02",
+                "nodeId": "mock:28",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-03",
+                "nodeId": "mock:46",
+                "parentId": "page:current"
+              }
+            ],
+            "nativeReadbackConfirmed": 3,
+            "nativeReadbackResponsePayloadBytesJsonEstimate": 64613,
+            "captureReceiptMetadataPayloadBytesJsonEstimate": 2440,
+            "screenshotResponseBytes": 210,
+            "requestPayloadBytesJsonEstimate": 2817,
+            "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+            "checkpointWrites": null,
+            "checkpointReadbacks": null,
+            "peakInFlightOperations": 1,
+            "errors": 0,
+            "retries": 0,
+            "localHarnessMs": 50.789
+          },
+          "roots": [
+            {
+              "screenId": "screen-01",
+              "nodeId": "mock:10",
+              "parentId": "page:current",
+              "nodeCount": 18
+            },
+            {
+              "screenId": "screen-02",
+              "nodeId": "mock:28",
+              "parentId": "page:current",
+              "nodeCount": 18
+            },
+            {
+              "screenId": "screen-03",
+              "nodeId": "mock:46",
+              "parentId": "page:current",
+              "nodeCount": 18
+            }
+          ],
+          "captures": [
+            {
+              "screenId": "screen-01",
+              "receiptId": "fw5-fw5-bench-f3-on_capture_screen-01_1",
+              "rootId": "mock:10",
+              "pageId": "page:current",
+              "readbackRevision": "v1-60fad413",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-02",
+              "receiptId": "fw5-fw5-bench-f3-on_capture_screen-02_1",
+              "rootId": "mock:28",
+              "pageId": "page:current",
+              "readbackRevision": "v1-f285488b",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-03",
+              "receiptId": "fw5-fw5-bench-f3-on_capture_screen-03_1",
+              "rootId": "mock:46",
+              "pageId": "page:current",
+              "readbackRevision": "v1-8c5947ad",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            }
+          ],
+          "stageOrder": [
+            "screen-01:render",
+            "screen-01:native-root-attached",
+            "screen-01:native-readback-confirmed",
+            "screen-01:png-exported",
+            "screen-02:render",
+            "screen-02:native-root-attached",
+            "screen-02:native-readback-confirmed",
+            "screen-02:png-exported",
+            "screen-03:render",
+            "screen-03:native-root-attached",
+            "screen-03:native-readback-confirmed",
+            "screen-03:png-exported"
+          ],
+          "outcomes": [
+            {
+              "screenId": "screen-01",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-02",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-03",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            }
+          ],
+          "paritySnapshot": [
+            {
+              "screenId": "screen-01",
+              "parentId": "page:current",
+              "nodeCount": 18
+            },
+            {
+              "screenId": "screen-02",
+              "parentId": "page:current",
+              "nodeCount": 18
+            },
+            {
+              "screenId": "screen-03",
+              "parentId": "page:current",
+              "nodeCount": 18
+            }
+          ],
+          "limitations": [
+            "The renderer function and executor are invoked directly in a deterministic harness; this does not measure serialized UI bridge messages or Figma Desktop latency.",
+            "The one-pixel PNG is synthetic fake-runtime output; it is not screenshot evidence from Figma or a visual-quality judgement.",
+            "The harness does not invoke the ChatTask checkpoint owner; checkpoint write/readback counts are null and covered only by task integration tests.",
+            "No reviewer/provider calls, OAuth calls, network access, or real document mutations occur."
+          ]
+        },
+        {
+          "scenario": "F10",
+          "screenCount": 10,
+          "gate": "ON",
+          "execution": "LOCAL_FAKE_FIGMA_RUNTIME",
+          "measured": {
+            "uiToPluginExecutorDispatches": 20,
+            "actualUIBridgeMessagesObserved": false,
+            "pluginAcknowledgements": 20,
+            "rendererInvocations": 10,
+            "nativeReadbackRequests": 10,
+            "nativeReadbackAcknowledgements": 10,
+            "nativePngExportCalls": 10,
+            "figmaApiOperations": {
+              "currentPage.findAll": 240,
+              "listAvailableFontsAsync": 10,
+              "loadFontAsync": 20,
+              "getLocalPaintStylesAsync": 10,
+              "getLocalTextStylesAsync": 10,
+              "createPaintStyle": 5,
+              "createTextStyle": 4,
+              "createFrame": 50,
+              "createText": 70,
+              "createRectangle": 30,
+              "getNodeByIdAsync": 40
+            },
+            "figmaApiOperationTotal": 489,
+            "nativeNodeMethodCalls": 32270,
+            "attachedNodes": 150,
+            "createdNodes": 150,
+            "nativeRootIds": [
+              {
+                "screenId": "screen-01",
+                "nodeId": "mock:10",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-02",
+                "nodeId": "mock:25",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-03",
+                "nodeId": "mock:40",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-04",
+                "nodeId": "mock:55",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-05",
+                "nodeId": "mock:70",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-06",
+                "nodeId": "mock:85",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-07",
+                "nodeId": "mock:100",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-08",
+                "nodeId": "mock:115",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-09",
+                "nodeId": "mock:130",
+                "parentId": "page:current"
+              },
+              {
+                "screenId": "screen-10",
+                "nodeId": "mock:145",
+                "parentId": "page:current"
+              }
+            ],
+            "nativeReadbackConfirmed": 10,
+            "nativeReadbackResponsePayloadBytesJsonEstimate": 498944,
+            "captureReceiptMetadataPayloadBytesJsonEstimate": 8195,
+            "screenshotResponseBytes": 700,
+            "requestPayloadBytesJsonEstimate": 9689,
+            "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+            "checkpointWrites": null,
+            "checkpointReadbacks": null,
+            "peakInFlightOperations": 1,
+            "errors": 0,
+            "retries": 0,
+            "localHarnessMs": 170.698
+          },
+          "roots": [
+            {
+              "screenId": "screen-01",
+              "nodeId": "mock:10",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-02",
+              "nodeId": "mock:25",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-03",
+              "nodeId": "mock:40",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-04",
+              "nodeId": "mock:55",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-05",
+              "nodeId": "mock:70",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-06",
+              "nodeId": "mock:85",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-07",
+              "nodeId": "mock:100",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-08",
+              "nodeId": "mock:115",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-09",
+              "nodeId": "mock:130",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-10",
+              "nodeId": "mock:145",
+              "parentId": "page:current",
+              "nodeCount": 15
+            }
+          ],
+          "captures": [
+            {
+              "screenId": "screen-01",
+              "receiptId": "fw5-fw5-bench-f10-on_capture_screen-01_1",
+              "rootId": "mock:10",
+              "pageId": "page:current",
+              "readbackRevision": "v1-a0bbf575",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-02",
+              "receiptId": "fw5-fw5-bench-f10-on_capture_screen-02_1",
+              "rootId": "mock:25",
+              "pageId": "page:current",
+              "readbackRevision": "v1-ced4e861",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-03",
+              "receiptId": "fw5-fw5-bench-f10-on_capture_screen-03_1",
+              "rootId": "mock:40",
+              "pageId": "page:current",
+              "readbackRevision": "v1-66b51bfc",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-04",
+              "receiptId": "fw5-fw5-bench-f10-on_capture_screen-04_1",
+              "rootId": "mock:55",
+              "pageId": "page:current",
+              "readbackRevision": "v1-bf240291",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-05",
+              "receiptId": "fw5-fw5-bench-f10-on_capture_screen-05_1",
+              "rootId": "mock:70",
+              "pageId": "page:current",
+              "readbackRevision": "v1-f9f6dbfd",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-06",
+              "receiptId": "fw5-fw5-bench-f10-on_capture_screen-06_1",
+              "rootId": "mock:85",
+              "pageId": "page:current",
+              "readbackRevision": "v1-93d85aaa",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-07",
+              "receiptId": "fw5-fw5-bench-f10-on_capture_screen-07_1",
+              "rootId": "mock:100",
+              "pageId": "page:current",
+              "readbackRevision": "v1-ff630e32",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-08",
+              "receiptId": "fw5-fw5-bench-f10-on_capture_screen-08_1",
+              "rootId": "mock:115",
+              "pageId": "page:current",
+              "readbackRevision": "v1-60779f2a",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-09",
+              "receiptId": "fw5-fw5-bench-f10-on_capture_screen-09_1",
+              "rootId": "mock:130",
+              "pageId": "page:current",
+              "readbackRevision": "v1-845b72c",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            },
+            {
+              "screenId": "screen-10",
+              "receiptId": "fw5-fw5-bench-f10-on_capture_screen-10_1",
+              "rootId": "mock:145",
+              "pageId": "page:current",
+              "readbackRevision": "v1-efe6547a",
+              "width": 1,
+              "height": 1,
+              "bytes": 70,
+              "exportScale": 1,
+              "status": "CAPTURED"
+            }
+          ],
+          "stageOrder": [
+            "screen-01:render",
+            "screen-01:native-root-attached",
+            "screen-01:native-readback-confirmed",
+            "screen-01:png-exported",
+            "screen-02:render",
+            "screen-02:native-root-attached",
+            "screen-02:native-readback-confirmed",
+            "screen-02:png-exported",
+            "screen-03:render",
+            "screen-03:native-root-attached",
+            "screen-03:native-readback-confirmed",
+            "screen-03:png-exported",
+            "screen-04:render",
+            "screen-04:native-root-attached",
+            "screen-04:native-readback-confirmed",
+            "screen-04:png-exported",
+            "screen-05:render",
+            "screen-05:native-root-attached",
+            "screen-05:native-readback-confirmed",
+            "screen-05:png-exported",
+            "screen-06:render",
+            "screen-06:native-root-attached",
+            "screen-06:native-readback-confirmed",
+            "screen-06:png-exported",
+            "screen-07:render",
+            "screen-07:native-root-attached",
+            "screen-07:native-readback-confirmed",
+            "screen-07:png-exported",
+            "screen-08:render",
+            "screen-08:native-root-attached",
+            "screen-08:native-readback-confirmed",
+            "screen-08:png-exported",
+            "screen-09:render",
+            "screen-09:native-root-attached",
+            "screen-09:native-readback-confirmed",
+            "screen-09:png-exported",
+            "screen-10:render",
+            "screen-10:native-root-attached",
+            "screen-10:native-readback-confirmed",
+            "screen-10:png-exported"
+          ],
+          "outcomes": [
+            {
+              "screenId": "screen-01",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-02",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-03",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-04",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-05",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-06",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-07",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-08",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-09",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            },
+            {
+              "screenId": "screen-10",
+              "visualCapture": "CAPTURED",
+              "visualReview": "VISUAL_REVIEW_UNAVAILABLE",
+              "overallVisualStatus": "UNVERIFIED"
+            }
+          ],
+          "paritySnapshot": [
+            {
+              "screenId": "screen-01",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-02",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-03",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-04",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-05",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-06",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-07",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-08",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-09",
+              "parentId": "page:current",
+              "nodeCount": 15
+            },
+            {
+              "screenId": "screen-10",
+              "parentId": "page:current",
+              "nodeCount": 15
+            }
+          ],
+          "limitations": [
+            "The renderer function and executor are invoked directly in a deterministic harness; this does not measure serialized UI bridge messages or Figma Desktop latency.",
+            "The one-pixel PNG is synthetic fake-runtime output; it is not screenshot evidence from Figma or a visual-quality judgement.",
+            "The harness does not invoke the ChatTask checkpoint owner; checkpoint write/readback counts are null and covered only by task integration tests.",
+            "No reviewer/provider calls, OAuth calls, network access, or real document mutations occur."
+          ]
+        }
+      ]
+    }
+  ],
+  "comparisons": [
+    {
+      "scenario": "F0",
+      "gateOff": null,
+      "gateOn": null,
+      "nativeTreeAndRootIdentityEquivalent": null,
+      "liveDesktopResult": "NOT_RUN"
+    },
+    {
+      "scenario": "F1",
+      "gateOff": {
+        "uiToPluginExecutorDispatches": 1,
+        "actualUIBridgeMessagesObserved": false,
+        "pluginAcknowledgements": 1,
+        "rendererInvocations": 1,
+        "nativeReadbackRequests": 1,
+        "nativeReadbackAcknowledgements": 1,
+        "nativePngExportCalls": 0,
+        "figmaApiOperations": {
+          "currentPage.findAll": 23,
+          "listAvailableFontsAsync": 1,
+          "loadFontAsync": 2,
+          "getLocalPaintStylesAsync": 1,
+          "getLocalTextStylesAsync": 1,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 5,
+          "createText": 7,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 2
+        },
+        "figmaApiOperationTotal": 54,
+        "nativeNodeMethodCalls": 1029,
+        "attachedNodes": 15,
+        "createdNodes": 15,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10",
+            "parentId": "page:current"
+          }
+        ],
+        "nativeReadbackConfirmed": 1,
+        "nativeReadbackResponsePayloadBytesJsonEstimate": 8985,
+        "captureReceiptMetadataPayloadBytesJsonEstimate": 0,
+        "screenshotResponseBytes": 0,
+        "requestPayloadBytesJsonEstimate": 317,
+        "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+        "checkpointWrites": null,
+        "checkpointReadbacks": null,
+        "peakInFlightOperations": 1,
+        "errors": 0,
+        "retries": 0,
+        "localHarnessMs": 57.059
+      },
+      "gateOn": {
+        "uiToPluginExecutorDispatches": 2,
+        "actualUIBridgeMessagesObserved": false,
+        "pluginAcknowledgements": 2,
+        "rendererInvocations": 1,
+        "nativeReadbackRequests": 1,
+        "nativeReadbackAcknowledgements": 1,
+        "nativePngExportCalls": 1,
+        "figmaApiOperations": {
+          "currentPage.findAll": 24,
+          "listAvailableFontsAsync": 1,
+          "loadFontAsync": 2,
+          "getLocalPaintStylesAsync": 1,
+          "getLocalTextStylesAsync": 1,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 5,
+          "createText": 7,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 4
+        },
+        "figmaApiOperationTotal": 57,
+        "nativeNodeMethodCalls": 1256,
+        "attachedNodes": 15,
+        "createdNodes": 15,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10",
+            "parentId": "page:current"
+          }
+        ],
+        "nativeReadbackConfirmed": 1,
+        "nativeReadbackResponsePayloadBytesJsonEstimate": 9013,
+        "captureReceiptMetadataPayloadBytesJsonEstimate": 810,
+        "screenshotResponseBytes": 70,
+        "requestPayloadBytesJsonEstimate": 935,
+        "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+        "checkpointWrites": null,
+        "checkpointReadbacks": null,
+        "peakInFlightOperations": 1,
+        "errors": 0,
+        "retries": 0,
+        "localHarnessMs": 58.363
+      },
+      "nativeTreeAndRootIdentityEquivalent": true,
+      "liveDesktopResult": "NOT_RUN"
+    },
+    {
+      "scenario": "F3",
+      "gateOff": {
+        "uiToPluginExecutorDispatches": 3,
+        "actualUIBridgeMessagesObserved": false,
+        "pluginAcknowledgements": 3,
+        "rendererInvocations": 3,
+        "nativeReadbackRequests": 3,
+        "nativeReadbackAcknowledgements": 3,
+        "nativePngExportCalls": 0,
+        "figmaApiOperations": {
+          "currentPage.findAll": 78,
+          "listAvailableFontsAsync": 3,
+          "loadFontAsync": 6,
+          "getLocalPaintStylesAsync": 3,
+          "getLocalTextStylesAsync": 3,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 15,
+          "createText": 36,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 6
+        },
+        "figmaApiOperationTotal": 162,
+        "nativeNodeMethodCalls": 5577,
+        "attachedNodes": 54,
+        "createdNodes": 54,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:28",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:46",
+            "parentId": "page:current"
+          }
+        ],
+        "nativeReadbackConfirmed": 3,
+        "nativeReadbackResponsePayloadBytesJsonEstimate": 64529,
+        "captureReceiptMetadataPayloadBytesJsonEstimate": 0,
+        "screenshotResponseBytes": 0,
+        "requestPayloadBytesJsonEstimate": 957,
+        "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+        "checkpointWrites": null,
+        "checkpointReadbacks": null,
+        "peakInFlightOperations": 1,
+        "errors": 0,
+        "retries": 0,
+        "localHarnessMs": 73.291
+      },
+      "gateOn": {
+        "uiToPluginExecutorDispatches": 6,
+        "actualUIBridgeMessagesObserved": false,
+        "pluginAcknowledgements": 6,
+        "rendererInvocations": 3,
+        "nativeReadbackRequests": 3,
+        "nativeReadbackAcknowledgements": 3,
+        "nativePngExportCalls": 3,
+        "figmaApiOperations": {
+          "currentPage.findAll": 81,
+          "listAvailableFontsAsync": 3,
+          "loadFontAsync": 6,
+          "getLocalPaintStylesAsync": 3,
+          "getLocalTextStylesAsync": 3,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 15,
+          "createText": 36,
+          "createRectangle": 3,
+          "getNodeByIdAsync": 12
+        },
+        "figmaApiOperationTotal": 171,
+        "nativeNodeMethodCalls": 6459,
+        "attachedNodes": 54,
+        "createdNodes": 54,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:28",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:46",
+            "parentId": "page:current"
+          }
+        ],
+        "nativeReadbackConfirmed": 3,
+        "nativeReadbackResponsePayloadBytesJsonEstimate": 64613,
+        "captureReceiptMetadataPayloadBytesJsonEstimate": 2440,
+        "screenshotResponseBytes": 210,
+        "requestPayloadBytesJsonEstimate": 2817,
+        "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+        "checkpointWrites": null,
+        "checkpointReadbacks": null,
+        "peakInFlightOperations": 1,
+        "errors": 0,
+        "retries": 0,
+        "localHarnessMs": 50.789
+      },
+      "nativeTreeAndRootIdentityEquivalent": true,
+      "liveDesktopResult": "NOT_RUN"
+    },
+    {
+      "scenario": "F10",
+      "gateOff": {
+        "uiToPluginExecutorDispatches": 10,
+        "actualUIBridgeMessagesObserved": false,
+        "pluginAcknowledgements": 10,
+        "rendererInvocations": 10,
+        "nativeReadbackRequests": 10,
+        "nativeReadbackAcknowledgements": 10,
+        "nativePngExportCalls": 0,
+        "figmaApiOperations": {
+          "currentPage.findAll": 230,
+          "listAvailableFontsAsync": 10,
+          "loadFontAsync": 20,
+          "getLocalPaintStylesAsync": 10,
+          "getLocalTextStylesAsync": 10,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 50,
+          "createText": 70,
+          "createRectangle": 30,
+          "getNodeByIdAsync": 20
+        },
+        "figmaApiOperationTotal": 459,
+        "nativeNodeMethodCalls": 29325,
+        "attachedNodes": 150,
+        "createdNodes": 150,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:25",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:40",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:55",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:70",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:85",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:100",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:115",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:130",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:145",
+            "parentId": "page:current"
+          }
+        ],
+        "nativeReadbackConfirmed": 10,
+        "nativeReadbackResponsePayloadBytesJsonEstimate": 498664,
+        "captureReceiptMetadataPayloadBytesJsonEstimate": 0,
+        "screenshotResponseBytes": 0,
+        "requestPayloadBytesJsonEstimate": 3333,
+        "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+        "checkpointWrites": null,
+        "checkpointReadbacks": null,
+        "peakInFlightOperations": 1,
+        "errors": 0,
+        "retries": 0,
+        "localHarnessMs": 141.403
+      },
+      "gateOn": {
+        "uiToPluginExecutorDispatches": 20,
+        "actualUIBridgeMessagesObserved": false,
+        "pluginAcknowledgements": 20,
+        "rendererInvocations": 10,
+        "nativeReadbackRequests": 10,
+        "nativeReadbackAcknowledgements": 10,
+        "nativePngExportCalls": 10,
+        "figmaApiOperations": {
+          "currentPage.findAll": 240,
+          "listAvailableFontsAsync": 10,
+          "loadFontAsync": 20,
+          "getLocalPaintStylesAsync": 10,
+          "getLocalTextStylesAsync": 10,
+          "createPaintStyle": 5,
+          "createTextStyle": 4,
+          "createFrame": 50,
+          "createText": 70,
+          "createRectangle": 30,
+          "getNodeByIdAsync": 40
+        },
+        "figmaApiOperationTotal": 489,
+        "nativeNodeMethodCalls": 32270,
+        "attachedNodes": 150,
+        "createdNodes": 150,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:10",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:25",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:40",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:55",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:70",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:85",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:100",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:115",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:130",
+            "parentId": "page:current"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:145",
+            "parentId": "page:current"
+          }
+        ],
+        "nativeReadbackConfirmed": 10,
+        "nativeReadbackResponsePayloadBytesJsonEstimate": 498944,
+        "captureReceiptMetadataPayloadBytesJsonEstimate": 8195,
+        "screenshotResponseBytes": 700,
+        "requestPayloadBytesJsonEstimate": 9689,
+        "serializationMethod": "UTF-8 JSON length for typed request payloads; Uint8Array response counted by byteLength",
+        "checkpointWrites": null,
+        "checkpointReadbacks": null,
+        "peakInFlightOperations": 1,
+        "errors": 0,
+        "retries": 0,
+        "localHarnessMs": 170.698
+      },
+      "nativeTreeAndRootIdentityEquivalent": true,
+      "liveDesktopResult": "NOT_RUN"
+    }
+  ],
+  "interpretation": [
+    "Gate-off and gate-on use the same deterministic fixture programs and fake Figma runtime within separate isolated module-load runs.",
+    "The gate-on path adds one bounded native export per newly rendered and readback-confirmed screen. This harness demonstrates export dispatch, not visual accuracy or perceived speed.",
+    "There is no registered reviewer, so every screenshot-bearing outcome remains UNVERIFIED. No visual quality PASS is inferred.",
+    "Checkpoint writes and reads are owned by the UI ChatTask path and are not invoked by this plugin-side harness; see integrated checkpoint tests.",
+    "Actual UI bridge serialization, real Desktop layout, rendering latency, Figma API timing, and memory high-water marks are not measured here."
+  ]
+}

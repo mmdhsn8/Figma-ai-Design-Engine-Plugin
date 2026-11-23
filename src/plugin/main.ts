@@ -23,6 +23,10 @@ import { handleModelPreferenceStorage } from "./model-preference-storage";
 import { handleDesignEnginePreferenceStorage } from "./design-engine-preference-storage";
 import { handleBrandKitStorage, PinnedBrandAssetResolutionError, resolvePinnedBrandVisualAssets } from "./brand-kit-storage";
 import { handleDesignSkillStorage } from "./design-skill-storage";
+import { FW2_ENABLED } from "../shared/design-context-feature";
+import { createDesignContextController } from "./design-context-controller";
+import { prepareContextReuse } from "./design-context-reuse";
+import { FW5_VISUAL_QA_ENABLED } from "../shared/fw5-visual-qa-feature";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
 const COMPANION_RESTORE_TICKET_KEY = "companion-restore-ticket-v1";
@@ -108,6 +112,11 @@ function reportToolExecutorFailure(
 
 const generationController = createGenerationController(figma, send);
 const figmaToolExecutor = createFigmaToolExecutor(figma, send);
+function activeDocumentId() {
+  const fileId = figma.fileKey ?? figma.root.getPluginData("fad.document-id");
+  return fileId ? `${fileId}-${figma.currentPage.id.replaceAll(":", "_")}` : undefined;
+}
+const designContext = createDesignContextController(figma, FW2_ENABLED, activeDocumentId);
 
 async function fontWarnings(input: DesignSpec | MultiScreenSpec): Promise<string[]> {
   try {
@@ -172,6 +181,19 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     });
     return;
   }
+  if (message.data.type === "design-context-read") {
+    const result = await designContext.read(message.data);
+    if (FW2_ENABLED) console.info("[FAD_DESIGN_CONTEXT] " + JSON.stringify(result.success ? {
+      scope: result.snapshot.scope, coverage: result.snapshot.coverage, digest: result.snapshot.digest,
+      nodes: result.snapshot.nodes.length, resources: result.snapshot.resources.length, reasons: result.snapshot.reasons,
+    } : { code: result.code }));
+    send(result);
+    return;
+  }
+  if (message.data.type === "design-context-cancel") {
+    designContext.cancel(message.data);
+    return;
+  }
   if (message.data.type === "chat-task-load" || message.data.type === "chat-task-save") {
     send(await handleChatTaskStorage(figma, message.data));
     return;
@@ -197,11 +219,6 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     const page = figma.currentPage;
     const pageId = page.id;
     const receiptKey = `fad.program-root.v1:${request.taskId}:${request.program.screens[0]?.id}`;
-    const activeDocumentId = () => {
-      const localId = figma.root.getPluginData("fad.document-id");
-      const fileId = figma.fileKey ?? localId;
-      return fileId ? `${fileId}-${figma.currentPage.id.replaceAll(":", "_")}` : undefined;
-    };
     const assertCurrentScope = () => {
       if (figma.currentPage.id !== pageId || activeDocumentId() !== request.documentId)
         throw new Error("stale_document_scope");
@@ -216,12 +233,15 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       };
       request.program.screens.forEach(({ root }) => collectAssets(root));
       const assets = await resolvePinnedBrandVisualAssets(figma.clientStorage, request.brandKit, [...referencedAssets]);
+      const grant = FW2_ENABLED && request.contextTicket
+        ? designContext.reuse(request.contextTicket, request.taskId, request.documentId) : undefined;
       const result = await renderDesignProgramLocal(figma, request.program, {
         taskId: request.taskId,
         documentId: request.documentId,
         pageId,
         executor: figmaToolExecutor,
         assets,
+        contextReuse: grant ? () => prepareContextReuse(figma, grant.snapshot, grant.current) : undefined,
         assertCurrentScope,
         requestId: request.requestId,
         expectedRootNodeId: request.expectedRootNodeId,
@@ -257,10 +277,14 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         adoptionOperationIds: result.operationIds,
         programFingerprint: result.fingerprint,
         nativeNodeCount: result.registeredRefs,
+        ...(FW5_VISUAL_QA_ENABLED ? { visualCaptureEligible: root.freshlyCreated === true } : {}),
         geometryVersion: result.geometryVersion,
         geometryRepairs: result.geometryRepairs,
         geometryDurationMs: result.timingsMs.geometry,
-        ...(result.fontFallback ? { findings: [{ code: "native_font_fallback", path: "typography", message: "A requested font could not be used for this text. Figma loaded a fallback font.", severity: "warning" as const }] } : {}),
+        ...((result.fontFallback || result.contextFindings?.length) ? { findings: [
+          ...(result.fontFallback ? [{ code: "native_font_fallback", path: "typography", message: "A requested font could not be used for this text. Figma loaded a fallback font.", severity: "warning" as const }] : []),
+          ...(result.contextFindings ?? []),
+        ] } : {}),
       });
     } catch (error) {
       const staleScope = error instanceof Error && error.message === "stale_document_scope";
@@ -299,7 +323,11 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     message.data.type === "tool-pause" ||
     message.data.type === "tool-delete-consent" ||
     message.data.type === "task-native-inspect" ||
-    message.data.type === "task-native-focus"
+    message.data.type === "task-native-focus" ||
+    message.data.type === "task-native-visual-capture" ||
+    message.data.type === "task-native-visual-capture-cancel" ||
+    message.data.type === "task-native-visual-repair" ||
+    message.data.type === "task-native-visual-repair-cancel"
   ) {
     void figmaToolExecutor(message.data).catch((error: unknown) => {
       if (message.data.type === "tool-execute" || message.data.type === "tool-delete-consent")

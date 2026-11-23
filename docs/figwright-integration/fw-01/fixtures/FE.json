@@ -1,0 +1,19 @@
+{
+  "fixtureId": "FE",
+  "locale": "fa-IR",
+  "direction": "RTL",
+  "viewport": "existing approved F1 disposable screen",
+  "projectDomain": "scoped edit",
+  "requestedScreenCount": 0,
+  "screenRoles": [],
+  "targetScreenId": "learning-dashboard",
+  "assetPolicy": "Synthetic content only.",
+  "brief": "Update only the selected screen’s main CTA label and accent color; preserve every other screen and component master.",
+  "expected": {
+    "targetRootNativeIdRecordedBeforeWrite": true,
+    "unrelatedRootIdsAndRelevantPropsRecordedBeforeWrite": true,
+    "onlyAuthorizedTargetNodesChanged": true,
+    "noUnintendedMutationDuplicationMasterDriftOrDeletion": true,
+    "nativeIdsComparedBeforeAndAfter": true
+  }
+}

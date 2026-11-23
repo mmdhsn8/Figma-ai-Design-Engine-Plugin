@@ -2,6 +2,7 @@ import { z } from "zod";
 import { CHAT_ABORT_ORIGINS } from "./chat-cancellation.js";
 import { DESIGN_PROGRAM_VERSION, DesignProgramV1Schema } from "./design-program.js";
 import { createDefaultVisualLanguage, ProjectVisualLanguageV1Schema } from "./design-composition.js";
+import { VisualQaOutcomeV1Schema } from "./fw5-visual-qa.js";
 
 const text = (maximum: number, minimum = 1) => z.string().trim().min(minimum).max(maximum);
 const orderRef = z.number().int().min(0).max(9);
@@ -255,7 +256,7 @@ export const UniversalDesignTraceEventSchema = z.object({
   engineRoute: z.literal("universal-design-v1"),
   buildId: z.literal(UNIVERSAL_DESIGN_TRACE_BUILD_ID),
   stageId: z.string().regex(/^(?:task|screen-(?:0[1-9]|10))$/u),
-  stage: z.enum(["intent", "plan", "compose", "repair", "normalize", "preflight", "persistence", "native_render", "native_readback", "verification", "task"]),
+  stage: z.enum(["intent", "plan", "compose", "repair", "normalize", "preflight", "persistence", "native_render", "native_readback", "visual_capture", "visual_review", "visual_repair", "verification", "task"]),
   event: z.enum(["request_started", "request_completed", "request_failed", "checkpoint_saved", "program_normalized", "preflight_completed", "render_dispatched", "render_acknowledged", "readback_completed", "recovered", "task_completed"]),
   outcome: z.enum(["started", "completed", "failed", "recovered"]),
   providerRequestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
@@ -386,11 +387,13 @@ export const UniversalScreenCheckpointSchema = z
     fingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u).optional(),
     rootRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u).optional(),
     nativeRootNodeId: z.string().min(1).max(100).optional(),
+    nativePageId: z.string().min(1).max(200).optional(),
     nativeBatchId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
     adoptionOperationIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u)).max(200).optional(),
     nativeNodeCount: z.number().int().min(0).max(300).optional(),
     verifiedNodeCount: z.number().int().min(0).max(500).optional(),
     geometryVersion: z.literal(1).optional(),
+    visualQa: VisualQaOutcomeV1Schema.optional(),
     renderAttempts: z.number().int().min(0).max(3).optional(),
     repairAttempts: z.number().int().min(0).max(1).default(0),
     schemaCorrections: z.number().int().min(0).max(2).default(0),

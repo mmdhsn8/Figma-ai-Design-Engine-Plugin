@@ -1,0 +1,19 @@
+{
+  "fixtureId": "F3",
+  "locale": "fa-IR",
+  "direction": "RTL",
+  "viewport": "390x844",
+  "projectDomain": "service booking",
+  "requestedScreenCount": 3,
+  "screenRoles": ["browse-filter", "service-details", "booking-confirmation"],
+  "assetPolicy": "Synthetic content; use only authorized assets or clearly labeled placeholders.",
+  "brief": "Design three Persian RTL 390×844 mobile screens for a service-booking app: Browse/Filter, Service Details with available time slots, and Booking Confirmation. The screens must be coherent, visually distinct, and professionally composed, with realistic synthetic data, consistent components and editable native layers. Do not create a shop/cart design.",
+  "expected": {
+    "rootOrder": ["browse-filter", "service-details", "booking-confirmation"],
+    "uniqueTaskOwnedRoots": 3,
+    "pagePurposeAndSemanticCompleteness": true,
+    "typographyAndControls": true,
+    "componentAndStyleContinuity": true,
+    "previewScrollAndSafeQA": true
+  }
+}

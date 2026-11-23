@@ -1,0 +1,137 @@
+{
+  "schemaVersion": "fw1-build-identities-v1",
+  "capturedDateLocal": "2026-11-22",
+  "primaryRepository": {
+    "path": "C:/Users/rayan-it/Desktop/figma ai engine v2/Figma Plugin Updated",
+    "branch": "main",
+    "commit": "639fdb4f432429ca0dccda3652677a84a4374769",
+    "workingTreeBeforeArtifacts": "clean",
+    "manifest": {
+      "path": "manifest.json",
+      "pluginId": "1574493506249715820",
+      "main": "dist/plugin.js",
+      "ui": "dist/ui.html",
+      "sha256": "01D4429B1D421FDD9F0A24EFCA793EF9FD912E2AD559D1505EC4A5FCB1A2934A",
+      "lastWriteUtc": "2026-11-08T07:39:57.6554022Z"
+    },
+    "artifacts": [
+      {
+        "path": "dist/plugin.js",
+        "sha256": "169DB749FE1FCFCB9464DF435EDF536FD9199B407EF6580C5AE9781F914C0665",
+        "bytes": 2169825,
+        "lastWriteUtc": "2026-11-21T04:41:18.1246195Z"
+      },
+      {
+        "path": "dist/ui.html",
+        "sha256": "5A896D41BDD974CCB68683AFF4084A74157B2B93EE46BE4560C59C307BF2DF06",
+        "bytes": 1537838,
+        "lastWriteUtc": "2026-11-21T04:41:17.0051294Z"
+      },
+      {
+        "path": "dist/ui-bundle.js",
+        "sha256": "4EA2067A1A3D449A10260797A19E42BE3007D2D72D6A79FFC71849984F7D6746",
+        "bytes": 1537563,
+        "lastWriteUtc": "2026-11-21T04:41:16.8981545Z"
+      },
+      {
+        "path": "dist-companion/companion/main.js",
+        "sha256": "E6B78B796FA2FC2BF247B9AEA983C03080105E85FF20D0CC9CADA2C8FED018D7",
+        "bytes": 2563,
+        "lastWriteUtc": "2026-11-17T11:52:19.8623834Z"
+      },
+      {
+        "path": "dist-companion/companion/server.js",
+        "sha256": "15A9B7DA41A0071A487806B549842461485FA79643941255819B78FFA733E00F",
+        "bytes": 178277,
+        "lastWriteUtc": "2026-11-17T11:52:19.8503874Z"
+      }
+    ],
+    "runtime": {
+      "os": "Microsoft Windows 10 Pro",
+      "windowsVersion": "10.0.19045",
+      "node": "v24.21.0",
+      "npm": "11.19.0",
+      "pnpm": "11.25.0",
+      "companionConfiguredPort": 1455,
+      "companionListenerObserved": false
+    },
+    "figma": {
+      "installedDesktopVersion": "126.11.11",
+      "figmaAgentVersion": "126.11.9",
+      "figmaDesktopProcessObserved": false,
+      "figmaAgentProcessObserved": true,
+      "activeDevelopmentManifestRegistration": "NOT MEASURED",
+      "loadedPluginVersion": "NOT MEASURED",
+      "selectedModelProviderSlug": "NOT MEASURED",
+      "filePageIdentityAndSaveHealth": "NOT MEASURED",
+      "registeredManifestPath": "NOT MEASURED"
+    }
+  },
+  "figwright": {
+    "repository": "https://github.com/awdr74100/figwright",
+    "releaseTag": "v0.8.0",
+    "releaseCommit": "458e3dfa5da5d5c53f1fd5334a35754ffb2a66ca",
+    "releaseDate": "2026-11-21",
+    "mcpPackageVersion": "0.8.0",
+    "pluginManifestId": "figwright-dev",
+    "pluginMain": "dist/code.js",
+    "pluginUi": "dist/index.html",
+    "rootLockfileVersion": "9.0",
+    "rootPackageManager": "pnpm@12.21.0",
+    "rootNodeEngine": "^24.11.0 || >=26.0.0",
+    "mcpNodeEngine": "^20.19.0 || >=22.12.0",
+    "readmeDocumentedToolCount": 147,
+    "exactRuntimeToolCatalog": "NOT MEASURED",
+    "pluginRegisteredOrLoaded": false,
+    "mcpClientConfigured": false,
+    "sourceCheckout": "C:/Users/rayan-it/AppData/Local/Temp/figwright-fw1-e96ab03b9f96ec534c77cb76525fd76e5d892abe",
+    "sourceCheckoutHeadAtInspection": "e96ab03b9f96ec534c77cb76525fd76e5d892abe",
+    "dependenciesInstalled": false,
+    "mcpConfigChanged": false,
+    "upstreamLicense": "MIT"
+  },
+  "continuationCheck": {
+    "dateLocal": "2026-11-22",
+    "figmaDesktopWindowInComputerUseInventory": false,
+    "figmaAgentProcessObserved": true,
+    "unverifiedBrowserWindowTitle": "Figma Design Status — Mozilla Firefox",
+    "unverifiedBrowserWindowOpened": false,
+    "listenersObserved": {
+      "localhost:1455": false,
+      "127.0.0.1:3055": false
+    },
+    "runtime": {
+      "node": "v24.21.0",
+      "npm": "11.19.0",
+      "npx": "11.19.0"
+    },
+    "existingCompanionDataDirectoryExists": true,
+    "observedEntryNamesOnly": [
+      "drafts-v1",
+      "credentials.v1.dpapi",
+      "installation.json"
+    ],
+    "credentialAndInstallationContentsRead": false,
+    "isolatedCompanionBuild": {
+      "path": "C:/Users/rayan-it/AppData/Local/Temp/fw1-companion-build-639fdb4",
+      "sourceRevision": "639fdb4f432429ca0dccda3652677a84a4374769",
+      "compiledEntryPoint": "companion/main.js",
+      "mainSha256": "E6B78B796FA2FC2BF247B9AEA983C03080105E85FF20D0CC9CADA2C8FED018D7",
+      "serverSha256": "15A9B7DA41A0071A487806B549842461485FA79643941255819B78FFA733E00F",
+      "matchesExistingDistCompanionHashes": true,
+      "existingDistCompanionModified": false,
+      "isolatedDataDirectoryCreated": false,
+      "serverStarted": false
+    },
+    "figwrightServerPackageDownloadedOrStarted": false,
+    "figmaFilesOpenedOrWritten": false,
+    "modelProviderCalls": 0,
+    "runIdsCreated": []
+  },
+  "evidenceLimits": [
+    "Hashes identify local files only; they do not prove the Figma Desktop process loaded them.",
+    "The installed Figma version comes from local uninstall metadata; no Desktop window was running.",
+    "Cached account settings were not inspected to infer the selected model.",
+    "The v0.8.0 tool count comes from its README; no connected client tools/list response was observed."
+  ]
+}

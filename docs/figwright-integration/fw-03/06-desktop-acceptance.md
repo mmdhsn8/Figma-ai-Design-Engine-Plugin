@@ -1,0 +1,11 @@
+# FW-3 — optional Desktop acceptance
+
+**LIVE PENDING.** Current FW-3 gate-on behavior only creates/validates an in-memory plan. There is no native batch handler, so a Desktop “gate on” run cannot test or compare native batch execution yet. Do not use the protected Test Shop — Phase 1 Storefront file or any existing user file.
+
+When a later change actually wires the typed executor and its readback receipt, use a newly created disposable Figma file explicitly authorized for testing. Build two isolated runs (gate-off and gate-on) in separate blank pages or separate fresh disposable documents. Use the same F1/F3 programs first; proceed to the FW-1 F10 only after those pass. No provider costs are needed if the saved local program fixtures are loaded directly.
+
+For each run, capture: build hash and flag; document/page/root IDs; the existing task/checkpoint revision and status before/after; operation IDs and actual node IDs; parent/type/bounds/layout/text/paint readback; adoption/readback/checkpoint receipt stages; UI-to-plugin dispatches and Figma API operations; root/child counts before/after; Stop then Resume behavior; and screenshots. Compare the two runs only after readback and checkpoint confirmation. Inject failure only in the disposable file using a deterministic failure after one child operation; retain the attached root, Stop, Resume, and verify no second root and no unrelated-node changes. Record measured Desktop wall-clock separately from local fake-runtime time.
+
+Acceptance requires zero unrelated edits, no verified status before full readback and existing checkpoint confirmation, no deletion/recreation after uncertainty, stable root IDs over resume, all 1/3/10 fixtures correct (10-screen acceptance still separate), and either fewer actual dispatches or a demonstrated recovery/diagnostic gain without safety regression. Automatic rollout remains prohibited until relevant live F1/F3 evidence and native safety acceptance are reviewed.
+
+**Current action:** none. This delivery does not expose a Desktop batch-write switch. The only useful next step is to complete the typed executor/bridge/task-owner integration under a separately reviewed implementation, then run the procedure above in a disposable file.

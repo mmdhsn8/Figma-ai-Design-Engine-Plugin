@@ -9,7 +9,7 @@ export type MockNode = SceneNode & {
   [key: string]: unknown;
 };
 
-export function createMockApi({ simulateFill = false } = {}) {
+export function createMockApi({ simulateFill = false, resetSiblingSizingOnAppend = false, rejectSizingRestoreAfterAppend = false, exportFailure = false, exportBytes, exportDelayMs = 0 }: { simulateFill?: boolean; resetSiblingSizingOnAppend?: boolean; rejectSizingRestoreAfterAppend?: boolean; exportFailure?: boolean; exportBytes?: Uint8Array; exportDelayMs?: number } = {}) {
   const roots: MockNode[] = [];
   const nodes: MockNode[] = [];
   const storage = new Map<string, unknown>();
@@ -17,7 +17,10 @@ export function createMockApi({ simulateFill = false } = {}) {
   const viewportFocusCalls: string[][] = [];
   const pageChangeListeners = new Map<string, Set<(event: NodeChangeEvent) => void>>();
   const documentChangeListeners = new Set<(event: DocumentChangeEvent) => void>();
+  let siblingSizingWasReset = false;
   let imageImportCalls = 0;
+  const exportCalls: Array<{ nodeId: string; settings: ExportSettings }> = [];
+  const mockPng = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1]);
   const emitDocumentChange = () => {
     const event = { documentChanges: [] } as unknown as DocumentChangeEvent;
     for (const listener of documentChangeListeners) listener(event);
@@ -194,6 +197,16 @@ export function createMockApi({ simulateFill = false } = {}) {
         node.children.push(child);
         (child as unknown as { parent: MockNode | PageNode | null }).parent =
           node as unknown as MockNode;
+        if (resetSiblingSizingOnAppend && node.layoutMode !== "NONE") {
+          for (const sibling of node.children.slice(0, -1)) {
+            const sizedSibling = sibling as SceneNode & { layoutSizingHorizontal: string; layoutSizingVertical: string };
+            sizedSibling.layoutSizingHorizontal = "FIXED";
+            sizedSibling.layoutSizingVertical = "FIXED";
+            if (sibling.type === "TEXT" && sibling.getPluginData("fad.design.program-text.v1") === "1")
+              (sibling as TextNode).textAutoResize = "WIDTH_AND_HEIGHT";
+          }
+          if (node.children.length > 1) siblingSizingWasReset = true;
+        }
       },
       remove() {
         [...node.children].forEach((child) => child.remove());
@@ -212,6 +225,12 @@ export function createMockApi({ simulateFill = false } = {}) {
       async setTextStyleIdAsync(id: string) {
         (node as unknown as Record<string, unknown>).textStyleId = id;
       },
+      async exportAsync(settings: ExportSettings) {
+        exportCalls.push({ nodeId: node.id, settings });
+        if (exportDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, exportDelayMs));
+        if (exportFailure) throw new Error("Injected PNG export failure.");
+        return new Uint8Array(exportBytes ?? mockPng);
+      },
     } as unknown as MockNode;
     for (const [property, read, write] of [
       [
@@ -229,6 +248,8 @@ export function createMockApi({ simulateFill = false } = {}) {
         configurable: true,
         get: read,
         set(value: "FIXED" | "HUG" | "FILL") {
+          if (rejectSizingRestoreAfterAppend && siblingSizingWasReset && value === "FILL")
+            throw new Error("Injected sizing readback recovery fault.");
           if (
             value === "FILL" &&
             (!node.parent ||
@@ -340,6 +361,8 @@ export function createMockApi({ simulateFill = false } = {}) {
   let setCurrentPageCalls = 0;
   const api = {
     fileKey: "file-test-56",
+    editorType: "figma",
+    mode: "default",
     mixed: Symbol("mixed"),
     root,
     currentPage: page,
@@ -377,7 +400,7 @@ export function createMockApi({ simulateFill = false } = {}) {
           const copy = makeNode(type);
           copy.name = source.name;
           copy.resize(source.width, source.height);
-          for (const key of ["layoutMode", "layoutWrap", "itemSpacing", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft", "primaryAxisAlignItems", "counterAxisAlignItems", "fills", "characters", "fontName", "fontSize", "textAlignHorizontal"] as const)
+          for (const key of ["layoutMode", "layoutWrap", "itemSpacing", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft", "primaryAxisAlignItems", "counterAxisAlignItems", "fills", "cornerRadius", "characters", "fontName", "fontSize", "textAlignHorizontal"] as const)
             (copy as Record<string, unknown>)[key] = source[key];
           for (const [key, value] of source.pluginData) copy.setPluginData(key, value);
           for (const child of source.children) copy.appendChild(copyNode(child));
@@ -419,6 +442,7 @@ export function createMockApi({ simulateFill = false } = {}) {
     loadFontAsync: async () => undefined,
     getLocalPaintStylesAsync: async () => paintStyles,
     getLocalTextStylesAsync: async () => textStyles,
+    getStyleByIdAsync: async (id: string) => [...paintStyles, ...textStyles].find((style) => style.id === id) ?? null,
     variables: {
       getLocalVariablesAsync: async () => [],
       getLocalVariableCollectionsAsync: async () => [],
@@ -445,6 +469,7 @@ export function createMockApi({ simulateFill = false } = {}) {
     },
     find: (name: string) => page.findAll((node) => node.name === name)[0] as MockNode | undefined,
     getImageImportCalls: () => imageImportCalls,
+    exportCalls,
     otherPage,
   };
 }

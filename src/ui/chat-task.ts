@@ -5,6 +5,7 @@ import {
   modelPlanStages,
   CHAT_PLAN_VERSION,
   chatFunctionToolsForState,
+  MAX_CHAT_PROVIDER_INPUT_BYTES,
   type ChatFunctionCall,
   type ChatLifecycleState,
   type ChatInputItem,
@@ -71,10 +72,12 @@ import {
   greetingReply,
   isExplicitCanvasRequest,
   isClearCreateRequest,
+  requestedDesignContext,
 } from "../shared/chat-generation";
-import { runUniversalDesignTask } from "./universal-design-task";
+import { runUniversalDesignTask, type UniversalDesignDependencies } from "./universal-design-task";
 import type { DesignProgramV1 } from "../shared/design-program";
-import type { DesignProgramRenderResponse } from "./design-program-bridge";
+import type { ContextResponse, DesignProgramRenderResponse } from "./design-program-bridge";
+import { CONTEXT_PRECEDENCE, EDIT_CONTEXT_PREFIX, plannerDesignContext, type ContextTicket } from "../shared/design-context";
 import type { UIToPluginMessage } from "../shared/messages";
 
 type Result = Extract<PluginToUIMessage, { type: "tool-result" }>;
@@ -159,10 +162,21 @@ type Dependencies = {
     progress: (event: MultiScreenProgressEvent) => Promise<void>,
   ): Promise<unknown>;
   assertAuthorized?(): Promise<void>;
-  renderProgram?(program: DesignProgramV1, requestId: string, expectedRootNodeId?: string): Promise<DesignProgramRenderResponse>;
+  renderProgram?(program: DesignProgramV1, requestId: string, expectedRootNodeId?: string, contextTicket?: ContextTicket): Promise<DesignProgramRenderResponse>;
+  readContext?(intent: "create" | "edit", target?: { nodeId: string; pageId: string }): Promise<ContextResponse | undefined>;
   inspectProgram?(
     request: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
   ): Promise<Extract<PluginToUIMessage, { type: "task-native-inspection-result" }>>;
+  captureVisual?(
+    request: Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>,
+    signal: AbortSignal,
+  ): Promise<Extract<PluginToUIMessage, { type: "task-native-visual-capture-result" }>>;
+  repairVisual?(
+    request: Extract<UIToPluginMessage, { type: "task-native-visual-repair" }>,
+    signal: AbortSignal,
+  ): Promise<Extract<PluginToUIMessage, { type: "task-native-visual-repair-result" }>>;
+  visualReviewer?: UniversalDesignDependencies["visualReviewer"];
+  authorizeVisualReview?: UniversalDesignDependencies["authorizeVisualReview"];
   isCurrent?(): boolean;
   timingEvidence?: "live" | "mock";
   maxConcurrentModelCalls?: 1 | 2;
@@ -3740,7 +3754,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     transition("TASK_COMPLETED");
     delete task.error;
     delete task.failure;
-    await save();
+    // The opted-in Universal conversation is recorded in History, not as a Canvas task.
+    if (task.executionRoute !== "universal-design-v1" || !deps.readContext) await save();
     return;
   }
   syncCapacityAccounting(task);
@@ -3836,6 +3851,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       task.stages[retryQualityStage]!.awaitingQualityRepair = true;
       await inspectAfterQualityRepair(retryQualityStage, true);
     }
+    let editContextAttempted = false;
+    let editDesignContext: ReturnType<typeof plannerDesignContext>;
     while (true) {
       check();
       if (task.executionRoute === "universal-design-v1" && task.intent === "create") {
@@ -3847,7 +3864,12 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           progress: deps.progress,
           assertAuthorized: deps.assertAuthorized,
           renderProgram: deps.renderProgram,
+          readContext: deps.readContext ? () => deps.readContext!("create") : undefined,
           inspectProgram: deps.inspectProgram,
+          captureVisual: deps.captureVisual,
+          repairVisual: deps.repairVisual,
+          visualReviewer: deps.visualReviewer,
+          authorizeVisualReview: deps.authorizeVisualReview,
           signal: deps.signal,
           now,
           onPhase: (phase) => { activePhase = phase; },
@@ -5812,6 +5834,23 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           ? "native_execution"
           : "planning";
       const input = chatTaskInput(task);
+      if (task.executionRoute === "universal-design-v1" && task.intent === "edit" &&
+        task.lifecycle === "EDIT_PLANNING" && task.editTarget && deps.readContext &&
+        requestedDesignContext(task.prompt, "edit")) {
+        if (!editContextAttempted) {
+          editContextAttempted = true;
+          await deps.assertAuthorized?.();
+          check();
+          const result = await deps.readContext("edit", { nodeId: task.editTarget.nodeId, pageId: task.editTarget.pageId });
+          check();
+          if (result?.success) editDesignContext = plannerDesignContext(result.snapshot);
+          else if (result) deps.progress(`Scoped edit context unavailable (${result.code}); using existing verified target evidence.`);
+        }
+        if (editDesignContext) {
+          const scoped: ChatInputItem = { role: "user", content: EDIT_CONTEXT_PREFIX + JSON.stringify({ context: editDesignContext, policy: CONTEXT_PRECEDENCE }) };
+          if (input.length < 40 && utf8Bytes(JSON.stringify([...input, scoped])) <= MAX_CHAT_PROVIDER_INPUT_BYTES) input.push(scoped);
+        }
+      }
       let turn: AuthorizedChatTurn | undefined;
       let turnDurationMs = 0;
       for (let attempt = 0; attempt < 3; attempt++) {

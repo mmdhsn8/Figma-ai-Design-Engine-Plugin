@@ -1,0 +1,20 @@
+{
+  "fixtureId": "F1",
+  "locale": "fa-IR",
+  "direction": "RTL",
+  "viewport": "390x844",
+  "projectDomain": "independent learning",
+  "requestedScreenCount": 1,
+  "screenRoles": ["learning-dashboard"],
+  "assetPolicy": "Synthetic content; use only authorized assets or clearly labeled placeholders.",
+  "brief": "Design one polished Persian RTL mobile screen (390×844 viewport) for an independent-learning application. Include a learning dashboard with progress, next lesson, meaningful course cards, a primary action and navigation. Use one consistent design system and editable native Figma layers. Long content may scroll vertically; no horizontal overflow.",
+  "expected": {
+    "rootOrder": ["learning-dashboard"],
+    "editableNativeHierarchy": true,
+    "manualTextEdit": true,
+    "componentAndStyleSemantics": true,
+    "persianShaping": true,
+    "boundsAndScroll": true,
+    "accidentalClippingOrDeletion": false
+  }
+}
