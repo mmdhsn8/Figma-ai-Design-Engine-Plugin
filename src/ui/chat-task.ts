@@ -2725,6 +2725,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       ]),
     );
     const report = async (eventValue: MultiScreenProgressEvent) => {
+      check();
       const event = MultiScreenProgressEventSchema.parse(eventValue);
       if (
         event.totalScreens !== request.screens.length ||
@@ -2770,6 +2771,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       link.currentScreenId = event.screenId;
       link.currentSectionId = event.sectionId;
       await save();
+      check();
       if (event.phase === "planning") deps.progress(`Planning ${event.totalScreens} screens…`);
       else if (event.phase === "screen-start" && event.screenId)
         deps.progress(
@@ -2793,9 +2795,9 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         deps.progress("All planned native screens passed generation verification.");
     };
     try {
-      const outcome = MultiScreenGenerationOutcomeSchema.parse(
-        await deps.generateMultiScreen(request, report),
-      );
+      const rawOutcome = await deps.generateMultiScreen(request, report);
+      check();
+      const outcome = MultiScreenGenerationOutcomeSchema.parse(rawOutcome);
       const nativeRoots = outcome.nativeRoots ?? [];
       if (
         outcome.generationId !== request.generationId ||
@@ -2853,6 +2855,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       delete task.failure;
       transition("TASK_COMPLETED");
       await save();
+      check();
     } catch (error) {
       link.status = deps.signal.aborted ? "paused" : "failed";
       link.errorCode = deps.signal.aborted ? "request_cancelled" : "generation_failed";
@@ -6236,14 +6239,22 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         : `Structured generation failed safely: ${(error instanceof Error ? error.message : "The saved generation could not continue.").slice(0, 500)}. Confirmed work is retained; no completion was reported.`;
     }
     task.error = isCancelled
-      ? task.intent === "edit"
-        ? "Edit cancelled. Verified target evidence and any confirmed native changes are retained."
-        : "Inspection cancelled. Saved read-only evidence is retained."
+      ? task.executionRoute === "universal-design-v1"
+        ? "Design task stopped. Saved programs and confirmed native screens are retained; Resume this task to continue."
+        : task.intent === "edit"
+          ? "Edit cancelled. Verified target evidence and any confirmed native changes are retained."
+          : "Inspection cancelled. Saved read-only evidence is retained."
       : sessionEnded ? "The Companion session changed or lost authorization. Reconnect and resume the saved task."
       : (["chat_request_invalid", "request_cancelled"].includes(transportCategory) && error && typeof error === "object" &&
           "safeMessage" in error && typeof error.safeMessage === "string"
         ? error.safeMessage
         : error instanceof Error ? error.message : "Stage failed safely.").slice(0, 500);
+    if (task.executionRoute === "universal-design-v1")
+      task.text = isCancelled
+        ? "Universal design paused. Saved plans, programs, and confirmed native screens are retained. Resume this task to continue."
+        : sessionEnded
+          ? "Universal design paused because the Companion session changed or lost authorization. Reconnect, then resume this saved task."
+          : `Universal design failed safely: ${task.error}. Confirmed native screens are retained; inspect the saved checkpoint before resuming.`.slice(0, 1_000);
     if (readOnly() && isCancelled) {
       const checkpoint = readOnlyCheckpoint(task);
       task.inspectionOutcome = "CANCELLED";

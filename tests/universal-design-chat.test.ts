@@ -963,6 +963,44 @@ describe("universal design Chat route", () => {
     expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete").map(({ id }) => id)).toEqual([root.id]);
   });
 
+  it("fences task completion when Stop arrives during the final checkpoint write", async () => {
+    const input = { ...cases[2]!, screens: cases[2]!.screens.slice(0, 1), brief: "Design one desktop screen for analytics." };
+    const h = makeHarness(input);
+    const controller = new AbortController();
+    let signalFinalWriteStarted!: () => void;
+    let releaseFinalWrite!: () => void;
+    const finalWriteStarted = new Promise<void>((resolve) => { signalFinalWriteStarted = resolve; });
+    const finalWriteGate = new Promise<void>((resolve) => { releaseFinalWrite = resolve; });
+    const persist = h.deps.save.getMockImplementation()!;
+    let held = false;
+    h.deps.save.mockImplementation(async (snapshot) => {
+      if (snapshot.status === "completed" && !held) {
+        held = true;
+        signalFinalWriteStarted();
+        await finalWriteGate;
+      }
+      await persist(snapshot);
+    });
+
+    const running = runChatTask(h.task, { ...h.deps, signal: controller.signal });
+    await finalWriteStarted;
+    expect(h.task.status).toBe("running");
+    expect(h.task.text).not.toContain("created and read back");
+    controller.abort("user_stop");
+    releaseFinalWrite();
+    await expect(running).rejects.toThrow("request_cancelled");
+
+    const root = h.mock.roots.find((node) => node.getPluginData("fad.generation.commit") === "complete")!;
+    expect(root).toBeDefined();
+    expect(root.removed).toBe(false);
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete").map(({ id }) => id)).toEqual([root.id]);
+    expect(h.task.status).toBe("stopped");
+    expect(h.task.universalScreens?.[0]).toMatchObject({ status: "verified", nativeRootNodeId: root.id });
+    expect(h.checkpoints.at(-1)?.status).toBe("stopped");
+    expect(h.checkpoints.at(-1)?.universalScreens?.[0]?.nativeRootNodeId).toBe(root.id);
+    expect(h.checkpoints.at(-1)?.text).not.toContain("created and read back");
+  });
+
   it("accepts the actual long ten-screen planning request and resumes its saved task after interruption", async () => {
     const input = scriptedMarineCase(10);
     input.brief += " " + "Show illustrative records and preserve data provenance. ".repeat(80);
@@ -1760,8 +1798,61 @@ describe("universal design Chat route", () => {
     expect(mock.getImageImportCalls()).toBe(1);
   });
 
+  it("runs the FW-1 F10 Persian residential building fixture through the Universal task owner", async () => {
+    const input: Case = {
+      name: "F10 Persian residential building management",
+      brief: "برای اپلیکیشن مدیریت ساختمان مسکونی ده صفحهٔ موبایل ۳۹۰×۸۴۴ با محتوای فارسی و راست‌چین بساز؛ اطلاعات نمونهٔ ساکنان، شارژ، اطلاعیه، تعمیر، رزرو، نظرسنجی و حساب ساختگی باشد.",
+      purpose: "Help residents manage shared building information and services with clear, editable screens.",
+      audience: "Residents of a managed apartment building",
+      platform: "mobile",
+      locale: "fa-IR",
+      tags: ["residential-building", "resident-services"],
+      entities: ["ساکن", "واحد", "شارژ", "پرداخت", "اطلاعیه", "درخواست تعمیر", "امکانات مشترک"],
+      goals: ["بررسی وضعیت ساختمان", "پرداخت شارژ", "پیگیری درخواست تعمیر", "رزرو امکانات"],
+      screens: [
+        { name: "خانه و وضعیت", role: "dashboard", purpose: "نمایش وضعیت کلی ساختمان و اقدام بعدی ساکن." },
+        { name: "شارژ و بدهی‌ها", role: "charges-debts", purpose: "نمایش اقلام ساختگی شارژ و وضعیت پرداخت." },
+        { name: "جزئیات پرداخت", role: "payment-details", purpose: "خلاصهٔ یک پرداخت آزمایشی و رسید قابل بررسی." },
+        { name: "اطلاعیه‌ها", role: "announcements", purpose: "مرور اطلاعیه‌های ساختگی و زمان انتشار." },
+        { name: "جزئیات اطلاعیه", role: "announcement-detail", purpose: "نمایش متن نمونهٔ اطلاعیه و اطلاعات مرتبط." },
+        { name: "ثبت درخواست تعمیر", role: "maintenance-request", purpose: "ثبت درخواست نمونه برای تعمیر بخش مشترک." },
+        { name: "پیگیری تعمیر", role: "maintenance-tracking", purpose: "نمایش وضعیت و مراحل ساختگی رسیدگی به تعمیر." },
+        { name: "رزرو امکانات", role: "facility-booking", purpose: "انتخاب زمان نمونه برای استفاده از فضای مشترک." },
+        { name: "نظرسنجی ساکنان", role: "resident-survey", purpose: "ثبت بازخورد نمونه دربارهٔ خدمات ساختمان." },
+        { name: "حساب و تنظیمات", role: "profile-settings", purpose: "نمایش تنظیمات حساب و ترجیحات ساکن." },
+      ],
+    };
+    const h = makeHarness(input, { maxConcurrentModelCalls: 2 });
+    const startedAt = performance.now();
+    await runChatTask(h.task, h.deps);
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    const screens = h.task.universalScreens!;
+    const completedRoots = h.mock.roots.filter((node) => node.parent?.id === h.mock.page.id && node.getPluginData("fad.generation.commit") === "complete");
+    expect(h.task.status).toBe("completed");
+    expect(h.task.projectPlan).toMatchObject({ locale: "fa-IR", direction: "rtl", screenCount: 10 });
+    expect(screens.map(({ status, screenId }) => [screenId, status])).toEqual(input.screens.map((_, index) => [`screen-${String(index + 1).padStart(2, "0")}`, "verified"]));
+    const programs = h.deps.renderProgram.mock.calls.map(([program]) => program);
+    expect(programs.map((program) => program.screens[0]?.id)).toEqual(input.screens.map((_, index) => `screen-${String(index + 1).padStart(2, "0")}`));
+    expect(programs.every(({ locale }) => locale.language === "fa-IR" && locale.direction === "rtl")).toBe(true);
+    const textNodes = (node: DesignProgramNode): Array<Extract<DesignProgramNode, { type: "text" }>> => node.type === "container"
+      ? node.children.flatMap(textNodes)
+      : node.type === "text" ? [node] : [];
+    expect(programs.flatMap(({ screens: [screen] }) => screen ? textNodes(screen.root) : []).some(({ text, align }) => /[\u0600-\u06ff]/u.test(text) && align === "right")).toBe(true);
+    expect(screens.every(({ nativeRootNodeId }) => Boolean(nativeRootNodeId))).toBe(true);
+    expect(new Set(screens.map(({ nativeRootNodeId }) => nativeRootNodeId)).size).toBe(10);
+    expect(completedRoots).toHaveLength(10);
+    expect(completedRoots.every((root) => root.parent?.id === h.mock.page.id && !root.removed)).toBe(true);
+    expect(h.task.universalMetrics?.peakConcurrentModelRequests).toBeLessThanOrEqual(2);
+    expect(h.model).toHaveBeenCalledTimes(12);
+    expect(screens.reduce((sum, screen) => sum + (screen.nativeNodeCount ?? 0), 0)).toBe(116);
+    expect(h.deps.save).toHaveBeenCalledTimes(58);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(10);
+    expect(h.deps.inspectProgram).toHaveBeenCalledTimes(10);
+    process.stderr.write(`FW6_F10_PERSIAN_UNIVERSAL_MOCK ${JSON.stringify({ elapsedMs, providerRequests: h.model.mock.calls.length, peakModelCalls: h.task.universalMetrics?.peakConcurrentModelRequests, nativeNodes: screens.reduce((sum, screen) => sum + (screen.nativeNodeCount ?? 0), 0), nativeRenderAdapterCalls: h.deps.renderProgram.mock.calls.length, nativeReadbackAdapterCalls: h.deps.inspectProgram.mock.calls.length, checkpointSaveAdapterCalls: h.deps.save.mock.calls.length, checkpointReadbacks: null, screenCount: screens.length, nativeRootIds: screens.map(({ screenId, nativeRootNodeId }) => ({ screenId, nodeId: nativeRootNodeId })), duplicateNativeRoots: screens.length - new Set(screens.map(({ nativeRootNodeId }) => nativeRootNodeId)).size, timingEvidence: h.task.universalMetrics?.timingEvidence })}\n`);
+  });
+
   it("records the serial 1/3/10-screen baseline with deterministic provider delays", async () => {
-    const measurements: Array<Record<string, number>> = [];
+    const measurements: Array<Record<string, unknown>> = [];
     for (const screenCount of [1, 3, 10]) {
       for (let repetition = 1; repetition <= 3; repetition++) {
         const input = scriptedMarineCase(screenCount);
@@ -1789,6 +1880,12 @@ describe("universal design Chat route", () => {
           readbackMs: h.task.universalMetrics!.readbackRoundTripMs,
           nativeNodes: h.task.universalScreens!.reduce((sum, screen) => sum + (screen.nativeNodeCount ?? 0), 0),
           nativeBatches: h.task.universalMetrics!.nativeBatches,
+          nativeRenderAdapterCalls: h.deps.renderProgram.mock.calls.length,
+          nativeReadbackAdapterCalls: h.deps.inspectProgram.mock.calls.length,
+          checkpointSaveAdapterCalls: h.deps.save.mock.calls.length,
+          checkpointReadbacks: null,
+          nativeRootIds: h.task.universalScreens!.map(({ screenId, nativeRootNodeId }) => ({ screenId, nodeId: nativeRootNodeId ?? null })),
+          duplicateNativeRoots: h.task.universalScreens!.filter(({ status }) => status === "verified").length - new Set(h.task.universalScreens!.filter(({ status }) => status === "verified").map(({ nativeRootNodeId }) => nativeRootNodeId)).size,
         });
         expect(h.task.status).toBe("completed");
         expect(h.task.universalMetrics?.concurrencyLimit).toBe(1);
@@ -1796,13 +1893,15 @@ describe("universal design Chat route", () => {
         expect(h.model).toHaveBeenCalledTimes(screenCount + 2);
         expect(h.deps.renderProgram).toHaveBeenCalledTimes(screenCount);
         expect(h.deps.inspectProgram).toHaveBeenCalledTimes(screenCount);
+        expect(h.task.universalScreens!.filter(({ status, nativeRootNodeId }) => status === "verified" && nativeRootNodeId)).toHaveLength(screenCount);
+        expect(new Set(h.task.universalScreens!.map(({ nativeRootNodeId }) => nativeRootNodeId)).size).toBe(screenCount);
       }
     }
     process.stderr.write(`PHASE6_SERIAL_BASELINE ${JSON.stringify(measurements)}\n`);
   }, 60_000);
 
   it("measures bounded screen scheduling at 1/3/10 with out-of-order provider completion and ordered native commits", async () => {
-    const measurements: Array<Record<string, number>> = [];
+    const measurements: Array<Record<string, unknown>> = [];
     for (const screenCount of [1, 3, 10]) {
       for (let repetition = 1; repetition <= 3; repetition++) {
         const input = scriptedMarineCase(screenCount);
@@ -1835,6 +1934,12 @@ describe("universal design Chat route", () => {
           readbackMs: metrics.readbackRoundTripMs,
           nativeNodes: h.task.universalScreens!.reduce((sum, screen) => sum + (screen.nativeNodeCount ?? 0), 0),
           nativeBatches: metrics.nativeBatches,
+          nativeRenderAdapterCalls: h.deps.renderProgram.mock.calls.length,
+          nativeReadbackAdapterCalls: h.deps.inspectProgram.mock.calls.length,
+          checkpointSaveAdapterCalls: h.deps.save.mock.calls.length,
+          checkpointReadbacks: null,
+          nativeRootIds: h.task.universalScreens!.map(({ screenId, nativeRootNodeId }) => ({ screenId, nodeId: nativeRootNodeId ?? null })),
+          duplicateNativeRoots: h.task.universalScreens!.filter(({ status }) => status === "verified").length - new Set(h.task.universalScreens!.filter(({ status }) => status === "verified").map(({ nativeRootNodeId }) => nativeRootNodeId)).size,
         });
         expect(h.task.status).toBe("completed");
         expect(h.task.universalManifest?.screens.map(({ screenId }) => screenId)).toEqual(input.screens.map((_, index) => `screen-${String(index + 1).padStart(2, "0")}`));
@@ -1850,6 +1955,8 @@ describe("universal design Chat route", () => {
         if (screenCount > 1) expect(h.modelCompletionScreenIds[0]).not.toBe("screen-01");
         expect(JSON.stringify(chatTaskSafeDiagnostic(h.task))).not.toContain(input.brief);
         expect(h.mock.nodes.filter((node) => node.parent?.type === "PAGE" && node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(screenCount);
+        expect(h.task.universalScreens!.filter(({ status, nativeRootNodeId }) => status === "verified" && nativeRootNodeId)).toHaveLength(screenCount);
+        expect(new Set(h.task.universalScreens!.map(({ nativeRootNodeId }) => nativeRootNodeId)).size).toBe(screenCount);
       }
     }
     process.stderr.write(`PHASE6_BOUNDED_PARALLEL_MOCK ${JSON.stringify(measurements)}\n`);

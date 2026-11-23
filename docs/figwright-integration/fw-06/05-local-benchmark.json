@@ -1,0 +1,231 @@
+{
+  "schemaVersion": 1,
+  "runAt": "2026-11-23",
+  "evidence": "LOCAL_FAKE_UNIVERSAL_TASK_HARNESS",
+  "sourceTest": "tests/universal-design-chat.test.ts; deterministic mock model adapter + mock Figma runtime",
+  "fixture": "Scripted marine archive for matched 1/3/10 scheduler comparison; separate F10 synthetic Persian RTL residential-building task modeled on FW-1 F10.",
+  "gate": {
+    "fw6": "No FW-6 feature flag; this change hardens Stop/error handling.",
+    "comparison": "Existing scheduler max-concurrency 1 vs existing bounded max-concurrency 2. Not a new FW-6 gate-on/off speed comparison.",
+    "finalBuild": "All existing FW gates unset (off)."
+  },
+  "buildVerification": {
+    "existingFlagsOff": {
+      "passed": true,
+      "uiBundleKb": 1582.8,
+      "pluginBundleKb": 2265.24,
+      "finalGeneratedArtifacts": true
+    },
+    "existingFlagsOn": {
+      "passed": true,
+      "variables": {
+        "VITE_FW2_CONTEXT": "fw2-context-v1",
+        "VITE_FW3_NATIVE_BATCH": "fw3-native-batch-v1",
+        "VITE_FW4_GEOMETRY": "fw4-geometry-v1",
+        "VITE_FW5_VISUAL_QA": "fw5-visual-qa-v1",
+        "VITE_FW5_VISUAL_QA_MODE": "review+bounded-repair"
+      },
+      "uiBundleKb": 1611.11,
+      "pluginBundleKb": 2309.88,
+      "finalGeneratedArtifacts": false
+    }
+  },
+  "measureDefinitions": {
+    "elapsedMs": "performance.now() duration inside the fake Universal task harness; not Figma Desktop or perceived latency.",
+    "providerRequests": "Mock model adapter calls (includes intent + plan + per-screen preparation), not provider stream attempts.",
+    "nativeRenderAdapterCalls": "Task dependency renderProgram mock calls, not serialized UI-to-plugin messages.",
+    "nativeReadbackAdapterCalls": "Task dependency inspectProgram mock calls, not plugin bridge acknowledgements.",
+    "checkpointSaveAdapterCalls": "Task dependency save mock invocations; no plugin storage readback is run by this benchmark.",
+    "nativeRootIds": "Deterministic mock node IDs retained in the verified ChatTask screens.",
+    "nullFields": "No measurement was made at that boundary; null is not zero."
+  },
+  "notMeasuredInUniversalTaskHarness": {
+    "actualUiToPluginMessages": null,
+    "bridgeAcknowledgements": null,
+    "providerStreamAttempts": null,
+    "figmaApiMethodInvocations": null,
+    "checkpointStorageReadbacks": null,
+    "visualCaptureRequests": null,
+    "visualReviewRequests": null,
+    "visualRechecks": null,
+    "memoryHighWaterBytes": null,
+    "serializedBridgePayloadBytes": null
+  },
+  "schedulerComparison": [
+    {
+      "screenCount": 1,
+      "serialMax1": {
+        "elapsedSamplesMs": [129, 136, 146],
+        "medianElapsedMs": 136,
+        "providerRequests": 3,
+        "peakModelCalls": 1,
+        "nativeNodes": 10,
+        "nativeRenderAdapterCalls": 1,
+        "nativeReadbackAdapterCalls": 1,
+        "checkpointSaveAdapterCalls": 13,
+        "checkpointReadbacks": null,
+        "actualUiToPluginDispatches": null,
+        "figmaApiMethodInvocations": null,
+        "nativeRootIds": [{"screenId": "screen-01", "nodeId": "mock:14"}],
+        "duplicateNativeRoots": 0
+      },
+      "boundedMax2": {
+        "elapsedSamplesMs": [139, 141, 143],
+        "medianElapsedMs": 141,
+        "providerRequests": 3,
+        "peakModelCalls": 1,
+        "nativeNodes": 10,
+        "nativeRenderAdapterCalls": 1,
+        "nativeReadbackAdapterCalls": 1,
+        "checkpointSaveAdapterCalls": 13,
+        "checkpointReadbacks": null,
+        "actualUiToPluginDispatches": null,
+        "figmaApiMethodInvocations": null,
+        "nativeRootIds": [{"screenId": "screen-01", "nodeId": "mock:14"}],
+        "duplicateNativeRoots": 0
+      },
+      "interpretation": "No parallel work is available in the one-screen scenario; the measured difference is warm-up and harness noise."
+    },
+    {
+      "screenCount": 3,
+      "serialMax1": {
+        "elapsedSamplesMs": [245, 247, 248],
+        "medianElapsedMs": 247,
+        "providerRequests": 5,
+        "peakModelCalls": 1,
+        "nativeNodes": 32,
+        "nativeRenderAdapterCalls": 3,
+        "nativeReadbackAdapterCalls": 3,
+        "checkpointSaveAdapterCalls": 23,
+        "checkpointReadbacks": null,
+        "actualUiToPluginDispatches": null,
+        "figmaApiMethodInvocations": null,
+        "nativeRootIds": [
+          {"screenId": "screen-01", "nodeId": "mock:14"},
+          {"screenId": "screen-02", "nodeId": "mock:24"},
+          {"screenId": "screen-03", "nodeId": "mock:34"}
+        ],
+        "duplicateNativeRoots": 0
+      },
+      "boundedMax2": {
+        "elapsedSamplesMs": [166, 171, 185],
+        "medianElapsedMs": 171,
+        "providerRequests": 5,
+        "peakModelCalls": 2,
+        "nativeNodes": 32,
+        "nativeRenderAdapterCalls": 3,
+        "nativeReadbackAdapterCalls": 3,
+        "checkpointSaveAdapterCalls": 23,
+        "checkpointReadbacks": null,
+        "actualUiToPluginDispatches": null,
+        "figmaApiMethodInvocations": null,
+        "nativeRootIds": [
+          {"screenId": "screen-01", "nodeId": "mock:14"},
+          {"screenId": "screen-02", "nodeId": "mock:24"},
+          {"screenId": "screen-03", "nodeId": "mock:34"}
+        ],
+        "duplicateNativeRoots": 0
+      },
+      "interpretation": "Mock total is lower in this deterministic harness. It is the existing scheduler comparison, not a measured FW-6 runtime improvement."
+    },
+    {
+      "screenCount": 10,
+      "serialMax1": {
+        "elapsedSamplesMs": [781, 788, 800],
+        "medianElapsedMs": 788,
+        "providerRequests": 12,
+        "peakModelCalls": 1,
+        "nativeNodes": 116,
+        "nativeRenderAdapterCalls": 10,
+        "nativeReadbackAdapterCalls": 10,
+        "checkpointSaveAdapterCalls": 58,
+        "checkpointReadbacks": null,
+        "actualUiToPluginDispatches": null,
+        "figmaApiMethodInvocations": null,
+        "nativeRootIds": [
+          {"screenId": "screen-01", "nodeId": "mock:14"},
+          {"screenId": "screen-02", "nodeId": "mock:24"},
+          {"screenId": "screen-03", "nodeId": "mock:34"},
+          {"screenId": "screen-04", "nodeId": "mock:46"},
+          {"screenId": "screen-05", "nodeId": "mock:58"},
+          {"screenId": "screen-06", "nodeId": "mock:70"},
+          {"screenId": "screen-07", "nodeId": "mock:82"},
+          {"screenId": "screen-08", "nodeId": "mock:94"},
+          {"screenId": "screen-09", "nodeId": "mock:106"},
+          {"screenId": "screen-10", "nodeId": "mock:118"}
+        ],
+        "duplicateNativeRoots": 0
+      },
+      "boundedMax2": {
+        "elapsedSamplesMs": [573, 575, 597],
+        "medianElapsedMs": 575,
+        "providerRequests": 12,
+        "peakModelCalls": 2,
+        "nativeNodes": 116,
+        "nativeRenderAdapterCalls": 10,
+        "nativeReadbackAdapterCalls": 10,
+        "checkpointSaveAdapterCalls": 58,
+        "checkpointReadbacks": null,
+        "actualUiToPluginDispatches": null,
+        "figmaApiMethodInvocations": null,
+        "nativeRootIds": [
+          {"screenId": "screen-01", "nodeId": "mock:14"},
+          {"screenId": "screen-02", "nodeId": "mock:24"},
+          {"screenId": "screen-03", "nodeId": "mock:34"},
+          {"screenId": "screen-04", "nodeId": "mock:46"},
+          {"screenId": "screen-05", "nodeId": "mock:58"},
+          {"screenId": "screen-06", "nodeId": "mock:70"},
+          {"screenId": "screen-07", "nodeId": "mock:82"},
+          {"screenId": "screen-08", "nodeId": "mock:94"},
+          {"screenId": "screen-09", "nodeId": "mock:106"},
+          {"screenId": "screen-10", "nodeId": "mock:118"}
+        ],
+        "duplicateNativeRoots": 0
+      },
+      "interpretation": "The existing max-2 mock path has a lower median total here, while first verification is not lower. This is not Desktop speed and does not measure the FW-6 patch."
+    }
+  ],
+  "f10PersianUniversalTask": {
+    "evidence": "LOCAL_FAKE_UNIVERSAL_TASK_HARNESS",
+    "locale": "fa-IR",
+    "direction": "rtl",
+    "screenCount": 10,
+    "elapsedMs": 1108,
+    "timingEvidence": "mock",
+    "providerRequests": 12,
+    "peakModelCalls": 1,
+    "nativeNodes": 116,
+    "nativeRenderAdapterCalls": 10,
+    "nativeReadbackAdapterCalls": 10,
+    "checkpointSaveAdapterCalls": 58,
+    "checkpointReadbacks": null,
+    "actualUiToPluginDispatches": null,
+    "figmaApiMethodInvocations": null,
+    "nativeRootIds": [
+      {"screenId": "screen-01", "nodeId": "mock:14"},
+      {"screenId": "screen-02", "nodeId": "mock:24"},
+      {"screenId": "screen-03", "nodeId": "mock:34"},
+      {"screenId": "screen-04", "nodeId": "mock:46"},
+      {"screenId": "screen-05", "nodeId": "mock:58"},
+      {"screenId": "screen-06", "nodeId": "mock:70"},
+      {"screenId": "screen-07", "nodeId": "mock:82"},
+      {"screenId": "screen-08", "nodeId": "mock:94"},
+      {"screenId": "screen-09", "nodeId": "mock:106"},
+      {"screenId": "screen-10", "nodeId": "mock:118"}
+    ],
+    "duplicateNativeRoots": 0
+  },
+  "separateNativeApiAndVisualGateEvidence": {
+    "sourceArtifact": "../fw-05/04-gate-off-on-metrics.json",
+    "scope": "Existing FW-5 plugin-only fake-runtime F1/F3/F10 capture comparison. It counts Figma mock API operations and export dispatches, but not task-owner checkpoint reads/writes or actual serialized UI bridge messages.",
+    "doNotCombineWithUniversalTaskRowsAsSameRun": true
+  },
+  "limitations": [
+    "No real Figma, OAuth session, provider/model, visual reviewer, or user document was used.",
+    "Local elapsed values include JavaScript scheduling and deterministic fake delays only.",
+    "The Universal task benchmark directly invokes mocked adapters; actual bridge message/ack counts and Figma API invocation counts are unavailable in this same run.",
+    "Task checkpoint save mock calls are measured; storage read-after-write confirmations are tested separately and are null in this benchmark.",
+    "FW-5 screenshot/review/recheck counters are measured in the separate plugin-only artifact above; no screenshot/provider loop is run in this task-level benchmark.",
+    "No FW-6 performance improvement is claimed. The cancellation hardening adds no batching or renderer change."
+  ]
+}

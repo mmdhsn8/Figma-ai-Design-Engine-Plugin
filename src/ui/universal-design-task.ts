@@ -943,9 +943,9 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       }));
     }
   };
-  const save = async () => {
+  const save = async (snapshot: ChatTask = task) => {
     check();
-    const parsed = ChatTaskSchema.safeParse(task);
+    const parsed = ChatTaskSchema.safeParse(snapshot);
     if (!parsed.success)
       fail("checkpoint_invalid", "The universal route could not save a schema-valid checkpoint; no new native render was dispatched.");
     if (utf8Bytes(JSON.stringify(parsed.data)) > CHAT_TASK_MAX_BYTES)
@@ -963,6 +963,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     });
     saveQueue = pendingWrite.then(() => undefined, () => undefined);
     await pendingWrite;
+    check();
     const durationMs = Math.max(0, Math.round(monotonicNow() - startedAt));
     if (task.universalMetrics) {
       task.universalMetrics.persistenceMs += durationMs;
@@ -2305,6 +2306,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     deps.signal.removeEventListener("abort", abortScheduler);
   }
 
+  check();
   if (screens.some(({ status }) => status !== "verified") || task.stages.some(({ completed }) => !completed))
     fail("native_verification_incomplete", "Not every planned screen has task-owned native readback; completion was refused.");
   task.universalMetrics!.totalElapsedMs = Math.max(0, Math.round(monotonicNow() - runStartedAt));
@@ -2330,15 +2332,24 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
             ? ` بازبینی بصری کامل نشد (${visualQaDetails})؛ کیفیت بصری تأییدنشده است و لایه‌های بومی حفظ شده‌اند.`
             : ` Visual review did not complete (${visualQaDetails}); visual quality remains unverified and native layers are retained.`
     : "";
-  task.text = plan.locale.toLocaleLowerCase().startsWith("fa")
+  const completionText = plan.locale.toLocaleLowerCase().startsWith("fa")
     ? `مسیر طراحی همگانی v1: ${plan.screenCount} صفحهٔ قابل‌ویرایش در فیگما ساخته و از لایه‌های بومی همان task بازخوانی شد. ${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} لایهٔ بومی ثبت شد.${usedFallback ? " برای یکی از فونت‌های در دسترس نبود‌ه از فونت جایگزین استفاده شد." : ""}${visualQaSummary}`
     : `Universal design route v1: created and read back ${plan.screenCount} editable native Figma screens (${screens.reduce((sum, item) => sum + (item.nativeNodeCount ?? 0), 0)} adopted layers).${usedFallback ? " Figma used a fallback for at least one requested font." : ""}${visualQaSummary}`;
-  task.pending = [];
-  task.recent = [];
-  task.status = "completed";
-  delete task.error;
-  delete task.failure;
-  transition("TASK_COMPLETED");
+  const completionCheckpoint = ChatTaskSchema.parse(task);
+  completionCheckpoint.text = completionText;
+  completionCheckpoint.pending = [];
+  completionCheckpoint.recent = [];
+  completionCheckpoint.status = "completed";
+  delete completionCheckpoint.error;
+  delete completionCheckpoint.failure;
+  if (completionCheckpoint.lifecycle !== "TASK_COMPLETED") {
+    completionCheckpoint.lifecycle = "TASK_COMPLETED";
+    completionCheckpoint.lifecycleTransitions++;
+  }
+  await save(completionCheckpoint);
+  check();
+  const liveMetrics = task.universalMetrics;
+  Object.assign(task, completionCheckpoint);
+  if (liveMetrics) task.universalMetrics = liveMetrics;
   recordTrace({ stageId: "task", stage: "task", event: "task_completed", outcome: "completed", durationMs: task.universalMetrics!.totalElapsedMs, nodeCount: task.universalMetrics!.acceptedScreenTimesMs.length });
-  await save();
 }

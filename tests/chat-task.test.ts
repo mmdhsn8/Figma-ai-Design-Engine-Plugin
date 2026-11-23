@@ -1169,6 +1169,77 @@ describe("progressive conversational canvas tasks", () => {
     }
   });
 
+  it("keeps an explicit Stop authoritative when a valid multi-screen outcome arrives late", async () => {
+    let activeRequest!: MultiScreenDesignRequest;
+    let report!: (event: MultiScreenProgressEvent) => Promise<void>;
+    let resolveOutcome!: (outcome: unknown) => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const generateMultiScreen = vi.fn((request: MultiScreenDesignRequest,
+      onProgress: (event: MultiScreenProgressEvent) => Promise<void>) => {
+      activeRequest = request;
+      report = onProgress;
+      markStarted();
+      return new Promise<unknown>((resolve) => { resolveOutcome = resolve; });
+    });
+    const h = harness(
+      [turn("classify_canvas_intent", { intent: "create" }), multiScreenPlan(["Home", "Settings"], "LTR")],
+      false,
+      generateMultiScreen,
+    );
+    const current = task();
+    current.id = "chat-generation-stop-fence";
+    current.prompt = "Create 2 mobile healthcare screens";
+    current.model = "provider/model-exact";
+    current.generationIntent = { schemaVersion: 1, screenCount: 2, target: "mobile", locale: "en-US" };
+    delete current.intent;
+
+    const running = runChatTask(current, h.deps);
+    await started;
+    const roots = activeRequest.screens.map(({ id: screenId }, index) => ({
+      screenId,
+      nodeId: `native-stop-root-${index + 1}`,
+      logicalRef: createChatScreenLogicalRef(activeRequest.generationId, screenId),
+    }));
+    for (const [screenIndex, nativeRoot] of roots.entries()) {
+      await report({
+        phase: "screen-verified",
+        screenId: nativeRoot.screenId,
+        screenIndex,
+        nativeRoot,
+        completedScreens: screenIndex + 1,
+        completedSections: (screenIndex + 1) * 3,
+        totalScreens: roots.length,
+      });
+    }
+    expect(current.generationLink?.completedScreenIds).toEqual(activeRequest.screens.map(({ id }) => id));
+
+    h.controller.abort("user_stop");
+    const checkpointCountAfterStop = h.checkpoints.length;
+    await expect(report({ phase: "complete", completedScreens: 2, completedSections: 6, totalScreens: 2 }))
+      .rejects.toThrow("Stopped");
+    expect(h.checkpoints).toHaveLength(checkpointCountAfterStop);
+    resolveOutcome({
+      generationId: activeRequest.generationId,
+      screenIds: activeRequest.screens.map(({ id }) => id),
+      verifiedScreenIds: activeRequest.screens.map(({ id }) => id),
+      nativeRoots: roots,
+      nodeCount: 24,
+    });
+    await expect(running).rejects.toThrow("Stopped");
+
+    expect(current.status).toBe("stopped");
+    expect(current.generationLink).toMatchObject({
+      status: "paused",
+      errorCode: "request_cancelled",
+      completedScreenIds: activeRequest.screens.map(({ id }) => id),
+      nativeRoots: roots,
+    });
+    expect(current.text).not.toContain("Created and verified");
+    expect(h.checkpoints.every(({ status, generationLink }) =>
+      status !== "completed" && generationLink?.status !== "completed")).toBe(true);
+  });
+
   it("does not complete a handoff when native verification omits a planned screen", async () => {
     const h = harness(
       [

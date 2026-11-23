@@ -572,30 +572,37 @@ describe("FW-5 visual evidence contract and native exporter", () => {
       ...base,
       visualCapture: { ...base.visualCapture, deadlineAtMs: Date.now() + 40 },
     }) as Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>;
-    await slow.executor(first);
-    expect(slow.messages.at(-1)).toMatchObject({ type: "task-native-visual-capture-result", success: false, receipt: { diagnostic: "capture_deadline_exceeded" } });
-    expect(slow.mock.exportCalls).toHaveLength(1);
-    expect(slow.root.removed).toBe(false);
+    vi.useFakeTimers();
+    try {
+      const firstRun = slow.executor(first);
+      await vi.advanceTimersByTimeAsync(40);
+      await firstRun;
+      expect(slow.messages.at(-1)).toMatchObject({ type: "task-native-visual-capture-result", success: false, receipt: { diagnostic: "capture_deadline_exceeded" } });
+      expect(slow.mock.exportCalls).toHaveLength(1);
+      expect(slow.root.removed).toBe(false);
 
-    const second = UIToPluginSchema.parse({
-      ...base,
-      requestId: "fw5_capture_screen_01_retry",
-      visualCapture: { ...base.visualCapture, captureNonce: "fw5_capture_screen_01_retry", deadlineAtMs: Date.now() + 5_000 },
-    }) as Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>;
-    await slow.executor(second);
-    expect(slow.messages.at(-1)).toMatchObject({ type: "task-native-visual-capture-result", success: false, receipt: { diagnostic: "capture_in_flight_limit" } });
-    expect(slow.mock.exportCalls).toHaveLength(1);
+      const second = UIToPluginSchema.parse({
+        ...base,
+        requestId: "fw5_capture_screen_01_retry",
+        visualCapture: { ...base.visualCapture, captureNonce: "fw5_capture_screen_01_retry", deadlineAtMs: Date.now() + 5_000 },
+      }) as Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>;
+      await slow.executor(second);
+      expect(slow.messages.at(-1)).toMatchObject({ type: "task-native-visual-capture-result", success: false, receipt: { diagnostic: "capture_in_flight_limit" } });
+      expect(slow.mock.exportCalls).toHaveLength(1);
 
-    await new Promise<void>((resolve) => setTimeout(resolve, 260));
-    const afterSettle = UIToPluginSchema.parse({
-      ...second,
-      requestId: "fw5_capture_screen_01_after_settle",
-      visualCapture: { ...second.visualCapture, captureNonce: "fw5_capture_screen_01_after_settle", deadlineAtMs: Date.now() + 5_000 },
-    }) as Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>;
-    await slow.executor(afterSettle);
-    expect(slow.messages.at(-1)).toMatchObject({ type: "task-native-visual-capture-result", success: false, receipt: { diagnostic: "root_reused_or_recovered" } });
-    expect(slow.mock.exportCalls).toHaveLength(1);
-    expect(slow.root.removed).toBe(false);
+      await vi.advanceTimersByTimeAsync(210);
+      const afterSettle = UIToPluginSchema.parse({
+        ...second,
+        requestId: "fw5_capture_screen_01_after_settle",
+        visualCapture: { ...second.visualCapture, captureNonce: "fw5_capture_screen_01_after_settle", deadlineAtMs: Date.now() + 5_000 },
+      }) as Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>;
+      await slow.executor(afterSettle);
+      expect(slow.messages.at(-1)).toMatchObject({ type: "task-native-visual-capture-result", success: false, receipt: { diagnostic: "root_reused_or_recovered" } });
+      expect(slow.mock.exportCalls).toHaveLength(1);
+      expect(slow.root.removed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("refuses a moved root before exporting and leaves its moved and unrelated nodes in place", async () => {
