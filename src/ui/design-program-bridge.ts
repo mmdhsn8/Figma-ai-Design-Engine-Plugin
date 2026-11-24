@@ -1,12 +1,9 @@
-import {
-  PluginToUISchema,
-  type PluginToUIMessage,
-  type UIToPluginMessage,
-} from "../shared/messages";
+import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
 import { FW2_FEATURE, ContextResultSchema, parseContextSnapshot, type ContextRead } from "../shared/design-context";
 import { requestedDesignContext } from "../shared/chat-generation";
 import { fw7Telemetry } from "./fw7-runtime";
 import { fw7CorrelationHash } from "../shared/fw7-observability";
+import { matchNativeBridgeReply } from "./native-bridge-reply";
 
 export type DesignProgramRenderRequest = Extract<UIToPluginMessage, { type: "design-program-render" }>;
 export type DesignProgramRenderResponse = Extract<PluginToUIMessage, { type: "design-program-render-result" }>;
@@ -77,11 +74,13 @@ export function renderDesignProgramBridge(
       window.removeEventListener("message", receive);
     };
     const receive = (event: MessageEvent) => {
-      const parsed = PluginToUISchema.safeParse(event.data?.pluginMessage);
-      if (!parsed.success) return;
-      if (parsed.data.type === "protocol-error" && parsed.data.requestId === request.requestId) {
+      const parsed = matchNativeBridgeReply(event.data?.pluginMessage, {
+        requestId: request.requestId, taskId: request.taskId, type: "design-program-render-result",
+      });
+      if (!parsed) return;
+      if (!parsed.success || parsed.data.type === "protocol-error") {
         finish();
-        reject(new Error(parsed.data.message));
+        reject(Object.assign(new Error("Figma rejected the native render message or returned invalid ownership evidence. Reload the development plugin before resuming."), { code: "native_render_protocol_error" }));
         return;
       }
       if (parsed.data.type !== "design-program-render-result") return;
@@ -105,7 +104,12 @@ export function renderDesignProgramBridge(
       reject(Object.assign(new Error("Figma did not acknowledge the render in time. Resume will reconcile the saved native screen identity."), { code: "native_render_ack_timeout" }));
     }, 60_000);
     window.addEventListener("message", receive);
-    parent.postMessage({ pluginMessage: request }, "*");
+    try { parent.postMessage({ pluginMessage: request }, "*"); }
+    catch {
+      finish();
+      reject(Object.assign(new Error("Figma could not receive the native render request. Resume after reopening the plugin."), { code: "native_render_transport_failed" }));
+      return;
+    }
     fw7Telemetry.record({
       runId: request.taskId, taskId: request.taskId, screenId: request.program.screens[0]?.id,
       requestIdHash: fw7CorrelationHash(request.requestId), boundary: "ui-plugin", kind: "bridge_dispatch",

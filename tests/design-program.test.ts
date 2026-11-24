@@ -160,6 +160,22 @@ describe("DesignProgramV1 local cross-domain spike", () => {
     expect(parseDesignProgram(unsupportedAsset)).toMatchObject({ success: false, findings: expect.arrayContaining([expect.objectContaining({ code: "asset_provenance_unverified" }), expect.objectContaining({ code: "unsupported_asset_source" })]) });
   });
 
+  it.each([["rtl", "start", "end"], ["rtl", "end", "start"], ["ltr", "start", "start"]] as const)(
+    "maps %s column cross-axis %s to native %s for a fixed-width child", (direction, crossAlign, expected) => {
+      const parsed = parseDesignProgram(copy(direction === "rtl" ? education : analytics));
+      if (!parsed.success) throw new Error(JSON.stringify(parsed.findings));
+      const root = parsed.data.screens[0]!.root;
+      if (root.type !== "container") throw new Error("Fixture needs a container.");
+      root.layout = { ...root.layout, axis: "column", crossAlign };
+      root.children[0]!.width = { mode: "fixed", value: 120 };
+      const compiled = compileDesignProgram(parsed.data);
+      if (!compiled.success) throw new Error(JSON.stringify(compiled.findings));
+      const wrapper = compiled.batch.screens[0]!.children[0];
+      if (wrapper?.type !== "frame") throw new Error("Expected a native content wrapper.");
+      expect(wrapper.children[0]).toMatchObject({ type: "frame", layout: { mode: "vertical", counterAxisAlign: expected } });
+    },
+  );
+
   it("compiles the same native adapter for education, booking, analytics, and unseen civic services", () => {
     const compiled = designProgramFixtures.map((fixture) => compileDesignProgram(fixture));
     expect(compiled.every((result) => result.success), JSON.stringify(compiled.map((result) => result.success ? [] : result.findings))).toBe(true);
@@ -353,6 +369,24 @@ describe("DesignProgramV1 local cross-domain spike", () => {
     expect(resultFor(messages, editBatch.batchId), JSON.stringify(resultFor(messages, editBatch.batchId))).toMatchObject({ type: "tool-result", success: true, committedOperationIds: ["phase2-heading-edit"] });
     expect(target.characters).not.toBe(beforeText);
     expect(rootNodes.slice(1).map(nativeSnapshot)).toEqual(otherSnapshots);
+
+    const thirdTitle = mock.find("Report title")!;
+    const afterFirstEdit = rootNodes.slice(0, 2).map(nativeSnapshot);
+    const thirdRef = thirdTitle.getPluginData("fad.tool.logical-ref.v1");
+    const thirdEdit = (owner: string, operationId: string) => FigmaToolOperationSchema.parse({
+      operationId, idempotencyKey: `${operationId}:1`, taskId: owner, documentId,
+      action: { tool: "set_properties", pageId: "page:current", ref: thirdRef, properties: { text: "Activity overview" } },
+    });
+    const thirdBefore = nativeSnapshot(rootNodes[2]!);
+    const foreignEdit = FigmaToolBatchSchema.parse({ type: "tool-execute", protocolVersion: 1, batchId: "phase2-foreign-edit", operations: [thirdEdit("unrelated-task", "phase2-wrong-task")] });
+    await runOperationBatch(executor, foreignEdit);
+    expect(resultFor(messages, foreignEdit.batchId)).toMatchObject({ success: false });
+    expect(nativeSnapshot(rootNodes[2]!)).toEqual(thirdBefore);
+    const permittedEdit = FigmaToolBatchSchema.parse({ type: "tool-execute", protocolVersion: 1, batchId: "phase2-third-edit", operations: [thirdEdit(taskId, "phase2-title-edit")] });
+    await runOperationBatch(executor, permittedEdit);
+    expect(resultFor(messages, permittedEdit.batchId)).toMatchObject({ success: true });
+    expect(thirdTitle.characters).toBe("Activity overview");
+    expect(rootNodes.slice(0, 2).map(nativeSnapshot)).toEqual(afterFirstEdit);
 
     const beforeReplayRootIds = mock.nodes.filter((node) => node.parent?.type === "PAGE" && node.getPluginData("fad.multi-screen.batch-id")).map((node) => node.id);
     const replay = await renderDesignProgramLocal(mock.api, education, { taskId, documentId, pageId: "page:current", executor });

@@ -22,15 +22,20 @@ async function phase6CheckpointProbe(existingChatId) {
     }, 15000);
     function receive(event) {
       const result = event.data?.pluginMessage;
-      if (result?.type !== "chat-task-result" || result.requestId !== requestId) return;
+      if (result?.requestId !== requestId || !["chat-task-result", "plugin-runtime-handshake-result", "protocol-error"].includes(result.type)) return;
       clearTimeout(timer);
       window.removeEventListener("message", receive);
-      if (result.success) resolve(result);
-      else reject(new Error(result.errorCode ?? "checkpoint_failed"));
+      if (result.success || result.compatible) resolve(result);
+      else reject(new Error(result.errorCode ?? (message.type === "plugin-runtime-handshake" ? "checkpoint_build_mismatch" : "checkpoint_failed")));
     }
     window.addEventListener("message", receive);
-    parent.postMessage({ pluginMessage: { ...message, chatId, requestId } }, "*");
+    const scope = message.type === "plugin-runtime-handshake" ? {} : { chatId };
+    parent.postMessage({ pluginMessage: { ...message, ...scope, requestId } }, "*");
   });
+  const buildId = window.__fadBuildId;
+  if (!buildId) throw new Error("Use the current plugin UI iframe console.");
+  const runtime = await send({ type: "plugin-runtime-handshake", protocolVersion: 1, buildId });
+  if (runtime.uiBuildId !== buildId || runtime.pluginBuildId !== buildId) throw new Error("checkpoint_build_mismatch");
   const loaded = await send({ type: "chat-task-load" });
   const { documentId } = loaded;
   if (existingChatId || loaded.task) {

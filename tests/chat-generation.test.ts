@@ -5,9 +5,24 @@ import { describe, expect, it } from "vitest";
 import {
   createMultiScreenDesignRequest,
   MultiScreenDesignRequestSchema,
+  greetingReply,
+  isClearCreateRequest,
+  isExplicitCanvasRequest,
   parseChatGenerationIntent,
   type ChatGenerationPlanInput,
 } from "../src/shared/chat-generation";
+
+it("routes explicit Romanized Persian instructions without treating discussion as a canvas action", () => {
+  const create = "lotfan 10 safhe mobile baraye modiriyat sakhteman besaz";
+  expect(isExplicitCanvasRequest(create)).toBe(true);
+  expect(isClearCreateRequest(create)).toBe(true);
+  expect(parseChatGenerationIntent(create)).toMatchObject({ kind: "ready", intent: { screenCount: 10, locale: "fa-IR", target: "mobile" } });
+  const edit = "safheye 3 ro virayesh kon";
+  expect(isExplicitCanvasRequest(edit)).toBe(true);
+  expect(isClearCreateRequest(edit)).toBe(false);
+  expect(isExplicitCanvasRequest("chetor 2 safhe mobile besazam?")).toBe(false);
+  expect(greetingReply("salam!")).toBeDefined();
+});
 
 const sharedBrief = {
   platform: "mobile" as const,

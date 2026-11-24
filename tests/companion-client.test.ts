@@ -114,7 +114,7 @@ describe("Figma UI companion client", () => {
     }));
     const adapter = createFW5VisualReviewAdapter({
       enabled: true, mode: "review+bounded-repair", token: "paired-local-token", model: "account-model",
-      models: [{ slug: "account-model", displayName: "Account Model" }],
+      models: [{ slug: "account-model", displayName: "Account Model", imageInput: "supported" }],
       session: { sessionId: status.sessionId!, accountScope: status.accountScope! },
       task, assertCurrent: vi.fn(), getStatus: async () => status,
       inspectRoot: async () => {
@@ -130,7 +130,7 @@ describe("Figma UI companion client", () => {
     });
     const grant = await adapter.authorize(identity);
     expect(grant).toMatchObject({ provider: "openai-responses", model: "account-model", consentImageCount: 1, imageRevision: 1 });
-    expect(prompts[0]).toContain("capability for this account/model is unknown");
+    expect(prompts[0]).toContain("This authorization covers only this one image");
     expect(prompts[0]).toContain("the initial screenshot");
     const result = await adapter.reviewer!.review(request, grant!, new AbortController().signal);
     expect(result).toMatchObject({ verdict: "pass", rootId: request.rootId });
@@ -138,7 +138,7 @@ describe("Figma UI companion client", () => {
     expect(inspections).toBe(2);
 
     const denied = createFW5VisualReviewAdapter({
-      enabled: true, mode: "review", token: "paired-local-token", model: "account-model", models: [{ slug: "account-model", displayName: "Account Model" }],
+      enabled: true, mode: "review", token: "paired-local-token", model: "account-model", models: [{ slug: "account-model", displayName: "Account Model", imageInput: "supported" }],
       session: { sessionId: status.sessionId!, accountScope: status.accountScope! }, task, assertCurrent: vi.fn(), getStatus: async () => status,
       inspectRoot: async () => { throw new Error("No transmission follows denied consent."); }, confirm: () => false, fetcher,
     });

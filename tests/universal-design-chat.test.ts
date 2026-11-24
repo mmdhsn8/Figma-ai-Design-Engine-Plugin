@@ -129,6 +129,37 @@ const cases: Case[] = [
   },
 ];
 
+const residentialCase: Case = {
+  name: "F10 Persian residential building management",
+  brief: "برای اپلیکیشن مدیریت ساختمان مسکونی ده صفحهٔ موبایل ۳۹۰×۸۴۴ با محتوای فارسی و راست‌چین بساز؛ اطلاعات نمونهٔ ساکنان، شارژ، اطلاعیه، تعمیر، رزرو، نظرسنجی و حساب ساختگی باشد.",
+  purpose: "Help residents manage shared building information and services with clear, editable screens.",
+  audience: "Residents of a managed apartment building",
+  platform: "mobile",
+  locale: "fa-IR",
+  tags: ["residential-building", "resident-services"],
+  entities: ["ساکن", "واحد", "شارژ", "پرداخت", "اطلاعیه", "درخواست تعمیر", "امکانات مشترک"],
+  goals: ["بررسی وضعیت ساختمان", "پرداخت شارژ", "پیگیری درخواست تعمیر", "رزرو امکانات"],
+  screens: [
+    { name: "خانه و وضعیت", role: "dashboard", purpose: "نمایش وضعیت کلی ساختمان و اقدام بعدی ساکن." },
+    { name: "شارژ و بدهی‌ها", role: "charges-debts", purpose: "نمایش اقلام ساختگی شارژ و وضعیت پرداخت." },
+    { name: "جزئیات پرداخت", role: "payment-details", purpose: "خلاصهٔ یک پرداخت آزمایشی و رسید قابل بررسی." },
+    { name: "اطلاعیه‌ها", role: "announcements", purpose: "مرور اطلاعیه‌های ساختگی و زمان انتشار." },
+    { name: "جزئیات اطلاعیه", role: "announcement-detail", purpose: "نمایش متن نمونهٔ اطلاعیه و اطلاعات مرتبط." },
+    { name: "ثبت درخواست تعمیر", role: "maintenance-request", purpose: "ثبت درخواست نمونه برای تعمیر بخش مشترک." },
+    { name: "پیگیری تعمیر", role: "maintenance-tracking", purpose: "نمایش وضعیت و مراحل ساختگی رسیدگی به تعمیر." },
+    { name: "رزرو امکانات", role: "facility-booking", purpose: "انتخاب زمان نمونه برای استفاده از فضای مشترک." },
+    { name: "نظرسنجی ساکنان", role: "resident-survey", purpose: "ثبت بازخورد نمونه دربارهٔ خدمات ساختمان." },
+    { name: "حساب و تنظیمات", role: "profile-settings", purpose: "نمایش تنظیمات حساب و ترجیحات ساکن." },
+  ],
+};
+
+const residentialDashboard: Case = {
+  ...residentialCase,
+  name: "F1 housing dashboard · Persian RTL",
+  brief: "برای مدیریت ساختمان یک صفحهٔ موبایل داشبورد فارسی بساز.",
+  screens: residentialCase.screens.slice(0, 1),
+};
+
 function draftFor(input: Case, regionCount = 3, visualLanguageV1?: ProjectVisualLanguageV1) {
   return ProjectPlanDraftSchema.parse({
     productPurpose: input.purpose,
@@ -1106,13 +1137,14 @@ describe("universal design Chat route", () => {
     expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(count);
   });
 
-  it.each(["hi", "hello", "سلام"])("answers %s without a model planner or native operation", async (prompt) => {
+  it.each(["hi", "hello", "سلام", "salam"])("answers %s without a model planner, native operation or checkpoint", async (prompt) => {
     const h = makeHarness({ ...cases[0]!, brief: prompt });
     const authorizeVisualReview = vi.fn();
     const captureVisual = vi.fn();
     const visualCapabilities = vi.fn();
     const visualReview = vi.fn();
     Object.assign(h.deps, {
+      readContext: undefined,
       authorizeVisualReview,
       captureVisual,
       visualReviewer: { capabilities: visualCapabilities, review: visualReview },
@@ -1122,6 +1154,7 @@ describe("universal design Chat route", () => {
     expect(h.task.text).toBeTruthy();
     expect(h.task.projectPlan).toBeUndefined();
     expect(h.model).not.toHaveBeenCalled();
+    expect(h.deps.save).not.toHaveBeenCalled();
     expect(h.deps.renderProgram).not.toHaveBeenCalled();
     expect(h.deps.execute).not.toHaveBeenCalled();
     expect(h.mock.nodes).toHaveLength(0);
@@ -1267,8 +1300,7 @@ describe("universal design Chat route", () => {
   });
 
   it("accepts the actual long ten-screen planning request and resumes its saved task after interruption", async () => {
-    const input = scriptedMarineCase(10);
-    input.brief += " " + "Show illustrative records and preserve data provenance. ".repeat(80);
+    const input = { ...residentialCase, brief: residentialCase.brief + " " + "Show illustrative records and preserve data provenance. ".repeat(132) };
     const h = makeHarness(input, { firstPlanMalformed: true, maxConcurrentModelCalls: 1 });
     const model = h.model.getMockImplementation()!;
     const render = h.deps.renderProgram.getMockImplementation()!;
@@ -1731,7 +1763,7 @@ describe("universal design Chat route", () => {
     expect(ProjectPlanDraftSchema.safeParse({ ...draft, screens: draft.screens.slice(0, 4), screenCount: 4, productPurpose: "" }).success).toBe(false);
   });
 
-  it.each(cases)("runs the actual Chat task coordinator, provider parser, Phase 2 adapter, native mock renderer and readback for $name", async (input) => {
+  it.each([...cases, residentialDashboard])("runs the actual Chat task coordinator, provider parser, Phase 2 adapter, native mock renderer and readback for $name", async (input) => {
     const h = makeHarness(input);
     await runChatTask(h.task, h.deps);
     expect(h.task.status).toBe("completed");
@@ -1742,6 +1774,8 @@ describe("universal design Chat route", () => {
     expect(h.task.projectPlan?.screens.map(({ name }) => name)).toEqual(input.screens.map(({ name }) => name));
     expect(h.task.projectPlan?.direction).toBe(input.locale === "fa-IR" ? "rtl" : "ltr");
     const composedPrograms = h.task.universalScreens!.map(({ program }) => program!);
+    expect(h.task.universalScreens?.some(({ findings }) => findings?.some(({ code }) =>
+      code === "quality_region_content_missing" || code === "quality_action_control_missing"))).toBe(false);
     expect(new Set(composedPrograms.map(({ visualLanguageV1 }) => JSON.stringify(visualLanguageV1))).size).toBe(1);
     expect(composedPrograms.every(({ screens }) => Boolean(screens[0]?.compositionV1?.decisionTrace && screens[0]?.compositionV1?.regions.length === 3))).toBe(true);
     expect(composedPrograms.every(({ screens }) => screens[0]?.compositionV1?.variationSeed === compositionVariationSeed(h.task.id, screens[0]!.id))).toBe(true);
@@ -1776,6 +1810,28 @@ describe("universal design Chat route", () => {
     expect(nativeText).toContain(input.screens[0]!.name);
     expect(nativeText).not.toMatch(/cart|checkout|apparel|clothing|clothes/iu);
     expect(chatTaskSafeDiagnostic(h.task)).toMatchObject({ executionRoute: "universal-design-v1", generationRoute: "universal_design_v1" });
+  });
+
+  it.each([residentialCase, ...cases.slice(0, 3)])("reports a hollow region, missing control and placeholder without imposing filler for $name", (input) => {
+    const program = programFor(input, 0);
+    const root = program.screens[0]!.root;
+    if (root.type !== "container") throw new Error("Fixture needs a container.");
+    const [heading, , action] = root.children;
+    if (heading?.type !== "container" || action?.type !== "container") throw new Error("Fixture needs mapped regions.");
+    heading.children = heading.children.map((child) => child.type === "text" ? { ...child, text: "Lorem ipsum" } : child);
+    action.interaction = "none";
+    root.children.push({
+      type: "image", id: "oversize-illustration", name: "Illustration placeholder", semanticRole: "illustration", interaction: "none",
+      width: { mode: "fixed", value: input.platform === "mobile" ? 290 : 1150 }, height: { mode: "fixed", value: 305 },
+      asset: { source: "placeholder", label: "Illustration" },
+    });
+    const compiled = compileDesignProgram(program);
+    if (!compiled.success) throw new Error(JSON.stringify(compiled.findings));
+    expect(compiled.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "quality_region_content_missing", path: "screens.screen-01.region-1", severity: "warning" }),
+      expect.objectContaining({ code: "quality_action_control_missing", path: "screens.screen-01.region-3", severity: "warning" }),
+      expect.objectContaining({ code: "quality_large_placeholder", path: "screens.screen-01.oversize-illustration", severity: "warning" }),
+    ]));
   });
 
   it("evaluates a newly authored unseen brief after implementation through the same unbranched Chat path", async () => {
@@ -1873,6 +1929,26 @@ describe("universal design Chat route", () => {
     expect(h.task.universalScreens?.[0]?.findings).toEqual([]);
     expect(h.deps.renderProgram).toHaveBeenCalledTimes(cases[0]!.screens.length);
     expect(h.model.mock.calls.map(([, lifecycle]) => lifecycle)).toContain("UNIVERSAL_REPAIR");
+  });
+
+  it("refuses to re-label a sibling screen response and resumes the correct screen", async () => {
+    const input = scriptedMarineCase(2);
+    const h = makeHarness(input, { maxConcurrentModelCalls: 1 });
+    const model = h.model.getMockImplementation()!;
+    const wrongProgram = programFor(input, 0);
+    wrongProgram.screens[0]!.id = "screen-02";
+    h.model.mockImplementation(async (...args) => args[2]?.endsWith("_screen-01_c1")
+      ? modelTurn("compose_design_program", { screenId: "screen-02", program: wrongProgram }, 3)
+      : model(...args));
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("provider_screen_scope_mismatch");
+    expect(h.deps.renderProgram).not.toHaveBeenCalled();
+    const saved = ChatTaskSchema.parse(h.checkpoints.at(-1));
+    expect(saved.universalScreens?.[0]).toMatchObject({ status: "pending", errorCode: "provider_screen_scope_mismatch" });
+    h.model.mockImplementation(model);
+    await runChatTask(saved, h.deps);
+    expect(saved.status).toBe("completed");
+    expect(saved.universalScreens?.map(({ screenId }) => screenId)).toEqual(["screen-01", "screen-02"]);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(2);
   });
 
   it("refuses native rendering when its one semantic repair leaves a finding unresolved", async () => {
@@ -2077,29 +2153,7 @@ describe("universal design Chat route", () => {
   });
 
   it("runs the FW-1 F10 Persian residential building fixture through the Universal task owner", async () => {
-    const input: Case = {
-      name: "F10 Persian residential building management",
-      brief: "برای اپلیکیشن مدیریت ساختمان مسکونی ده صفحهٔ موبایل ۳۹۰×۸۴۴ با محتوای فارسی و راست‌چین بساز؛ اطلاعات نمونهٔ ساکنان، شارژ، اطلاعیه، تعمیر، رزرو، نظرسنجی و حساب ساختگی باشد.",
-      purpose: "Help residents manage shared building information and services with clear, editable screens.",
-      audience: "Residents of a managed apartment building",
-      platform: "mobile",
-      locale: "fa-IR",
-      tags: ["residential-building", "resident-services"],
-      entities: ["ساکن", "واحد", "شارژ", "پرداخت", "اطلاعیه", "درخواست تعمیر", "امکانات مشترک"],
-      goals: ["بررسی وضعیت ساختمان", "پرداخت شارژ", "پیگیری درخواست تعمیر", "رزرو امکانات"],
-      screens: [
-        { name: "خانه و وضعیت", role: "dashboard", purpose: "نمایش وضعیت کلی ساختمان و اقدام بعدی ساکن." },
-        { name: "شارژ و بدهی‌ها", role: "charges-debts", purpose: "نمایش اقلام ساختگی شارژ و وضعیت پرداخت." },
-        { name: "جزئیات پرداخت", role: "payment-details", purpose: "خلاصهٔ یک پرداخت آزمایشی و رسید قابل بررسی." },
-        { name: "اطلاعیه‌ها", role: "announcements", purpose: "مرور اطلاعیه‌های ساختگی و زمان انتشار." },
-        { name: "جزئیات اطلاعیه", role: "announcement-detail", purpose: "نمایش متن نمونهٔ اطلاعیه و اطلاعات مرتبط." },
-        { name: "ثبت درخواست تعمیر", role: "maintenance-request", purpose: "ثبت درخواست نمونه برای تعمیر بخش مشترک." },
-        { name: "پیگیری تعمیر", role: "maintenance-tracking", purpose: "نمایش وضعیت و مراحل ساختگی رسیدگی به تعمیر." },
-        { name: "رزرو امکانات", role: "facility-booking", purpose: "انتخاب زمان نمونه برای استفاده از فضای مشترک." },
-        { name: "نظرسنجی ساکنان", role: "resident-survey", purpose: "ثبت بازخورد نمونه دربارهٔ خدمات ساختمان." },
-        { name: "حساب و تنظیمات", role: "profile-settings", purpose: "نمایش تنظیمات حساب و ترجیحات ساکن." },
-      ],
-    };
+    const input = residentialCase;
     const h = makeHarness(input, { maxConcurrentModelCalls: 2 });
     const startedAt = performance.now();
     await runChatTask(h.task, h.deps);
@@ -2178,11 +2232,12 @@ describe("universal design Chat route", () => {
     process.stderr.write(`PHASE6_SERIAL_BASELINE ${JSON.stringify(measurements)}\n`);
   }, 60_000);
 
-  it("measures bounded screen scheduling at 1/3/10 with out-of-order provider completion and ordered native commits", async () => {
+  it("measures bounded screen scheduling at 1/2/3/10 with out-of-order provider completion and ordered native commits", async () => {
     const measurements: Array<Record<string, unknown>> = [];
-    for (const screenCount of [1, 3, 10]) {
+    for (const fixture of [residentialDashboard, onlineShopCase(), cases[1]!, residentialCase]) {
+      const screenCount = fixture.screens.length;
       for (let repetition = 1; repetition <= 3; repetition++) {
-        const input = scriptedMarineCase(screenCount);
+        const input = { ...fixture, independentScreens: true };
         const h = makeHarness(input, {
           providerDelayForScreen: (screenId) => screenId === "screen-01" ? 60 : 15,
           maxConcurrentModelCalls: 2,
@@ -2206,11 +2261,14 @@ describe("universal design Chat route", () => {
         const elapsedMs = Math.round(performance.now() - startedAt);
         const metrics = h.task.universalMetrics!;
         measurements.push({
+          fixture: `F${screenCount}`,
+          domain: fixture.name,
           screens: screenCount,
           repetition,
           elapsedMs,
           providerRequests: h.model.mock.calls.length,
           providerRounds: metrics.providerRounds,
+          providerInputBytes: metrics.providerInputBytes,
           intentRequests: metrics.intentRequests,
           intentClassificationMs: metrics.intentClassificationMs,
           peakModelCalls: metrics.peakConcurrentModelRequests,
@@ -2232,6 +2290,7 @@ describe("universal design Chat route", () => {
           checkpointReadbacks: null,
           nativeRootIds: h.task.universalScreens!.map(({ screenId, nativeRootNodeId }) => ({ screenId, nodeId: nativeRootNodeId ?? null })),
           duplicateNativeRoots: h.task.universalScreens!.filter(({ status }) => status === "verified").length - new Set(h.task.universalScreens!.filter(({ status }) => status === "verified").map(({ nativeRootNodeId }) => nativeRootNodeId)).size,
+          falseCompletion: h.task.status === "completed" && h.task.universalScreens!.some(({ status, nativeRootNodeId }) => status !== "verified" || !nativeRootNodeId),
         });
         expect(h.task.status).toBe("completed");
         expect(h.task.universalManifest?.screens.map(({ screenId }) => screenId)).toEqual(input.screens.map((_, index) => `screen-${String(index + 1).padStart(2, "0")}`));

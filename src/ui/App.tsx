@@ -2158,7 +2158,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           ({ id: brandId, status }) => brandId === brandStore.defaultBrandId && status === "active",
         );
         const skillStore = await ensureDesignSkillsLoaded();
-        const isPersian = /[\u0600-\u06ff]/u.test(text);
+        const isPersian = boundedGenerationIntent?.locale === "fa-IR" || /[\u0600-\u06ff]/u.test(text);
         const taskKind =
           /\b(edit|change|update|modify|fix|restyle)\b|(?:ویرایش|تغییر|اصلاح|بهبود)/iu.test(text)
             ? "existing-screen-edit"

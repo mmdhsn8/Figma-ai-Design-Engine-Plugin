@@ -83,7 +83,7 @@ const PairingRestoreSchema = z.object({ sessionToken: z.string().min(32).max(128
 const PairingActionSchema = z.object({ disconnected: z.literal(true) }).strict();
 const PairingCancelSchema = z.object({ cancelled: z.literal(true) }).strict();
 const ModelSchema = z
-  .object({ slug: z.string().min(1).max(200), displayName: z.string().min(1).max(200) })
+  .object({ slug: z.string().min(1).max(200), displayName: z.string().min(1).max(200), imageInput: z.enum(["supported", "unsupported"]).optional() })
   .strict();
 const ModelListSchema = z
   .object({ models: z.array(ModelSchema).max(100), status: StatusSchema.optional() })
@@ -232,6 +232,7 @@ export type CompanionErrorCategory =
   | "plan_use_not_admitted"
   | "authorization_required"
   | "consent_required"
+  | "visual_review_capability_unknown"
   | "visual_review_request_invalid"
   | "account_not_eligible"
   | "unsupported_capability"
@@ -1218,6 +1219,7 @@ function mapError(value: string): CompanionErrorCategory {
     "plan_use_not_admitted",
     "authorization_required",
     "consent_required",
+    "visual_review_capability_unknown",
     "visual_review_request_invalid",
     "account_not_eligible",
     "unsupported_capability",

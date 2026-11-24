@@ -202,6 +202,8 @@ export interface CompanionServerOptions {
   streamIdleTimeoutMs?: number;
   streamOverallTimeoutMs?: number;
   temporaryDirectory?: string;
+  /** A trusted modality source for this exact provider session and model, when available. */
+  getVerifiedImageInput?: (sessionId: string, model: string) => "supported" | "unsupported" | undefined;
 }
 
 export interface CompanionServerHandle {
@@ -226,6 +228,7 @@ interface LiveSession {
 export interface AccountModel {
   slug: string;
   displayName: string;
+  imageInput?: "supported" | "unsupported";
 }
 
 interface PendingAuthorization {
@@ -1556,7 +1559,13 @@ export function createCompanionServer(options: CompanionServerOptions) {
       current.models = models;
       providerBodyCompleted = true;
       fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_result", stage: "model_catalog_body", result: "succeeded", durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)), observedCount: models.length });
-      sendJson(response, 200, { models, status: status() });
+      sendJson(response, 200, {
+        models: models.map((model) => {
+          const imageInput = options.getVerifiedImageInput?.(current.sessionId, model.slug);
+          return imageInput ? { ...model, imageInput } : model;
+        }),
+        status: status(),
+      });
     } catch (error) {
       if (!providerBodyCompleted && !clientAbort.signal.aborted) fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_result", stage: "model_catalog_body", result: "failed", reasonCode: "model_catalog_processing_failed" });
       if (clientAbort.signal.aborted) return;
@@ -1777,11 +1786,6 @@ export function createCompanionServer(options: CompanionServerOptions) {
       sendJson(response, 400, { error: "visual_review_image_invalid" });
       return;
     }
-    if (activeVisualReviewController) {
-      png.fill(0);
-      sendJson(response, 409, { error: "inference_busy" });
-      return;
-    }
     const session = await getAuthorizedSession();
     if (!session.ok) {
       png.fill(0);
@@ -1800,6 +1804,21 @@ export function createCompanionServer(options: CompanionServerOptions) {
     if (!session.value.models.some(({ slug }) => slug === reviewRequest.model)) {
       png.fill(0);
       sendJson(response, 400, { error: "model_not_verified_for_account", capability: visualReviewCapability({ authorized: true, consented: true, model: reviewRequest.model }) });
+      return;
+    }
+
+    const imageInput = options.getVerifiedImageInput?.(session.value.sessionId, reviewRequest.model);
+    if (imageInput !== "supported") {
+      png.fill(0);
+      sendJson(response, 422, {
+        error: imageInput === "unsupported" ? "unsupported_capability" : "visual_review_capability_unknown",
+        capability: visualReviewCapability({ authorized: true, consented: true, model: reviewRequest.model, observed: imageInput }),
+      });
+      return;
+    }
+    if (activeVisualReviewController) {
+      png.fill(0);
+      sendJson(response, 409, { error: "inference_busy" });
       return;
     }
 
@@ -2086,6 +2105,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
     let providerHeadersReceived = false;
     let providerHttpSucceeded = false;
     let providerStreamReported = false;
+    let requestSession: LiveSession | undefined;
     try {
       const session = await getAuthorizedSession();
       if (!session.ok) {
@@ -2096,6 +2116,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
         });
         return;
       }
+      requestSession = session.value;
       let loggedRefresh = false;
       const checkChatScope = (completed?: ResponsesDiagnostic) => {
         const current = liveSession;
@@ -2210,9 +2231,13 @@ export function createCompanionServer(options: CompanionServerOptions) {
         stage: "chat_provider_headers", result: upstream.ok ? "received" : "failed", counter: "providerResponses",
         durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)), reasonCode: upstream.ok ? undefined : `http_${upstream.status}` });
       if (!upstream.ok) {
-        const upstreamError = await readResponsesHttpError(upstream, timeoutMs);
-        const category = classifyResponsesHttpError(upstream.status, upstreamError);
-        await applySessionHttpFailure(category);
+        const upstreamError = await readResponsesHttpError(upstream, timeoutMs, clientAbort.signal);
+        checkChatScope();
+        const upstreamCategory = classifyResponsesHttpError(upstream.status, upstreamError);
+        const credentialRotated = liveSession !== requestSession &&
+          (upstreamCategory === "session_expired" || upstream.status === 401);
+        const category = credentialRotated ? "responses_transport_error" : upstreamCategory;
+        if (liveSession === requestSession) await applySessionHttpFailure(category);
         logChatDiagnostic({
           requestId: correlatedId,
           model,
@@ -2221,10 +2246,12 @@ export function createCompanionServer(options: CompanionServerOptions) {
           chatState: "failed",
           ...(upstreamError.code ? { errorCode: upstreamError.code } : {}),
         });
-        sendJson(response, upstream.status, {
+        sendJson(response, credentialRotated ? 503 : upstream.status, {
           error: category,
           requestId: correlatedId,
-          message: chatErrorMessage(category),
+          message: credentialRotated
+            ? "The provider rejected an earlier credential while the session was renewing. Retry the saved request."
+            : chatErrorMessage(category),
           diagnostic: {
             ...responsesHttpDiagnostic(model, upstream.status, category, upstreamError),
             requestId: correlatedId,
@@ -2475,12 +2502,14 @@ export function createCompanionServer(options: CompanionServerOptions) {
         error instanceof Error && error.message === "response_too_large"
           ? "response_too_large"
           : classifyResponsesTransportError(error);
-      if (category === "session_expired" || category === "plan_use_scope_missing") {
-        await applySessionHttpFailure(category);
-      } else if (category === "quota_or_rate_limit" || category === "plan_use_not_admitted") {
-        authStatus = "scope_granted";
+      if (requestSession && liveSession === requestSession) {
+        if (category === "session_expired" || category === "plan_use_scope_missing") {
+          await applySessionHttpFailure(category);
+        } else if (category === "quota_or_rate_limit" || category === "plan_use_not_admitted") {
+          authStatus = "scope_granted";
+        }
+        safeMessage = category;
       }
-      safeMessage = category;
       const detected =
         error instanceof ResponsesStreamError
           ? error.diagnostic
@@ -4626,9 +4655,10 @@ function classifyResponsesErrorCode(code?: string, param?: string): string {
 async function readResponsesHttpError(
   response: Response,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<{ code?: string; param?: string }> {
   try {
-    const body = await readJsonResponse(response, 64 * 1_024, timeoutMs);
+    const body = await readJsonResponse(response, 64 * 1_024, timeoutMs, signal);
     return responseFailureDetails(body);
   } catch {
     return {};

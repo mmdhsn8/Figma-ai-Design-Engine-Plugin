@@ -15,6 +15,7 @@ import type { chatTaskBridge as chatTaskBridgeType } from "../src/ui/chat-task-b
 const pluginBundle = readFileSync(new URL("../dist/plugin.js", import.meta.url), "utf8");
 const uiHtml = readFileSync(new URL("../dist/ui.html", import.meta.url), "utf8");
 const bundledBuildId = uiHtml.match(/__fadBuildId=["']([^"']{1,100})["']/u)?.[1]
+  ?? uiHtml.match(/git-[a-f0-9]{12}-[a-f0-9]{64}/u)?.[0]
   ?? pluginBundle.match(/git-[A-Za-z0-9._:+-]{1,100}/u)?.[0]
   ?? "source-unknown";
 let compiledUiBridge = "";
@@ -98,7 +99,7 @@ describe("Figma main sandbox runtime compatibility", () => {
       clearTimeout,
       console: { log: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     };
-    const boot = () => {
+    const boot = (bundle = pluginBundle) => {
       const context = createContext({ ...sandbox }, { codeGeneration: { strings: false, wasm: false } });
       expect(runInContext("typeof Intl", context)).toBe("undefined");
       // Exercise a sandbox whose collation differs from the UI's. A persisted
@@ -111,7 +112,7 @@ describe("Figma main sandbox runtime compatibility", () => {
       // stable checkpoint hash uses 32-bit operations and remains unaffected.
       const originalAsUintN = BigInt.asUintN;
       BigInt.asUintN = (bits, value) => originalAsUintN(bits, value) ^ 1n;`, context);
-      runInContext(pluginBundle, context);
+      runInContext(bundle, context);
     };
 
     expect(boot).not.toThrow();
@@ -124,6 +125,23 @@ describe("Figma main sandbox runtime compatibility", () => {
     const handshake = (requestId: string, buildId: string) => request({
       type: "plugin-runtime-handshake", requestId, protocolVersion: 1, buildId,
     });
+    if (process.env.FAD_PREVIOUS_ARTIFACTS) {
+      const previousUi = readFileSync(`${process.env.FAD_PREVIOUS_ARTIFACTS}/ui.html`, "utf8");
+      const previousPlugin = readFileSync(`${process.env.FAD_PREVIOUS_ARTIFACTS}/plugin.js`, "utf8");
+      const previousId = previousUi.match(/git-[a-f0-9]{12}-[a-f0-9]{64}/u)?.[0];
+      expect(previousId).toBeTruthy();
+      expect(previousId).not.toBe(bundledBuildId);
+      boot(previousPlugin);
+      expect(figma.showUI.mock.lastCall?.[0]).toBe(previousUi);
+      await handshake("vm-current-ui-old-controller", bundledBuildId);
+      expect(result()).toMatchObject({ compatible: false, uiBuildId: bundledBuildId, pluginBuildId: previousId });
+      await request({ type: "chat-task-load", requestId: "vm-real-mixed-bundles" });
+      expect(result()).toMatchObject({ success: false, errorCode: "checkpoint_build_mismatch" });
+      boot();
+      await handshake("vm-old-ui-current-controller", previousId!);
+      expect(result()).toMatchObject({ compatible: false, uiBuildId: previousId, pluginBuildId: bundledBuildId });
+      expect(figma.clientStorage.setAsync).not.toHaveBeenCalled();
+    }
     await request({
       type: "design-context-read", requestId: "vm-context-01", feature: FW2_FEATURE,
       taskId: "task-vm-01", documentId: "file-1-page-1", intent: "create",
@@ -326,8 +344,12 @@ describe("Figma main sandbox runtime compatibility", () => {
       expect([...storage.entries()]).toEqual(durable);
 
       boot();
-      await handshake("vm-shop-runtime-reload", bundledBuildId);
+      await expect(uiBridge({ type: "chat-task-load", requestId: "vm-shop-restart", ...scope }))
+        .rejects.toMatchObject({ code: "checkpoint_build_mismatch" });
+      const afterRejectedLoad = sent.length;
       const confirmation = await uiBridge({ type: "chat-task-load", requestId: "vm-shop-confirm", ...scope, confirm: shopRevision });
+      expect(sent.slice(afterRejectedLoad).map((message) => (message as { type: string }).type))
+        .toEqual(["plugin-runtime-handshake", "chat-task-load"]);
       expect(confirmation).toMatchObject({ success: true, revision: shopRevision });
       expect(confirmation).not.toHaveProperty("task");
       const recovery = await uiBridge({ type: "chat-task-load", requestId: "vm-shop-recovery", ...scope });

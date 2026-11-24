@@ -25,6 +25,53 @@ function textContrast(program: DesignProgramV1, node: ProgramText, surface: stri
   return { foreground, background, ratio: contrastRatio(foreground, background, 1) };
 }
 
+export function auditDesignProgramComposition(program: DesignProgramV1): DesignProgramFinding[] {
+  const findings: DesignProgramFinding[] = [];
+  const masters = new Map(program.componentsV1?.map(({ id, root }) => [id, root]));
+  for (const screen of program.screens) {
+    if (!screen.compositionV1) continue;
+    const contentByNode = new Map<string, { text: boolean; control: boolean }>();
+    const visit = (node: DesignProgramNode, index: boolean): { text: boolean; control: boolean } => {
+      const content = {
+        text: node.type === "text" && /[\p{L}\p{N}]/u.test(node.text) && !/^(?:placeholder|lorem ipsum|sample text)$/iu.test(node.text.trim()),
+        control: ["button", "input", "navigation"].includes(node.interaction ?? "none"),
+      };
+      if (node.type === "container") {
+        for (const child of node.children) {
+          const nested = visit(child, index);
+          content.text ||= nested.text;
+          content.control ||= nested.control;
+        }
+      } else if (node.type === "instance") {
+        const master = masters.get(node.componentId);
+        if (master) {
+          const nested = visit(master, false);
+          content.text ||= nested.text;
+          content.control ||= nested.control;
+        }
+      } else if (index && node.type === "image" && node.asset.source === "placeholder" &&
+        node.width.value * node.height.value >= screen.viewport.width * screen.viewport.height / 4) {
+        findings.push({ code: "quality_large_placeholder", path: `screens.${screen.id}.${node.id}`, severity: "warning",
+          message: "This placeholder reserves at least a quarter of the nominal viewport area. Check whether it displaces the main content or action." });
+      }
+      if (index) contentByNode.set(node.id, content);
+      return content;
+    };
+    visit(screen.root, true);
+    for (const region of screen.compositionV1.regions) {
+      if (!["text", "data", "action"].includes(region.contentKind)) continue;
+      const content = contentByNode.get(region.nodeId);
+      const path = `screens.${screen.id}.${region.nodeId}`;
+      if (!content?.text) findings.push({ code: "quality_region_content_missing", path, severity: "warning",
+        message: "This mapped region has no meaningful editable text. Add content specific to its purpose when the screen state calls for it." });
+      if (region.contentKind === "action" && !content?.control)
+        findings.push({ code: "quality_action_control_missing", path, severity: "warning",
+          message: "This mapped action region has no native button, input or navigation role. Make the next action identifiable." });
+    }
+  }
+  return findings;
+}
+
 export function auditDesignProgramContrast(program: DesignProgramV1): DesignProgramFinding[] {
   const findings: DesignProgramFinding[] = [];
   const components = new Map(program.componentsV1?.map(({ id, root }) => [id, root]));

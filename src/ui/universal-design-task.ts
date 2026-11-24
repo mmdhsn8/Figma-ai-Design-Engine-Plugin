@@ -133,7 +133,7 @@ function planRequestContext(task: ChatTask): Record<string, unknown> {
       : /\b(?:mobile|phone)\b|موبایل|گوشی/iu.test(task.prompt)
         ? "mobile"
         : undefined);
-  const isPersian = /[\u0600-\u06ff]/u.test(task.prompt);
+  const isPersian = explicit?.locale === "fa-IR" || /[\u0600-\u06ff]/u.test(task.prompt);
   return {
     requestId: task.id,
     originalBrief: task.prompt,
@@ -141,7 +141,6 @@ function planRequestContext(task: ChatTask): Record<string, unknown> {
     requestedPlatform: requestedTarget ?? "model-selected-within-supported-presets",
     requestedLocale: explicit?.locale ?? (isPersian ? "fa-IR" : "en-US"),
     requestedDirection: isPersian ? "rtl" : "ltr",
-    pinned: pinnedContext(task),
     supportedCapabilities: [
       "editable native Figma frames, text and vector shapes",
       "mobile viewport 390×844 or desktop viewport 1440×900",
@@ -265,12 +264,11 @@ function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", sc
   const routeInstruction = purpose === "plan"
     ? "Return only one plan_universal_project tool call. Respect the exact count/device/language constraints in this context. Choose useful distinct screens if the brief did not provide a count. Declare a screen dependency only when the saved content of that screen is required to author another; navigation alone is not a generation dependency. Do not guess private document data."
     : purpose === "compose"
-      ? `Return only one compose_design_program tool call for the single currentScreen. Reuse the exact shared visualLanguageV1; choose a useful general archetype from the allowed vocabulary and explain the choice in decisionTrace. Give each planned region a real container nodeId in the editable tree, prioritize the user goal, and use the stable variation seed ${compositionVariationSeed(task.id, screen!.screenId)}. Use semantic textRole values so typography tokens apply. Follow contentSamplePolicy exactly and label fictional sample data as illustrative. Only use an image assetRef if its ID is in the pinned Brand Kit assetCatalog; otherwise make a visibly labeled native placeholder or editable vector. Do not force card grids, add at least three nodes, or include other screens.`
+      ? `Return only one compose_design_program call for currentScreen. Reuse visualLanguageV1 and choose an archetype that makes the screen's main task and entry/exit states clear. Map each planned region to an editable container; use real domain labels, illustrative example values where allowed, and an identifiable primary control when the plan calls for action. Use the shared navigation language across screens and keep sparse states sparse. For RTL, group controls in reading order and write UI copy in the requested language. Use semantic textRole values for typography, the stable variation seed ${compositionVariationSeed(task.id, screen!.screenId)}, and only pinned Brand Kit assets. Prefer useful editable content to large decorative placeholders. Do not force card grids, pad the tree, or add other screens.`
       : "Return only one repair_design_program tool call. Modify only the supplied invalid fields/findings in this saved one-screen program and preserve all other valid content.";
   const payload = {
     contract: purpose === "plan" ? "ProjectPlanDraftV1" : "DesignProgramV1",
     requestId: task.id,
-    brief: purpose === "plan" ? task.prompt : undefined,
     context,
     pinned: pinnedContext(task),
     ...(purpose === "compose" ? {
@@ -439,13 +437,13 @@ function failContrast(screenId: string, findings: Array<{ code: string; path: st
     fail("program_contrast_unresolved", `No safe semantic color repair on ${screenId}. ${details.join(" ")} No native render was dispatched for this screen.`);
 }
 
-function findingsForProgram(program: DesignProgramV1, expectedScreenId: string, plan: ProjectPlanV1, planScreen: ProjectPlanV1["screens"][number], task: ChatTask): Array<{ code: string; path: string; message: string }> {
+function evaluateProgram(program: DesignProgramV1, plan: ProjectPlanV1, planScreen: ProjectPlanV1["screens"][number], task: ChatTask) {
   const findings: Array<{ code: string; path: string; message: string }> = [];
   const screen = program.screens[0];
   if (!screen || program.screens.length !== 1)
     findings.push({ code: "one_screen_required", path: "screens", message: "The saved program must contain exactly one screen." });
   else {
-    if (screen.id !== expectedScreenId)
+    if (screen.id !== planScreen.screenId)
       findings.push({ code: "screen_identity_mismatch", path: "screens.0.id", message: "The program screen ID differs from the stable planned ID." });
     if (screen.viewport.preset !== planScreen.viewport.preset || screen.viewport.width !== planScreen.viewport.width || screen.viewport.height !== planScreen.viewport.height)
       findings.push({ code: "viewport_mismatch", path: "screens.0.viewport", message: "The program viewport differs from the saved project plan." });
@@ -453,13 +451,16 @@ function findingsForProgram(program: DesignProgramV1, expectedScreenId: string, 
   if (program.locale.direction !== plan.direction || program.locale.language.toLocaleLowerCase() !== plan.locale.toLocaleLowerCase())
     findings.push({ code: "locale_mismatch", path: "locale", message: "The program language or reading direction differs from the saved project plan." });
   const allowedBrandAssetIds = pinnedBrandAssetIds(task);
-  const parsed = parseDesignProgram(program, { allowedBrandAssetIds });
-  if (!parsed.success)
-    findings.push(...parsed.findings.filter((finding) => finding.severity === "error").slice(0, 10).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })));
   const compiled = compileDesignProgram(program, { allowedBrandAssetIds });
+  // For a repair checkpoint, preserve the fingerprint of a valid program that the native adapter rejected.
+  const parsedForRepair = compiled.success ? undefined : parseDesignProgram(program, { allowedBrandAssetIds });
+  const fingerprint = compiled.success ? compiled.fingerprint : parsedForRepair?.success ? parsedForRepair.fingerprint : undefined;
+  const warnings = compiled.success
+    ? compiled.findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }))
+    : [];
   if (!compiled.success)
     findings.push(...compiled.findings.slice(0, 10).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })));
-  if (parsed.success && screen) {
+  if (fingerprint && screen) {
     const textContent: string[] = [];
     const visit = (node: DesignProgramV1["screens"][number]["root"]) => {
       if (node.type === "text") textContent.push(node.text.trim());
@@ -499,7 +500,11 @@ function findingsForProgram(program: DesignProgramV1, expectedScreenId: string, 
       findings.push(...actionable.map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })));
     }
   }
-  return [...new Map(findings.map((finding) => [`${finding.code}:${finding.path}`, finding])).values()].slice(0, 12);
+  return {
+    findings: [...new Map(findings.map((finding) => [`${finding.code}:${finding.path}`, finding])).values()].slice(0, 12),
+    warnings,
+    fingerprint,
+  };
 }
 
 function visualLanguageForPlan(plan: ProjectPlanV1): ProjectVisualLanguageV1 {
@@ -1308,16 +1313,20 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         return false;
       });
       if (validation) continue;
-      if (turn.kind !== "tool_calls" || turn.calls.length !== 1 || turn.calls[0]?.action.tool !== expectedTool) {
+      const call = turn.kind === "tool_calls" && turn.calls.length === 1 ? turn.calls[0] : undefined;
+      const action = call?.action;
+      const wrongScreen = action?.tool === "compose_design_program" && action.screenId !== screen.screenId;
+      if (action?.tool !== expectedTool || wrongScreen) {
+        const code = wrongScreen && purpose === "compose" ? "provider_screen_scope_mismatch" : "provider_tool_contract_invalid";
         await withTaskLock(async () => {
           screen.status = purpose === "compose" ? "pending" : "repair_pending";
-          screen.errorCode = "provider_tool_contract_invalid";
+          screen.errorCode = code;
           delete screen.activeRequestId;
           await save();
         });
-        fail("provider_tool_contract_invalid", `The provider did not return exactly one ${expectedTool} call for ${screen.screenId}.`);
+        fail(code, `The provider did not return exactly one ${expectedTool} call for ${screen.screenId}. Resume to retry the saved screen.`);
       }
-      return ChatFunctionCallSchema.parse(turn.calls[0]);
+      return ChatFunctionCallSchema.parse(call);
     }
   };
 
@@ -1460,12 +1469,11 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     const screenPlan = plan.screens.find(({ screenId }) => screenId === screen.screenId);
     if (!screenPlan) fail("checkpoint_incomplete", `The saved plan has no ${screen.screenId} screen definition.`);
     const normalized = normalizeDesignProgramContrast(parsed.data);
-    const findings = findingsForProgram(normalized.program, screen.screenId, plan, screenPlan, task);
-    const checked = parseDesignProgram(normalized.program, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
-    if (!checked.success) fail("program_validation_failed", "The restored screen failed strict program validation.");
+    const { findings, fingerprint } = evaluateProgram(normalized.program, plan, screenPlan, task);
+    if (!fingerprint) fail("program_validation_failed", "The restored screen failed strict program validation.");
     logContrastRepairs(screen.screenId, normalized.repairs);
     screen.program = normalized.program;
-    screen.fingerprint = checked.fingerprint;
+    screen.fingerprint = fingerprint;
     screen.findings = findings;
     screen.status = findings.length ? "repair_pending" : "program_saved";
     if (findings.length) screen.errorCode = "program_preflight_failed";
@@ -1560,6 +1568,20 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     task.recent = [];
   };
 
+  const prepareProgram = (program: DesignProgramV1, screenPlan: ProjectPlanV1["screens"][number]) =>
+    withPreparationPriority(() => {
+      const normalizeStartedAt = monotonicNow();
+      const normalized = normalizedProgram(program, plan, screenPlan);
+      const preflightStartedAt = monotonicNow();
+      const evaluation = evaluateProgram(normalized, plan, screenPlan, task);
+      return {
+        normalized,
+        ...evaluation,
+        normalizeMs: Math.max(0, Math.round(preflightStartedAt - normalizeStartedAt)),
+        preflightMs: Math.max(0, Math.round(monotonicNow() - preflightStartedAt)),
+      };
+    });
+
   const composeOneScreen = async (screen: UniversalScreenCheckpoint, queueWaitMs: number) => {
     const screenIndex = plan.screens.findIndex(({ screenId }) => screenId === screen.screenId);
     const screenPlan = plan.screens[screenIndex];
@@ -1570,19 +1592,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       const call = await getScreenCall(screen, "compose", schedulerController.signal, queueWaitMs);
       if (call.action.tool !== "compose_design_program") fail("provider_tool_contract_invalid", `The provider returned an unexpected action for ${screen.screenId}.`);
       const composeAction = call.action;
-      const prepared = await withPreparationPriority(() => {
-        const normalizeStartedAt = monotonicNow();
-        const normalized = normalizedProgram(composeAction.program, plan, screenPlan);
-        const normalizeMs = Math.max(0, Math.round(monotonicNow() - normalizeStartedAt));
-        const preflightStartedAt = monotonicNow();
-        const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
-        const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
-        const compiled = compileDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
-        const warnings = compiled.success ? compiled.findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })) : [];
-        const preflightMs = Math.max(0, Math.round(monotonicNow() - preflightStartedAt));
-        return { normalized, normalizeMs, findings, parsed, warnings, preflightMs };
-      });
-      const { normalized, normalizeMs, findings, parsed, warnings, preflightMs } = prepared;
+      const { normalized, normalizeMs, findings, fingerprint, warnings, preflightMs } =
+        await prepareProgram(composeAction.program, screenPlan);
       await withTaskLock(async () => {
         if (schedulerController.signal.aborted) throw new UniversalDesignTaskError("request_cancelled", "The screen result was not committed after its task was cancelled.");
         task.universalMetrics!.programNormalizationMs += normalizeMs;
@@ -1590,7 +1601,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         recordTrace({ stageId: screen.screenId, stage: "normalize", event: "program_normalized", outcome: "completed", durationMs: normalizeMs, outputBytes: utf8Bytes(JSON.stringify(normalized)) });
         recordTrace({ stageId: screen.screenId, stage: "preflight", event: "preflight_completed", outcome: findings.length ? "failed" : "completed", durationMs: preflightMs, outputBytes: utf8Bytes(JSON.stringify(normalized)), ...(findings.length ? { qaFindingCodes: findings.slice(0, 8).map(({ code }) => code), qaCoverage: "complete" as const } : { qaFindingCodes: warnings.slice(0, 8).map(({ code }) => code), qaCoverage: "complete" as const }) });
         screen.program = normalized;
-        screen.fingerprint = parsed.success ? parsed.fingerprint : undefined;
+        screen.fingerprint = fingerprint;
         screen.findings = findings.length ? findings : warnings;
         screen.status = findings.length ? "repair_pending" : "program_saved";
         if (findings.length) screen.errorCode = "program_preflight_failed";
@@ -1623,19 +1634,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         fail("repair_scope_mismatch", "The repair referenced findings outside the locally measured preflight report.");
       if (JSON.stringify(repairAction.program) === JSON.stringify(screen.program))
         fail("program_repair_no_progress", `The bounded repair returned an unchanged program for ${screen.screenId}; further repair was stopped.`);
-      const prepared = await withPreparationPriority(() => {
-        const normalizeStartedAt = monotonicNow();
-        const normalized = normalizedProgram(repairAction.program, plan, screenPlan);
-        const normalizeMs = Math.max(0, Math.round(monotonicNow() - normalizeStartedAt));
-        const preflightStartedAt = monotonicNow();
-        const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
-        const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
-        const compiled = compileDesignProgram(normalized, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
-        const warnings = compiled.success ? compiled.findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) })) : [];
-        const preflightMs = Math.max(0, Math.round(monotonicNow() - preflightStartedAt));
-        return { normalized, normalizeMs, findings, parsed, warnings, preflightMs };
-      });
-      const { normalized, normalizeMs, findings, parsed, warnings, preflightMs } = prepared;
+      const { normalized, normalizeMs, findings, fingerprint, warnings, preflightMs } =
+        await prepareProgram(repairAction.program, screenPlan);
       await withTaskLock(async () => {
         if (schedulerController.signal.aborted) throw new UniversalDesignTaskError("request_cancelled", "The repaired screen result was not committed after its task was cancelled.");
         task.universalMetrics!.programNormalizationMs += normalizeMs;
@@ -1644,7 +1644,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         recordTrace({ stageId: screen.screenId, stage: "preflight", event: "preflight_completed", outcome: findings.length ? "failed" : "completed", durationMs: preflightMs, outputBytes: utf8Bytes(JSON.stringify(normalized)), qaFindingCodes: (findings.length ? findings : warnings).slice(0, 8).map(({ code }) => code), qaCoverage: "complete" });
         screen.repairAttempts++;
         screen.program = normalized;
-        screen.fingerprint = parsed.success ? parsed.fingerprint : undefined;
+        screen.fingerprint = fingerprint;
         screen.findings = findings.length ? findings : warnings;
         screen.status = findings.length ? "repair_pending" : "program_saved";
         if (findings.length) screen.errorCode = "program_preflight_failed";
@@ -1985,6 +1985,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
             }).join(",") : "";
             const category = safeErrorCode(error);
             const reason = category === "unsupported_capability" ? "visual_review_unsupported_capability"
+              : category === "visual_review_capability_unknown" ? "visual_review_capability_unknown"
               : category === "authorization_required" || category === "plan_use_scope_missing" || category === "session_expired" ? "visual_review_authorization_required"
                 : category === "model_not_verified_for_account" ? "visual_review_model_unavailable"
                   : category === "request_timed_out" || error instanceof Error && /timed out/iu.test(error.message) ? "visual_review_timed_out"

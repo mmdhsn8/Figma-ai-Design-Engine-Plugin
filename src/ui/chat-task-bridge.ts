@@ -96,7 +96,8 @@ type CheckpointResult = Extract<PluginToUIMessage, { type: "chat-task-result" }>
 export async function chatTaskBridge(
   message: Extract<UIToPluginMessage, { type: "chat-task-load" | "chat-task-save" }>,
 ) {
-  await ensureCheckpointRuntime();
+  const handshake = ensureCheckpointRuntime();
+  await handshake;
   const json = message.type === "chat-task-save" ? checkpointJson(message.task) : undefined;
   const expected = json === undefined ? undefined : checkpointRevision(json);
   const outbound =
@@ -186,6 +187,9 @@ export async function chatTaskBridge(
         success: result.success,
       });
       if (!result.success) {
+        // A still-open iframe can outlive the controller that acknowledged its handshake.
+        if (result.errorCode === "checkpoint_build_mismatch" && runtimeHandshake === handshake)
+          runtimeHandshake = undefined;
         if (!confirming && result.errorCode === "checkpoint_read_unconfirmed") {
           reconcile();
           return;

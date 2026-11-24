@@ -5,6 +5,7 @@ import {
 } from "../shared/messages";
 import { fw7Telemetry } from "./fw7-runtime";
 import { fw7CorrelationHash } from "../shared/fw7-observability";
+import { matchNativeBridgeReply } from "./native-bridge-reply";
 
 type Request = Extract<UIToPluginMessage, { type: "task-native-inspect" | "task-native-focus" }>;
 type VisualCaptureRequest = Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>;
@@ -19,18 +20,21 @@ type VisualRepairResponse = Extract<PluginToUIMessage, { type: "task-native-visu
 
 export function taskNativeBridge(message: Request): Promise<Response> {
   return new Promise((resolve, reject) => {
+    const inspecting = message.type === "task-native-inspect";
     const finish = () => {
       window.clearTimeout(timer);
       window.removeEventListener("message", receive);
     };
     const receive = (event: MessageEvent) => {
-      const parsed = PluginToUISchema.safeParse(event.data?.pluginMessage);
-      if (!parsed.success) return;
-      if (parsed.data.type === "protocol-error") {
-        if (parsed.data.requestId !== message.requestId) return;
+      const parsed = matchNativeBridgeReply(event.data?.pluginMessage, {
+        requestId: message.requestId, taskId: inspecting ? message.taskId : undefined,
+        type: inspecting ? "task-native-inspection-result" : "task-native-focus-result",
+      });
+      if (!parsed) return;
+      if (!parsed.success || parsed.data.type === "protocol-error") {
         fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "bridge_ack_received", stage: "native_inspection", operation: "protocol-error", result: "failed", reasonCode: "protocol_error", counter: "uiPluginAcksReceived" });
         finish();
-        reject(new Error(parsed.data.message));
+        reject(Object.assign(new Error("Figma rejected the task-layer request or returned invalid layer evidence. Reload the development plugin before retrying."), { code: "native_readback_protocol_error" }));
         return;
       }
       if (message.type === "task-native-inspect") {
@@ -53,7 +57,12 @@ export function taskNativeBridge(message: Request): Promise<Response> {
       reject(Object.assign(new Error("Figma did not respond to the task-layer request. Resume to retry native readback."), { code: "native_readback_timeout" }));
     }, 15_000);
     window.addEventListener("message", receive);
-    parent.postMessage({ pluginMessage: message }, "*");
+    try { parent.postMessage({ pluginMessage: message }, "*"); }
+    catch {
+      finish();
+      reject(Object.assign(new Error("Figma could not receive the task-layer request. Reopen the plugin and retry."), { code: "native_readback_transport_failed" }));
+      return;
+    }
     fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "bridge_dispatch", stage: message.type === "task-native-inspect" ? "native_readback" : "native_focus", operation: message.type, result: "started", counter: "uiPluginDispatches" });
   });
 }

@@ -3758,8 +3758,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
     transition("TASK_COMPLETED");
     delete task.error;
     delete task.failure;
-    // The opted-in Universal conversation is recorded in History, not as a Canvas task.
-    if (task.executionRoute !== "universal-design-v1" || !deps.readContext) await save();
+    // Greetings and Universal conversation are recorded in Chat History.
+    if (reply === undefined && task.executionRoute !== "universal-design-v1") await save();
     return;
   }
   syncCapacityAccounting(task);

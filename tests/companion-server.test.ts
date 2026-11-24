@@ -76,7 +76,7 @@ describe("loopback companion", () => {
   });
 
   it("sends one consent-scoped PNG through Responses with strict structured output and no retries", async () => {
-    const harness = await createHarness({ visualReviewOutput: { verdict: "pass", confidence: 0.92, reason: null, findings: [] } });
+    const harness = await createHarness({ imageInput: "supported", visualReviewOutput: { verdict: "pass", confidence: 0.92, reason: null, findings: [] } });
     const token = await authorizeAndDiscover(harness);
     const status = await (await request(harness.handle, "/v1/status", { token })).json() as { sessionId: string; accountScope: string };
     const response = await request(harness.handle, "/v1/visual-review", { token, body: visualReviewFixture({
@@ -97,8 +97,18 @@ describe("loopback companion", () => {
     expect(new Headers(harness.responsesRequest!.headers).get("authorization")).toBe("Bearer access-secret");
   });
 
+  it.each(["unknown", "unsupported"] as const)("does not send an image with %s capability even when consent is present", async (imageInput) => {
+    const harness = await createHarness({ imageInput });
+    const token = await authorizeAndDiscover(harness);
+    const status = await (await request(harness.handle, "/v1/status", { token })).json() as { sessionId: string; accountScope: string };
+    const response = await request(harness.handle, "/v1/visual-review", { token, body: visualReviewFixture({ sessionId: status.sessionId, accountScope: status.accountScope }) });
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({ capability: { status: imageInput } });
+    expect(harness.responsesCallCount).toBe(0);
+  });
+
   it("maps the plan-sharing unsupported image capability without retrying or changing routes", async () => {
-    const harness = await createHarness({ responsesHttpError: { status: 400, body: { error: { code: "subscription_sharing_unsupported_capability" } } } });
+    const harness = await createHarness({ imageInput: "supported", responsesHttpError: { status: 400, body: { error: { code: "subscription_sharing_unsupported_capability" } } } });
     const token = await authorizeAndDiscover(harness);
     const status = await (await request(harness.handle, "/v1/status", { token })).json() as { sessionId: string; accountScope: string };
     const response = await request(harness.handle, "/v1/visual-review", { token, body: visualReviewFixture({ sessionId: status.sessionId, accountScope: status.accountScope }) });
@@ -140,7 +150,7 @@ describe("loopback companion", () => {
   });
 
   it("accepts a same-account token refresh and cancels an in-flight image response on Stop", async () => {
-    const refreshed = await createHarness({ refresh: true, expiresIn: 2 });
+    const refreshed = await createHarness({ imageInput: "supported", refresh: true, expiresIn: 2 });
     const token = await authorizeAndDiscover(refreshed);
     const status = await (await request(refreshed.handle, "/v1/status", { token })).json() as { sessionId: string; accountScope: string };
     const review = await request(refreshed.handle, "/v1/visual-review", { token, body: visualReviewFixture({ sessionId: status.sessionId, accountScope: status.accountScope }) });
@@ -148,7 +158,7 @@ describe("loopback companion", () => {
     expect(refreshed.refreshRequest).toContain("grant_type=refresh_token");
     expect(new Headers(refreshed.responsesRequest!.headers).get("authorization")).toBe("Bearer access-rotated");
 
-    const stalled = await createHarness({ stalledStream: true });
+    const stalled = await createHarness({ imageInput: "supported", stalledStream: true });
     const stalledToken = await authorizeAndDiscover(stalled);
     const stalledStatus = await (await request(stalled.handle, "/v1/status", { token: stalledToken })).json() as { sessionId: string; accountScope: string };
     const abort = new AbortController();
@@ -182,6 +192,29 @@ describe("loopback companion", () => {
     const events = await (await first).text();
     expect(events).toContain("event: tool_validation");
     expect(events).not.toContain("request_cancelled");
+  });
+
+  it("keeps a renewed session ready when an earlier Chat request returns an expired-token error", async () => {
+    const harness = await createHarness({ refresh: true, expiresIn: 120 });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const gate = harness.stallNextChatHeaders("headers", true);
+    const first = request(harness.handle, "/v1/chat", { token, body: {
+      requestId: "old-credential-chat", model: "account-model", lifecycle: "UNIVERSAL_COMPOSING",
+      input: [{ role: "user", content: "Compose the saved screen." }],
+    } });
+    await gate.started;
+    try {
+      harness.advanceTime(70_000);
+      expect((await request(harness.handle, "/v1/models", { token, body: {} })).status).toBe(200);
+    } finally {
+      gate.release();
+    }
+    const failed = await first;
+    const status = await request(harness.handle, "/v1/status", { token });
+    await expect(status.json()).resolves.toMatchObject({ auth: "ready", planUseAuthorized: true });
+    expect(failed.status).toBe(503);
+    await expect(failed.json()).resolves.toMatchObject({ error: "responses_transport_error", message: expect.stringContaining("Retry") });
   });
 
   it("reports a real account disconnect during a provider stream as lost authorization", async () => {
@@ -4089,6 +4122,7 @@ async function createHarness(
     draftStore?: DraftStore;
     scope?: string;
     expiresIn?: number;
+    imageInput?: "unknown" | "supported" | "unsupported";
     refresh?: boolean;
     refreshFailure?: boolean;
     modelsUnauthorized?: boolean;
@@ -4151,7 +4185,7 @@ async function createHarness(
     markResponseStreamStarted = resolve;
   });
   let stallNextResponses = false;
-  const chatHeaderGates: Array<{ started: Promise<void>; markStarted(): void; wait: Promise<void>; release(): void }> = [];
+  const chatHeaderGates: Array<{ started: Promise<void>; markStarted(): void; wait: Promise<void>; release(): void; expiredToken?: boolean }> = [];
   const chatStreamGates: typeof chatHeaderGates = [];
   let nextResponsesUsageFailure = false;
   const resetResponseStreamWaiter = () => {
@@ -4270,6 +4304,7 @@ async function createHarness(
             resolve();
           });
         });
+        if (chatHeaderGate.expiredToken) return Response.json({ error: { code: "subscription_sharing_invalid_user" } }, { status: 401 });
       }
       const chatStreamGate = isChat ? chatStreamGates.shift() : undefined;
       if (chatStreamGate) {
@@ -4483,6 +4518,8 @@ async function createHarness(
     createCompanionServer({
       port: 0,
       fetchImpl,
+      getVerifiedImageInput: (_sessionId, model) => model === "account-model" && options.imageInput !== "unknown"
+        ? options.imageInput : undefined,
       draftStore: options.draftStore,
       installationStore: store,
       credentialStore,
@@ -4586,12 +4623,12 @@ async function createHarness(
       stallNextResponses = true;
       resetResponseStreamWaiter();
     },
-    stallNextChatHeaders(phase: "headers" | "stream" = "headers") {
+    stallNextChatHeaders(phase: "headers" | "stream" = "headers", expiredToken = false) {
       let markStarted!: () => void;
       let release!: () => void;
       const started = new Promise<void>((resolve) => { markStarted = resolve; });
       const wait = new Promise<void>((resolve) => { release = resolve; });
-      (phase === "headers" ? chatHeaderGates : chatStreamGates).push({ started, markStarted, wait, release });
+      (phase === "headers" ? chatHeaderGates : chatStreamGates).push({ started, markStarted, wait, release, expiredToken });
       return { started, release };
     },
     failNextResponseWithUsage() {

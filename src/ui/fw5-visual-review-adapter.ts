@@ -1,4 +1,3 @@
-import { visualReviewCapability } from "../shared/fw5-provider-visual-review";
 import { FW5_VISUAL_CAPTURE_LIMITS, type VisualReviewGrantV1, type VisualReviewRequestV1, type VisualReviewerV1 } from "../shared/fw5-visual-qa";
 import type { ChatTask } from "../shared/chat-task";
 import type { PluginToUIMessage } from "../shared/messages";
@@ -25,6 +24,14 @@ export function createFW5VisualReviewAdapter(input: {
   authorize(identity: VisualIdentity): Promise<VisualReviewGrantV1 | undefined>;
 } {
   const enabled = input.enabled && input.mode !== "capture-only";
+  const requireImageInput = () => {
+    const model = input.models.find(({ slug }) => slug === input.model);
+    if (!model) throw new CompanionClientError("model_not_verified_for_account");
+    if (model.imageInput !== "supported") throw new CompanionClientError(
+      model.imageInput === "unsupported" ? "unsupported_capability" : "visual_review_capability_unknown",
+    );
+    return model;
+  };
   const assertSession = async () => {
     input.assertCurrent();
     const status = await input.getStatus();
@@ -70,6 +77,7 @@ export function createFW5VisualReviewAdapter(input: {
         review: async (review: VisualReviewRequestV1, grant: VisualReviewGrantV1, signal: AbortSignal) => {
           input.assertCurrent();
           if (signal.aborted) throw new CompanionClientError("request_cancelled");
+          requireImageInput();
           if (grant.provider !== "openai-responses" || grant.model !== input.model || grant.sessionId !== input.session.sessionId ||
               grant.accountScope !== input.session.accountScope || grant.consentImageCount !== 1 || grant.taskGeneration !== review.taskGeneration ||
               grant.imageRevision !== review.imageRevision || !grant.authorizationId)
@@ -90,16 +98,14 @@ export function createFW5VisualReviewAdapter(input: {
       input.assertCurrent();
       taskScreen(identity);
       await assertSession();
-      const model = input.models.find(({ slug }) => slug === input.model)!;
+      const model = requireImageInput();
       const stage = identity.imageRevision === 2 ? "the post-repair recheck screenshot" : "the initial screenshot";
-      const capability = visualReviewCapability({ authorized: true, consented: true, model: input.model });
       const accepted = input.confirm(
         `Allow one visual QA image to be sent?\n\n` +
           `Screen: ${identity.screenId}\nNative root: ${identity.rootId}\nFigma page: ${identity.pageId}\n` +
           `Task: ${identity.taskId} (${identity.taskGeneration})\nImage: ${stage}\n\n` +
           `A Figma screenshot may contain private design data. Recipient: OpenAI Responses through the existing ChatGPT plan-use session. ` +
-          `Selected model: ${model.displayName} (${model.slug}). Image-review capability for this account/model is ${capability.status}; your consent is required to attempt this review. ` +
-          `(the available model list has no image-modality metadata). This authorization covers only this one image; if a second screenshot is needed, ` +
+          `Selected model: ${model.displayName} (${model.slug}). This authorization covers only this one image; if a second screenshot is needed, ` +
           `you will be asked again. The image is not added to Chat history or checkpoints. The request may use ChatGPT plan usage.\n\n` +
           `Send this screenshot for this task, screen, root, and page?`,
       );

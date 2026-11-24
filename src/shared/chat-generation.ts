@@ -752,8 +752,12 @@ const TOP_LEVEL_EDIT =
 const EXISTING_EDIT_COMMAND =
   /\b(?:edit|change|update|modify|fix|restyle)\s+(?:(?:the|existing|current|selected)\s+)?(?:screen|page|frame|canvas|design)\b|\b(?:edit|change|update|modify)\s+(?:screen|page)\s+\d+\b|(?:صفحه|اسکرین)(?:\s+\d+)?\s*(?:را|رو)\s*(?:ویرایش|تغییر|اصلاح|بهبود)(?:\s+کن|\s+بده|\s+بدید)|(?:ویرایش|تغییر|اصلاح|بهبود)\s*(?:صفحه|اسکرین)(?:\s+\d+)?/iu;
 
+const ROMANIZED_CREATE = /^(?:lotfan\s+)?([0-9۰-۹٠-٩]+)\s+(?:safheh?|screens?)\b[^.!?؟\n]{0,160}\b(?:besaz(?:id)?|tarahi\s+kon(?:id)?)[.!]?$/iu;
+const ROMANIZED_EDIT = /^(?:lotfan\s+)?safhe(?:h|ye)?\s+[0-9۰-۹٠-٩]+\s+(?:ro|ra)\s+(?:virayesh|eslah|taghir)\s+kon(?:id)?[.!]?$/iu;
+
 export function isClearCreateRequest(prompt: string): boolean {
   const normalized = prompt.trim().toLocaleLowerCase();
+  if (ROMANIZED_CREATE.test(normalized)) return true;
   return Boolean(
     normalized &&
       CREATE_VERB.test(normalized) &&
@@ -768,14 +772,16 @@ const PERSIAN_CANVAS_COMMAND = /بساز|(?:طراحی|ایجاد|ویرایش|�
 const ADVICE_REQUEST = /\b(?:how (?:do|can|should|would) (?:i|we)|how to|what (?:is|are)|why|can you (?:teach|explain how))\b|چطور|چگونه|چیست/iu;
 
 export function isExplicitCanvasRequest(prompt: string): boolean {
+  const trimmed = prompt.trim();
+  if (ROMANIZED_CREATE.test(trimmed) || ROMANIZED_EDIT.test(trimmed)) return true;
   return CANVAS_TARGET.test(prompt) && !ADVICE_REQUEST.test(prompt) &&
-    (ENGLISH_CANVAS_COMMAND.test(prompt.trim()) || PERSIAN_CANVAS_COMMAND.test(prompt));
+    (ENGLISH_CANVAS_COMMAND.test(trimmed) || PERSIAN_CANVAS_COMMAND.test(prompt));
 }
 
 export function greetingReply(prompt: string): string | undefined {
   const greeting = prompt.trim().replace(/[\s.!؟?!،,]+$/gu, "");
   if (/^(?:hi|hello|hey)$/iu.test(greeting)) return "Hi! How can I help?";
-  if (/^(?:سلام|درود)$/u.test(greeting)) return "سلام! چطور می‌تونم کمک کنم؟";
+  if (/^(?:سلام|درود|salam)$/iu.test(greeting)) return "سلام! چطور می‌تونم کمک کنم؟";
   return undefined;
 }
 
@@ -798,10 +804,11 @@ export function requestedDesignContext(prompt: string, intent: "create" | "edit"
 
 export function parseChatGenerationIntent(prompt: string): ParsedChatGenerationIntent {
   const normalized = prompt.trim().toLocaleLowerCase();
+  const romanizedCount = ROMANIZED_CREATE.exec(normalized)?.[1];
   if (!isClearCreateRequest(normalized)) return { kind: "not_a_handoff" };
   const screenTerm =
     /(?:\b(?:screens?|pages?|views?)\b|(?:صفحه(?:‌ها|ها|ی|های)?|اسکرین(?:‌ها|ها)?))/iu;
-  if (!screenTerm.test(normalized)) return { kind: "not_a_handoff" };
+  if (!romanizedCount && !screenTerm.test(normalized)) return { kind: "not_a_handoff" };
   const screenAdjective =
     /(?:(?:new|editable|mobile|desktop|web|phone|responsive|جدید|قابل‌ویرایش|موبایل|دسکتاپ)\s+){0,3}/iu;
   const screenNoun =
@@ -816,7 +823,7 @@ export function parseChatGenerationIntent(prompt: string): ParsedChatGenerationI
   ).exec(normalized);
   const persianWordMatch =
     /(یک|دو|سه|چهار|پنج|شش|هفت|هشت|نه|ده)\s*(?:صفحه|اسکرین)/iu.exec(normalized);
-  const rawCount = numericMatch?.[1];
+  const rawCount = romanizedCount ?? numericMatch?.[1];
   const word = englishWordMatch?.[1] ?? persianWordMatch?.[1];
   const count = rawCount ? Number(asciiDigits(rawCount)) : word ? countWords[word] : undefined;
   if (count === undefined) return { kind: "not_a_handoff" };
@@ -827,7 +834,7 @@ export function parseChatGenerationIntent(prompt: string): ParsedChatGenerationI
     )
   )
     return { kind: "unsupported_target" };
-  const isPersian = /[\u0600-\u06ff]/u.test(normalized);
+  const isPersian = Boolean(romanizedCount) || /[\u0600-\u06ff]/u.test(normalized);
   return {
     kind: "ready",
     intent: {

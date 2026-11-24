@@ -1,0 +1,1308 @@
+{
+  "schemaVersion": 1,
+  "checkout": {
+    "branch": "main",
+    "baselineCommit": "0eb4ae215787d02af66e376004b6863f119ab0c7",
+    "baselineClean": true,
+    "finalState": "working-tree"
+  },
+  "environment": {
+    "platform": "Windows",
+    "node": "v24.21.0",
+    "npm": "11.19.0",
+    "vitest": "5.0.5"
+  },
+  "artifacts": {
+    "onDiskAtStart": {
+      "buildId": "git-686d10612e99-3d0244696304a6165cae1063c15dbe9e79e7483bf52660ebd50b34d51646e40b",
+      "uiSha256": "dc31ca88ba6c9382c627cfe8aa6e3c4f54c5a45df85e6998f61ea4826adeb5dd",
+      "pluginSha256": "07fefa81bbb3ce947ded9a89800dabea2cc243c1b1be5a7a4b0ce9eb8fe86f9e"
+    },
+    "baseline": {
+      "buildId": "git-0eb4ae215787-3d0244696304a6165cae1063c15dbe9e79e7483bf52660ebd50b34d51646e40b",
+      "artifacts": {
+        "dist/ui.html": {
+          "bytes": 1601318,
+          "sha256": "b5c1b4325d82c9fd1bdd0f98f9d103c2b8e39b01ace37a7b2d07e90d542e7a9e"
+        },
+        "dist/plugin.js": {
+          "bytes": 2303469,
+          "sha256": "69ded3a0cc61f32b1aed3d7209e5e6640ddd208d49859b17fe583233f88f41e8"
+        }
+      }
+    },
+    "final": {
+      "buildId": "git-0eb4ae215787-a5789b7c34b5516018a5727108c94082dc1f3cc9d32297983808ebe16c22d761",
+      "artifacts": {
+        "dist/ui.html": {
+          "bytes": 1603559,
+          "sha256": "7856d219d099698134cc0a8eb941fae06871c3d28d77a55708de7c7544a47100"
+        },
+        "dist/plugin.js": {
+          "bytes": 2307702,
+          "sha256": "f566b0859d555c156e595f6d0480ad83b4d2c1d74c9384969d808cb3e8bd66ef"
+        }
+      }
+    }
+  },
+  "changedFiles": [
+    "docs/figwright-integration/stabilization/third-pass-evidence.json",
+    "docs/figwright-integration/stabilization/third-pass.md",
+    "docs/roadmap-v2/phase-06/checkpoint-desktop-diagnostics.md",
+    "src/companion/server.ts",
+    "src/shared/chat-generation.ts",
+    "src/shared/design-program-adapter.ts",
+    "src/shared/design-program-quality.ts",
+    "src/ui/App.tsx",
+    "src/ui/chat-task-bridge.ts",
+    "src/ui/chat-task.ts",
+    "src/ui/companion-client.ts",
+    "src/ui/design-program-bridge.ts",
+    "src/ui/fw5-visual-review-adapter.ts",
+    "src/ui/native-bridge-reply.ts",
+    "src/ui/task-native-bridge.ts",
+    "src/ui/universal-design-task.ts",
+    "tests/chat-generation.test.ts",
+    "tests/companion-client.test.ts",
+    "tests/companion-server.test.ts",
+    "tests/design-program.test.ts",
+    "tests/fw5-visual-qa.test.ts",
+    "tests/native-bridge-protocol.test.ts",
+    "tests/plugin-runtime-compatibility.test.ts",
+    "tests/universal-design-chat.test.ts"
+  ],
+  "checks": {
+    "npm run typecheck": "pass",
+    "npm run lint": "pass",
+    "npm run build": "pass via npm pretest",
+    "npm test -- --silent=passed-only": {
+      "baseline": {
+        "passed": 850,
+        "skipped": 1,
+        "filesPassed": 50
+      },
+      "final": {
+        "passed": 869,
+        "skipped": 1,
+        "filesPassed": 51
+      }
+    },
+    "npx --no-install tsc -p tsconfig.companion.json": "pass",
+    "npm run verify:phase5": {
+      "status": "pass",
+      "runtimeTests": 3,
+      "mixedArtifacts": "baseline and current UI IDs against both emitted controllers"
+    },
+    "git diff --check": "pass",
+    "targetedGates": {
+      "passed": 45,
+      "filesPassed": 5,
+      "files": [
+        "design-context.test.ts",
+        "fw3-native-batch.test.ts",
+        "fw4-geometry-convergence.test.ts",
+        "fw5-visual-qa.test.ts",
+        "fw7-production-instrumentation.test.ts"
+      ]
+    }
+  },
+  "defaults": {
+    "FW2": false,
+    "FW3": false,
+    "FW4": false,
+    "FW5": false,
+    "FW5Mode": "capture-only",
+    "FW7": false
+  },
+  "benchmark": {
+    "command": "node node_modules/vitest/vitest.mjs run tests/universal-design-chat.test.ts --maxWorkers=1 -t 'measures bounded screen scheduling' --silent=passed-only",
+    "boundaries": {
+      "provider": "scripted fake with gated out-of-order completion and fixed 60/15 ms delays",
+      "native": "production renderer and inspector with fake Figma API",
+      "checkpoint": "in-memory adapter",
+      "measurements": "host wall-clock and adapter counts"
+    },
+    "baseline": [
+      {
+        "fixture": "F1",
+        "domain": "F1 housing dashboard · Persian RTL",
+        "screens": 1,
+        "repetition": 1,
+        "elapsedMs": 300,
+        "providerRequests": 3,
+        "providerRounds": 3,
+        "providerInputBytes": 9172,
+        "intentRequests": 1,
+        "intentClassificationMs": 4,
+        "peakModelCalls": 1,
+        "firstNativeMs": 248,
+        "firstVerifiedMs": 261,
+        "providerMs": 107,
+        "compositionMs": 90,
+        "queueWaitMs": 0,
+        "normalizationMs": 6,
+        "preflightMs": 45,
+        "persistenceMs": 14,
+        "nativeMs": 34,
+        "readbackMs": 7,
+        "nativeNodes": 10,
+        "nativeBatches": 1,
+        "nativeRenderAdapterCalls": 1,
+        "nativeReadbackAdapterCalls": 1,
+        "checkpointSaveAdapterCalls": 13,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F1",
+        "domain": "F1 housing dashboard · Persian RTL",
+        "screens": 1,
+        "repetition": 2,
+        "elapsedMs": 149,
+        "providerRequests": 3,
+        "providerRounds": 3,
+        "providerInputBytes": 9172,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 1,
+        "firstNativeMs": 133,
+        "firstVerifiedMs": 139,
+        "providerMs": 68,
+        "compositionMs": 66,
+        "queueWaitMs": 0,
+        "normalizationMs": 1,
+        "preflightMs": 6,
+        "persistenceMs": 13,
+        "nativeMs": 25,
+        "readbackMs": 2,
+        "nativeNodes": 10,
+        "nativeBatches": 1,
+        "nativeRenderAdapterCalls": 1,
+        "nativeReadbackAdapterCalls": 1,
+        "checkpointSaveAdapterCalls": 13,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F1",
+        "domain": "F1 housing dashboard · Persian RTL",
+        "screens": 1,
+        "repetition": 3,
+        "elapsedMs": 138,
+        "providerRequests": 3,
+        "providerRounds": 3,
+        "providerInputBytes": 9172,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 1,
+        "firstNativeMs": 126,
+        "firstVerifiedMs": 131,
+        "providerMs": 81,
+        "compositionMs": 80,
+        "queueWaitMs": 0,
+        "normalizationMs": 1,
+        "preflightMs": 5,
+        "persistenceMs": 9,
+        "nativeMs": 16,
+        "readbackMs": 1,
+        "nativeNodes": 10,
+        "nativeBatches": 1,
+        "nativeRenderAdapterCalls": 1,
+        "nativeReadbackAdapterCalls": 1,
+        "checkpointSaveAdapterCalls": 13,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F2",
+        "domain": "two-screen online shop",
+        "screens": 2,
+        "repetition": 1,
+        "elapsedMs": 206,
+        "providerRequests": 4,
+        "providerRounds": 4,
+        "providerInputBytes": 12606,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 160,
+        "firstVerifiedMs": 166,
+        "providerMs": 147,
+        "compositionMs": 146,
+        "queueWaitMs": 0,
+        "normalizationMs": 2,
+        "preflightMs": 10,
+        "persistenceMs": 18,
+        "nativeMs": 35,
+        "readbackMs": 2,
+        "nativeNodes": 20,
+        "nativeBatches": 2,
+        "nativeRenderAdapterCalls": 2,
+        "nativeReadbackAdapterCalls": 2,
+        "checkpointSaveAdapterCalls": 18,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F2",
+        "domain": "two-screen online shop",
+        "screens": 2,
+        "repetition": 2,
+        "elapsedMs": 179,
+        "providerRequests": 4,
+        "providerRounds": 4,
+        "providerInputBytes": 12606,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 135,
+        "firstVerifiedMs": 139,
+        "providerMs": 115,
+        "compositionMs": 114,
+        "queueWaitMs": 0,
+        "normalizationMs": 2,
+        "preflightMs": 7,
+        "persistenceMs": 11,
+        "nativeMs": 38,
+        "readbackMs": 2,
+        "nativeNodes": 20,
+        "nativeBatches": 2,
+        "nativeRenderAdapterCalls": 2,
+        "nativeReadbackAdapterCalls": 2,
+        "checkpointSaveAdapterCalls": 18,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F2",
+        "domain": "two-screen online shop",
+        "screens": 2,
+        "repetition": 3,
+        "elapsedMs": 185,
+        "providerRequests": 4,
+        "providerRounds": 4,
+        "providerInputBytes": 12606,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 156,
+        "firstVerifiedMs": 161,
+        "providerMs": 123,
+        "compositionMs": 122,
+        "queueWaitMs": 0,
+        "normalizationMs": 2,
+        "preflightMs": 10,
+        "persistenceMs": 14,
+        "nativeMs": 29,
+        "readbackMs": 2,
+        "nativeNodes": 20,
+        "nativeBatches": 2,
+        "nativeRenderAdapterCalls": 2,
+        "nativeReadbackAdapterCalls": 2,
+        "checkpointSaveAdapterCalls": 18,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F3",
+        "domain": "appointment booking · Persian RTL",
+        "screens": 3,
+        "repetition": 1,
+        "elapsedMs": 285,
+        "providerRequests": 5,
+        "providerRounds": 5,
+        "providerInputBytes": 21208,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 135,
+        "firstVerifiedMs": 140,
+        "providerMs": 125,
+        "compositionMs": 124,
+        "queueWaitMs": 40,
+        "normalizationMs": 2,
+        "preflightMs": 12,
+        "persistenceMs": 95,
+        "nativeMs": 62,
+        "readbackMs": 6,
+        "nativeNodes": 32,
+        "nativeBatches": 3,
+        "nativeRenderAdapterCalls": 3,
+        "nativeReadbackAdapterCalls": 3,
+        "checkpointSaveAdapterCalls": 23,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F3",
+        "domain": "appointment booking · Persian RTL",
+        "screens": 3,
+        "repetition": 2,
+        "elapsedMs": 307,
+        "providerRequests": 5,
+        "providerRounds": 5,
+        "providerInputBytes": 21208,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 195,
+        "firstVerifiedMs": 203,
+        "providerMs": 202,
+        "compositionMs": 201,
+        "queueWaitMs": 120,
+        "normalizationMs": 1,
+        "preflightMs": 15,
+        "persistenceMs": 104,
+        "nativeMs": 57,
+        "readbackMs": 5,
+        "nativeNodes": 32,
+        "nativeBatches": 3,
+        "nativeRenderAdapterCalls": 3,
+        "nativeReadbackAdapterCalls": 3,
+        "checkpointSaveAdapterCalls": 23,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F3",
+        "domain": "appointment booking · Persian RTL",
+        "screens": 3,
+        "repetition": 3,
+        "elapsedMs": 302,
+        "providerRequests": 5,
+        "providerRounds": 5,
+        "providerInputBytes": 21208,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 196,
+        "firstVerifiedMs": 203,
+        "providerMs": 190,
+        "compositionMs": 189,
+        "queueWaitMs": 53,
+        "normalizationMs": 1,
+        "preflightMs": 15,
+        "persistenceMs": 51,
+        "nativeMs": 56,
+        "readbackMs": 5,
+        "nativeNodes": 32,
+        "nativeBatches": 3,
+        "nativeRenderAdapterCalls": 3,
+        "nativeReadbackAdapterCalls": 3,
+        "checkpointSaveAdapterCalls": 23,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F10",
+        "domain": "F10 Persian residential building management",
+        "screens": 10,
+        "repetition": 1,
+        "elapsedMs": 702,
+        "providerRequests": 12,
+        "providerRounds": 12,
+        "providerInputBytes": 83546,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 166,
+        "firstVerifiedMs": 172,
+        "providerMs": 566,
+        "compositionMs": 564,
+        "queueWaitMs": 1985,
+        "normalizationMs": 1,
+        "preflightMs": 48,
+        "persistenceMs": 198,
+        "nativeMs": 271,
+        "readbackMs": 23,
+        "nativeNodes": 116,
+        "nativeBatches": 10,
+        "nativeRenderAdapterCalls": 10,
+        "nativeReadbackAdapterCalls": 10,
+        "checkpointSaveAdapterCalls": 58,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:46"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:58"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:70"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:82"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:94"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:106"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:118"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F10",
+        "domain": "F10 Persian residential building management",
+        "screens": 10,
+        "repetition": 2,
+        "elapsedMs": 571,
+        "providerRequests": 12,
+        "providerRounds": 12,
+        "providerInputBytes": 83546,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 143,
+        "firstVerifiedMs": 148,
+        "providerMs": 499,
+        "compositionMs": 498,
+        "queueWaitMs": 1603,
+        "normalizationMs": 0,
+        "preflightMs": 30,
+        "persistenceMs": 168,
+        "nativeMs": 193,
+        "readbackMs": 20,
+        "nativeNodes": 116,
+        "nativeBatches": 10,
+        "nativeRenderAdapterCalls": 10,
+        "nativeReadbackAdapterCalls": 10,
+        "checkpointSaveAdapterCalls": 58,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:46"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:58"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:70"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:82"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:94"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:106"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:118"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F10",
+        "domain": "F10 Persian residential building management",
+        "screens": 10,
+        "repetition": 3,
+        "elapsedMs": 573,
+        "providerRequests": 12,
+        "providerRounds": 12,
+        "providerInputBytes": 83546,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 144,
+        "firstVerifiedMs": 149,
+        "providerMs": 510,
+        "compositionMs": 509,
+        "queueWaitMs": 1607,
+        "normalizationMs": 1,
+        "preflightMs": 31,
+        "persistenceMs": 153,
+        "nativeMs": 193,
+        "readbackMs": 19,
+        "nativeNodes": 116,
+        "nativeBatches": 10,
+        "nativeRenderAdapterCalls": 10,
+        "nativeReadbackAdapterCalls": 10,
+        "checkpointSaveAdapterCalls": 58,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:46"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:58"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:70"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:82"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:94"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:106"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:118"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      }
+    ],
+    "final": [
+      {
+        "fixture": "F1",
+        "domain": "F1 housing dashboard · Persian RTL",
+        "screens": 1,
+        "repetition": 1,
+        "elapsedMs": 294,
+        "providerRequests": 3,
+        "providerRounds": 3,
+        "providerInputBytes": 9039,
+        "intentRequests": 1,
+        "intentClassificationMs": 3,
+        "peakModelCalls": 1,
+        "firstNativeMs": 252,
+        "firstVerifiedMs": 265,
+        "providerMs": 109,
+        "compositionMs": 95,
+        "queueWaitMs": 0,
+        "normalizationMs": 4,
+        "preflightMs": 37,
+        "persistenceMs": 13,
+        "nativeMs": 44,
+        "readbackMs": 7,
+        "nativeNodes": 10,
+        "nativeBatches": 1,
+        "nativeRenderAdapterCalls": 1,
+        "nativeReadbackAdapterCalls": 1,
+        "checkpointSaveAdapterCalls": 13,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F1",
+        "domain": "F1 housing dashboard · Persian RTL",
+        "screens": 1,
+        "repetition": 2,
+        "elapsedMs": 139,
+        "providerRequests": 3,
+        "providerRounds": 3,
+        "providerInputBytes": 9039,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 1,
+        "firstNativeMs": 125,
+        "firstVerifiedMs": 131,
+        "providerMs": 67,
+        "compositionMs": 66,
+        "queueWaitMs": 0,
+        "normalizationMs": 1,
+        "preflightMs": 4,
+        "persistenceMs": 12,
+        "nativeMs": 18,
+        "readbackMs": 1,
+        "nativeNodes": 10,
+        "nativeBatches": 1,
+        "nativeRenderAdapterCalls": 1,
+        "nativeReadbackAdapterCalls": 1,
+        "checkpointSaveAdapterCalls": 13,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F1",
+        "domain": "F1 housing dashboard · Persian RTL",
+        "screens": 1,
+        "repetition": 3,
+        "elapsedMs": 114,
+        "providerRequests": 3,
+        "providerRounds": 3,
+        "providerInputBytes": 9039,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 1,
+        "firstNativeMs": 101,
+        "firstVerifiedMs": 106,
+        "providerMs": 64,
+        "compositionMs": 63,
+        "queueWaitMs": 0,
+        "normalizationMs": 0,
+        "preflightMs": 2,
+        "persistenceMs": 8,
+        "nativeMs": 20,
+        "readbackMs": 1,
+        "nativeNodes": 10,
+        "nativeBatches": 1,
+        "nativeRenderAdapterCalls": 1,
+        "nativeReadbackAdapterCalls": 1,
+        "checkpointSaveAdapterCalls": 13,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F2",
+        "domain": "two-screen online shop",
+        "screens": 2,
+        "repetition": 1,
+        "elapsedMs": 186,
+        "providerRequests": 4,
+        "providerRounds": 4,
+        "providerInputBytes": 12577,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 146,
+        "firstVerifiedMs": 151,
+        "providerMs": 120,
+        "compositionMs": 119,
+        "queueWaitMs": 0,
+        "normalizationMs": 2,
+        "preflightMs": 5,
+        "persistenceMs": 19,
+        "nativeMs": 24,
+        "readbackMs": 2,
+        "nativeNodes": 20,
+        "nativeBatches": 2,
+        "nativeRenderAdapterCalls": 2,
+        "nativeReadbackAdapterCalls": 2,
+        "checkpointSaveAdapterCalls": 18,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F2",
+        "domain": "two-screen online shop",
+        "screens": 2,
+        "repetition": 2,
+        "elapsedMs": 195,
+        "providerRequests": 4,
+        "providerRounds": 4,
+        "providerInputBytes": 12577,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 150,
+        "firstVerifiedMs": 155,
+        "providerMs": 148,
+        "compositionMs": 147,
+        "queueWaitMs": 0,
+        "normalizationMs": 1,
+        "preflightMs": 4,
+        "persistenceMs": 21,
+        "nativeMs": 25,
+        "readbackMs": 2,
+        "nativeNodes": 20,
+        "nativeBatches": 2,
+        "nativeRenderAdapterCalls": 2,
+        "nativeReadbackAdapterCalls": 2,
+        "checkpointSaveAdapterCalls": 18,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F2",
+        "domain": "two-screen online shop",
+        "screens": 2,
+        "repetition": 3,
+        "elapsedMs": 206,
+        "providerRequests": 4,
+        "providerRounds": 4,
+        "providerInputBytes": 12577,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 163,
+        "firstVerifiedMs": 167,
+        "providerMs": 141,
+        "compositionMs": 140,
+        "queueWaitMs": 0,
+        "normalizationMs": 2,
+        "preflightMs": 7,
+        "persistenceMs": 14,
+        "nativeMs": 43,
+        "readbackMs": 2,
+        "nativeNodes": 20,
+        "nativeBatches": 2,
+        "nativeRenderAdapterCalls": 2,
+        "nativeReadbackAdapterCalls": 2,
+        "checkpointSaveAdapterCalls": 18,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F3",
+        "domain": "appointment booking · Persian RTL",
+        "screens": 3,
+        "repetition": 1,
+        "elapsedMs": 207,
+        "providerRequests": 5,
+        "providerRounds": 5,
+        "providerInputBytes": 21012,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 132,
+        "firstVerifiedMs": 137,
+        "providerMs": 155,
+        "compositionMs": 154,
+        "queueWaitMs": 46,
+        "normalizationMs": 1,
+        "preflightMs": 4,
+        "persistenceMs": 30,
+        "nativeMs": 49,
+        "readbackMs": 4,
+        "nativeNodes": 32,
+        "nativeBatches": 3,
+        "nativeRenderAdapterCalls": 3,
+        "nativeReadbackAdapterCalls": 3,
+        "checkpointSaveAdapterCalls": 23,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F3",
+        "domain": "appointment booking · Persian RTL",
+        "screens": 3,
+        "repetition": 2,
+        "elapsedMs": 189,
+        "providerRequests": 5,
+        "providerRounds": 5,
+        "providerInputBytes": 21012,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 126,
+        "firstVerifiedMs": 131,
+        "providerMs": 139,
+        "compositionMs": 138,
+        "queueWaitMs": 43,
+        "normalizationMs": 2,
+        "preflightMs": 6,
+        "persistenceMs": 27,
+        "nativeMs": 32,
+        "readbackMs": 3,
+        "nativeNodes": 32,
+        "nativeBatches": 3,
+        "nativeRenderAdapterCalls": 3,
+        "nativeReadbackAdapterCalls": 3,
+        "checkpointSaveAdapterCalls": 23,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F3",
+        "domain": "appointment booking · Persian RTL",
+        "screens": 3,
+        "repetition": 3,
+        "elapsedMs": 197,
+        "providerRequests": 5,
+        "providerRounds": 5,
+        "providerInputBytes": 21012,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 120,
+        "firstVerifiedMs": 125,
+        "providerMs": 132,
+        "compositionMs": 131,
+        "queueWaitMs": 40,
+        "normalizationMs": 3,
+        "preflightMs": 5,
+        "persistenceMs": 30,
+        "nativeMs": 42,
+        "readbackMs": 4,
+        "nativeNodes": 32,
+        "nativeBatches": 3,
+        "nativeRenderAdapterCalls": 3,
+        "nativeReadbackAdapterCalls": 3,
+        "checkpointSaveAdapterCalls": 23,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F10",
+        "domain": "F10 Persian residential building management",
+        "screens": 10,
+        "repetition": 1,
+        "elapsedMs": 629,
+        "providerRequests": 12,
+        "providerRounds": 12,
+        "providerInputBytes": 83504,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 139,
+        "firstVerifiedMs": 145,
+        "providerMs": 459,
+        "compositionMs": 458,
+        "queueWaitMs": 1570,
+        "normalizationMs": 1,
+        "preflightMs": 12,
+        "persistenceMs": 170,
+        "nativeMs": 236,
+        "readbackMs": 24,
+        "nativeNodes": 116,
+        "nativeBatches": 10,
+        "nativeRenderAdapterCalls": 10,
+        "nativeReadbackAdapterCalls": 10,
+        "checkpointSaveAdapterCalls": 58,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:46"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:58"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:70"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:82"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:94"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:106"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:118"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F10",
+        "domain": "F10 Persian residential building management",
+        "screens": 10,
+        "repetition": 2,
+        "elapsedMs": 594,
+        "providerRequests": 12,
+        "providerRounds": 12,
+        "providerInputBytes": 83504,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 147,
+        "firstVerifiedMs": 153,
+        "providerMs": 485,
+        "compositionMs": 484,
+        "queueWaitMs": 1611,
+        "normalizationMs": 0,
+        "preflightMs": 11,
+        "persistenceMs": 166,
+        "nativeMs": 215,
+        "readbackMs": 20,
+        "nativeNodes": 116,
+        "nativeBatches": 10,
+        "nativeRenderAdapterCalls": 10,
+        "nativeReadbackAdapterCalls": 10,
+        "checkpointSaveAdapterCalls": 58,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:46"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:58"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:70"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:82"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:94"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:106"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:118"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      },
+      {
+        "fixture": "F10",
+        "domain": "F10 Persian residential building management",
+        "screens": 10,
+        "repetition": 3,
+        "elapsedMs": 572,
+        "providerRequests": 12,
+        "providerRounds": 12,
+        "providerInputBytes": 83504,
+        "intentRequests": 1,
+        "intentClassificationMs": 0,
+        "peakModelCalls": 2,
+        "firstNativeMs": 144,
+        "firstVerifiedMs": 149,
+        "providerMs": 511,
+        "compositionMs": 509,
+        "queueWaitMs": 1580,
+        "normalizationMs": 0,
+        "preflightMs": 12,
+        "persistenceMs": 161,
+        "nativeMs": 191,
+        "readbackMs": 19,
+        "nativeNodes": 116,
+        "nativeBatches": 10,
+        "nativeRenderAdapterCalls": 10,
+        "nativeReadbackAdapterCalls": 10,
+        "checkpointSaveAdapterCalls": 58,
+        "checkpointReadbacks": null,
+        "nativeRootIds": [
+          {
+            "screenId": "screen-01",
+            "nodeId": "mock:14"
+          },
+          {
+            "screenId": "screen-02",
+            "nodeId": "mock:24"
+          },
+          {
+            "screenId": "screen-03",
+            "nodeId": "mock:34"
+          },
+          {
+            "screenId": "screen-04",
+            "nodeId": "mock:46"
+          },
+          {
+            "screenId": "screen-05",
+            "nodeId": "mock:58"
+          },
+          {
+            "screenId": "screen-06",
+            "nodeId": "mock:70"
+          },
+          {
+            "screenId": "screen-07",
+            "nodeId": "mock:82"
+          },
+          {
+            "screenId": "screen-08",
+            "nodeId": "mock:94"
+          },
+          {
+            "screenId": "screen-09",
+            "nodeId": "mock:106"
+          },
+          {
+            "screenId": "screen-10",
+            "nodeId": "mock:118"
+          }
+        ],
+        "duplicateNativeRoots": 0,
+        "falseCompletion": false
+      }
+    ]
+  },
+  "liveDesktop": "pending",
+  "actualProviderCalls": 0
+}

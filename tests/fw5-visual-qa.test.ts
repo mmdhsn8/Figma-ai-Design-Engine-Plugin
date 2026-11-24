@@ -161,6 +161,7 @@ async function runTaskCheckpointCapture(captureFails = false, reviewOptions?: {
   consent?: boolean;
   mode?: "review" | "review+bounded-repair";
   providerAdapter?: boolean;
+  imageInput?: "unknown" | "unsupported";
   geometryMismatch?: boolean;
   repairVisual?: (request: Extract<UIToPluginMessage, { type: "task-native-visual-repair" }>) => Promise<Extract<PluginToUIMessage, { type: "task-native-visual-repair-result" }>>;
 }) {
@@ -334,7 +335,8 @@ async function runTaskCheckpointCapture(captureFails = false, reviewOptions?: {
     mode: reviewOptions.mode ?? "review",
     token: "paired-local-token",
     model: "account-model",
-    models: [{ slug: "account-model", displayName: "Account Model" }],
+    models: [{ slug: "account-model", displayName: "Account Model",
+      imageInput: reviewOptions.imageInput === "unknown" ? undefined : reviewOptions.imageInput ?? "supported" }],
     session: providerSession,
     task,
     assertCurrent: () => undefined,
@@ -980,6 +982,13 @@ describe("FW-5 visual evidence contract and native exporter", () => {
     expect(repairVisual).not.toHaveBeenCalled();
     expect(task.universalScreens?.[0]?.visualQa).toBeUndefined();
     expect(saved.every((snapshot) => snapshot.universalScreens?.every((screen) => !Object.hasOwn(screen, "visualQa")))).toBe(true);
+  });
+
+  it.each(["unknown", "unsupported"] as const)("does not prompt for or transmit pixels with %s image input", async (imageInput) => {
+    const { task, providerPrompts, providerFetcher } = await runTaskCheckpointCapture(false, { providerAdapter: true, imageInput, mode: "review" });
+    expect(providerPrompts).toHaveLength(0);
+    expect(providerFetcher).not.toHaveBeenCalled();
+    expect(task.universalScreens?.[0]?.visualQa?.visualReview).toBe(imageInput === "unknown" ? "VISUAL_REVIEW_UNAVAILABLE" : "VISUAL_REVIEW_UNSUPPORTED");
   });
 
   it("does not invoke the image reviewer when request-scoped consent is absent", async () => {

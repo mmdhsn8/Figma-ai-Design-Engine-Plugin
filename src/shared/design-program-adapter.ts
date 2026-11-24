@@ -1,14 +1,13 @@
 import type {
   DesignNode,
   FrameNodeSpec,
-  SizingMode,
 } from "./schema";
 import {
   parseMultiScreenValue,
   type MultiScreenSpec,
 } from "./multi-screen-schema";
 import { auditVisualQuality } from "./visual-quality";
-import { auditDesignProgramContrast, programColor, programPageColor } from "./design-program-quality";
+import { auditDesignProgramComposition, auditDesignProgramContrast, programColor, programPageColor } from "./design-program-quality";
 import type { VisualAsset } from "./visual-schema";
 import {
   designProgramTokens,
@@ -32,8 +31,8 @@ function semanticRadius(semanticRole: string, program: DesignProgramV1): number 
   return radii.compact;
 }
 
-function sizing(mode: SizingMode): SizingMode {
-  return mode;
+function reverseInlineAlignment<T extends string>(alignment: T): T | "start" | "end" {
+  return alignment === "start" ? "end" : alignment === "end" ? "start" : alignment;
 }
 
 function safeCounterAlign(
@@ -52,7 +51,7 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
     width: node.width.value,
     height: node.height.value,
     sizing: {
-      width: sizing(node.width.mode), height: sizing(node.height.mode),
+      width: node.width.mode, height: node.height.mode,
       ...(node.width.min === undefined ? {} : { minWidth: node.width.min }),
       ...(node.width.max === undefined ? {} : { maxWidth: node.width.max }),
       ...(node.height.min === undefined ? {} : { minHeight: node.height.min }),
@@ -65,8 +64,9 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
     const children = node.children.map((child) => nodeToNative(child, program, screenId, direction, availableAssetIds));
     const rtlRow = direction === "rtl" && node.layout.axis === "row";
     if (rtlRow) children.reverse();
-    const align = node.layout.align;
-    const primaryAxisAlign = rtlRow && (align === "start" || align === "end") ? (align === "start" ? "end" : "start") : align;
+    const primaryAxisAlign = rtlRow ? reverseInlineAlignment(node.layout.align) : node.layout.align;
+    const crossAlign = direction === "rtl" && node.layout.axis === "column"
+      ? reverseInlineAlignment(node.layout.crossAlign) : node.layout.crossAlign;
     return {
       ...common,
       type: "frame",
@@ -79,7 +79,7 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
         gap: node.layout.gap,
         padding: node.layout.padding,
         primaryAxisAlign,
-        counterAxisAlign: safeCounterAlign(node.layout.crossAlign, node.children, node.layout.axis),
+        counterAxisAlign: safeCounterAlign(crossAlign, node.children, node.layout.axis),
       },
     };
   }
@@ -142,7 +142,7 @@ export function compileDesignProgram(value: unknown, options: { assets?: VisualA
       type: "frame", name: `${screen.id} content`, width: screen.viewport.width, height: contentHeight,
       sizing: { width: "fixed", height: "fixed" },
       background: pageColor,
-      layout: { mode: "vertical", padding: { top: 24, right: 24, bottom: 24, left: 24 }, counterAxisAlign: "start" },
+      layout: { mode: "vertical", padding: { top: 24, right: 24, bottom: 24, left: 24 }, counterAxisAlign: program.locale.direction === "rtl" ? "end" : "start" },
       children: [nodeToNative(screen.root, program, screen.id, program.locale.direction, new Set(assets.map(({ id }) => id)))],
       logicalRef: `${program.id}.${screen.id}.content`.slice(0, 120),
     };
@@ -192,6 +192,7 @@ export function compileDesignProgram(value: unknown, options: { assets?: VisualA
     if (diagnostic.code !== "low-contrast")
       findings.push({ code: `quality_${diagnostic.code}`, path: diagnostic.path, message: diagnostic.message, severity: "warning" });
   }
+  findings.push(...auditDesignProgramComposition(program));
   const semanticRoles: Array<{ logicalRef: string; role: string }> = [];
   for (const screen of program.screens) {
     const visit = (node: DesignProgramNode) => {
