@@ -30,6 +30,7 @@ import { fw7CorrelationHash } from "../shared/fw7-observability";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
 const COMPANION_RESTORE_TICKET_KEY = "companion-restore-ticket-v1";
+let checkpointRuntimeCompatible = false;
 
 function send(message: PluginToUIMessage, taskId?: string): void {
   figma.ui.postMessage(message);
@@ -142,6 +143,27 @@ async function fontWarnings(input: DesignSpec | MultiScreenSpec): Promise<string
 
 figma.ui.onmessage = async (rawMessage: unknown) => {
   if (rawMessage && typeof rawMessage === "object" && "type" in rawMessage &&
+      rawMessage.type === "plugin-runtime-handshake") {
+    const handshake = UIToPluginSchema.safeParse(rawMessage);
+    if (!handshake.success) {
+      checkpointRuntimeCompatible = false;
+      send({ type: "protocol-error", requestId: toolRequestId(rawMessage), message: "The plugin runtime handshake was invalid. Reload the development plugin." });
+      return;
+    }
+    if (handshake.data.type !== "plugin-runtime-handshake") return;
+    const compatible = handshake.data.protocolVersion === 1 && handshake.data.buildId === FW7_BUILD_ID;
+    checkpointRuntimeCompatible = compatible;
+    send({
+      type: "plugin-runtime-handshake-result",
+      requestId: handshake.data.requestId,
+      protocolVersion: 1,
+      uiBuildId: handshake.data.buildId,
+      pluginBuildId: FW7_BUILD_ID,
+      compatible,
+    });
+    return;
+  }
+  if (rawMessage && typeof rawMessage === "object" && "type" in rawMessage &&
       (rawMessage.type === "chat-task-save" || rawMessage.type === "chat-task-load")) {
     const request = rawMessage as { requestId?: unknown; documentId?: unknown };
     const requestId = typeof request.requestId === "string" && request.requestId.length <= 100
@@ -162,6 +184,10 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       type: "chat-task-result", requestId, documentId, success: false,
       errorCategory: "checkpoint_storage", errorCode, error,
     });
+    if (!checkpointRuntimeCompatible) {
+      rejectCheckpoint("checkpoint_build_mismatch", "The UI and Figma plugin builds have not completed a compatible checkpoint handshake. Reload the development plugin and reopen it.");
+      return;
+    }
     const wire = rawMessage.type === "chat-task-load" ? "load" : "taskJson" in rawMessage ? "json" : "object";
     traceCheckpoint("controller", "received", requestId, { operation: rawMessage.type, wire, buildId: FW7_BUILD_ID });
     try {
@@ -197,6 +223,8 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     });
     return;
   }
+  // Handshake handling above replies before schema-based operation dispatch.
+  if (message.data.type === "plugin-runtime-handshake") return;
   if (["design-program-render", "task-native-inspect", "task-native-visual-capture", "task-native-visual-repair"].includes(message.data.type)) {
     const request = message.data as UIToPluginMessage & { requestId?: string; taskId?: string };
     const runId = request.taskId ?? request.requestId ?? "plugin-unscoped";

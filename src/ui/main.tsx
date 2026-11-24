@@ -1,7 +1,10 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { FW7_BUILD_ID } from "../shared/fw7-feature";
 import styles from "./styles.css?inline";
+
+(window as Window & { __fadBuildId?: string }).__fadBuildId = FW7_BUILD_ID;
 
 const style = document.createElement("style");
 style.textContent = styles;

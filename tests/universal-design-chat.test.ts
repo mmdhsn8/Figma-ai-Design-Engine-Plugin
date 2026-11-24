@@ -17,6 +17,7 @@ import { brandAssetContentHash, BrandKitRevisionSchema, createBrandVisualAsset, 
 import { ONE_PIXEL_PNG } from "./visual-fixtures";
 import { CompanionClientError, type AuthorizedChatTurn } from "../src/ui/companion-client";
 import type { PluginToUIMessage } from "../src/shared/messages";
+import { FW7_BUILD_ID } from "../src/shared/fw7-feature";
 import { chatTaskBridge } from "../src/ui/chat-task-bridge";
 import { selectChatExecutionRoute } from "../src/ui/universal-design-route";
 import { createDesignContextController } from "../src/plugin/design-context-controller";
@@ -758,12 +759,20 @@ describe("universal design Chat route", () => {
           success: false, errorCategory: "checkpoint_storage", errorCode: "checkpoint_protocol_error" };
     };
     vi.stubGlobal("window", {
+      __fadBuildId: FW7_BUILD_ID,
       addEventListener: events.addEventListener.bind(events),
       removeEventListener: events.removeEventListener.bind(events),
       setTimeout, clearTimeout,
     });
     vi.stubGlobal("parent", {
-      postMessage: ({ pluginMessage }: { pluginMessage: { requestId: string; taskJson?: string } }) => {
+      postMessage: ({ pluginMessage }: { pluginMessage: { requestId: string; taskJson?: string; type?: string; buildId?: string } }) => {
+        if (pluginMessage.type === "plugin-runtime-handshake") {
+          events.dispatchEvent(new MessageEvent("message", { data: { pluginMessage: {
+            type: "plugin-runtime-handshake-result", requestId: pluginMessage.requestId,
+            protocolVersion: 1, uiBuildId: FW7_BUILD_ID, pluginBuildId: FW7_BUILD_ID, compatible: true,
+          } } }));
+          return;
+        }
         void handle(pluginMessage).then((response) => {
           events.dispatchEvent(new MessageEvent("message", { data: { pluginMessage: response } }));
         });

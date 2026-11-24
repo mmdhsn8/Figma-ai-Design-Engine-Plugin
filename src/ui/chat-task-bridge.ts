@@ -25,11 +25,58 @@ export class ChatTaskBridgeError extends Error {
   }
 }
 
+let runtimeHandshake: Promise<void> | undefined;
+
+function ensureCheckpointRuntime() {
+  if (runtimeHandshake) return runtimeHandshake;
+  runtimeHandshake = new Promise<void>((resolve, reject) => {
+    const uiBuildId = (window as Window & { __fadBuildId?: string }).__fadBuildId ?? FW7_BUILD_ID;
+    const requestId = `checkpoint-runtime-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const finish = (error?: ChatTaskBridgeError) => {
+      clearTimeout(deadline);
+      window.removeEventListener("message", receive);
+      if (error) reject(error);
+      else resolve();
+    };
+    const receive = (event: MessageEvent) => {
+      const raw = event.data?.pluginMessage;
+      if (raw?.requestId !== requestId) return;
+      const parsed = PluginToUISchema.safeParse(raw);
+      if (!parsed.success || parsed.data.type !== "plugin-runtime-handshake-result") return;
+      const result = parsed.data;
+      if (result.compatible && result.protocolVersion === 1 && result.uiBuildId === uiBuildId && result.pluginBuildId === uiBuildId) {
+        finish();
+        return;
+      }
+      finish(new ChatTaskBridgeError(
+        `The UI and Figma plugin builds are incompatible (${result.uiBuildId} / ${result.pluginBuildId}). Reload the development plugin and reopen it.`,
+        "checkpoint_build_mismatch",
+      ));
+    };
+    const deadline = window.setTimeout(() => finish(new ChatTaskBridgeError(
+      "Figma did not confirm that the UI and plugin builds match. Reload the development plugin and reopen it.",
+      "checkpoint_build_mismatch",
+    )), 3_000);
+    window.addEventListener("message", receive);
+    parent.postMessage({ pluginMessage: {
+      type: "plugin-runtime-handshake",
+      requestId,
+      protocolVersion: 1,
+      buildId: uiBuildId,
+    } }, "*");
+  }).catch((error: unknown) => {
+    runtimeHandshake = undefined;
+    throw error;
+  });
+  return runtimeHandshake;
+}
+
 type CheckpointResult = Extract<PluginToUIMessage, { type: "chat-task-result" }>;
 
-export function chatTaskBridge(
+export async function chatTaskBridge(
   message: Extract<UIToPluginMessage, { type: "chat-task-load" | "chat-task-save" }>,
 ) {
+  await ensureCheckpointRuntime();
   const json = message.type === "chat-task-save" ? checkpointJson(message.task) : undefined;
   const expected = json === undefined ? undefined : checkpointRevision(json);
   const outbound =
@@ -168,13 +215,15 @@ export function chatTaskBridge(
   });
 }
 
-export function chatHistoryBridge(
+export async function chatHistoryBridge(
   message: Extract<
     UIToPluginMessage,
     { type: "chat-history-load" | "chat-history-upsert" | "chat-history-delete" | "chat-history-delete-all" }
   >,
 ) {
-  return new Promise<Extract<PluginToUIMessage, { type: "chat-history-result" }>>(
+  const mutating = message.type === "chat-history-upsert" || message.type === "chat-history-delete" || message.type === "chat-history-delete-all";
+  if (mutating) await ensureCheckpointRuntime();
+  return await new Promise<Extract<PluginToUIMessage, { type: "chat-history-result" }>>(
     (resolve, reject) => {
       const finish = () => {
         clearTimeout(timer);
@@ -182,6 +231,11 @@ export function chatHistoryBridge(
       };
       const receive = (event: MessageEvent) => {
         const parsed = PluginToUISchema.safeParse(event.data?.pluginMessage);
+        if (parsed.success && parsed.data.type === "protocol-error" && parsed.data.requestId === message.requestId) {
+          finish();
+          reject(new Error(parsed.data.message.slice(0, 300)));
+          return;
+        }
         if (
           !parsed.success ||
           parsed.data.type !== "chat-history-result" ||

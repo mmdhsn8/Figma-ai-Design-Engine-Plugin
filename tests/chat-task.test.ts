@@ -5016,6 +5016,7 @@ describe("document-scoped canvas task checkpoints", () => {
     } as unknown as PluginAPI;
     const events = new EventTarget();
     const fakeWindow = {
+      __fadBuildId: "source-unknown",
       addEventListener: events.addEventListener.bind(events),
       removeEventListener: events.removeEventListener.bind(events),
       setTimeout: globalThis.setTimeout.bind(globalThis),
@@ -5027,6 +5028,11 @@ describe("document-scoped canvas task checkpoints", () => {
       events.dispatchEvent(event);
     };
     const parentPostMessage = vi.fn(({ pluginMessage }: { pluginMessage: unknown }) => {
+      if (pluginMessage && typeof pluginMessage === "object" && "type" in pluginMessage && pluginMessage.type === "plugin-runtime-handshake") {
+        const handshake = pluginMessage as unknown as { requestId: string; buildId: string };
+        dispatch({ type: "plugin-runtime-handshake-result", requestId: handshake.requestId, protocolVersion: 1, uiBuildId: handshake.buildId, pluginBuildId: handshake.buildId, compatible: true });
+        return;
+      }
       const decoded = decodeChatTaskStorageMessage(pluginMessage);
       if (!decoded.success) throw new Error(decoded.code);
       const message = decoded.data;
@@ -5047,8 +5053,9 @@ describe("document-scoped canvas task checkpoints", () => {
         task: checkpoint,
       });
       await vi.advanceTimersByTimeAsync(10_000);
-      expect(parentPostMessage).toHaveBeenCalledTimes(2);
-      expect(parentPostMessage.mock.calls[1]?.[0].pluginMessage).toMatchObject({ type: "chat-task-load" });
+      const sentMessages = parentPostMessage.mock.calls.map(([call]) => call.pluginMessage);
+      expect(sentMessages.filter((message) => typeof message === "object" && message !== null && "type" in message && message.type === "chat-task-save")).toHaveLength(1);
+      expect(sentMessages.find((message) => typeof message === "object" && message !== null && "type" in message && message.type === "chat-task-load")).toMatchObject({ type: "chat-task-load" });
       await vi.advanceTimersByTimeAsync(2_500);
       await expect(pendingSave).resolves.toMatchObject({ success: true, requestId: "large-screen-save-0001" });
 
@@ -5090,6 +5097,7 @@ describe("document-scoped canvas task checkpoints", () => {
     } as unknown as PluginAPI;
     const events = new EventTarget();
     const fakeWindow = {
+      __fadBuildId: "source-unknown",
       addEventListener: events.addEventListener.bind(events),
       removeEventListener: events.removeEventListener.bind(events),
       setTimeout: globalThis.setTimeout.bind(globalThis),
@@ -5101,6 +5109,11 @@ describe("document-scoped canvas task checkpoints", () => {
       events.dispatchEvent(event);
     };
     const parentPostMessage = vi.fn(({ pluginMessage }: { pluginMessage: unknown }) => {
+      if (pluginMessage && typeof pluginMessage === "object" && "type" in pluginMessage && pluginMessage.type === "plugin-runtime-handshake") {
+        const handshake = pluginMessage as unknown as { requestId: string; buildId: string };
+        dispatch({ type: "plugin-runtime-handshake-result", requestId: handshake.requestId, protocolVersion: 1, uiBuildId: handshake.buildId, pluginBuildId: handshake.buildId, compatible: true });
+        return;
+      }
       const decoded = decodeChatTaskStorageMessage(pluginMessage);
       if (!decoded.success) throw new Error(decoded.code);
       const message = decoded.data;
@@ -5121,8 +5134,9 @@ describe("document-scoped canvas task checkpoints", () => {
       const assertion = expect(pendingSave).rejects.toMatchObject({ code });
       await vi.advanceTimersByTimeAsync(15_000);
       await assertion;
-      expect(parentPostMessage.mock.calls.length).toBeGreaterThan(2);
-      expect(parentPostMessage.mock.calls[1]?.[0].pluginMessage).toMatchObject({ type: "chat-task-load" });
+      expect(parentPostMessage.mock.calls.map(([call]) => call.pluginMessage).some(
+        (message) => typeof message === "object" && message !== null && "type" in message && message.type === "chat-task-load",
+      )).toBe(true);
     } finally {
       vi.unstubAllGlobals();
       vi.useRealTimers();

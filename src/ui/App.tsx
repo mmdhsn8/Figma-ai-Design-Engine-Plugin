@@ -696,9 +696,17 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const [pendingDeleteChat, setPendingDeleteChat] = useState<ChatHistoryConversation | "all" | null>(
     null,
   );
+  const [deleteDialogError, setDeleteDialogError] = useState("");
   const [chatSwitchBusy, setChatSwitchBusy] = useState(false);
   const chatSwitching = useRef(false);
-  const closeDeleteDialog = useCallback(() => setPendingDeleteChat(null), []);
+  const openDeleteDialog = useCallback((target: ChatHistoryConversation | "all") => {
+    setDeleteDialogError("");
+    setPendingDeleteChat(target);
+  }, []);
+  const closeDeleteDialog = useCallback(() => {
+    setPendingDeleteChat(null);
+    setDeleteDialogError("");
+  }, []);
   const activeChatIdRef = useRef<string | null>(null);
   const activeChatModel = useRef("");
   const chatSelectionEpoch = useRef(0);
@@ -1235,7 +1243,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
 
       currentRequest.current = null;
       setBusy(false);
-      if (message.type === "validation-result") {
+      if (message.type === "plugin-runtime-handshake-result") {
+        return;
+      } else if (message.type === "validation-result") {
         const counts = message.counts;
         if (message.success && message.multiScreen) {
           setNotice({
@@ -1959,6 +1969,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           : { ...request, type: "chat-history-delete", chatId: target.id },
       );
       if (epoch !== chatSelectionEpoch.current) return;
+      setDeleteDialogError("");
       setHistoryCorruptRecordCount(result.corruptRecordCount ?? 0);
       const history = result.history;
       const removedActive = target === "all" || activeChatIdRef.current === target.id;
@@ -2005,8 +2016,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         }
       }
     } catch (error) {
-      setPendingDeleteChat(null);
-      setChatActivity(error instanceof Error ? error.message : "Chat history could not be deleted.");
+      const message = error instanceof Error ? error.message : "Chat history could not be deleted.";
+      setDeleteDialogError(safeChatProse(message).slice(0, 300));
+      setChatActivity(message);
     } finally {
       if (epoch === chatSelectionEpoch.current) {
         chatSwitching.current = false;
@@ -4491,8 +4503,8 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           onRename={(conversation, title) => void renameConversation(conversation, title)}
           onDuplicate={(conversation) => void duplicateConversation(conversation)}
           onExport={exportConversation}
-          onDelete={setPendingDeleteChat}
-          onDeleteAll={() => setPendingDeleteChat("all")}
+          onDelete={openDeleteDialog}
+          onDeleteAll={() => openDeleteDialog("all")}
         />
       ) : activeView === "more" ? (
         <MoreMenu
@@ -6607,6 +6619,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         <ChatDeleteDialog
           conversation={pendingDeleteChat}
           busy={chatSwitchBusy}
+          error={deleteDialogError}
           onCancel={closeDeleteDialog}
           onConfirm={() => void deleteConversation()}
         />

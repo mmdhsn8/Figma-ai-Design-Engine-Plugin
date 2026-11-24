@@ -4,11 +4,13 @@ import type { ChatHistoryConversation } from "../shared/chat-history";
 export function ChatDeleteDialog({
   conversation,
   busy,
+  error = "",
   onCancel,
   onConfirm,
 }: {
   conversation: ChatHistoryConversation | "all";
   busy: boolean;
+  error?: string;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -64,6 +66,7 @@ export function ChatDeleteDialog({
             ? "This permanently removes all saved chats and their checkpoints for this Figma page, including chats hidden by search. Existing canvas layers are kept."
             : "This permanently removes the conversation and its saved checkpoint. Existing canvas layers are kept."}
         </p>
+        {error && <p className="history-load-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button
             ref={cancelButton}

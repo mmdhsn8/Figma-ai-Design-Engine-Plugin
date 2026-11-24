@@ -7,9 +7,10 @@ import { ChatTaskSchema } from "../src/shared/chat-task";
 import { checkpointJson, checkpointRevision } from "../src/shared/chat-checkpoint-wire";
 import { FW2_FEATURE } from "../src/shared/design-context";
 import { parseProjectPlanDraft, universalJobManifestFingerprint } from "../src/shared/universal-design";
-import { chatTaskBridge } from "../src/ui/chat-task-bridge";
+import { chatHistoryBridge, chatTaskBridge } from "../src/ui/chat-task-bridge";
 
 const pluginBundle = readFileSync(new URL("../dist/plugin.js", import.meta.url), "utf8");
+const bundledBuildId = pluginBundle.match(/git-[A-Za-z0-9._:+-]{1,100}/u)?.[0] ?? "source-unknown";
 
 function savedFingerprint(value: unknown): string {
   const json = checkpointJson(value);
@@ -57,13 +58,15 @@ describe("Figma main sandbox runtime compatibility", () => {
         setAsync: vi.fn(async (key: string, value: unknown) => {
           storage.set(key, JSON.stringify(value));
         }),
-        deleteAsync: vi.fn(async () => undefined),
+        deleteAsync: vi.fn(async (key: string) => { storage.delete(key); }),
         keysAsync: vi.fn(async () => []),
       },
     };
     const sandbox = {
       figma,
       Intl: undefined,
+      setTimeout,
+      clearTimeout,
       console: { log: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     };
     const boot = () => {
@@ -88,6 +91,9 @@ describe("Figma main sandbox runtime compatibility", () => {
     const request = (message: unknown) =>
       (figma.ui.onmessage as (value: unknown) => Promise<void>)(message);
     const result = () => figma.ui.postMessage.mock.lastCall?.[0];
+    const handshake = (requestId: string, buildId: string) => request({
+      type: "plugin-runtime-handshake", requestId, protocolVersion: 1, buildId,
+    });
     await request({
       type: "design-context-read", requestId: "vm-context-01", feature: FW2_FEATURE,
       taskId: "task-vm-01", documentId: "file-1-page-1", intent: "create",
@@ -99,6 +105,12 @@ describe("Figma main sandbox runtime compatibility", () => {
     expect(page.setPluginData).not.toHaveBeenCalled();
     expect(root.setPluginData).not.toHaveBeenCalled();
     expect(storage.size).toBe(0);
+    await handshake("vm-runtime-stale", "stale-ui-build");
+    expect(result()).toMatchObject({ type: "plugin-runtime-handshake-result", compatible: false, uiBuildId: "stale-ui-build", pluginBuildId: bundledBuildId });
+    await request({ type: "chat-task-load", requestId: "vm-no-handshake", documentId: "file-1-page-1" });
+    expect(result()).toMatchObject({ success: false, errorCode: "checkpoint_build_mismatch" });
+    await handshake("vm-runtime-current", bundledBuildId);
+    expect(result()).toMatchObject({ type: "plugin-runtime-handshake-result", compatible: true, uiBuildId: bundledBuildId, pluginBuildId: bundledBuildId });
     const task = ChatTaskSchema.parse({
       version: 1,
       id: "task-vm-01",
@@ -141,6 +153,7 @@ describe("Figma main sandbox runtime compatibility", () => {
     });
 
     boot();
+    await handshake("vm-runtime-reload", bundledBuildId);
     await request({
       type: "chat-task-load",
       requestId: "vm-confirm-01",
@@ -198,6 +211,7 @@ describe("Figma main sandbox runtime compatibility", () => {
     const sent: unknown[] = [];
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     vi.stubGlobal("window", {
+      __fadBuildId: bundledBuildId,
       addEventListener: events.addEventListener.bind(events),
       removeEventListener: events.removeEventListener.bind(events),
       setTimeout: globalThis.setTimeout.bind(globalThis), clearTimeout: globalThis.clearTimeout.bind(globalThis),
@@ -218,8 +232,11 @@ describe("Figma main sandbox runtime compatibility", () => {
     try {
       await expect(chatTaskBridge({ type: "chat-task-save", requestId: "vm-shop-save", ...scope, task: shop }))
         .resolves.toMatchObject({ success: true, revision: shopRevision });
-      expect(sent[0]).toMatchObject({ type: "chat-task-save", ...scope, taskJson: checkpointJson(shop), revision: shopRevision });
-      expect(sent[0]).not.toHaveProperty("task");
+      const sentSave = sent.find((message) => Boolean(
+        message && typeof message === "object" && "type" in message && message.type === "chat-task-save",
+      ));
+      expect(sentSave).toMatchObject({ type: "chat-task-save", ...scope, taskJson: checkpointJson(shop), revision: shopRevision });
+      expect(sentSave).not.toHaveProperty("task");
 
       const durable = [...storage.entries()];
       const writes = figma.clientStorage.setAsync.mock.calls.length;
@@ -249,6 +266,7 @@ describe("Figma main sandbox runtime compatibility", () => {
       expect([...storage.entries()]).toEqual(durable);
 
       boot();
+      await handshake("vm-shop-runtime-reload", bundledBuildId);
       const confirmation = await chatTaskBridge({ type: "chat-task-load", requestId: "vm-shop-confirm", ...scope, confirm: shopRevision });
       expect(confirmation).toMatchObject({ success: true, revision: shopRevision });
       expect(confirmation).not.toHaveProperty("task");
@@ -257,6 +275,27 @@ describe("Figma main sandbox runtime compatibility", () => {
       expect(recovery.task?.universalScreens?.map(({ screenId, nativeRootNodeId }) => [screenId, nativeRootNodeId]))
         .toEqual([["screen-01", undefined], ["screen-02", undefined]]);
       expect(figma.clientStorage.deleteAsync).not.toHaveBeenCalled();
+
+      const historyRecord = {
+        id: scope.chatId,
+        title: "Shop Browse and Product Detail",
+        createdAt: 1,
+        updatedAt: 2,
+        taskState: "running" as const,
+        messages: [],
+      };
+      const savedHistory = await chatHistoryBridge({
+        type: "chat-history-upsert", requestId: "vm-shop-history-save",
+        documentId: scope.documentId, conversation: historyRecord, activeChatId: scope.chatId,
+      });
+      expect(savedHistory.history?.conversations).toEqual([historyRecord]);
+      const deletedHistory = await chatHistoryBridge({
+        type: "chat-history-delete-all", requestId: "vm-shop-history-delete-all", documentId: scope.documentId,
+      });
+      expect(deletedHistory.history).toEqual({ version: 1, activeChatId: null, conversations: [] });
+      expect(storage.has(`fad.chat-task.v2:${scope.documentId}:${scope.chatId}`)).toBe(false);
+      expect(storage.get(`fad.chat-history.v1:${scope.documentId}`)).toBe(JSON.stringify({ version: 1, activeChatId: null, conversations: [] }));
+      expect(page.children).toEqual([]);
     } finally {
       vi.unstubAllGlobals();
       logSpy.mockRestore();

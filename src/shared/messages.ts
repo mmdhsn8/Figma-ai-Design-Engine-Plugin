@@ -245,6 +245,12 @@ const MultiScreenRenderResultSchema = z
   .strict();
 
 export const UIToPluginSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("plugin-runtime-handshake"),
+    requestId: z.string().min(1).max(100),
+    protocolVersion: z.literal(1),
+    buildId: z.string().min(1).max(100),
+  }).strict(),
   ContextReadSchema,
   ContextCancelSchema,
   z
@@ -472,6 +478,14 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
 ]);
 
 export const PluginToUISchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("plugin-runtime-handshake-result"),
+    requestId: z.string().min(1).max(100),
+    protocolVersion: z.number().int(),
+    uiBuildId: z.string().max(100),
+    pluginBuildId: z.string().max(100),
+    compatible: z.boolean(),
+  }).strict(),
   ContextResultSchema,
   DesignSkillStorageResultSchema,
   BrandKitStorageResultSchema,

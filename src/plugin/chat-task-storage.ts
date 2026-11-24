@@ -14,6 +14,7 @@ import { fw7CorrelationHash } from "../shared/fw7-observability";
 const MAX_QUEUED_CHAT_TASK_STORAGE_OPERATIONS = 8;
 const MAX_CHAT_TASK_STORAGE_KEYS = 32;
 const MAX_IN_FLIGHT_CHAT_TASK_SAVES = 8;
+const CHECKPOINT_DELETE_DRAIN_TIMEOUT_MS = 20_000;
 const storageQueues = new Map<string, { tail: Promise<void>; pending: number }>();
 const inFlightSaves = new Map<
   string,
@@ -30,10 +31,29 @@ class ChatTaskStorageBusyError extends Error {
 }
 
 export async function withChatCheckpointDeletion<T>(documentId: string, remove: () => Promise<T>): Promise<T> {
-  if (checkpointDeletions.has(documentId) || [...inFlightSaves.values()].some((save) => save.documentId === documentId))
+  if (checkpointDeletions.has(documentId))
     throw new ChatTaskStorageBusyError("A checkpoint update is still in progress. Wait for it to finish before deleting chats.");
   checkpointDeletions.add(documentId);
   try {
+    // Block new writes first, then let writes already owned by this document finish.
+    const pendingWrites = [...inFlightSaves.values()]
+      .filter((save) => save.documentId === documentId)
+      .map((save) => save.result);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const drained = await Promise.race([
+        Promise.allSettled(pendingWrites).then(() => true),
+        new Promise<boolean>((resolve) => {
+          timeout = setTimeout(() => resolve(false), CHECKPOINT_DELETE_DRAIN_TIMEOUT_MS);
+        }),
+      ]);
+      if (!drained)
+        throw new ChatTaskStorageBusyError(
+          "A checkpoint update did not finish within 20 seconds. No chat data was changed; retry after storage recovery.",
+        );
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
     return await remove();
   } finally {
     checkpointDeletions.delete(documentId);

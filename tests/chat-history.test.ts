@@ -13,6 +13,7 @@ import {
 } from "../src/shared/chat-history";
 import { handleChatHistoryStorage } from "../src/plugin/chat-history-storage";
 import { handleChatTaskStorage } from "../src/plugin/chat-task-storage";
+import { chatHistoryBridge } from "../src/ui/chat-task-bridge";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ChatHistoryView } from "../src/ui/chat-history-view";
@@ -615,26 +616,104 @@ describe("document-scoped chat history", () => {
       await setAsync(key, value);
     });
     const saving = save("first-overlapping-save");
-    const refusedDelete = await handleChatHistoryStorage(mock.api, request);
+    const deleting = handleChatHistoryStorage(mock.api, request);
+    await Promise.resolve();
+    const refusedSave = await save("second-overlapping-save");
+    expect(refusedSave.success).toBe(false);
+    expect(refusedSave.errorCode).toBe("checkpoint_queue_full");
     releaseSave();
     expect((await saving).success).toBe(true);
-    expect(refusedDelete.success).toBe(false);
-    expect(refusedDelete.error).toContain("checkpoint update is still in progress");
-    expect(mock.storage.has(taskKey)).toBe(true);
-
-    const getAsync = mock.api.clientStorage.getAsync;
-    let releaseDelete!: () => void;
-    const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve; });
-    vi.spyOn(mock.api.clientStorage, "getAsync").mockImplementationOnce(async (key) => {
-      await deleteGate;
-      return getAsync(key);
-    });
-    const deleting = handleChatHistoryStorage(mock.api, request);
-    const refusedSave = await save("second-overlapping-save");
-    releaseDelete();
-    expect((await deleting).success).toBe(true);
-    expect(refusedSave.errorCode).toBe("checkpoint_queue_full");
+    const deleted = await deleting;
+    expect(deleted.success, deleted.error).toBe(true);
+    expect(deleted.history?.conversations).toEqual([]);
     expect(mock.storage.has(taskKey)).toBe(false);
     expect(mock.storage.get(historyKey)).toEqual({ version: 1, activeChatId: null, conversations: [] });
+  });
+
+  it("bounds a stuck checkpoint drain without deleting chat data", async () => {
+    vi.useFakeTimers();
+    const mock = createMockApi();
+    const chatId = "conversation-0001";
+    const task = scopedTask(mock.api, chatId, "running");
+    const { documentId } = task;
+    const historyKey = `fad.chat-history.v1:${documentId}`;
+    const taskKey = `fad.chat-task.v2:${documentId}:${chatId}`;
+    await handleChatHistoryStorage(mock.api, {
+      type: "chat-history-upsert", requestId: "save-bounded-history", documentId,
+      conversation: conversation(chatId),
+    });
+    let releaseSave!: () => void;
+    const saveGate = new Promise<void>((resolve) => { releaseSave = resolve; });
+    const setAsync = mock.api.clientStorage.setAsync;
+    vi.spyOn(mock.api.clientStorage, "setAsync").mockImplementationOnce(async (key, value) => {
+      await saveGate;
+      await setAsync(key, value);
+    });
+    const saving = handleChatTaskStorage(mock.api, {
+      type: "chat-task-save", requestId: "save-bounded-checkpoint", documentId, chatId, task,
+    });
+    const deleting = handleChatHistoryStorage(mock.api, {
+      type: "chat-history-delete-all", requestId: "delete-bounded-history", documentId,
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(20_000);
+      const result = await deleting;
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("No chat data was changed");
+      expect((mock.storage.get(historyKey) as { conversations?: unknown[] }).conversations).toHaveLength(1);
+      expect(mock.storage.has(taskKey)).toBe(false);
+      releaseSave();
+      expect((await saving).success).toBe(true);
+      expect(mock.storage.has(taskKey)).toBe(true);
+    } finally {
+      releaseSave();
+      vi.useRealTimers();
+    }
+  });
+
+  it("surfaces a stale plugin protocol rejection immediately from Delete All", async () => {
+    const events = new EventTarget();
+    const fakeWindow = {
+      __fadBuildId: "source-unknown",
+      addEventListener: events.addEventListener.bind(events),
+      removeEventListener: events.removeEventListener.bind(events),
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    } as unknown as Window;
+    const dispatch = (pluginMessage: unknown) => {
+      const event = new Event("message");
+      Object.defineProperty(event, "data", { value: { pluginMessage } });
+      events.dispatchEvent(event);
+    };
+    vi.stubGlobal("window", fakeWindow);
+    vi.stubGlobal("parent", {
+      postMessage: ({ pluginMessage }: { pluginMessage: { type: string; requestId: string; buildId?: string } }) => {
+        if (pluginMessage.type === "plugin-runtime-handshake") {
+          dispatch({
+            type: "plugin-runtime-handshake-result",
+            requestId: pluginMessage.requestId,
+            protocolVersion: 1,
+            uiBuildId: pluginMessage.buildId,
+            pluginBuildId: pluginMessage.buildId,
+            compatible: true,
+          });
+          return;
+        }
+        dispatch({
+          type: "protocol-error",
+          requestId: pluginMessage.requestId,
+          message: "The plugin received an invalid request. Reload the plugin and try again.",
+        });
+      },
+    });
+    try {
+      await expect(chatHistoryBridge({
+        type: "chat-history-delete-all",
+        requestId: "delete-all-history-0001",
+        documentId: "file-page_1",
+      })).rejects.toThrow("Reload the plugin and try again");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
