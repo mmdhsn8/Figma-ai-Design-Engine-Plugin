@@ -48,14 +48,21 @@ describe("Figma loopback companion configuration", () => {
       new URL("../src/companion/main.ts", import.meta.url),
       "utf8",
     );
+    const companionRunner = readFileSync(
+      new URL("../scripts/companion.mjs", import.meta.url),
+      "utf8",
+    );
     const companionConfig = JSON.parse(
       readFileSync(new URL("../tsconfig.companion.json", import.meta.url), "utf8"),
     ) as { compilerOptions: { rootDir: string; outDir: string } };
 
     expect(companionConfig.compilerOptions.rootDir).toBe("src");
     expect(companionConfig.compilerOptions.outDir).toBe("dist-companion");
-    expect(packageJson.scripts.companion).toContain("node dist-companion/companion/main.js");
-    expect(packageJson.scripts.companion).not.toContain("node dist-companion/main.js");
+    expect(packageJson.scripts.companion).toBe("node scripts/companion.mjs");
+    expect(companionRunner).toContain("node_modules/typescript/bin/tsc");
+    expect(companionRunner).toContain("tsconfig.companion.json");
+    expect(companionRunner).toContain("dist-companion/companion/main.js");
+    expect(companionRunner).toContain("FW7_BUILD_ID: buildId");
     expect(companionMain).toContain("FAD_STREAM_IDLE_TIMEOUT_MS");
     expect(companionMain).toContain("FAD_STREAM_OVERALL_TIMEOUT_MS");
   });

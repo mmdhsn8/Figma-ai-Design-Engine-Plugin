@@ -2,18 +2,26 @@ import assert from "node:assert/strict";
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createCompanionServer } from "../dist-companion/companion/server.js";
-import { createDraftStore } from "../dist-companion/companion/draft-store.js";
-import {
-  createDesignPlan,
-  normalizeGeneratedDesignResponse,
-} from "../dist-companion/shared/design-generation.js";
+import { computeBuildIdentity } from "./build-identity.mjs";
+import { verifyBuildIdentityRegression } from "./verify-build-identity.mjs";
 
 const root = new URL("../", import.meta.url);
+const rootPath = fileURLToPath(root);
+const buildId = computeBuildIdentity(rootPath);
+process.env.FW7_BUILD_ID = buildId;
+process.env.FW7_DIAGNOSTICS = "fw7-diagnostics-v1";
+const [{ createCompanionServer }, { createDraftStore }, { createDesignPlan, normalizeGeneratedDesignResponse }, { fw7Telemetry }] = await Promise.all([
+  import("../dist-companion/companion/server.js"),
+  import("../dist-companion/companion/draft-store.js"),
+  import("../dist-companion/shared/design-generation.js"),
+  import("../dist-companion/companion/fw7-runtime.js"),
+]);
+verifyBuildIdentityRegression();
 const readJson = async (path) => JSON.parse(await readFile(new URL(path, root), "utf8"));
 const pluginBundle = await readFile(new URL("dist/plugin.js", root), "utf8");
 const uiHtml = await readFile(new URL("dist/ui.html", root), "utf8");
 const companionServer = await readFile(new URL("dist-companion/companion/server.js", root), "utf8");
+const companionRunner = await readFile(new URL("scripts/companion.mjs", root), "utf8");
 const nativeQualitySource = await readFile(
   new URL("src/shared/native-visual-quality.ts", root),
   "utf8",
@@ -61,13 +69,14 @@ if (process.env.APPDATA) {
     console.log(`Figma Desktop manifest registration verified: ${registrations[0]}`);
   }
 }
-assert.match(
-  pkg.scripts.companion,
-  /tsc -p tsconfig\.companion\.json && node dist-companion\/companion\/main\.js/u,
-);
+assert.equal(pkg.scripts.companion, "node scripts/companion.mjs");
+assert.match(companionRunner, /node_modules\/typescript\/bin\/tsc/u);
+assert.match(companionRunner, /dist-companion\/companion\/main\.js/u);
 assert.equal(manifest.main, "dist/plugin.js");
 assert.equal(manifest.ui, "dist/ui.html");
 assert.ok(uiStart >= 0 && uiEnd > uiStart, "Could not isolate the embedded plugin UI.");
+assert.ok(uiHtml.includes(buildId), "Compiled UI does not carry the current source build identity.");
+assert.ok(pluginBundle.includes(buildId), "Compiled Plugin does not carry the current source build identity.");
 const controllerBundle =
   pluginBundle.slice(0, uiStart) + pluginBundle.slice(uiEnd + uiEndMarker.length);
 assert.doesNotMatch(
@@ -229,6 +238,8 @@ for (const [source, output] of [
 }
 assert.equal(typeof createDraftStore, "function");
 assert.equal(typeof normalizeGeneratedDesignResponse, "function");
+fw7Telemetry.record({ runId: "phase5-build-id", boundary: "task-owner", kind: "task_started", stage: "build_verification", result: "started" });
+assert.equal(fw7Telemetry.snapshot("phase5-build-id")[0]?.buildId, buildId);
 assert.ok(
   createDesignPlan({
     prompt: "Create a two-screen mobile storefront.",
@@ -258,9 +269,7 @@ try {
   assert.equal(health.status, 200);
   assert.deepEqual(await health.json(), { companion: "running" });
   assert.equal(health.headers.get("x-fad-draft-scope"), "generation-v1");
-  console.log(
-    "Compiled companion boots on ephemeral loopback; current plugin/UI/companion entrypoints verified. No OAuth or Figma Desktop acceptance performed.",
-  );
+  console.log(`Compiled companion boots on ephemeral loopback (identity ${buildId}); plugin/UI artifacts match current build inputs. No OAuth or Figma Desktop acceptance performed.`);
 } finally {
   await handle.close();
 }

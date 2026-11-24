@@ -1,0 +1,21 @@
+{
+  "issue": "Dirty source builds collide under the former build identity.",
+  "reproducer": "Create a Git commit, edit the same tracked file twice without committing, and compute git-<short HEAD>+dirty for each edit.",
+  "head": "51dc1a632ded",
+  "states": [
+    {
+      "path": "source.ts",
+      "contents": "const value = 2;",
+      "gitStatus": "M source.ts",
+      "oldBuildId": "git-51dc1a632ded+dirty"
+    },
+    {
+      "path": "source.ts",
+      "contents": "const value = 3;",
+      "gitStatus": "M source.ts",
+      "oldBuildId": "git-51dc1a632ded+dirty"
+    }
+  ],
+  "whyItFailed": "The old identifier recorded only whether the worktree was dirty. It did not include the changed source bytes, so the runtime handshake could accept artifacts built from different uncommitted states.",
+  "observed": "A temporary Git repository reproduced the same identifier for both distinct file contents. The temporary repository was removed after the check."
+}

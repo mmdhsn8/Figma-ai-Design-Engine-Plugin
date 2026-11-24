@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "companion": "tsc -p tsconfig.companion.json && node dist-companion/companion/main.js",
+    "companion": "node scripts/companion.mjs",
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0",
@@ -14,7 +14,7 @@
     "pretest": "npm run build",
     "test": "vitest run",
     "qa:native-repair": "vitest run tests/native-repair-recovery.test.ts tests/native-visual-quality.test.ts --maxWorkers=1",
-    "verify:phase5": "node scripts/verify-phase5-build.mjs",
+    "verify:phase5": "node scripts/verify-phase5-build.mjs && vitest run tests/plugin-runtime-compatibility.test.ts --maxWorkers=1",
     "bench:phase5": "node scripts/benchmark-phase5.mjs",
     "fw7:acceptance": "node docs/figwright-integration/fw-07/collect-events.mjs"
   },
