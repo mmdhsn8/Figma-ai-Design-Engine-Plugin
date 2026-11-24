@@ -17,8 +17,9 @@ const MAX_IN_FLIGHT_CHAT_TASK_SAVES = 8;
 const storageQueues = new Map<string, { tail: Promise<void>; pending: number }>();
 const inFlightSaves = new Map<
   string,
-  { signature: string; result: Promise<ChatTaskStorageResult> }
+  { documentId: string; signature: string; result: Promise<ChatTaskStorageResult> }
 >();
+const checkpointDeletions = new Set<string>();
 const recentSaves = new Map<string, { signature: string; result: ChatTaskStorageResult }>();
 const MAX_RECENT_SAVES = 16;
 
@@ -26,6 +27,17 @@ type ChatTaskStorageResult = Extract<PluginToUIMessage, { type: "chat-task-resul
 
 class ChatTaskStorageBusyError extends Error {
   readonly code = "checkpoint_queue_full";
+}
+
+export async function withChatCheckpointDeletion<T>(documentId: string, remove: () => Promise<T>): Promise<T> {
+  if (checkpointDeletions.has(documentId) || [...inFlightSaves.values()].some((save) => save.documentId === documentId))
+    throw new ChatTaskStorageBusyError("A checkpoint update is still in progress. Wait for it to finish before deleting chats.");
+  checkpointDeletions.add(documentId);
+  try {
+    return await remove();
+  } finally {
+    checkpointDeletions.delete(documentId);
+  }
 }
 
 async function withStorageQueue<T>(key: string, work: () => Promise<T>): Promise<T> {
@@ -70,6 +82,8 @@ export async function handleChatTaskStorage(
   options: ChatTaskStorageOptions = {},
 ): Promise<Extract<PluginToUIMessage, { type: "chat-task-result" }>> {
   if (message.type !== "chat-task-save") return performChatTaskStorage(api, message, options);
+  if (checkpointDeletions.has(message.documentId))
+    return saveRequestConflict(message, "Chat history deletion is in progress.", "checkpoint_queue_full");
   let signature: string;
   try {
     signature = checkpointJson(message.task);
@@ -114,7 +128,7 @@ export async function handleChatTaskStorage(
     );
 
   const result = performChatTaskStorage(api, message, options, signature);
-  inFlightSaves.set(requestKey, { signature, result });
+  inFlightSaves.set(requestKey, { documentId: message.documentId, signature, result });
   const completed = await result;
   inFlightSaves.delete(requestKey);
   if (completed.success) {

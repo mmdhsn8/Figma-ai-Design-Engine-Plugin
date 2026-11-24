@@ -545,12 +545,13 @@ describe("document-scoped chat history", () => {
     expect(mock.roots[0]).toBe(node);
   });
 
-  it.each(["single", "all"])("refuses %s deletion with a running checkpoint and preserves both records", async (mode) => {
+  it.each(["single", "all"])("allows %s deletion of an interrupted chat while preserving canvas layers", async (mode) => {
     const mock = createMockApi();
     const documentId = `${mock.api.fileKey}-${mock.api.currentPage.id.replaceAll(":", "_")}`;
     const chatId = "conversation-0001";
-    const record = conversation(chatId);
+    const record = { ...conversation(chatId), taskState: "running" as const };
     const task = scopedTask(mock.api, chatId, "running");
+    const frame = mock.api.createFrame();
     const savedTask = await handleChatTaskStorage(mock.api, {
       type: "chat-task-save",
       requestId: `save-running-task-${mode}`,
@@ -566,28 +567,74 @@ describe("document-scoped chat history", () => {
       conversation: record,
     });
 
-    const request = { requestId: "refuse-running-delete", documentId };
+    const request = { requestId: "delete-interrupted-chat", documentId };
     const result = await handleChatHistoryStorage(mock.api, mode === "all"
       ? { ...request, type: "chat-history-delete-all" }
       : { ...request, type: "chat-history-delete", chatId });
-    expect(result.success).toBe(false);
-    expect(result.error).toContain("still running");
+    expect(result.success, result.error).toBe(true);
     expect(
       (
         await handleChatTaskStorage(mock.api, {
           type: "chat-task-load",
-          requestId: "running-task-retained",
+          requestId: "interrupted-task-deleted",
           chatId,
         })
       ).task,
-    ).toEqual(task);
+    ).toBeNull();
     expect(
       (
         await handleChatHistoryStorage(mock.api, {
           type: "chat-history-load",
-          requestId: "running-history-retained",
+          requestId: "interrupted-history-deleted",
         })
       ).history?.conversations,
-    ).toEqual([record]);
+    ).toEqual([]);
+    expect(mock.roots).toEqual([frame]);
+  });
+
+  it("keeps a live checkpoint write and Delete All from racing each other", async () => {
+    const mock = createMockApi();
+    const chatId = "conversation-0001";
+    const task = scopedTask(mock.api, chatId, "running");
+    const { documentId } = task;
+    const taskKey = `fad.chat-task.v2:${documentId}:${chatId}`;
+    const historyKey = `fad.chat-history.v1:${documentId}`;
+    await handleChatHistoryStorage(mock.api, {
+      type: "chat-history-upsert", requestId: "save-race-history", documentId,
+      conversation: conversation(chatId),
+    });
+    const request = { type: "chat-history-delete-all", requestId: "delete-race-history", documentId } as const;
+    const save = (requestId: string) => handleChatTaskStorage(mock.api, {
+      type: "chat-task-save", requestId, documentId, chatId, task,
+    });
+    const setAsync = mock.api.clientStorage.setAsync;
+    let releaseSave!: () => void;
+    const saveGate = new Promise<void>((resolve) => { releaseSave = resolve; });
+    vi.spyOn(mock.api.clientStorage, "setAsync").mockImplementationOnce(async (key, value) => {
+      await saveGate;
+      await setAsync(key, value);
+    });
+    const saving = save("first-overlapping-save");
+    const refusedDelete = await handleChatHistoryStorage(mock.api, request);
+    releaseSave();
+    expect((await saving).success).toBe(true);
+    expect(refusedDelete.success).toBe(false);
+    expect(refusedDelete.error).toContain("checkpoint update is still in progress");
+    expect(mock.storage.has(taskKey)).toBe(true);
+
+    const getAsync = mock.api.clientStorage.getAsync;
+    let releaseDelete!: () => void;
+    const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve; });
+    vi.spyOn(mock.api.clientStorage, "getAsync").mockImplementationOnce(async (key) => {
+      await deleteGate;
+      return getAsync(key);
+    });
+    const deleting = handleChatHistoryStorage(mock.api, request);
+    const refusedSave = await save("second-overlapping-save");
+    releaseDelete();
+    expect((await deleting).success).toBe(true);
+    expect(refusedSave.errorCode).toBe("checkpoint_queue_full");
+    expect(mock.storage.has(taskKey)).toBe(false);
+    expect(mock.storage.get(historyKey)).toEqual({ version: 1, activeChatId: null, conversations: [] });
   });
 });

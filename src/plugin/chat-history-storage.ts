@@ -10,6 +10,7 @@ import {
 import { ChatTaskSchema } from "../shared/chat-task";
 import { utf8Bytes } from "../shared/generation-limits";
 import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
+import { withChatCheckpointDeletion } from "./chat-task-storage";
 
 const CHAT_HISTORY_ARCHIVE_MAX_BYTES = 2 * 1024 * 1024;
 const writeQueues = new Map<string, Promise<void>>();
@@ -192,7 +193,7 @@ export async function handleChatHistoryStorage(
       throw new Error(
         "Document/page changed; reopen the original page before changing chat history.",
       );
-    const result = await serializeByKey(key, async () => {
+    const accessHistory = () => serializeByKey(key, async () => {
       const raw: unknown = await api.clientStorage.getAsync(key);
       const archiveRaw: unknown = await api.clientStorage.getAsync(archiveKey);
       const parsedArchive = parsePreservedHistory(archiveRaw);
@@ -301,10 +302,8 @@ export async function handleChatHistoryStorage(
             throw new Error(
               "A chat checkpoint is invalid and was preserved; repair it before deleting this chat.",
             );
-          if (task.data.status === "running")
-            throw new Error(
-              "This task is still running. Stop it and wait for its checkpoint before deleting the chat.",
-            );
+          if (task.data.documentId !== documentId)
+            throw new Error("A saved checkpoint belongs to a different Figma page and was preserved.");
         }
         const nextConversations = current.conversations.filter(({ id }) => !targets.has(id));
         const next: ChatHistoryIndex = {
@@ -358,6 +357,9 @@ export async function handleChatHistoryStorage(
         recoveryCount: recovery.unreadableCount,
       };
     });
+    const result = message.type === "chat-history-delete" || message.type === "chat-history-delete-all"
+      ? await withChatCheckpointDeletion(documentId, accessHistory)
+      : await accessHistory();
     return {
       type: "chat-history-result",
       requestId: message.requestId,

@@ -61,8 +61,8 @@ export function ChatDeleteDialog({
         </h2>
         <p id="delete-chat-description">
           {conversation === "all"
-            ? "This permanently removes all saved chats and their checkpoints for this Figma page, including chats hidden by search. Existing canvas layers are kept. Stop any running tasks before deleting."
-            : "This removes the conversation and its saved checkpoint from this document. Existing Figma canvas layers are not deleted. A task checkpoint marked as running cannot be deleted."}
+            ? "This permanently removes all saved chats and their checkpoints for this Figma page, including chats hidden by search. Existing canvas layers are kept."
+            : "This permanently removes the conversation and its saved checkpoint. Existing canvas layers are kept."}
         </p>
         <div className="dialog-actions">
           <button
