@@ -53,9 +53,9 @@ export function auditDesignProgramContrast(program: DesignProgramV1): DesignProg
 
 export function normalizeDesignProgramContrast(program: DesignProgramV1) {
   const repairs: Array<{ path: string; foreground: string; background: string; alpha: number; before: number; replacement: string; after: number }> = [];
-  const rewrite = (node: DesignProgramNode, surface: string | undefined, path: string): DesignProgramNode => {
+  const rewrite = (node: DesignProgramNode, surface: string | undefined, path: string, insideButton = false): DesignProgramNode => {
     if (node.type === "container") {
-      const children = node.children.map((child) => rewrite(child, node.background ?? surface, path));
+      const children = node.children.map((child) => rewrite(child, node.background ?? surface, path, insideButton || node.interaction === "button"));
       return children.some((child, index) => child !== node.children[index]) ? { ...node, children } : node;
     }
     if (node.type !== "text" || surface === undefined) return node;
@@ -64,8 +64,10 @@ export function normalizeDesignProgramContrast(program: DesignProgramV1) {
 
     const supportingText = node.color === "token:muted" || node.textRole === "caption" || /(?:muted|caption|secondary|supporting)/iu.test(node.semanticRole);
     const textColors = supportingText ? ["muted", "text"] : ["text", "muted"];
-    for (const role of [...textColors, "primary", "accent", "surface", "raised-surface", "page", "background"]) {
-      const color = `token:${role}`;
+    const candidates = [...textColors, "primary", "accent", "surface", "raised-surface", "page", "background"].map((role) => `token:${role}`);
+    // A local neutral label keeps the action's surface and the shared palette intact.
+    if (insideButton || node.textRole === "action") candidates.push("#000000", "#FFFFFF");
+    for (const color of candidates) {
       const replacement = programColor(program, color);
       const after = contrastRatio(replacement, background);
       if (after === undefined || after < MIN_TEXT_CONTRAST) continue;

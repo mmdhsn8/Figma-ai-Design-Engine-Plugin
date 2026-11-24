@@ -7,7 +7,7 @@ export function ChatDeleteDialog({
   onCancel,
   onConfirm,
 }: {
-  conversation: ChatHistoryConversation;
+  conversation: ChatHistoryConversation | "all";
   busy: boolean;
   onCancel: () => void;
   onConfirm: () => void;
@@ -56,10 +56,13 @@ export function ChatDeleteDialog({
         aria-describedby="delete-chat-description"
       >
         <span className="page-eyebrow">DELETE CHAT DATA</span>
-        <h2 id="delete-chat-title">Delete “{conversation.title}”?</h2>
+        <h2 id="delete-chat-title">
+          {conversation === "all" ? "Delete all saved chats?" : `Delete “${conversation.title}”?`}
+        </h2>
         <p id="delete-chat-description">
-          This removes the conversation and its saved checkpoint from this document. Existing Figma
-          canvas layers are not deleted. A task checkpoint marked as running cannot be deleted.
+          {conversation === "all"
+            ? "This permanently removes all saved chats and their checkpoints for this Figma page, including chats hidden by search. Existing canvas layers are kept. Stop any running tasks before deleting."
+            : "This removes the conversation and its saved checkpoint from this document. Existing Figma canvas layers are not deleted. A task checkpoint marked as running cannot be deleted."}
         </p>
         <div className="dialog-actions">
           <button
@@ -72,7 +75,7 @@ export function ChatDeleteDialog({
             Cancel
           </button>
           <button className="danger-action" type="button" onClick={onConfirm} disabled={busy}>
-            {busy ? "Deleting chat data…" : "Delete chat data"}
+            {busy ? "Deleting chat data…" : conversation === "all" ? "Delete All" : "Delete chat data"}
           </button>
         </div>
       </section>

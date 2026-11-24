@@ -194,8 +194,11 @@ export type ProjectPlanResult = { success: true; plan: ProjectPlanV1; fingerprin
 
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
-  if (value && typeof value === "object")
-    return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)]));
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    // The UI and Figma sandbox may have different collation rules.
+    return Object.fromEntries(Object.keys(record).sort().map((key) => [key, canonical(record[key])]));
+  }
   return value;
 }
 
@@ -232,8 +235,8 @@ export const UniversalJobManifestV1Schema = z
   })
   .strict()
   .superRefine((manifest, context) => {
-    const fingerprint = universalJobManifestFingerprint({ ...manifest, fingerprint: undefined });
-    if (fingerprint !== manifest.fingerprint)
+    const { fingerprint, ...configuration } = manifest;
+    if (universalJobManifestFingerprint(configuration) !== fingerprint)
       context.addIssue({ code: "custom", path: ["fingerprint"], message: "The immutable task manifest fingerprint does not match its saved values." });
     if (manifest.screens.some((screen, index) => screen.order !== index || screen.screenId !== `screen-${String(index + 1).padStart(2, "0")}`))
       context.addIssue({ code: "custom", path: ["screens"], message: "The manifest screen identities and order must be contiguous and stable." });
@@ -241,13 +244,23 @@ export const UniversalJobManifestV1Schema = z
 export type UniversalJobManifestV1 = z.infer<typeof UniversalJobManifestV1Schema>;
 
 export function universalJobManifestFingerprint(manifest: unknown): string {
-  const value = JSON.stringify(canonical(manifest));
-  let hash = 0xcbf29ce484222325n;
+  return `ujm1-${fingerprint64(manifest)}`;
+}
+
+function fingerprint64(input: unknown): string {
+  const value = JSON.stringify(canonical(input));
+  // FNV-1a modulo 2^64, using two unsigned words to preserve saved hashes
+  // without relying on BigInt operations in the Figma sandbox.
+  let high = 0xcbf29ce4;
+  let low = 0x84222325;
   for (let index = 0; index < value.length; index++) {
-    hash ^= BigInt(value.charCodeAt(index));
-    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+    const mixed = (low ^ value.charCodeAt(index)) >>> 0;
+    // 0x100000001b3 = 2^40 + 435. The low word product is exact as a Number.
+    const product = mixed * 0x1b3;
+    high = (Math.imul(high, 0x1b3) + (mixed << 8) + Math.floor(product / 0x100000000)) >>> 0;
+    low = product >>> 0;
   }
-  return `ujm1-${hash.toString(16).padStart(16, "0")}`;
+  return high.toString(16).padStart(8, "0") + low.toString(16).padStart(8, "0");
 }
 
 export const UniversalDesignTraceEventSchema = z.object({
@@ -278,13 +291,7 @@ export const UniversalDesignTraceEventSchema = z.object({
 export type UniversalDesignTraceEvent = z.infer<typeof UniversalDesignTraceEventSchema>;
 
 export function projectPlanFingerprint(plan: ProjectPlanV1): string {
-  const value = JSON.stringify(canonical(plan));
-  let hash = 0xcbf29ce484222325n;
-  for (let index = 0; index < value.length; index++) {
-    hash ^= BigInt(value.charCodeAt(index));
-    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
-  }
-  return `ppv1-${hash.toString(16).padStart(16, "0")}`;
+  return `ppv1-${fingerprint64(plan)}`;
 }
 
 export function parseProjectPlanDraft(

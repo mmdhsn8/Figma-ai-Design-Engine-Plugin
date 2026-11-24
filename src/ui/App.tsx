@@ -693,7 +693,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const [historyLoadError, setHistoryLoadError] = useState("");
   const [historyCorruptRecordCount, setHistoryCorruptRecordCount] = useState(0);
   const [historyDocumentId, setHistoryDocumentId] = useState<string | null>(null);
-  const [pendingDeleteChat, setPendingDeleteChat] = useState<ChatHistoryConversation | null>(null);
+  const [pendingDeleteChat, setPendingDeleteChat] = useState<ChatHistoryConversation | "all" | null>(
+    null,
+  );
   const [chatSwitchBusy, setChatSwitchBusy] = useState(false);
   const chatSwitching = useRef(false);
   const closeDeleteDialog = useCallback(() => setPendingDeleteChat(null), []);
@@ -911,7 +913,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   }, []);
 
   useEffect(() => {
-    if (!chatHistoryLoaded || !historyDocumentId || !activeChatId) return;
+    if (!chatHistoryLoaded || !historyDocumentId || !activeChatId || chatSwitching.current) return;
     const messages = boundedHistoryMessages(chatMessages);
     const existing = chatHistoryRef.current.find(({ id }) => id === activeChatId);
     const taskId = chatTaskSnapshot?.id;
@@ -1950,19 +1952,20 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
     const epoch = ++chatSelectionEpoch.current;
     setChatSwitchBusy(true);
     try {
-      const result = await chatHistoryBridge({
-        type: "chat-history-delete",
-        requestId: nextRequestId(),
-        documentId: historyDocumentId,
-        chatId: target.id,
-      });
+      const request = { requestId: nextRequestId(), documentId: historyDocumentId };
+      const result = await chatHistoryBridge(
+        target === "all"
+          ? { ...request, type: "chat-history-delete-all" }
+          : { ...request, type: "chat-history-delete", chatId: target.id },
+      );
       if (epoch !== chatSelectionEpoch.current) return;
       setHistoryCorruptRecordCount(result.corruptRecordCount ?? 0);
       const history = result.history;
-      const removedActive = activeChatIdRef.current === target.id;
+      const removedActive = target === "all" || activeChatIdRef.current === target.id;
       setPendingDeleteChat(null);
       const conversations =
-        history?.conversations ?? chatHistoryRef.current.filter(({ id }) => id !== target.id);
+        history?.conversations ??
+        (target === "all" ? [] : chatHistoryRef.current.filter(({ id }) => id !== target.id));
       chatHistoryRef.current = conversations;
       setChatHistory(conversations);
       if (removedActive) {
@@ -1974,6 +1977,12 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         setChatTaskSnapshot(null);
         setChatPendingTool(false);
         setChatRetryMessageId(null);
+        if (target === "all") {
+          activeChatModel.current = "";
+          setChatInput("");
+          setChatActivity("All saved chats for this Figma page were deleted.");
+          return;
+        }
         const next = history?.conversations.find(({ id }) => id === history.activeChatId);
         if (next) {
           const loaded = await chatTaskBridge({
@@ -1997,7 +2006,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
       }
     } catch (error) {
       setPendingDeleteChat(null);
-      setChatActivity(error instanceof Error ? error.message : "The chat could not be deleted.");
+      setChatActivity(error instanceof Error ? error.message : "Chat history could not be deleted.");
     } finally {
       if (epoch === chatSelectionEpoch.current) {
         chatSwitching.current = false;
@@ -4483,6 +4492,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           onDuplicate={(conversation) => void duplicateConversation(conversation)}
           onExport={exportConversation}
           onDelete={setPendingDeleteChat}
+          onDeleteAll={() => setPendingDeleteChat("all")}
         />
       ) : activeView === "more" ? (
         <MoreMenu

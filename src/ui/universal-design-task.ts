@@ -1,7 +1,7 @@
 import { DesignProgramV1Schema, parseDesignProgram, type DesignProgramV1 } from "../shared/design-program";
 import { compileDesignProgram } from "../shared/design-program-adapter";
 import { auditDesignProgramContrast, normalizeDesignProgramContrast } from "../shared/design-program-quality";
-import { ChatFunctionCallSchema, MAX_CHAT_PROVIDER_INPUT_BYTES, UNIVERSAL_CONTEXT_PREFIX, type ChatFunctionCall, type ChatLifecycleState, type ChatInputItem } from "../shared/chat-tools";
+import { ChatFunctionCallSchema, MAX_CHAT_PROVIDER_INPUT_BYTES, UNIVERSAL_CONTEXT_PREFIX, missingStructuredChatCall, type ChatFunctionCall, type ChatLifecycleState, type ChatInputItem } from "../shared/chat-tools";
 import { isClearCreateRequest, isExplicitCanvasRequest, parseChatGenerationIntent, requestedDesignContext } from "../shared/chat-generation";
 import { resolveBrandKitTokens } from "../shared/brand-kit";
 import { CHAT_TASK_MAX_BYTES, CHAT_TASK_MAX_VALIDATION_CORRECTIONS, ChatTaskSchema, type ChatTask } from "../shared/chat-task";
@@ -310,7 +310,8 @@ function stageCandidates(plan: ProjectPlanV1) {
     priority: index + 1,
     navigation: screen.navigationTargets,
     dependsOn: screen.dependencies,
-    contentPlaceholders: screen.regions.map(({ content }) => content),
+    // The saved plan keeps the full region content. Chat progress uses shorter labels.
+    contentPlaceholders: screen.regions.map(({ content }) => content.slice(0, 120).trim()),
     componentOpportunities: plan.componentOpportunities.slice(0, 8),
     logicalRefs: [],
     completionCriteria: ["One bounded DesignProgramV1 is saved before render.", "Renderer ownership and fresh native readback match the saved screen."],
@@ -329,6 +330,18 @@ function stageCandidates(plan: ProjectPlanV1) {
     repairOperationsAttempted: 0,
     awaitingQualityRepair: false,
   }));
+}
+
+function planStages(plan: ProjectPlanV1): ChatTask["stages"] {
+  const stages = ChatTaskSchema.shape.stages.safeParse(stageCandidates(plan));
+  if (!stages.success) {
+    const issue = stages.error.issues[0];
+    const path = issue?.path.map(String).join(".");
+    fail("plan_stage_initialization_failed", `Task progress validation failed (${issue?.code ?? "invalid"} at stages.${path || "root"}). Retry planning.`);
+  }
+  if (!stages.data.length || stages.data.length !== plan.screenCount)
+    fail("plan_stage_initialization_failed", "The planned screen count does not match task progress. Retry planning.");
+  return stages.data;
 }
 
 function initialMetrics(now: number, timingEvidence: "live" | "mock") {
@@ -1145,7 +1158,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         continue;
       }
       if (turn.kind !== "tool_calls")
-        fail("provider_response_incomplete", `The provider returned prose instead of the required ${expectedTool} call.`);
+        fail(missingStructuredChatCall(turn.text).errorCode, `The provider did not return the required ${expectedTool} call. Retry planning.`);
       if (turn.calls.length !== 1 || turn.calls[0]?.action.tool !== expectedTool)
         fail("provider_tool_contract_invalid", `The provider must return exactly one ${expectedTool} call for this lifecycle.`);
       const call = ChatFunctionCallSchema.parse(turn.calls[0]);
@@ -1276,12 +1289,17 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
           ...(turn.timing?.upstreamFirstDeltaMs !== undefined ? { firstDeltaMs: turn.timing.upstreamFirstDeltaMs } : {}),
         });
         if (turn.kind === "tool_validation") {
+          const paths = [...new Set(turn.issues.flatMap(({ fieldPaths }) => fieldPaths))];
+          const fields = paths.slice(0, 3).map((path) => path.replace(/^arguments\./u, "").slice(0, 96)).join(", ");
+          const nodeDimensions = paths.some((path) => /\.root\.(?:children\.\d+\.)*(?:width|height)(?:\.|$)/u.test(path));
+          const dimensionHint = nodeDimensions
+            ? ' Every node width and height must be an object like {"mode":"fixed","value":120}, with mode fixed, hug, or fill and a numeric value.'
+            : "";
           if (task.validationCorrections >= CHAT_TASK_MAX_VALIDATION_CORRECTIONS || screen.schemaCorrections >= 2)
-            fail("model_schema_repair_exhausted", `The structured ${purpose} response for ${screen.screenId} remained invalid after its bounded correction budget.`);
+            fail("model_schema_repair_exhausted", `The structured ${purpose} response for ${screen.screenId} remained invalid after its bounded correction budget.${fields ? ` Rejected fields: ${fields}.` : ""}`);
           task.validationCorrections++;
           screen.schemaCorrections++;
-          const codes = [...new Set(turn.issues.slice(0, 8).map(({ errorCode, toolName }) => `${toolName ?? expectedTool}:${errorCode}`))];
-          screen.schemaFeedback = `The previous structured response failed boundary validation (${codes.join(", ")}). Return one corrected ${expectedTool} call for ${screen.screenId}; do not change its scope.`;
+          screen.schemaFeedback = `Correct the rejected fields${fields ? ` (${fields})` : ""} in ${expectedTool} for ${screen.screenId}.${dimensionHint}`;
           screen.status = purpose === "compose" ? "pending" : "repair_pending";
           delete screen.activeRequestId;
           await save();
@@ -1333,6 +1351,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       ...(task.brandKit ? { brandKit: { id: task.brandKit.id, revision: task.brandKit.revision, tokenHash: task.brandKit.tokenHash, assetIds: task.brandKit.assets.map(({ assetId }) => assetId) } } : {}),
       skills: (task.designSkills ?? []).map(({ id, revisionId }) => ({ id, revisionId })),
     });
+    let acceptedPlan: ProjectPlanV1;
     if (!planResult.success) {
       if (task.validationCorrections >= CHAT_TASK_MAX_VALIDATION_CORRECTIONS)
         fail("project_plan_invalid", `The project plan could not satisfy the saved request: ${planResult.findings.map(({ code }) => code).join(", ")}.`);
@@ -1355,24 +1374,26 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         skills: (task.designSkills ?? []).map(({ id, revisionId }) => ({ id, revisionId })),
       });
       if (!retryResult.success) fail("project_plan_invalid", `The bounded plan correction failed (${retryResult.findings.map(({ code }) => code).join(", ")}).`);
-      const finalized = finalizePlan(retryResult.plan, task);
-      task.projectPlan = finalized.plan;
-      task.projectPlanFingerprint = finalized.fingerprint;
+      acceptedPlan = retryResult.plan;
     } else {
-      const finalized = finalizePlan(planResult.plan, task);
-      task.projectPlan = finalized.plan;
-      task.projectPlanFingerprint = finalized.fingerprint;
+      acceptedPlan = planResult.plan;
     }
-    const plan = task.projectPlan!;
-    task.universalManifest = createJobManifest(task, plan, task.projectPlanFingerprint!);
-    task.pending = [];
-    task.recent = [];
-    task.universalScreens = plan.screens.map(({ screenId }) => checkpoint({ screenId, status: "pending", composeAttempts: 0, repairDispatches: 0, repairAttempts: 0, schemaCorrections: 0 }));
-    task.stages = ChatTaskSchema.parse({ ...task, stages: stageCandidates(plan) }).stages;
+    const { plan, fingerprint } = finalizePlan(acceptedPlan, task);
+    if (plan.taskId !== task.id)
+      fail("plan_checkpoint_inconsistent", "The project plan does not belong to the active task.");
+    Object.assign(task, {
+      projectPlan: plan,
+      projectPlanFingerprint: fingerprint,
+      universalManifest: createJobManifest(task, plan, fingerprint),
+      universalScreens: plan.screens.map(({ screenId }) => checkpoint({ screenId, status: "pending", composeAttempts: 0, repairDispatches: 0, repairAttempts: 0, schemaCorrections: 0 })),
+      stages: planStages(plan),
+      pending: [],
+      recent: [],
+    });
     transition("UNIVERSAL_COMPOSING");
     delete task.validationFeedback;
-    deps.progress(`Universal design route v1 · saved ${plan.screenCount} planned screens before native work.`);
     await save();
+    deps.progress(`Universal design route v1 · saved ${plan.screenCount} planned screens before native work.`);
   } else {
     const plan = ProjectPlanV1Schema.safeParse(task.projectPlan);
     if (!plan.success || plan.data.taskId !== task.id || !task.projectPlanFingerprint || projectPlanFingerprint(plan.data) !== task.projectPlanFingerprint)
@@ -1394,8 +1415,10 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       task.universalScreens = plan.data.screens.map(({ screenId }) => checkpoint({ screenId, status: "pending", composeAttempts: 0, repairDispatches: 0, repairAttempts: 0, schemaCorrections: 0 }));
     if (task.universalScreens.length !== plan.data.screenCount || task.universalScreens.some((item, index) => item.screenId !== plan.data.screens[index]?.screenId))
       fail("screen_checkpoint_inconsistent", "Saved screen checkpoints do not match the ordered project plan; no new root will be created.");
-    if (task.stages.length !== plan.data.screenCount)
-      task.stages = ChatTaskSchema.parse({ ...task, stages: stageCandidates(plan.data) }).stages;
+    if (task.stages.length !== plan.data.screenCount) {
+      task.stages = planStages(plan.data);
+      await save();
+    }
   }
 
   const plan = task.projectPlan!;
@@ -2319,7 +2342,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
   }
 
   check();
-  if (screens.some(({ status }) => status !== "verified") || task.stages.some(({ completed }) => !completed))
+  if (!screens.length || screens.length !== task.stages.length || screens.some(({ status }) => status !== "verified") || task.stages.some(({ completed }) => !completed))
     fail("native_verification_incomplete", "Not every planned screen has task-owned native readback; completion was refused.");
   task.universalMetrics!.totalElapsedMs = Math.max(0, Math.round(monotonicNow() - runStartedAt));
   const usedFallback = screens.some(({ findings }) => findings?.some(({ code }) => code === "native_font_fallback"));

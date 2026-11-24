@@ -2,6 +2,7 @@ import { chatAbortOrigin } from "../shared/chat-cancellation";
 import {
   ChatFunctionCallSchema,
   parseResponsesFunctionCalls,
+  missingStructuredChatCall,
   modelPlanStages,
   CHAT_PLAN_VERSION,
   chatFunctionToolsForState,
@@ -74,7 +75,7 @@ import {
   isClearCreateRequest,
   requestedDesignContext,
 } from "../shared/chat-generation";
-import { runUniversalDesignTask, type UniversalDesignDependencies } from "./universal-design-task";
+import { runUniversalDesignTask, UniversalDesignTaskError, type UniversalDesignDependencies } from "./universal-design-task";
 import type { DesignProgramV1 } from "../shared/design-program";
 import type { ContextResponse, DesignProgramRenderResponse } from "./design-program-bridge";
 import { CONTEXT_PRECEDENCE, EDIT_CONTEXT_PREFIX, plannerDesignContext, type ContextTicket } from "../shared/design-context";
@@ -6016,6 +6017,10 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
       if (turn.kind === "done") {
         delete task.validationFeedback;
         task.lastResponseCalls = 0;
+        if (task.lifecycle === "UNIVERSAL_CLASSIFY" && task.executionRoute === "universal-design-v1") {
+          const issue = missingStructuredChatCall(turn.text);
+          throw new UniversalDesignTaskError(issue.errorCode, "The model did not return a valid canvas intent. Retry planning.");
+        }
         if (readOnly()) {
           const evidence = readOnlyCheckpoint(task);
           const lastDiscovery = evidence.discoveries.at(-1)?.discovery;
@@ -6333,6 +6338,8 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         phase,
         code: sessionEnded ? "stale_task_session" : isCancelled
           ? "request_cancelled"
+          : error instanceof UniversalDesignTaskError
+            ? error.code
           : checkpointFailure && checkpointCode && /^[a-z_]{1,80}$/u.test(checkpointCode)
             ? checkpointCode
             : /^[a-z_]{1,80}$/u.test(transportCategory)

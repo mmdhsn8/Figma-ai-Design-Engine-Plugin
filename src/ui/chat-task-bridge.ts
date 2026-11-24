@@ -8,6 +8,7 @@ import {
 } from "../shared/chat-checkpoint-wire";
 import { fw7Telemetry } from "./fw7-runtime";
 import { fw7CorrelationHash } from "../shared/fw7-observability";
+import { FW7_BUILD_ID } from "../shared/fw7-feature";
 
 const CHAT_TASK_WRITE_ACK_TIMEOUT_MS = 10_000;
 const CHAT_TASK_WRITE_RECONCILE_TIMEOUT_MS = 5_000;
@@ -33,7 +34,14 @@ export function chatTaskBridge(
   const expected = json === undefined ? undefined : checkpointRevision(json);
   const outbound =
     message.type === "chat-task-save"
-      ? { ...message, task: JSON.parse(json!), revision: expected }
+      ? {
+          type: message.type,
+          requestId: message.requestId,
+          documentId: message.documentId,
+          ...(message.chatId ? { chatId: message.chatId } : {}),
+          taskJson: json!,
+          revision: expected!,
+        }
       : message;
 
   return new Promise<CheckpointResult>((resolve, reject) => {
@@ -155,7 +163,7 @@ export function chatTaskBridge(
         );
     }, CHAT_TASK_WRITE_ACK_TIMEOUT_MS);
     window.addEventListener("message", receive);
-    trace("post", { operation: message.type });
+    trace("post", { operation: message.type, wire: message.type === "chat-task-save" ? "json" : "load", buildId: FW7_BUILD_ID });
     post(outbound);
   });
 }
@@ -163,7 +171,7 @@ export function chatTaskBridge(
 export function chatHistoryBridge(
   message: Extract<
     UIToPluginMessage,
-    { type: "chat-history-load" | "chat-history-upsert" | "chat-history-delete" }
+    { type: "chat-history-load" | "chat-history-upsert" | "chat-history-delete" | "chat-history-delete-all" }
   >,
 ) {
   return new Promise<Extract<PluginToUIMessage, { type: "chat-history-result" }>>(
@@ -186,8 +194,8 @@ export function chatHistoryBridge(
       };
       const timer = setTimeout(() => {
         finish();
-        reject(new Error("Chat history request timed out; saved checkpoints were not changed."));
-      }, 10_000);
+        reject(new Error("Chat history request timed out. Reopen the plugin to check the saved history."));
+      }, message.type === "chat-history-delete-all" ? 30_000 : 10_000);
       window.addEventListener("message", receive);
       parent.postMessage({ pluginMessage: message }, "*");
     },

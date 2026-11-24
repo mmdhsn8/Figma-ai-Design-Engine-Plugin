@@ -174,13 +174,13 @@ describe("loopback companion", () => {
     try {
       harness.advanceTime(70_000);
       const second = await send("chat-refresh-0001_p6_screen-02_c1");
-      expect(await second.text()).toContain("event: done");
+      expect(await second.text()).toContain("event: tool_validation");
       expect(harness.refreshRequest).toContain("grant_type=refresh_token");
     } finally {
       gate.release();
     }
     const events = await (await first).text();
-    expect(events).toContain("event: done");
+    expect(events).toContain("event: tool_validation");
     expect(events).not.toContain("request_cancelled");
   });
 
@@ -222,6 +222,33 @@ describe("loopback companion", () => {
     expect(upstream).not.toHaveProperty("tools");
   });
 
+  it("distinguishes Universal function calls, hidden structured text, invalid calls, and provider interruption", async () => {
+    const privateText = '{"intent":"create","private":"do-not-forward"}';
+    const valid = { type: "function_call", call_id: "shop-classification-1", name: "classify_canvas_intent", arguments: '{"intent":"create"}' };
+    const harness = await createHarness({ chatResponses: [
+      { text: privateText, outputItems: [valid] },
+      { text: privateText },
+      { text: privateText.slice(0, -1) },
+      { text: "I can help you plan your shop." },
+      { outputItems: [{ ...valid, arguments: "{" }] },
+      { outputItems: [{ ...valid, name: "unsupported_shop_tool" }] },
+      { incompleteReason: "max_output_tokens" },
+    ] });
+    const token = await authorizeAndDiscover(harness);
+    await request(harness.handle, "/v1/smoke", { token, body: { model: "account-model" } });
+    const results = ["event: tool_calls", "structured_text_instead_of_tool_call", "malformed_structured_text", "unexpected_prose", "malformed_json", "unknown_tool", "event: error"];
+    for (const [index, expected] of results.entries()) {
+      const response = await request(harness.handle, "/v1/chat", { token, body: {
+        requestId: `shop-structured-${index}`, model: "account-model", lifecycle: "UNIVERSAL_CLASSIFY",
+        input: [{ role: "user", content: "create 2 screen for online shop" }],
+      } });
+      const events = await response.text();
+      expect(events).toContain(expected);
+      expect(events).not.toContain("do-not-forward");
+      expect(events).not.toContain("event: done");
+    }
+  });
+
   it("forwards long Universal context and ordered tool records, and reports unsupported records without poisoning the next request", async () => {
     const harness = await createHarness();
     const token = await authorizeAndDiscover(harness);
@@ -257,8 +284,11 @@ describe("loopback companion", () => {
     expect(harness.responsesRequests).toHaveLength(count);
     const retry = await send("valid-history-0001", input);
     expect(retry.status).toBe(200);
-    expect(await retry.text()).toContain("event: done");
-    expect(JSON.parse(harness.responsesRequests.at(-1)!.body).input).toEqual(input);
+    expect(await retry.text()).toContain("unexpected_prose");
+    expect(JSON.parse(harness.responsesRequests.at(-1)!.body)).toMatchObject({
+      input, tool_choice: { type: "function", name: "plan_universal_project" }, parallel_tool_calls: false,
+    });
+    expect(JSON.parse(harness.responsesRequests.at(-1)!.body).instructions).not.toContain("plan_canvas_task");
   });
 
   it("rejects a delayed model catalog response after the authenticated account changes", async () => {
@@ -316,11 +346,11 @@ describe("loopback companion", () => {
     const [firstResponse, secondResponse] = await Promise.all([first, second]);
     expect(firstResponse.status).toBe(200);
     expect(secondResponse.status).toBe(200);
-    expect(await firstResponse.text()).toContain("event: done");
-    expect(await secondResponse.text()).toContain("event: done");
+    expect(await firstResponse.text()).toContain("event: tool_validation");
+    expect(await secondResponse.text()).toContain("event: tool_validation");
     expect(harness.responsesRequests.filter(({ body: rawBody }) => {
-      const parsed = JSON.parse(rawBody) as { tool_choice?: unknown };
-      return parsed.tool_choice === "auto";
+      const parsed = JSON.parse(rawBody) as { tool_choice?: { name?: string } };
+      return parsed.tool_choice?.name === "compose_design_program";
     })).toHaveLength(2);
   }, 20_000);
 
@@ -4174,7 +4204,10 @@ async function createHarness(
         stream?: boolean;
       };
       if (options.responsesFetchFailure) throw new TypeError("private transport failure text");
-      const chatHeaderGate = Array.isArray(responsePayload.tools) && responsePayload.tool_choice === "auto"
+      const forcedFunction = (responsePayload.tool_choice as { name?: string } | undefined)?.name;
+      const isChat = responsePayload.tool_choice === "auto" ||
+        ["classify_canvas_intent", "plan_universal_project", "compose_design_program", "repair_design_program"].includes(forcedFunction ?? "");
+      const chatHeaderGate = isChat
         ? chatHeaderGates.shift()
         : undefined;
       if (chatHeaderGate) {
@@ -4190,7 +4223,7 @@ async function createHarness(
           });
         });
       }
-      const chatStreamGate = responsePayload.tool_choice === "auto" ? chatStreamGates.shift() : undefined;
+      const chatStreamGate = isChat ? chatStreamGates.shift() : undefined;
       if (chatStreamGate) {
         let cancelled = false;
         return new Response(new ReadableStream({
@@ -4268,7 +4301,7 @@ async function createHarness(
       }
       if (Array.isArray(responsePayload.tools) || responsePayload.tool_choice === "none") {
         if (
-          typeof responsePayload.tool_choice === "object" &&
+          !isChat && typeof responsePayload.tool_choice === "object" &&
           responsePayload.tool_choice !== null
         ) {
           const name = (responsePayload.tool_choice as { name?: string }).name;

@@ -495,7 +495,7 @@ const descriptions: Record<ChatToolName, string> = {
   plan_universal_project:
     "Create one open-domain ProjectPlanV1 for the already checkpointed new design request. Use free-form product purpose, entities, roles and domain tags; return the exact requested screen count when one was given, otherwise choose 1–10 distinct useful screens. Each screen needs one purpose, 1–6 semantic content regions, user task, entry/exit, relationships, density and scroll intent. Define one shared ProjectVisualLanguageV1 for light/dark mode, semantic colors, typography, spacing, radii, navigation language and rationale. Respect the task-pinned Brand Kit and explicit user style choices. Distinguish requested from inferred screens, facts from assumptions, and never invent real records. No document inspection or canvas mutation.",
   compose_design_program:
-    "Compose exactly one planned screen as a complete DesignProgramV1 with shared visualLanguageV1 and screen-level compositionV1. Match the supplied stable screen ID, viewport, language, direction, variation seed and pinned revisions. Map every planned region to a unique editable container. For repeated fixed-size elements, optionally declare local masters in componentsV1 and reference their IDs from fixed-size instance nodes. Repeat reused master definitions exactly. Masters cannot contain images or other instances. Use only authorized Brand Kit asset IDs and declare their provenance. No URLs, executable code, unrequested screens or guessed document refs.",
+    "Compose exactly one planned screen as a complete DesignProgramV1 with shared visualLanguageV1 and screen-level compositionV1. Match the supplied stable screen ID, viewport, language, direction, variation seed and pinned revisions. Every node, including descendants and component roots, needs separate width and height objects such as {\"mode\":\"fixed\",\"value\":120}. Modes are fixed, hug, and fill. The viewport width and height remain numbers. Map every planned region to a unique editable container. For repeated fixed-size elements, optionally declare local masters in componentsV1 and reference their IDs from fixed-size instance nodes. Repeat reused master definitions exactly. Masters cannot contain images or other instances. Use only authorized Brand Kit asset IDs and declare their provenance. No URLs, executable code, unrequested screens or guessed document refs.",
   repair_design_program:
     "Repair only the supplied one-screen DesignProgramV1 fields identified by the bounded findings. Preserve the shared project visual language, valid content, stable IDs, screen identity, scope and visual intent. Return one complete corrected program; use only pinned Brand Kit assets from supplied context, and do not add screens, tools, external assets or executable content.",
 };
@@ -649,6 +649,20 @@ export const ChatFunctionCallValidationIssueSchema = z
   })
   .strict();
 export type ChatFunctionCallValidationIssue = z.infer<typeof ChatFunctionCallValidationIssueSchema>;
+
+export function missingStructuredChatCall(text: string, refused = false): ChatFunctionCallValidationIssue {
+  let errorCode = refused ? "provider_refusal" : text.trim() ? "unexpected_prose" : "missing_tool_call";
+  const body = text.trim().replace(/^```(?:json)?\s*\n/iu, "").replace(/\n```$/u, "").trim();
+  if (!refused && /^[{[]/u.test(body)) {
+    try {
+      JSON.parse(body);
+      errorCode = "structured_text_instead_of_tool_call";
+    } catch {
+      errorCode = "malformed_structured_text";
+    }
+  }
+  return { stage: "call_item", errorCode, fieldPaths: ["output"] };
+}
 
 export class ChatFunctionCallValidationError extends Error {
   constructor(readonly validationIssues: ChatFunctionCallValidationIssue[]) {

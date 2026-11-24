@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ChatTask } from "../src/shared/chat-task";
 import {
   CHAT_HISTORY_MAX_CHATS,
@@ -16,6 +16,8 @@ import { handleChatTaskStorage } from "../src/plugin/chat-task-storage";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ChatHistoryView } from "../src/ui/chat-history-view";
+import { ChatDeleteDialog } from "../src/ui/chat-delete-dialog";
+import { UIToPluginSchema } from "../src/shared/messages";
 import type { ChatHistoryConversation } from "../src/shared/chat-history";
 import { createMockApi } from "./figma-mock";
 
@@ -29,6 +31,19 @@ const conversation = (id: string, title = "New chat"): ChatHistoryConversation =
 });
 
 describe("chat history schema and export", () => {
+  it("describes the scope of Delete All in the confirmation dialog", () => {
+    const html = renderToStaticMarkup(createElement(ChatDeleteDialog, {
+      conversation: "all",
+      busy: false,
+      onCancel: () => undefined,
+      onConfirm: () => undefined,
+    }));
+    expect(html).toContain('role="alertdialog"');
+    expect(html).toContain("Delete all saved chats?");
+    expect(html).toContain("including chats hidden by search");
+    expect(html).toContain("Existing canvas layers are kept");
+  });
+
   it("labels an active restored running checkpoint as needing recovery", () => {
     const active = {
       ...conversation("conversation-0001", "Saved task"),
@@ -45,6 +60,7 @@ describe("chat history schema and export", () => {
         onDuplicate: () => undefined,
         onExport: () => undefined,
         onDelete: () => undefined,
+        onDeleteAll: () => undefined,
       }),
     );
     expect(html).toContain("Current · Needs recovery");
@@ -70,11 +86,14 @@ describe("chat history schema and export", () => {
         onDuplicate: () => undefined,
         onExport: () => undefined,
         onDelete: () => undefined,
+        onDeleteAll: () => undefined,
       }),
     );
 
     expect((html.match(/class="history-card /gu) ?? []).length).toBe(CHAT_HISTORY_MAX_CHATS);
-    expect(html).toContain("Showing 40 of 40 saved chats");
+    expect(html).toContain("Showing 100 of 100 saved chats");
+    expect(html.indexOf(">Delete All</button>")).toBeGreaterThan(0);
+    expect(html.indexOf(">Delete All</button>")).toBeLessThan(html.indexOf("Search conversations"));
     expect(html).toContain("Earlier");
     expect(html).toContain('dir="auto">گفتگو');
     expect(html).toContain('dir="auto">ساخت صفحه محصول');
@@ -95,6 +114,7 @@ describe("chat history schema and export", () => {
         onDuplicate: () => undefined,
         onExport: () => undefined,
         onDelete: () => undefined,
+        onDeleteAll: () => undefined,
       }),
     );
     expect(html).toContain("2 saved history records need recovery");
@@ -225,6 +245,74 @@ function scopedTask(api: PluginAPI, id: string, status: ChatTask["status"] = "re
 }
 
 describe("document-scoped chat history", () => {
+  it("supports 100 saved chats and clears the current page through one Delete All request", async () => {
+    const mock = createMockApi();
+    const documentId = `${mock.api.fileKey}-${mock.api.currentPage.id.replaceAll(":", "_")}`;
+    const historyKey = `fad.chat-history.v1:${documentId}`;
+    const records = Array.from({ length: 99 }, (_, index) => conversation(`conversation-${index}`));
+    mock.storage.set(historyKey, { version: 1, activeChatId: records[0]!.id, conversations: records });
+    const last = conversation("conversation-99");
+    const hundredth = await handleChatHistoryStorage(mock.api, {
+      type: "chat-history-upsert", requestId: "add-chat-100", documentId, conversation: last,
+    });
+    expect(hundredth.history?.conversations).toHaveLength(100);
+    const overflow = await handleChatHistoryStorage(mock.api, {
+      type: "chat-history-upsert", requestId: "add-chat-101", documentId, conversation: conversation("conversation-100"),
+    });
+    expect(overflow.error).toContain("history is full");
+    const firstKey = `fad.chat-task.v2:${documentId}:${records[0]!.id}`;
+    const lastKey = `fad.chat-task.v2:${documentId}:${last.id}`;
+    const legacyKey = `fad.chat-task.v1:${documentId}`;
+    mock.storage.set(firstKey, scopedTask(mock.api, records[0]!.id));
+    mock.storage.set(lastKey, scopedTask(mock.api, last.id));
+    mock.storage.set(legacyKey, { ...scopedTask(mock.api, last.id), id: last.id });
+    const otherPageKey = `fad.chat-history.v1:${mock.api.fileKey}-other`;
+    const otherPage = { version: 1, activeChatId: last.id, conversations: [last] };
+    mock.storage.set(otherPageKey, otherPage);
+    const existingFrame = mock.api.createFrame();
+
+    const request = { type: "chat-history-delete-all", requestId: "delete-all-chats", documentId } as const;
+    expect(UIToPluginSchema.safeParse(request).success).toBe(true);
+    expect(UIToPluginSchema.safeParse({ ...request, chatId: last.id }).success).toBe(false);
+    const stale = await handleChatHistoryStorage(mock.api, { ...request, documentId: "other-page" });
+    expect(stale.success).toBe(false);
+    expect(mock.storage.get(historyKey)).toEqual(hundredth.history);
+    const deleted = await handleChatHistoryStorage(mock.api, request);
+    expect(deleted.history).toEqual({ version: 1, activeChatId: null, conversations: [] });
+    const reloaded = await handleChatHistoryStorage(mock.api, { type: "chat-history-load", requestId: "reload-history" });
+    expect(reloaded.history).toEqual(deleted.history);
+    expect([firstKey, lastKey, legacyKey].some((key) => mock.storage.has(key))).toBe(false);
+    expect(mock.storage.get(otherPageKey)).toEqual(otherPage);
+    expect(mock.roots).toEqual([existingFrame]);
+  });
+
+  it("restores checkpoints when a bulk delete fails partway through storage updates", async () => {
+    const mock = createMockApi();
+    const task = scopedTask(mock.api, "conversation-0001");
+    const documentId = task.documentId;
+    const historyKey = `fad.chat-history.v1:${documentId}`;
+    const first = conversation("conversation-0001");
+    const second = conversation("conversation-0002");
+    const history = { version: 1, activeChatId: first.id, conversations: [first, second] };
+    mock.storage.set(historyKey, history);
+    const firstKey = `fad.chat-task.v2:${documentId}:${first.id}`;
+    const secondKey = `fad.chat-task.v2:${documentId}:${second.id}`;
+    const otherTask = scopedTask(mock.api, second.id);
+    mock.storage.set(firstKey, task);
+    mock.storage.set(secondKey, otherTask);
+    const deleteAsync = mock.api.clientStorage.deleteAsync;
+    vi.spyOn(mock.api.clientStorage, "deleteAsync").mockImplementation(async (key) => {
+      if (key === secondKey) throw new Error("Injected deletion failure");
+      await deleteAsync(key);
+    });
+
+    const result = await handleChatHistoryStorage(mock.api, { type: "chat-history-delete-all", requestId: "delete-with-failure", documentId });
+    expect(result.error).toContain("Injected deletion failure");
+    expect(mock.storage.get(historyKey)).toEqual(history);
+    expect(mock.storage.get(firstKey)).toEqual(task);
+    expect(mock.storage.get(secondKey)).toEqual(otherTask);
+  });
+
   it("persists concurrent chat upserts without losing other conversations", async () => {
     const mock = createMockApi();
     const documentId = `${mock.api.fileKey}-${mock.api.currentPage.id.replaceAll(":", "_")}`;
@@ -457,19 +545,20 @@ describe("document-scoped chat history", () => {
     expect(mock.roots[0]).toBe(node);
   });
 
-  it("refuses to delete a chat with a running checkpoint and preserves both records", async () => {
+  it.each(["single", "all"])("refuses %s deletion with a running checkpoint and preserves both records", async (mode) => {
     const mock = createMockApi();
     const documentId = `${mock.api.fileKey}-${mock.api.currentPage.id.replaceAll(":", "_")}`;
     const chatId = "conversation-0001";
     const record = conversation(chatId);
     const task = scopedTask(mock.api, chatId, "running");
-    await handleChatTaskStorage(mock.api, {
+    const savedTask = await handleChatTaskStorage(mock.api, {
       type: "chat-task-save",
-      requestId: "save-running-task",
+      requestId: `save-running-task-${mode}`,
       documentId,
       chatId,
       task,
     });
+    expect(savedTask.success).toBe(true);
     await handleChatHistoryStorage(mock.api, {
       type: "chat-history-upsert",
       requestId: "save-running-history",
@@ -477,12 +566,10 @@ describe("document-scoped chat history", () => {
       conversation: record,
     });
 
-    const result = await handleChatHistoryStorage(mock.api, {
-      type: "chat-history-delete",
-      requestId: "refuse-running-delete",
-      documentId,
-      chatId,
-    });
+    const request = { requestId: "refuse-running-delete", documentId };
+    const result = await handleChatHistoryStorage(mock.api, mode === "all"
+      ? { ...request, type: "chat-history-delete-all" }
+      : { ...request, type: "chat-history-delete", chatId });
     expect(result.success).toBe(false);
     expect(result.error).toContain("still running");
     expect(

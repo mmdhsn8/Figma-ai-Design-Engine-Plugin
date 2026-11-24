@@ -151,15 +151,6 @@ function preservedCount(archive: PreservedHistory): number {
   return Math.max(archive.records.length, archive.metadata.length ? 1 : 0);
 }
 
-function removeArchivedChat(archive: PreservedHistory, chatId: string): PreservedHistory {
-  const matchingId = (value: unknown) => isRecord(value) && value.id === chatId;
-  return {
-    version: 1,
-    records: archive.records.filter((record) => !matchingId(record)),
-    metadata: archive.metadata,
-  };
-}
-
 async function serializeByKey<T>(key: string, work: () => Promise<T>): Promise<T> {
   const previous = writeQueues.get(key) ?? Promise.resolve();
   let release!: () => void;
@@ -189,7 +180,7 @@ export async function handleChatHistoryStorage(
   api: PluginAPI,
   message: Extract<
     UIToPluginMessage,
-    { type: "chat-history-load" | "chat-history-upsert" | "chat-history-delete" }
+    { type: "chat-history-load" | "chat-history-upsert" | "chat-history-delete" | "chat-history-delete-all" }
   >,
 ): Promise<Extract<PluginToUIMessage, { type: "chat-history-result" }>> {
   const { pageId, documentId } = pageScope(api);
@@ -275,22 +266,26 @@ export async function handleChatHistoryStorage(
         };
       }
 
-      if (message.type === "chat-history-delete") {
-        const existing = current.conversations.find(({ id }) => id === message.chatId);
-        if (!existing)
+      if (message.type === "chat-history-delete" || message.type === "chat-history-delete-all") {
+        const targets = new Set(
+          current.conversations
+            .filter(({ id }) => message.type === "chat-history-delete-all" || id === message.chatId)
+            .map(({ id }) => id),
+        );
+        if (targets.size === 0)
           return {
             history: current,
             archive,
             archiveDamaged: !parsedArchive.writable,
             recoveryCount: recovery.unreadableCount,
           };
-        const taskKeys = [`fad.chat-task.v2:${documentId}:${message.chatId}`];
+        const taskKeys = [...targets].map((id) => `fad.chat-task.v2:${documentId}:${id}`);
         const legacyRaw: unknown = await api.clientStorage.getAsync(legacyTaskKey);
         if (
           legacyRaw &&
           typeof legacyRaw === "object" &&
           "id" in legacyRaw &&
-          legacyRaw.id === message.chatId
+          typeof legacyRaw.id === "string" && targets.has(legacyRaw.id)
         )
           taskKeys.push(legacyTaskKey);
         const taskBackups = await Promise.all(
@@ -311,18 +306,18 @@ export async function handleChatHistoryStorage(
               "This task is still running. Stop it and wait for its checkpoint before deleting the chat.",
             );
         }
-        const nextConversations = current.conversations.filter(({ id }) => id !== message.chatId);
+        const nextConversations = current.conversations.filter(({ id }) => !targets.has(id));
         const next: ChatHistoryIndex = {
           version: 1,
           activeChatId:
-            current.activeChatId === message.chatId
+            current.activeChatId && targets.has(current.activeChatId)
               ? (nextConversations[0]?.id ?? null)
               : current.activeChatId,
           conversations: nextConversations,
         };
-        const nextArchive = removeArchivedChat(
-          prepareArchive(recovery.preservedRecords, recovery.preservedMetadata),
-          message.chatId,
+        const nextArchive = prepareArchive(recovery.preservedRecords, recovery.preservedMetadata);
+        nextArchive.records = nextArchive.records.filter(
+          (record) => !isRecord(record) || typeof record.id !== "string" || !targets.has(record.id),
         );
         const archiveChanged = jsonIdentity(nextArchive) !== jsonIdentity(archive);
         const mainBackup = raw;
@@ -330,7 +325,10 @@ export async function handleChatHistoryStorage(
           if (api.currentPage.id !== pageId)
             throw new Error("Page changed while deleting chat history.");
           if (archiveChanged) await api.clientStorage.setAsync(archiveKey, nextArchive);
-          for (const taskKey of taskKeys) await api.clientStorage.deleteAsync(taskKey);
+          for (const backup of taskBackups)
+            if (backup.value != null) await api.clientStorage.deleteAsync(backup.key);
+          if (api.currentPage.id !== pageId)
+            throw new Error("Page changed while deleting chat history.");
           await api.clientStorage.setAsync(key, next);
           archive = nextArchive;
         } catch (error) {

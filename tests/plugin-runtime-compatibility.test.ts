@@ -1,13 +1,25 @@
 import { readFileSync } from "node:fs";
-import { runInNewContext } from "node:vm";
+import { createContext, runInContext } from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 import { brandAssetContentHash } from "../src/shared/brand-kit";
 import { encodeBase64, embeddedImageBytes } from "../src/shared/visual-assets";
 import { ChatTaskSchema } from "../src/shared/chat-task";
 import { checkpointJson, checkpointRevision } from "../src/shared/chat-checkpoint-wire";
 import { FW2_FEATURE } from "../src/shared/design-context";
+import { parseProjectPlanDraft, universalJobManifestFingerprint } from "../src/shared/universal-design";
+import { chatTaskBridge } from "../src/ui/chat-task-bridge";
 
 const pluginBundle = readFileSync(new URL("../dist/plugin.js", import.meta.url), "utf8");
+
+function savedFingerprint(value: unknown): string {
+  const json = checkpointJson(value);
+  let hash = 0xcbf29ce484222325n;
+  for (let index = 0; index < json.length; index++) {
+    hash ^= BigInt(json.charCodeAt(index));
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return hash.toString(16).padStart(16, "0");
+}
 
 describe("Figma main sandbox runtime compatibility", () => {
   it("executes the built plugin and verifies checkpoint receipts across a controller reload", async () => {
@@ -54,9 +66,23 @@ describe("Figma main sandbox runtime compatibility", () => {
       Intl: undefined,
       console: { log: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     };
+    const boot = () => {
+      const context = createContext({ ...sandbox }, { codeGeneration: { strings: false, wasm: false } });
+      expect(runInContext("typeof Intl", context)).toBe("undefined");
+      // Exercise a sandbox whose collation differs from the UI's. A persisted
+      // fingerprint must be independent of either process's locale ordering.
+      runInContext(`String.prototype.localeCompare = function (other) {
+        const left = String(this), right = String(other);
+        return left < right ? 1 : left > right ? -1 : 0;
+      };
+      // Exercise a sandbox with a divergent unsigned BigInt result. The bridge's
+      // stable checkpoint hash uses 32-bit operations and remains unaffected.
+      const originalAsUintN = BigInt.asUintN;
+      BigInt.asUintN = (bits, value) => originalAsUintN(bits, value) ^ 1n;`, context);
+      runInContext(pluginBundle, context);
+    };
 
-    expect(runInNewContext("typeof Intl", sandbox)).toBe("undefined");
-    expect(() => runInNewContext(pluginBundle, sandbox)).not.toThrow();
+    expect(boot).not.toThrow();
     expect(figma.showUI).toHaveBeenCalledOnce();
     expect(typeof figma.ui.onmessage).toBe("function");
     const request = (message: unknown) =>
@@ -114,7 +140,7 @@ describe("Figma main sandbox runtime compatibility", () => {
       requestId: "vm-save-invalid",
     });
 
-    runInNewContext(pluginBundle, sandbox);
+    boot();
     await request({
       type: "chat-task-load",
       requestId: "vm-confirm-01",
@@ -125,6 +151,116 @@ describe("Figma main sandbox runtime compatibility", () => {
     expect(result()).not.toHaveProperty("task");
     await request({ type: "chat-task-load", requestId: "vm-load-01", ...scope });
     expect(result()).toMatchObject({ success: true, task: { id: task.id }, revision });
+
+    const names = ["Shop Browse", "Product Detail"];
+    const prompt = "create 2 screen for online shop";
+    const planned = parseProjectPlanDraft({
+      productPurpose: "Help shoppers browse and evaluate products.",
+      projectNarrative: "Show a catalog and a product detail view.",
+      audience: "Online shoppers",
+      primaryUserGoals: ["Browse products", "Review details"],
+      capabilities: [], keyEntities: [], domainTags: ["shop"],
+      platform: "mobile", locale: "en-US", direction: "ltr", screenCount: 2,
+      styleDirection: "Clear product hierarchy", contentDensity: "medium",
+      contentSamplePolicy: "clearly-illustrative", accessibilityMinimums: [],
+      componentOpportunities: [], designConstraints: [], knownFacts: [], assumptions: [], nonGoals: [],
+      screens: names.map((name, order) => ({
+        name, order, role: order ? "details" : "catalog", purpose: name, source: "inferred",
+        primaryTask: name, entryState: "Arrive at view", exitState: "Finish reviewing",
+        regions: [{ name: "Main", semanticRole: "main", content: "Editable product content", priority: 1 }],
+        dataRelationships: [], responsiveConstraints: [], accessibilityNotes: [], entityRefs: [],
+        actions: [], states: [], navigationOrders: [], dependencyOrders: [], scroll: "none",
+      })),
+    }, { taskId: task.id, requestedScreenCount: 2 });
+    if (!planned.success) throw new Error("Expected a valid two-screen project plan fixture.");
+    const model = "account-visible-model";
+    const manifest = {
+      version: 1, taskId: task.id, engineRoute: "universal-design-v1", modelSlug: model,
+      planFingerprint: planned.fingerprint, designProgramVersion: planned.plan.designProgramVersion,
+      platform: planned.plan.platform, locale: planned.plan.locale, direction: planned.plan.direction,
+      screens: planned.plan.screens.map(({ screenId, order, name, role, dependencies }) => ({ screenId, order, name, role, dependencies })),
+      skills: [], capabilities: planned.plan.capabilityFlags,
+      layoutCapabilities: ["auto-layout", "fill-and-hug-sizing", "bounded-wrap", "vertical-scroll", "native-components", "editable-text"],
+    };
+    expect(planned.fingerprint).toBe(`ppv1-${savedFingerprint(planned.plan)}`);
+    expect(universalJobManifestFingerprint(manifest)).toBe(`ujm1-${savedFingerprint(manifest)}`);
+    const unicodeManifest = { ...manifest, screens: [{ ...manifest.screens[0]!, name: "صفحهٔ اول 🛍️" }] };
+    expect(universalJobManifestFingerprint(unicodeManifest)).toBe(`ujm1-${savedFingerprint(unicodeManifest)}`);
+    const shop = ChatTaskSchema.parse({
+      ...task, ...scope, model, prompt, intent: "create", status: "running", lifecycle: "UNIVERSAL_COMPOSING",
+      projectPlan: planned.plan, projectPlanFingerprint: planned.fingerprint,
+      universalManifest: { ...manifest, fingerprint: universalJobManifestFingerprint(manifest) },
+      stages: names.map((title) => ({ title, completed: false, operations: 0, rounds: 0 })),
+      universalScreens: planned.plan.screens.map(({ screenId }) => ({ screenId, status: "pending" })),
+    });
+    const shopRevision = checkpointRevision(checkpointJson(shop));
+    const events = new EventTarget();
+    const sent: unknown[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.stubGlobal("window", {
+      addEventListener: events.addEventListener.bind(events),
+      removeEventListener: events.removeEventListener.bind(events),
+      setTimeout: globalThis.setTimeout.bind(globalThis), clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    });
+    vi.stubGlobal("parent", {
+      postMessage: ({ pluginMessage }: { pluginMessage: unknown }) => {
+        const copy = structuredClone(pluginMessage) as { type?: string; task?: { projectPlan?: { viewport: object } } };
+        sent.push(copy);
+        // Inject a nested object marshalling failure without changing the production validator.
+        // The exact Desktop transport behavior is not assumed by this fake runtime.
+        if (copy.type === "chat-task-save" && copy.task?.projectPlan)
+          Reflect.deleteProperty(copy.task.projectPlan.viewport, "width");
+        void request(copy).then(() => {
+          events.dispatchEvent(new MessageEvent("message", { data: { pluginMessage: structuredClone(result()) } }));
+        });
+      },
+    });
+    try {
+      await expect(chatTaskBridge({ type: "chat-task-save", requestId: "vm-shop-save", ...scope, task: shop }))
+        .resolves.toMatchObject({ success: true, revision: shopRevision });
+      expect(sent[0]).toMatchObject({ type: "chat-task-save", ...scope, taskJson: checkpointJson(shop), revision: shopRevision });
+      expect(sent[0]).not.toHaveProperty("task");
+
+      const durable = [...storage.entries()];
+      const writes = figma.clientStorage.setAsync.mock.calls.length;
+      const secret = "fixture-private-content-must-not-be-logged";
+      const malformed = { ...shop, prompt: secret, projectPlan: { ...planned.plan, viewport: { ...planned.plan.viewport, width: 401 } } };
+      const badJson = checkpointJson(malformed);
+      const truncated = badJson.slice(0, -1);
+      await request({ type: "chat-task-save", requestId: "vm-shop-truncated", ...scope, taskJson: truncated, revision: checkpointRevision(truncated) });
+      expect(result()).toMatchObject({ success: false, errorCode: "checkpoint_protocol_error" });
+      await request({ type: "chat-task-save", requestId: "vm-shop-invalid", ...scope, taskJson: badJson, revision: checkpointRevision(badJson) });
+      expect(result()).toMatchObject({ success: false, errorCode: "checkpoint_protocol_error" });
+      expect(result()).toHaveProperty("error", expect.stringContaining("chat-task-save during schema validation"));
+      expect(result()).toHaveProperty("error", expect.stringContaining("task.projectPlan.viewport.width"));
+      expect(result()).toHaveProperty("error", expect.not.stringContaining(secret));
+      const diagnostics = sandbox.console.log.mock.calls.flat().join(" ");
+      expect(diagnostics).toContain('"event":"rejected"');
+      expect(diagnostics).toContain('"phase":"json"');
+      expect(diagnostics).toContain('"phase":"schema"');
+      expect(diagnostics).toContain("task.projectPlan.viewport.width");
+      expect(diagnostics).not.toContain(secret);
+      await request({ type: "chat-task-save", requestId: "vm-shop-revision", ...scope, taskJson: checkpointJson(shop), revision: { ...shopRevision, bytes: shopRevision.bytes + 1 } });
+      expect(result()).toMatchObject({ success: false, errorCode: "checkpoint_revision_mismatch" });
+      const badManifest = checkpointJson({ ...shop, universalManifest: { ...shop.universalManifest, modelSlug: "different-model" } });
+      await request({ type: "chat-task-save", requestId: "vm-shop-manifest", ...scope, taskJson: badManifest, revision: checkpointRevision(badManifest) });
+      expect(result()).toMatchObject({ success: false, errorCode: "checkpoint_protocol_error", error: expect.stringContaining("task.universalManifest.fingerprint") });
+      expect(figma.clientStorage.setAsync).toHaveBeenCalledTimes(writes);
+      expect([...storage.entries()]).toEqual(durable);
+
+      boot();
+      const confirmation = await chatTaskBridge({ type: "chat-task-load", requestId: "vm-shop-confirm", ...scope, confirm: shopRevision });
+      expect(confirmation).toMatchObject({ success: true, revision: shopRevision });
+      expect(confirmation).not.toHaveProperty("task");
+      const recovery = await chatTaskBridge({ type: "chat-task-load", requestId: "vm-shop-recovery", ...scope });
+      expect(recovery).toMatchObject({ success: true, revision: shopRevision, task: { id: task.id, stages: names.map((title) => ({ title, completed: false })) } });
+      expect(recovery.task?.universalScreens?.map(({ screenId, nativeRootNodeId }) => [screenId, nativeRootNodeId]))
+        .toEqual([["screen-01", undefined], ["screen-02", undefined]]);
+      expect(figma.clientStorage.deleteAsync).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      logSpy.mockRestore();
+    }
   });
 
   it("encodes and decodes base64 without btoa or atob", () => {

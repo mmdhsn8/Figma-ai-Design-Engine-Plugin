@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const CHAT_HISTORY_MAX_CHATS = 40;
+export const CHAT_HISTORY_MAX_CHATS = 100;
 export const CHAT_HISTORY_MAX_MESSAGES = 80;
 export const CHAT_HISTORY_MAX_BYTES = 2 * 1024 * 1024;
 

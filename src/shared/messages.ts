@@ -51,6 +51,10 @@ const ChatTaskSaveMessageSchema = z
     revision: CheckpointRevisionSchema.optional(),
   })
   .strict();
+export const ChatTaskJsonSaveEnvelopeSchema = ChatTaskSaveMessageSchema.omit({ task: true }).extend({
+  taskJson: z.string(),
+  revision: CheckpointRevisionSchema,
+});
 export const ChatTaskStorageMessageSchema = z.discriminatedUnion("type", [
   ChatTaskLoadMessageSchema,
   ChatTaskSaveMessageSchema,
@@ -358,6 +362,11 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       chatId: ChatHistoryChatIdSchema,
     })
     .strict(),
+  z.object({
+    type: z.literal("chat-history-delete-all"),
+    requestId: z.string().min(1).max(100),
+    documentId: z.string().min(1).max(300),
+  }).strict(),
   FigmaToolBatchSchema,
   FigmaToolCancelSchema,
   FigmaToolPauseSchema,

@@ -4270,6 +4270,13 @@ body:has(.app-shell.is-chat-view) #root {
 }
 
 /* Phase 7 non-Chat refinements. Keep these selectors isolated from the frozen Chat surface. */
+.history-heading-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+  flex-direction: column;
+  gap: 6px;
+}
 .more-page,
 .more-group {
   min-width: 0;

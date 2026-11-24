@@ -58,6 +58,7 @@ import {
   validateChatRequestInput,
   chatFunctionToolsForState,
   parseResponsesFunctionCalls,
+  missingStructuredChatCall,
   type ChatFunctionCallValidationIssue,
 } from "../shared/chat-tools.js";
 import { MAX_SECTION_BYTES } from "../shared/generation-limits.js";
@@ -2054,6 +2055,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
     const model = body.value.model;
     const lifecycle = lifecycleResult.data;
     const availableTools = chatFunctionToolsForState(lifecycle);
+    const universalTool = isUniversalLifecycle(lifecycle) ? availableTools[0]?.name : undefined;
     const inputMode = inputResult.data.some(
       (item) => "type" in item && item.type === "function_call_output",
     )
@@ -2171,10 +2173,12 @@ export function createCompanionServer(options: CompanionServerOptions) {
           },
           body: JSON.stringify({
             model,
-            instructions: lifecycle === "CONVERSATION" ? "Reply conversationally in the user's language. Do not plan or claim any Canvas action." : isUniversalLifecycle(lifecycle) ? `${UNIVERSAL_CHAT_INSTRUCTIONS}\n${chatLifecycleGuidance(lifecycle)}` : `${CHAT_INSTRUCTIONS}\n${chatLifecycleGuidance(lifecycle)}\nCurrent lifecycle state: ${lifecycle}. Planning contract v1: plan_canvas_task accepts planVersion, brief, stages, optional designName, and targetRefs (required for edits). Each stage contains title, goal, optional purpose, priority, navigation, dependsOn, contentPlaceholders, componentOpportunities, pageId, logicalRefs, completionCriteria, estimatedMutations and propertyEdit. For a stage that only updates properties of one existing node, provide propertyEdit as a set_properties action with the requested values even if they already match. For enhancement of an existing design, declare new layer aliases in the saved stage when known. During execution, the runner checkpoints fresh aliases from a valid batch under the approved existing frame within the stage reference limit. Order parents before children and reuse the original alias in later calls. Never use a native task- ref as a new alias. For existing design enhancements, prefer in-place edits, and specify measurable hierarchy, spacing, typography, and layout outcomes. For a screen background color request, use the existing screen frame ref and only the requested fill in propertyEdit. The runner resolves the effective background layer and verifies it locally. Existing verified edit refs may satisfy acceptance without mutation; estimates are advisory. Use one operation for a one-property edit. Work above 32 mutations is continued locally in persisted segments, so never replan at that boundary. Never copy checkpoint execution metadata into planning arguments. Once a saved plan exists, execute its unfinished stages; do not call plan_canvas_task again. Runtime progress is locally owned.`,
+            instructions: lifecycle === "CONVERSATION" ? "Reply conversationally in the user's language. Do not plan or claim any Canvas action." : isUniversalLifecycle(lifecycle) ? `${UNIVERSAL_CHAT_INSTRUCTIONS}\n${chatLifecycleGuidance(lifecycle)}\nCurrent lifecycle state: ${lifecycle}.` : `${CHAT_INSTRUCTIONS}\n${chatLifecycleGuidance(lifecycle)}\nCurrent lifecycle state: ${lifecycle}. Planning contract v1: plan_canvas_task accepts planVersion, brief, stages, optional designName, and targetRefs (required for edits). Each stage contains title, goal, optional purpose, priority, navigation, dependsOn, contentPlaceholders, componentOpportunities, pageId, logicalRefs, completionCriteria, estimatedMutations and propertyEdit. For a stage that only updates properties of one existing node, provide propertyEdit as a set_properties action with the requested values even if they already match. For enhancement of an existing design, declare new layer aliases in the saved stage when known. During execution, the runner checkpoints fresh aliases from a valid batch under the approved existing frame within the stage reference limit. Order parents before children and reuse the original alias in later calls. Never use a native task- ref as a new alias. For existing design enhancements, prefer in-place edits, and specify measurable hierarchy, spacing, typography, and layout outcomes. For a screen background color request, use the existing screen frame ref and only the requested fill in propertyEdit. The runner resolves the effective background layer and verifies it locally. Existing verified edit refs may satisfy acceptance without mutation; estimates are advisory. Use one operation for a one-property edit. Work above 32 mutations is continued locally in persisted segments, so never replan at that boundary. Never copy checkpoint execution metadata into planning arguments. Once a saved plan exists, execute its unfinished stages; do not call plan_canvas_task again. Runtime progress is locally owned.`,
             input: inputResult.data,
             ...(lifecycle === "CONVERSATION"
               ? { tool_choice: "none" }
+              : universalTool
+                ? { tools: availableTools, tool_choice: { type: "function", name: universalTool }, parallel_tool_calls: false }
               : { tools: availableTools, tool_choice: "auto", parallel_tool_calls: true }),
             store: false,
             stream: true,
@@ -2245,7 +2249,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
           generatedBytes += Buffer.byteLength(delta, "utf8");
           if (generatedBytes > 256 * 1024) throw new Error("response_too_large");
           streamedText += delta;
-          writeChatEvent(response, "delta", { requestId: correlatedId, delta });
+          if (!universalTool) writeChatEvent(response, "delta", { requestId: correlatedId, delta });
         },
         requestStartedAt!,
         (diagnostic) => {
@@ -2284,6 +2288,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
           requestId: correlatedId,
           model,
           inputMode,
+          lifecycle,
           outcome: "invalid_event" as const,
           chatState: "invalid_tool_calls" as const,
           errorCode: validationIssues[0]?.errorCode ?? "invalid_function_call",
@@ -2300,7 +2305,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
       }
       const availableNames = new Set(availableTools.map(({ name }) => name));
       const duplicatePlanOnly =
-        lifecycle !== "UNPLANNED" &&
+        !universalTool && lifecycle !== "UNPLANNED" &&
         lifecycle !== "INSPECTING" &&
         lifecycle !== "EDIT_PLANNING" &&
         calls.length > 0 &&
@@ -2321,6 +2326,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
           requestId: correlatedId,
           model,
           inputMode,
+          lifecycle,
           chatState: "invalid_tool_calls",
           errorCode: "tool_not_available_for_state",
           toolValidationIssues: validationIssues,
@@ -2365,6 +2371,16 @@ export function createCompanionServer(options: CompanionServerOptions) {
         });
       const responseText =
         streamedText || completed.text || completed.outputText || outputContent.text;
+      if (universalTool && (calls.length !== 1 || calls[0]?.name !== universalTool)) {
+        const issue: ChatFunctionCallValidationIssue = calls.length
+          ? { stage: "call_set", errorCode: "unexpected_tool_count", fieldPaths: ["calls"] }
+          : missingStructuredChatCall(responseText, Boolean(outputContent.refusal));
+        logChatDiagnostic({ ...completed.diagnostic, requestId: correlatedId, lifecycle,
+          chatState: "invalid_tool_calls", errorCode: issue.errorCode, toolValidationIssues: [issue] });
+        writeChatEvent(response, "tool_validation", { requestId: correlatedId, issues: [issue], timing });
+        response.end();
+        return;
+      }
       if (Buffer.byteLength(responseText || outputContent.refusal, "utf8") > 256 * 1024) {
         throw new ResponsesStreamError("response_too_large", {
           ...completed.diagnostic,
@@ -2378,6 +2394,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
           requestId: correlatedId,
           model,
           inputMode,
+          lifecycle,
           chatState: "tool_calls",
         });
         writeChatEvent(response, "tool_calls", {
@@ -2385,7 +2402,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
           calls,
           functionCallItems: calls.map(({ functionCall }) => functionCall),
           timing,
-          text: responseText,
+          text: universalTool ? "" : responseText,
         });
       } else {
         const text = responseText || outputContent.refusal;

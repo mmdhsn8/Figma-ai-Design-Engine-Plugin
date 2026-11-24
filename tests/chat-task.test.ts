@@ -19,9 +19,10 @@ import {
 import { chatTaskInput, runChatTask, waitForChatCapacity } from "../src/ui/chat-task";
 import { handleChatTaskStorage } from "../src/plugin/chat-task-storage";
 import { chatTaskBridge, ChatTaskBridgeError } from "../src/ui/chat-task-bridge";
+import { decodeChatTaskStorageMessage } from "../src/shared/chat-checkpoint-wire";
 import { CompanionClientError, type AuthorizedChatTurn } from "../src/ui/companion-client";
 import type { FigmaToolOperation } from "../src/shared/figma-tools";
-import type { PluginToUIMessage, UIToPluginMessage } from "../src/shared/messages";
+import type { PluginToUIMessage } from "../src/shared/messages";
 import { MAX_NATIVE_QUALITY_SCAN_NODES } from "../src/shared/native-visual-quality";
 import { BrandKitRevisionSchema, pinBrandKit } from "../src/shared/brand-kit";
 import {
@@ -5026,7 +5027,9 @@ describe("document-scoped canvas task checkpoints", () => {
       events.dispatchEvent(event);
     };
     const parentPostMessage = vi.fn(({ pluginMessage }: { pluginMessage: unknown }) => {
-      const message = pluginMessage as Extract<UIToPluginMessage, { type: "chat-task-load" | "chat-task-save" }>;
+      const decoded = decodeChatTaskStorageMessage(pluginMessage);
+      if (!decoded.success) throw new Error(decoded.code);
+      const message = decoded.data;
       void handleChatTaskStorage(api, message).then((response) => {
         // Simulate an acknowledgement lost between the Figma controller and UI.
         if (message.type === "chat-task-load") dispatch(response);
@@ -5098,7 +5101,9 @@ describe("document-scoped canvas task checkpoints", () => {
       events.dispatchEvent(event);
     };
     const parentPostMessage = vi.fn(({ pluginMessage }: { pluginMessage: unknown }) => {
-      const message = pluginMessage as Extract<UIToPluginMessage, { type: "chat-task-load" | "chat-task-save" }>;
+      const decoded = decodeChatTaskStorageMessage(pluginMessage);
+      if (!decoded.success) throw new Error(decoded.code);
+      const message = decoded.data;
       void handleChatTaskStorage(api, message).then((response) => {
         dispatch(response);
       });

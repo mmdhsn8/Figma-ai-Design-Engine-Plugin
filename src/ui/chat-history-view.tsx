@@ -15,6 +15,7 @@ export function ChatHistoryView({
   onDuplicate,
   onExport,
   onDelete,
+  onDeleteAll,
 }: {
   conversations: ChatHistoryConversation[];
   activeChatId: string | null;
@@ -29,6 +30,7 @@ export function ChatHistoryView({
   onDuplicate: (conversation: ChatHistoryConversation) => void;
   onExport: (conversation: ChatHistoryConversation) => void;
   onDelete: (conversation: ChatHistoryConversation) => void;
+  onDeleteAll: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -76,9 +78,19 @@ export function ChatHistoryView({
             Each chat keeps its own messages and resumable task checkpoint.
           </p>
         </div>
-        <button className="primary-action" type="button" onClick={onNew} disabled={!canSwitch}>
-          New Chat
-        </button>
+        <div className="history-heading-actions">
+          <button className="primary-action" type="button" onClick={onNew} disabled={!canSwitch}>
+            New Chat
+          </button>
+          <button
+            className="danger-action"
+            type="button"
+            onClick={onDeleteAll}
+            disabled={!canSwitch || conversations.length === 0}
+          >
+            Delete All
+          </button>
+        </div>
       </div>
       {!canSwitch && disabledReason && (
         <p className="history-lock-note" role="status">

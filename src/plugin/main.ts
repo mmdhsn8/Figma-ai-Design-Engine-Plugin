@@ -1,7 +1,6 @@
 import { countDesignNodes, parseDesignText } from "../shared/schema";
 import { isMultiScreenInput, parseMultiScreenText } from "../shared/multi-screen-schema";
 import {
-  ChatTaskStorageMessageSchema,
   UIToPluginSchema,
   type PluginToUIMessage,
   type UIToPluginMessage,
@@ -15,9 +14,8 @@ import { createGenerationController } from "./generation-controller";
 import { createFigmaToolExecutor } from "./figma-tool-executor";
 import { renderDesignProgramLocal } from "./design-program-spike";
 import { handleChatTaskStorage } from "./chat-task-storage";
-import { CHAT_TASK_MAX_BYTES } from "../shared/chat-task";
-import { utf8Bytes } from "../shared/generation-limits";
-import { traceCheckpoint } from "../shared/chat-checkpoint-wire";
+import { checkpointHash, decodeChatTaskStorageMessage, traceCheckpoint } from "../shared/chat-checkpoint-wire";
+import { FW7_BUILD_ID } from "../shared/fw7-feature";
 import { handleChatHistoryStorage } from "./chat-history-storage";
 import { handleModelPreferenceStorage } from "./model-preference-storage";
 import { handleDesignEnginePreferenceStorage } from "./design-engine-preference-storage";
@@ -145,14 +143,14 @@ async function fontWarnings(input: DesignSpec | MultiScreenSpec): Promise<string
 figma.ui.onmessage = async (rawMessage: unknown) => {
   if (rawMessage && typeof rawMessage === "object" && "type" in rawMessage &&
       (rawMessage.type === "chat-task-save" || rawMessage.type === "chat-task-load")) {
-    const request = rawMessage as { requestId?: unknown; documentId?: unknown; task?: unknown };
+    const request = rawMessage as { requestId?: unknown; documentId?: unknown };
     const requestId = typeof request.requestId === "string" && request.requestId.length <= 100
       ? request.requestId : "";
     const documentId = typeof request.documentId === "string" && request.documentId.length <= 300
       ? request.documentId : "";
-    const postResult = (result: Extract<PluginToUIMessage, { type: "chat-task-result" }>) => {
+    const postResult = (result: Extract<PluginToUIMessage, { type: "chat-task-result" }>, taskId?: string) => {
       try {
-        send(result, typeof request.task === "object" && request.task && "id" in request.task && typeof request.task.id === "string" ? request.task.id : undefined);
+        send(result, taskId);
         traceCheckpoint("controller", "ack_posted", requestId, {
           success: result.success, code: result.errorCode, ...result.revision,
         });
@@ -164,21 +162,27 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       type: "chat-task-result", requestId, documentId, success: false,
       errorCategory: "checkpoint_storage", errorCode, error,
     });
-    traceCheckpoint("controller", "received", requestId, { operation: rawMessage.type });
+    const wire = rawMessage.type === "chat-task-load" ? "load" : "taskJson" in rawMessage ? "json" : "object";
+    traceCheckpoint("controller", "received", requestId, { operation: rawMessage.type, wire, buildId: FW7_BUILD_ID });
     try {
-      const raw = rawMessage.type === "chat-task-save" ? JSON.stringify(request.task) : undefined;
-      if (raw !== undefined && utf8Bytes(raw) > CHAT_TASK_MAX_BYTES) {
-        rejectCheckpoint("checkpoint_size_limit", "Task checkpoint exceeds its 512 KiB safety budget. Existing canvas changes are retained.");
-        return;
-      }
-      const checkpoint = ChatTaskStorageMessageSchema.safeParse(rawMessage);
+      const checkpoint = decodeChatTaskStorageMessage(rawMessage);
       if (!checkpoint.success) {
-        rejectCheckpoint("checkpoint_protocol_error", "Figma received an invalid checkpoint message. Reload the development plugin before retrying.");
+        traceCheckpoint("controller", "rejected", requestId, {
+          operation: rawMessage.type, wire, buildId: FW7_BUILD_ID,
+          code: checkpoint.code, phase: checkpoint.phase, bytes: checkpoint.bytes, issues: checkpoint.issues,
+        });
+        rejectCheckpoint(checkpoint.code, checkpoint.code === "checkpoint_size_limit"
+          ? "Task checkpoint exceeds its 512 KiB safety budget. Existing canvas changes are retained."
+          : checkpoint.code === "checkpoint_revision_mismatch"
+            ? "The checkpoint changed during transport. The last saved checkpoint was retained."
+            : `Figma rejected the ${rawMessage.type} during ${checkpoint.phase} validation. The last saved checkpoint was retained. Reference ${checkpointHash(requestId)}.${checkpoint.issues ? ` Checks: ${checkpoint.issues}.` : ""}`.slice(0, 500));
         return;
       }
       const taskId = checkpoint.data.type === "chat-task-save" ? checkpoint.data.task?.id : undefined;
+      if (taskId)
+        traceCheckpoint("controller", "validated", requestId, { taskHash: checkpointHash(taskId), wire });
       fw7Telemetry.record({ runId: taskId ?? checkpoint.data.requestId, ...(taskId ? { taskId } : {}), requestIdHash: fw7CorrelationHash(checkpoint.data.requestId), boundary: "ui-plugin", kind: "bridge_request_received", stage: "checkpoint", operation: checkpoint.data.type, result: "received", counter: "pluginRequestsReceived" });
-      postResult(await handleChatTaskStorage(figma, checkpoint.data, { prevalidated: true }));
+      postResult(await handleChatTaskStorage(figma, checkpoint.data, { prevalidated: true }), taskId);
     } catch {
       rejectCheckpoint("checkpoint_controller_failed", "Figma could not process the checkpoint request.");
     }
@@ -226,7 +230,8 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
   if (
     message.data.type === "chat-history-load" ||
     message.data.type === "chat-history-upsert" ||
-    message.data.type === "chat-history-delete"
+    message.data.type === "chat-history-delete" ||
+    message.data.type === "chat-history-delete-all"
   ) {
     send(await handleChatHistoryStorage(figma, message.data));
     return;

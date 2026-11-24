@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { ChatTaskSchema, chatTaskSafeDiagnostic, type ChatTask } from "../src/shared/chat-task";
-import { ChatInputItemSchema, parseResponsesFunctionCalls, validateChatRequestInput, type ChatInputItem, type ChatLifecycleState } from "../src/shared/chat-tools";
+import { ChatTaskSchema, chatTaskRetryLabel, chatTaskSafeDiagnostic, type ChatTask } from "../src/shared/chat-task";
+import { checkpointJson, checkpointRevision, decodeChatTaskStorageMessage } from "../src/shared/chat-checkpoint-wire";
+import { ChatFunctionCallValidationError, ChatInputItemSchema, parseResponsesFunctionCalls, validateChatRequestInput, type ChatInputItem, type ChatLifecycleState } from "../src/shared/chat-tools";
 import { parseChatGenerationIntent, isClearCreateRequest } from "../src/shared/chat-generation";
 import { UniversalDesignProgramV1Schema, parseDesignProgram, type DesignProgramNode, type DesignProgramV1 } from "../src/shared/design-program";
 import { compositionVariationSeed, createDefaultVisualLanguage, type ProjectVisualLanguageV1 } from "../src/shared/design-composition";
@@ -16,6 +17,7 @@ import { brandAssetContentHash, BrandKitRevisionSchema, createBrandVisualAsset, 
 import { ONE_PIXEL_PNG } from "./visual-fixtures";
 import { CompanionClientError, type AuthorizedChatTurn } from "../src/ui/companion-client";
 import type { PluginToUIMessage } from "../src/shared/messages";
+import { chatTaskBridge } from "../src/ui/chat-task-bridge";
 import { selectChatExecutionRoute } from "../src/ui/universal-design-route";
 import { createDesignContextController } from "../src/plugin/design-context-controller";
 import { CONTEXT_COMPONENT_KEY, prepareContextReuse } from "../src/plugin/design-context-reuse";
@@ -357,6 +359,7 @@ function addContrastFailure(program: DesignProgramV1) {
 }
 
 function makeHarness(input: Case, options: {
+  longPlanRegion?: boolean;
   firstPlanMalformed?: boolean;
   firstProgramViewportMismatch?: boolean;
   repairViewportMismatch?: boolean;
@@ -453,7 +456,9 @@ function makeHarness(input: Case, options: {
           kind: "tool_validation" as const,
           issues: [{ toolName: "plan_universal_project", callId: "universal-call-0002", stage: "arguments_schema" as const, errorCode: "too_small", fieldPaths: ["productPurpose"] }],
         };
-      return modelTurn("plan_universal_project", draftFor(input, options.sparseConfirmation ? 1 : 3, options.planLanguage), index);
+      const draft = draftFor(input, options.sparseConfirmation ? 1 : 3, options.planLanguage);
+      if (options.longPlanRegion) draft.screens[0]!.regions[0]!.content = "Product assortment, accessible price labels, a concise explanation of key product differences, and clear availability information for shoppers.";
+      return modelTurn("plan_universal_project", draft, index);
     }
     if (lifecycle === "UNIVERSAL_COMPOSING") {
       const screenId = payload.context?.currentScreen?.screenId;
@@ -607,7 +612,213 @@ function scriptedMarineCase(screenCount: number): Case {
   };
 }
 
+function onlineShopCase(brief = "create 2 screen for online shop", locale: Case["locale"] = "en-US"): Case {
+  const persian = locale === "fa-IR";
+  return {
+    name: "two-screen online shop",
+    brief, locale, platform: "mobile",
+    purpose: "Help shoppers browse a catalog and evaluate an item.",
+    audience: "Online shoppers",
+    tags: ["commerce"], entities: ["product"],
+    goals: persian ? ["مشاهدهٔ کالاها", "بررسی جزئیات"] : ["Browse products", "Review product details"],
+    screens: [
+      { name: persian ? "فهرست کالاها" : "Product catalog", role: "catalog", purpose: persian ? "کالاهای فروشگاه را مرور کنید." : "Browse the available products." },
+      { name: persian ? "جزئیات کالا" : "Product detail", role: "product-detail", purpose: persian ? "قیمت و ویژگی‌های کالا را بررسی کنید." : "Compare item features and price." },
+    ],
+  };
+}
+
 describe("universal design Chat route", () => {
+  it("gives the composer the exact nested dimension paths before retrying a rejected screen", async () => {
+    const input = onlineShopCase("Create 2 screens for a lifestyle app in Figma.");
+    const h = makeHarness(input, { maxConcurrentModelCalls: 1 });
+    const model = h.model.getMockImplementation()!;
+    let attempts = 0;
+    h.model.mockImplementation(async (...args) => {
+      if (args[2]?.endsWith("_screen-01_c1")) {
+        attempts++;
+        const program = programFor(input, 0);
+        const root = program.screens[0]!.root;
+        if (root.type !== "container") throw new Error("Expected a fixture container.");
+        Object.assign(root.children[0]!, { width: 340, height: "hug" });
+        try {
+          return modelTurn("compose_design_program", { screenId: "screen-01", program }, 90);
+        } catch (error) {
+          if (!(error instanceof ChatFunctionCallValidationError)) throw error;
+          return { kind: "tool_validation", issues: error.validationIssues };
+        }
+      }
+      if (args[2]?.endsWith("_screen-01_c2")) {
+        attempts++;
+        const payload = args[0].at(-1);
+        if (!payload || !("content" in payload)) throw new Error("Expected a compose retry.");
+        const { priorValidation } = JSON.parse(payload.content.split("\n", 2)[1]!);
+        expect(priorValidation).toContain("program.screens.0.root.children.0.width");
+        expect(priorValidation).toContain("program.screens.0.root.children.0.height");
+        expect(priorValidation).toContain('{"mode":"fixed","value":120}');
+        expect(h.deps.renderProgram).not.toHaveBeenCalled();
+      }
+      return model(...args);
+    });
+    await runChatTask(h.task, h.deps);
+    expect(attempts).toBe(2);
+    expect(h.task.status).toBe("completed");
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(2);
+  });
+  it.each([
+    ["create 2 screen for online shop", "en-US"],
+    ["برای فروشگاه آنلاین ۲ صفحه بساز", "fa-IR"],
+  ] as const)("initializes two stages from a valid plan with a long region for %s", async (brief, locale) => {
+    const h = makeHarness(onlineShopCase(brief, locale), { longPlanRegion: true });
+    await runChatTask(h.task, h.deps);
+    const firstPlan = h.checkpoints.find(({ projectPlan }) => projectPlan);
+    expect(firstPlan?.projectPlan).toMatchObject({ taskId: h.task.id, screenCount: 2, locale });
+    expect(JSON.stringify(h.modelInputs[1])).toContain('requestedScreenCount\\":2');
+    expect(firstPlan?.projectPlan?.screens[0]?.regions[0]?.content.length).toBeGreaterThan(120);
+    expect(firstPlan?.stages).toHaveLength(2);
+    expect(firstPlan?.universalScreens?.map(({ screenId }) => screenId)).toEqual(["screen-01", "screen-02"]);
+    expect(h.task).toMatchObject({ intent: "create", status: "completed" });
+    expect(h.task.stages.every(({ verified }) => verified)).toBe(true);
+    const roots = h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete");
+    expect(roots).toHaveLength(2);
+    expect(new Set(roots.map(({ id }) => id)).size).toBe(2);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(2);
+    expect(h.deps.inspectProgram).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries the same two-screen task after invalid model output and an interrupted plan request", async () => {
+    const h = makeHarness(onlineShopCase(), { longPlanRegion: true });
+    const unrelated = h.mock.api.createRectangle();
+    const taskId = h.task.id;
+    h.model.mockResolvedValueOnce({ kind: "done", text: '{"intent":"create","private":"do-not-display"}' });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("structured_text_instead_of_tool_call");
+    expect(h.task).toMatchObject({ id: taskId, status: "failed", stages: [], failure: { code: "structured_text_instead_of_tool_call", phase: "planning" } });
+    expect(h.task.error).not.toContain("do-not-display");
+    expect(chatTaskRetryLabel(h.task)).toBe("Retry planning");
+    const resumed = structuredClone(h.checkpoints.at(-1)!);
+    const model = h.model.getMockImplementation()!;
+    h.model.mockImplementationOnce(model).mockRejectedValueOnce(new CompanionClientError("responses_transport_error"));
+    await expect(runChatTask(resumed, h.deps)).rejects.toMatchObject({ category: "responses_transport_error" });
+    expect(resumed).toMatchObject({ id: taskId, intent: "create", stages: [], failure: { code: "responses_transport_error", phase: "transport" } });
+    expect(h.deps.renderProgram).not.toHaveBeenCalled();
+    expect(h.mock.page.children).toEqual([unrelated]);
+    await runChatTask(structuredClone(h.checkpoints.at(-1)!), h.deps);
+    const completed = h.checkpoints.at(-1)!;
+    expect(completed).toMatchObject({ id: taskId, status: "completed" });
+    expect(completed.stages).toHaveLength(2);
+    const rootIds = completed.universalScreens!.map(({ nativeRootNodeId }) => nativeRootNodeId);
+    expect(new Set(rootIds).size).toBe(2);
+    expect(h.mock.page.children.map(({ id }) => id)).toEqual(expect.arrayContaining([unrelated.id, ...rootIds]));
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers a pre-fix checkpoint with a valid two-screen plan and no registered stages", async () => {
+    const h = makeHarness(onlineShopCase(), { longPlanRegion: true });
+    const save = h.deps.save.getMockImplementation()!;
+    h.deps.save.mockImplementation(async (snapshot) => {
+      if (snapshot.projectPlan) throw new Error("Test interruption at first plan save");
+      await save(snapshot);
+    });
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("Test interruption at first plan save");
+    expect(h.deps.renderProgram).not.toHaveBeenCalled();
+    expect(h.deps.progress.mock.calls.flat().join(" ")).not.toContain("saved 2 planned screens");
+    const oldCheckpoint = ChatTaskSchema.parse({ ...h.task, stages: [] });
+    expect(chatTaskRetryLabel(oldCheckpoint)).toBe("Retry planning");
+    h.deps.save.mockImplementation(save);
+    await runChatTask(oldCheckpoint, h.deps);
+    expect(h.lifecycles.filter((state) => state === "UNIVERSAL_PLANNING")).toHaveLength(1);
+    expect(oldCheckpoint).toMatchObject({ id: h.task.id, status: "completed" });
+    expect(oldCheckpoint.stages).toHaveLength(2);
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(2);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers a rejected two-screen shop checkpoint and preserves its first root across Stop and Resume", async () => {
+    const input = onlineShopCase();
+    input.screens[0]!.name = "Shop Browse";
+    input.screens[1]!.name = "Product Detail";
+    const h = makeHarness(input);
+    const scope = { chatId: "chat-shop-recovery", documentId: h.task.documentId };
+    h.task.chatId = scope.chatId;
+    const unrelated = h.mock.api.createRectangle();
+    const roots = () => h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete");
+    const events = new EventTarget();
+    let rejectFirstPlan = true;
+    let firstPlanEnvelope: unknown;
+    const handle = async (message: { requestId: string; taskJson?: string }): Promise<PluginToUIMessage> => {
+      let parsed = decodeChatTaskStorageMessage(structuredClone(message));
+      if (parsed.success && parsed.data.type === "chat-task-save" && parsed.data.task?.projectPlan && rejectFirstPlan) {
+        rejectFirstPlan = false;
+        firstPlanEnvelope = message;
+        parsed = decodeChatTaskStorageMessage({ ...message, unexpectedField: true });
+      }
+      return parsed.success
+        ? handleChatTaskStorage(h.mock.api, parsed.data, { prevalidated: true })
+        : { type: "chat-task-result", requestId: message.requestId, documentId: scope.documentId,
+          success: false, errorCategory: "checkpoint_storage", errorCode: "checkpoint_protocol_error" };
+    };
+    vi.stubGlobal("window", {
+      addEventListener: events.addEventListener.bind(events),
+      removeEventListener: events.removeEventListener.bind(events),
+      setTimeout, clearTimeout,
+    });
+    vi.stubGlobal("parent", {
+      postMessage: ({ pluginMessage }: { pluginMessage: { requestId: string; taskJson?: string } }) => {
+        void handle(pluginMessage).then((response) => {
+          events.dispatchEvent(new MessageEvent("message", { data: { pluginMessage: response } }));
+        });
+      },
+    });
+    const record = h.deps.save.getMockImplementation()!;
+    let saveSequence = 0;
+    h.deps.save.mockImplementation(async (snapshot) => {
+      const response = await chatTaskBridge({ type: "chat-task-save", requestId: `shop-save-${++saveSequence}`, ...scope, task: snapshot });
+      expect(response.revision).toEqual(checkpointRevision(checkpointJson(snapshot)));
+      await record(snapshot);
+    });
+    const load = async (requestId: string) => ChatTaskSchema.parse((await chatTaskBridge({ type: "chat-task-load", requestId, ...scope })).task);
+    try {
+      await expect(runChatTask(h.task, h.deps)).rejects.toMatchObject({ code: "checkpoint_protocol_error" });
+      expect(firstPlanEnvelope).toMatchObject({ taskJson: expect.any(String), revision: expect.any(Object) });
+      expect(firstPlanEnvelope).not.toHaveProperty("task");
+      expect(h.task.stages.map(({ title }) => title)).toEqual(["1/2 Shop Browse", "2/2 Product Detail"]);
+      expect(chatTaskRetryLabel(h.task)).toBe("Retry storage recovery");
+      expect(h.deps.renderProgram).not.toHaveBeenCalled();
+      expect(h.mock.page.children).toEqual([unrelated]);
+
+      const recovered = await load("shop-retry-storage");
+      expect(recovered.id).toBe(h.task.id);
+      expect(recovered.projectPlan).toBeUndefined();
+      expect(recovered.pending[0]?.action.tool).toBe("plan_universal_project");
+      const stop = new AbortController();
+      const render = h.deps.renderProgram.getMockImplementation()!;
+      h.deps.renderProgram.mockImplementationOnce(async (...args) => {
+        const response = await render(...args);
+        stop.abort("user_stop");
+        return response;
+      });
+      await expect(runChatTask(recovered, { ...h.deps, signal: stop.signal })).rejects.toThrow("request_cancelled");
+      expect(roots()).toHaveLength(1);
+      const firstRootId = roots()[0]!.id;
+
+      const resumed = await load("shop-resume-storage");
+      expect(resumed).toMatchObject({ id: h.task.id, status: "stopped", projectPlan: { screenCount: 2 } });
+      await runChatTask(resumed, h.deps);
+      const completed = await load("shop-completed-storage");
+      expect(completed).toMatchObject({ id: h.task.id, status: "completed" });
+      expect(completed.stages.map(({ title, verified }) => [title, verified])).toEqual([
+        ["1/2 Shop Browse", true], ["2/2 Product Detail", true],
+      ]);
+      expect(h.lifecycles.filter((phase) => phase === "UNIVERSAL_PLANNING")).toHaveLength(1);
+      const rootIds = roots().map(({ id }) => id);
+      expect(new Set(rootIds).size).toBe(2);
+      expect(rootIds[0]).toBe(firstRootId);
+      expect(completed.universalScreens?.map(({ nativeRootNodeId }) => nativeRootNodeId)).toEqual(rootIds);
+      expect(h.mock.page.children).toContain(unrelated);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
   it.each(["hi", "سلام", "hello"])("FW-2 does not read, plan or mutate for %s, even with a selected library", async (brief) => {
     const h = makeHarness({ ...cases[1]!, brief }, { fw2: "rich" });
     const before = h.mock.nodes.map(({ id }) => id);
@@ -791,6 +1002,44 @@ describe("universal design Chat route", () => {
     await runChatTask(reloaded, h.deps);
     expect(h.deps.renderProgram).toHaveBeenCalledTimes(1);
     expect(h.mock.roots.map(({ id }) => id)).toEqual(rootIds);
+  });
+
+  it("renders a single screen when the Generate label needs a neutral foreground on #D94F3D", async () => {
+    const input = { ...scriptedMarineCase(1), brief: "create 1 random screen" };
+    const language = createDefaultVisualLanguage({ styleDirection: "Warm editorial", density: "medium", locale: input.locale });
+    const colorRoles = {
+      page: "#FFFFFF", surface: "#FFFFFF", raisedSurface: "#FFFFFF", text: "#343434",
+      mutedText: "#444444", primary: "#D94F3D", accent: "#D94F3D", border: "#CCCCCC",
+    };
+    const h = makeHarness(input, { planLanguage: { ...language, colorRoles } });
+    const original = h.model.getMockImplementation()!;
+    h.model.mockImplementation(async (...args) => {
+      const turn = await original(...args);
+      const action = turn.kind === "tool_calls" ? turn.calls[0]?.action : undefined;
+      if (action?.tool !== "compose_design_program") return turn;
+      const program = action.program;
+      const root = program.screens[0]?.root;
+      const button = root?.type === "container" ? root.children[2] : undefined;
+      const label = button?.type === "container" ? button.children[0] : undefined;
+      if (button?.type !== "container" || label?.type !== "text") throw new Error("Expected fixture button and label.");
+      button.background = "token:primary";
+      Object.assign(label, { id: "generate-label", name: "Generate label", text: "Generate", color: "#FFFFFF", textRole: "label" });
+      return modelTurn("compose_design_program", { screenId: action.screenId, program }, 30);
+    });
+
+    await runChatTask(h.task, h.deps);
+    expect(h.lifecycles).not.toContain("UNIVERSAL_REPAIR");
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(1);
+    const program = h.deps.renderProgram.mock.calls[0]![0];
+    expect(auditDesignProgramContrast(program)).toEqual([]);
+    expect(program.tokens.colors.primary).toBe("#D94F3D");
+    const nativeLabel = h.mock.nodes.find(({ name }) => name === "Generate label");
+    expect(nativeLabel?.fills).toEqual([expect.objectContaining({ type: "SOLID", color: { r: 0, g: 0, b: 0 } })]);
+    const nativeButton = nativeLabel?.parent;
+    if (nativeButton?.type !== "FRAME") throw new Error("Expected an editable button frame.");
+    expect(nativeButton.fills).toEqual([expect.objectContaining({ type: "SOLID", color: { r: 217 / 255, g: 79 / 255, b: 61 / 255 } })]);
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(1);
+    expect(h.task.status).toBe("completed");
   });
 
   it("reports measurable contrast failures without requesting model repair when the active palette has no compliant color", async () => {
@@ -1909,6 +2158,20 @@ describe("universal design Chat route", () => {
           providerDelayForScreen: (screenId) => screenId === "screen-01" ? 60 : 15,
           maxConcurrentModelCalls: 2,
         });
+        if (screenCount > 1) {
+          let releaseFirst!: () => void;
+          const secondCompleted = new Promise<void>((resolve) => { releaseFirst = resolve; });
+          const model = h.model.getMockImplementation()!;
+          h.model.mockImplementation(async (...args) => {
+            const requestId = args[2];
+            if (requestId?.endsWith("_screen-01_c1")) await secondCompleted;
+            try {
+              return await model(...args);
+            } finally {
+              if (requestId?.endsWith("_screen-02_c1")) releaseFirst();
+            }
+          });
+        }
         const startedAt = performance.now();
         await runChatTask(h.task, h.deps);
         const elapsedMs = Math.round(performance.now() - startedAt);
