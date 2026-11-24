@@ -274,6 +274,19 @@ describe("Figma main sandbox runtime compatibility", () => {
     runInContext(compiledUiBridge, uiContext);
     const uiBridge = (uiContext as unknown as { FadCompiledUiBridge: { chatTaskBridge: typeof chatTaskBridgeType } }).FadCompiledUiBridge.chatTaskBridge;
     try {
+      const emittedUiWindow = uiContext.window as unknown as { __fadBuildId: string };
+      const emittedUiBuildId = emittedUiWindow.__fadBuildId;
+      const firstMismatchDispatch = sent.length;
+      emittedUiWindow.__fadBuildId = "deliberately-stale-ui-build";
+      await expect(uiBridge({
+        type: "chat-task-load",
+        requestId: "vm-compiled-stale-load",
+        ...scope,
+      })).rejects.toMatchObject({ code: "checkpoint_build_mismatch" });
+      expect(sent.slice(firstMismatchDispatch).map((message) => (message as { type: string }).type))
+        .toEqual(["plugin-runtime-handshake"]);
+      emittedUiWindow.__fadBuildId = emittedUiBuildId;
+
       await expect(uiBridge({ type: "chat-task-save", requestId: "vm-shop-save", ...scope, task: shop }))
         .resolves.toMatchObject({ success: true, revision: shopRevision });
       const sentSave = sent.find((message) => Boolean(
@@ -346,6 +359,62 @@ describe("Figma main sandbox runtime compatibility", () => {
     } finally {
       vi.unstubAllGlobals();
       logSpy.mockRestore();
+    }
+  });
+
+  it("fails promptly when an older plugin rejects the checkpoint handshake", async () => {
+    vi.useFakeTimers();
+    const events = new EventTarget();
+    const posted: unknown[] = [];
+    const context = createContext({
+      window: {
+        __fadBuildId: bundledBuildId,
+        addEventListener: events.addEventListener.bind(events),
+        removeEventListener: events.removeEventListener.bind(events),
+        setTimeout: globalThis.setTimeout.bind(globalThis),
+        clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      },
+      parent: {
+        postMessage: ({ pluginMessage }: { pluginMessage: { requestId: string; type: string } }) => {
+          posted.push(pluginMessage);
+          if (pluginMessage.type !== "plugin-runtime-handshake") return;
+          events.dispatchEvent(new MessageEvent("message", {
+            data: {
+              pluginMessage: {
+                type: "protocol-error",
+                requestId: pluginMessage.requestId,
+                message: "The plugin received an invalid request.",
+              },
+            },
+          }));
+        },
+      },
+      setTimeout,
+      clearTimeout,
+      console: { info: vi.fn(), log: vi.fn() },
+    });
+    runInContext(compiledUiBridge, context);
+    const bridge = (context as unknown as {
+      FadCompiledUiBridge: { chatTaskBridge: typeof chatTaskBridgeType };
+    }).FadCompiledUiBridge.chatTaskBridge;
+    let observed: unknown;
+    const outcome = bridge({
+      type: "chat-task-load",
+      requestId: "stale-plugin-load-01",
+      documentId: "file-1-page-1",
+    }).then(
+      () => { observed = "resolved"; },
+      (error: unknown) => { observed = error; },
+    );
+    try {
+      for (let index = 0; index < 6; index++) await Promise.resolve();
+      expect(observed).toMatchObject({ code: "checkpoint_build_mismatch" });
+      expect(posted).toHaveLength(1);
+      expect(posted[0]).toMatchObject({ type: "plugin-runtime-handshake" });
+      await outcome;
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
     }
   });
 

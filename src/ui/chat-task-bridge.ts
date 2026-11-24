@@ -42,7 +42,27 @@ function ensureCheckpointRuntime() {
       const raw = event.data?.pluginMessage;
       if (raw?.requestId !== requestId) return;
       const parsed = PluginToUISchema.safeParse(raw);
-      if (!parsed.success || parsed.data.type !== "plugin-runtime-handshake-result") return;
+      if (!parsed.success) {
+        finish(new ChatTaskBridgeError(
+          "Figma returned an invalid runtime handshake response. Reload the development plugin and reopen it.",
+          "checkpoint_protocol_error",
+        ));
+        return;
+      }
+      if (parsed.data.type === "protocol-error") {
+        finish(new ChatTaskBridgeError(
+          "The Figma plugin rejected the checkpoint handshake. Reload the development plugin and reopen it.",
+          "checkpoint_build_mismatch",
+        ));
+        return;
+      }
+      if (parsed.data.type !== "plugin-runtime-handshake-result") {
+        finish(new ChatTaskBridgeError(
+          "Figma returned an unexpected runtime handshake response. Reload the development plugin and reopen it.",
+          "checkpoint_protocol_error",
+        ));
+        return;
+      }
       const result = parsed.data;
       if (result.compatible && result.protocolVersion === 1 && result.uiBuildId === uiBuildId && result.pluginBuildId === uiBuildId) {
         finish();
