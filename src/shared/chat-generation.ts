@@ -805,9 +805,9 @@ export function parseChatGenerationIntent(prompt: string): ParsedChatGenerationI
   const screenAdjective =
     /(?:(?:new|editable|mobile|desktop|web|phone|responsive|جدید|قابل‌ویرایش|موبایل|دسکتاپ)\s+){0,3}/iu;
   const screenNoun =
-    /(?:screens?|pages?|views?|صفحه(?:‌ها|ها|ی|های)?|اسکرین(?:‌ها|ها)?)/iu;
+    /(?:(?:screens?|pages?|views?)\b|صفحه(?:‌ها|ها|ی|های)?|اسکرین(?:‌ها|ها)?)/iu;
   const numericMatch = new RegExp(
-    `([0-9۰-۹٠-٩]{1,3})\\s*${screenAdjective.source}${screenNoun.source}`,
+    `(?<![0-9۰-۹٠-٩])([0-9۰-۹٠-٩]+)\\s*${screenAdjective.source}${screenNoun.source}`,
     "iu",
   ).exec(normalized);
   const englishWordMatch = new RegExp(
@@ -819,7 +819,7 @@ export function parseChatGenerationIntent(prompt: string): ParsedChatGenerationI
   const rawCount = numericMatch?.[1];
   const word = englishWordMatch?.[1] ?? persianWordMatch?.[1];
   const count = rawCount ? Number(asciiDigits(rawCount)) : word ? countWords[word] : undefined;
-  if (!count) return { kind: "not_a_handoff" };
+  if (count === undefined) return { kind: "not_a_handoff" };
   if (count < 1 || count > 10) return { kind: "out_of_range", screenCount: count };
   if (
     /\bresponsive\b|\b(?:both\s+)?mobile\s*(?:and|\+)\s*desktop\b|موبایل\s*(?:و|\+)\s*دسکتاپ/iu.test(

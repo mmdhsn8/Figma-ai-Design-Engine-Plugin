@@ -4888,6 +4888,13 @@ describe("document-scoped canvas task checkpoints", () => {
       task: { ...savedTask, text: "different contents" },
     });
     expect(conflictingDuplicate).toMatchObject({ success: false, errorCode: "checkpoint_request_conflict" });
+    const conflictingTaskId = await handleChatTaskStorage(api, {
+      type: "chat-task-save",
+      requestId: saveRequestId,
+      documentId: savedTask.documentId,
+      task: { ...savedTask, id: "another-task-same-storage-key" },
+    });
+    expect(conflictingTaskId).toMatchObject({ success: false, errorCode: "checkpoint_request_conflict" });
     expect(setAsync).toHaveBeenCalledTimes(1);
     const loaded = await handleChatTaskStorage(api, {
       type: "chat-task-load",

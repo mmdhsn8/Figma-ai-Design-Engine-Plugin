@@ -97,6 +97,9 @@ describe("Chat to structured generation contract", () => {
       kind: "out_of_range",
       screenCount: 11,
     });
+    expect(parseChatGenerationIntent("Create 0 screens")).toEqual({ kind: "out_of_range", screenCount: 0 });
+    expect(parseChatGenerationIntent("Create 1001 screens")).toEqual({ kind: "out_of_range", screenCount: 1001 });
+    expect(parseChatGenerationIntent("Create screens with 2 screenshots").kind).toBe("not_a_handoff");
   });
 
   it.each([1, 3, 10])(

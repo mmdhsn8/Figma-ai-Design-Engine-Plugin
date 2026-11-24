@@ -1257,6 +1257,13 @@ describe("universal design Chat route", () => {
     expect(h.checkpoints.at(-1)?.status).toBe("stopped");
     expect(h.checkpoints.at(-1)?.universalScreens?.[0]?.nativeRootNodeId).toBe(root.id);
     expect(h.checkpoints.at(-1)?.text).not.toContain("created and read back");
+
+    // The saved verification predates this canvas change.
+    const saved = ChatTaskSchema.parse(h.checkpoints.at(-1));
+    root.remove();
+    await expect(runChatTask(saved, h.deps)).rejects.toThrow(/native_root_(removed|missing)/);
+    expect(saved.status).toBe("failed");
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(1);
   });
 
   it("accepts the actual long ten-screen planning request and resumes its saved task after interruption", async () => {
@@ -1276,21 +1283,34 @@ describe("universal design Chat route", () => {
         .toEqual({ success: true, data: items });
       return model(items, state);
     });
-    h.deps.renderProgram.mockImplementationOnce(async (program, id) => {
-      await render(program, id);
-      throw new Error("Interrupted after native commit");
+    let interrupted = false;
+    h.deps.renderProgram.mockImplementation(async (program, id, expectedRoot, ticket) => {
+      const result = await render(program, id, expectedRoot, ticket);
+      if (!interrupted && program.screens[0]?.id === "screen-06") {
+        interrupted = true;
+        throw new Error("Interrupted after native commit");
+      }
+      return result;
     });
     await expect(runChatTask(h.task, h.deps)).rejects.toThrow("Interrupted after native commit");
     const persisted = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
     expect(persisted.projectPlan?.screenCount).toBe(10);
-    const firstRoot = h.mock.roots.find((node) => node.getPluginData("fad.generation.commit") === "complete");
-    expect(firstRoot).toBeDefined();
+    const confirmed = persisted.universalScreens?.filter(({ status }) => status === "verified");
+    expect(confirmed).toHaveLength(5);
+    const previouslyAttached = h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete").map(({ id }) => id);
+    expect(previouslyAttached).toHaveLength(6);
     await runChatTask(persisted, h.deps);
     expect(longPlanRequests).toBe(2);
     expect(persisted.status).toBe("completed");
     const roots = h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete");
     expect(roots).toHaveLength(10);
-    expect(roots.map(({ id }) => id)).toContain(firstRoot!.id);
+    const orderedIds = persisted.universalScreens?.map(({ nativeRootNodeId }) => nativeRootNodeId);
+    expect(orderedIds?.slice(0, 6)).toEqual(previouslyAttached);
+    expect(roots.map(({ id }) => id)).toEqual(orderedIds);
+    expect(new Set(orderedIds).size).toBe(10);
+    expect(h.deps.renderProgram.mock.calls.filter(([program]) => program.screens[0]?.id === "screen-06")).toHaveLength(2);
+    expect(h.deps.inspectProgram.mock.calls.filter(([request]) => request.type === "task-native-inspect" &&
+      request.geometry?.expectedRootNodeId === previouslyAttached[0])).toHaveLength(2);
   });
 
   it("restarts a lost Companion planning turn from the persisted attempt without writing a native node", async () => {

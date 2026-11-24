@@ -560,6 +560,12 @@ export function createCompanionServer(options: CompanionServerOptions) {
     };
   }
 
+  function currentAuthorizedSession(session: LiveSession): LiveSession | undefined {
+    const current = liveSession;
+    return current?.sessionId === session.sessionId && current.subjectHash === session.subjectHash &&
+      current.scopes.has(PLAN_USE_SCOPE) ? current : undefined;
+  }
+
   async function persistCredentialState(next: CredentialState): Promise<boolean> {
     let checked: CredentialState;
     try {
@@ -1514,21 +1520,22 @@ export function createCompanionServer(options: CompanionServerOptions) {
         fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_result", stage: "model_catalog_body", result: "cancelled", reasonCode: "caller_cancelled" });
         return;
       }
-      if (liveSession !== session.value) {
+      if (!currentAuthorizedSession(session.value)) {
         sendJson(response, 409, { error: "account_mismatch", status: status() });
         return;
       }
       if (!result.ok) {
         const category = classifyHttpStatus(result.status);
-        await applySessionHttpFailure(category);
+        if (liveSession === session.value) await applySessionHttpFailure(category);
         sendJson(response, result.status, { error: category, status: status() });
         return;
       }
-      const body = (await readJsonResponse(result, 1_024 * 1_024, timeoutMs)) as {
+      const body = (await readJsonResponse(result, 1_024 * 1_024, timeoutMs, clientAbort.signal)) as {
         models?: unknown;
       };
       if (clientAbort.signal.aborted) return;
-      if (liveSession !== session.value) {
+      const current = currentAuthorizedSession(session.value);
+      if (!current) {
         sendJson(response, 409, { error: "account_mismatch", status: status() });
         return;
       }
@@ -1546,14 +1553,14 @@ export function createCompanionServer(options: CompanionServerOptions) {
             .filter(({ slug, displayName }) => slug.length <= 200 && displayName.length <= 200)
             .slice(0, 100)
         : [];
-      session.value.models = models;
+      current.models = models;
       providerBodyCompleted = true;
       fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_result", stage: "model_catalog_body", result: "succeeded", durationMs: Math.max(0, Math.round(performance.now() - providerStartedAt)), observedCount: models.length });
       sendJson(response, 200, { models, status: status() });
     } catch (error) {
       if (!providerBodyCompleted && !clientAbort.signal.aborted) fw7Telemetry.record({ runId: telemetryRunId, boundary: "companion-provider", kind: "provider_request_result", stage: "model_catalog_body", result: "failed", reasonCode: "model_catalog_processing_failed" });
       if (clientAbort.signal.aborted) return;
-      if (liveSession !== session.value) {
+      if (!currentAuthorizedSession(session.value)) {
         sendJson(response, 409, { error: "account_mismatch", status: status() });
         return;
       }
@@ -1598,7 +1605,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
         sendJson(response, session.statusCode, { error: session.error, status: status() });
         return;
       }
-      if (clientAbort.signal.aborted || liveSession !== session.value) {
+      if (clientAbort.signal.aborted || !currentAuthorizedSession(session.value)) {
         if (!request.aborted && !response.destroyed) {
           sendJson(response, 401, { error: "signed_out", status: status() });
         }
@@ -1674,7 +1681,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
       providerStreamCompleted = true;
       fw7Telemetry.record({ runId: telemetryRunId, providerModel: sanitizeDiagnosticModel(model), boundary: "companion-provider", kind: "provider_request_result", stage: "model_smoke_stream", result: "succeeded", durationMs: completed.diagnostic.elapsedMs });
       if (clientAbort.signal.aborted) throw new Error("request_cancelled");
-      if (clientAbort.signal.aborted || liveSession !== session.value) {
+      const current = currentAuthorizedSession(session.value);
+      if (!current) {
         sendJson(response, 401, { error: "signed_out", status: status() });
         return;
       }
@@ -1695,8 +1703,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
           errorCode: "function_call_smoke_failed",
         });
       }
-      session.value.verifiedModel = completed.diagnostic.model;
-      session.value.verifiedAt = now();
+      current.verifiedModel = completed.diagnostic.model;
+      current.verifiedAt = now();
       authStatus = "ready";
       safeMessage = undefined;
       sendJson(response, 200, {
@@ -1804,9 +1812,8 @@ export function createCompanionServer(options: CompanionServerOptions) {
     response.once("close", abortForClosedResponse);
     const ensureCurrentVisualSession = () => {
       if (clientAbort.signal.aborted) throw new Error("request_cancelled");
-      const current = liveSession;
-      if (!current || current.sessionId !== reviewRequest.sessionId || current.subjectHash !== session.value.subjectHash ||
-          !current.scopes.has(PLAN_USE_SCOPE)) throw new Error("stale_task_session");
+      const current = currentAuthorizedSession(session.value);
+      if (!current || current.sessionId !== reviewRequest.sessionId) throw new Error("stale_task_session");
       if (!current.models.some(({ slug }) => slug === reviewRequest.model)) throw new Error("model_not_verified_for_account");
     };
     const reviewRunId = reviewRequest.taskId;
@@ -2714,7 +2721,7 @@ export function createCompanionServer(options: CompanionServerOptions) {
         sendJson(response, session.statusCode, { error: session.error, status: status() });
         return;
       }
-      if (clientAbort.signal.aborted || liveSession !== session.value) {
+      if (clientAbort.signal.aborted || !currentAuthorizedSession(session.value)) {
         if (!request.aborted && !response.destroyed) {
           sendJson(response, 401, { error: "signed_out", status: status() });
         }
@@ -3283,11 +3290,17 @@ export function createCompanionServer(options: CompanionServerOptions) {
           pairingGrants: credentialState.pairingGrants,
           oauthSession: storedSessionFromLive(refreshed),
         });
+        if (liveSession !== refreshed) {
+          return { ok: false as const, statusCode: 401, error: "signed_out" };
+        }
         if (!scopes.has(PLAN_USE_SCOPE)) {
           return { ok: false as const, statusCode: 403, error: "plan_use_scope_missing" };
         }
         return { ok: true as const, value: refreshed };
       } catch (error) {
+        if (liveSession !== session) {
+          return { ok: false as const, statusCode: 401, error: "signed_out" };
+        }
         const category = classifyError(error);
         if (category === "session_expired" || category === "client_id_mismatch") {
           await requireSignIn(category);
@@ -4242,7 +4255,6 @@ export async function readCompletedResponse(
 
   try {
     if (signal?.aborted) {
-      await reader.cancel();
       throw new ResponsesStreamError(
         "request_cancelled",
         diagnostic("cancelled", { terminationReason: "caller_cancelled", cancellationOrigin: chatAbortOrigin(signal) }),
@@ -4252,12 +4264,10 @@ export async function readCompletedResponse(
       const current = performance.now();
       const overallRemaining = deadline - current;
       if (overallRemaining <= 0) {
-        await reader.cancel();
         throw timeoutError("overall");
       }
       const idleRemaining = idleTimeoutMs - (current - lastActivityAt);
       if (idleRemaining <= 0) {
-        await reader.cancel();
         throw timeoutError("idle");
       }
       const timeoutKind = idleRemaining <= overallRemaining ? "idle" : "overall";
@@ -4344,7 +4354,8 @@ export async function readCompletedResponse(
     );
   } finally {
     signal?.removeEventListener("abort", cancelReader);
-    await reader.cancel().catch(() => undefined);
+    // Upstream cleanup can remain pending after the local result or deadline is known.
+    cancelReader();
     reader.releaseLock();
   }
 }
@@ -4721,7 +4732,6 @@ async function readResponseText(
       if (signal?.aborted) throw new Error("request_cancelled");
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        await reader.cancel();
         throw new Error("request_timed_out");
       }
       const { value, done } = await readChunkWithTimeout(reader, remaining);
@@ -4729,13 +4739,13 @@ async function readResponseText(
       if (done) return output + decoder.decode();
       bytes += value.byteLength;
       if (bytes > maximumBytes) {
-        await reader.cancel();
         throw new Error("response_too_large");
       }
       output += decoder.decode(value, { stream: true });
     }
   } finally {
     signal?.removeEventListener("abort", cancelOnAbort);
+    cancelOnAbort();
     reader.releaseLock();
   }
 }
@@ -4753,9 +4763,6 @@ async function readChunkWithTimeout<T>(
         timer = setNodeTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
       }),
     ])) as StreamReadResult<T>;
-  } catch (error) {
-    await reader.cancel().catch(() => undefined);
-    throw error;
   } finally {
     if (timer) clearNodeTimeout(timer);
   }

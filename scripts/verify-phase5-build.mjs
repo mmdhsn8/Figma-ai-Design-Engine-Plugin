@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { computeBuildIdentity } from "./build-identity.mjs";
 import { verifyBuildIdentityRegression } from "./verify-build-identity.mjs";
@@ -10,13 +11,25 @@ const rootPath = fileURLToPath(root);
 const buildId = computeBuildIdentity(rootPath);
 process.env.FW7_BUILD_ID = buildId;
 process.env.FW7_DIAGNOSTICS = "fw7-diagnostics-v1";
-const [{ createCompanionServer }, { createDraftStore }, { createDesignPlan, normalizeGeneratedDesignResponse }, { fw7Telemetry }] = await Promise.all([
+const [{ createCompanionServer, readCompletedResponse }, { createDraftStore }, { createDesignPlan, normalizeGeneratedDesignResponse }, { fw7Telemetry }] = await Promise.all([
   import("../dist-companion/companion/server.js"),
   import("../dist-companion/companion/draft-store.js"),
   import("../dist-companion/shared/design-generation.js"),
   import("../dist-companion/companion/fw7-runtime.js"),
 ]);
 verifyBuildIdentityRegression();
+const providerResponse = (events) => new globalThis.Response(
+  events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+  { headers: { "Content-Type": "text/event-stream" } },
+);
+const delta = { type: "response.output_text.delta", delta: "synthetic sample" };
+const terminal = { type: "response.completed", response: { status: "completed", output: [] } };
+const completed = await readCompletedResponse(providerResponse([delta, terminal]), 1000, performance.now() + 1000);
+assert.equal(completed.diagnostic.terminationReason, "response_completed");
+await assert.rejects(
+  readCompletedResponse(providerResponse([delta]), 1000, performance.now() + 1000),
+  { message: "response_incomplete" },
+);
 const readJson = async (path) => JSON.parse(await readFile(new URL(path, root), "utf8"));
 const pluginBundle = await readFile(new URL("dist/plugin.js", root), "utf8");
 const uiHtml = await readFile(new URL("dist/ui.html", root), "utf8");

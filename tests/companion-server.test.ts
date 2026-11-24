@@ -317,6 +317,25 @@ describe("loopback companion", () => {
     });
   });
 
+  it("accepts a delayed model catalog from the same session after token rotation", async () => {
+    const harness = await createHarness({ refresh: true, expiresIn: 120 });
+    const token = await authorizeAndDiscover(harness);
+    const gate = harness.stallNextModelsResponse();
+    const first = request(harness.handle, "/v1/models", { token, body: {} });
+    await gate.started;
+    try {
+      harness.advanceTime(70_000);
+      const second = await request(harness.handle, "/v1/models", { token, body: {} });
+      expect(second.status).toBe(200);
+      expect(harness.refreshRequest).toContain("grant_type=refresh_token");
+    } finally {
+      gate.release();
+    }
+    const response = await first;
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ models: [{ slug: "account-model" }] });
+  });
+
   it("admits two independent universal Chat model streams and applies a hard third-request cap", async () => {
     const harness = await createHarness();
     const token = await authorizeAndDiscover(harness);
@@ -2938,6 +2957,35 @@ describe("loopback companion", () => {
         elapsedMs: expect.any(Number),
       },
     });
+  });
+
+  it("returns response.completed even while upstream cancellation is still draining", async () => {
+    let finishCancellation!: () => void;
+    const cancellation = new Promise<void>((resolve) => { finishCancellation = resolve; });
+    let markCancellationStarted!: () => void;
+    const cancellationStarted = new Promise<void>((resolve) => { markCancellationStarted = resolve; });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n'));
+      },
+      cancel() {
+        markCancellationStarted();
+        return cancellation;
+      },
+    });
+    const response = new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+    let completed = false;
+    const reading = readCompletedResponse(response, 1_000, performance.now() + 1_000).then(() => {
+      completed = true;
+    });
+    try {
+      await cancellationStarted;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(completed).toBe(true);
+    } finally {
+      finishCancellation();
+      await reading;
+    }
   });
 
   it("accepts response.completed already received before a delayed SSE handler crosses the deadline", async () => {

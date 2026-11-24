@@ -1714,7 +1714,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
   try {
   for (const screen of screens) {
     check();
-    if (screen.status === "verified") continue;
+    const previouslyVerified = screen.status === "verified";
     const ready = readySignals.get(screen.screenId);
     if (!ready) fail("checkpoint_incomplete", `The ${screen.screenId} screen has no scheduler readiness checkpoint.`);
     await ready.promise;
@@ -1726,86 +1726,6 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     if (!stage) fail("checkpoint_incomplete", "The screen has no matching existing Chat stage.");
     screen.startedAtMs ??= now();
     screenRunStartedAt.set(screen.screenId, screenRunStartedAt.get(screen.screenId) ?? monotonicNow());
-
-    if (screen.status === "pending" || !screen.program) {
-      deps.onPhase?.("planning");
-      transition("UNIVERSAL_COMPOSING");
-      deps.progress(`Universal design route v1 · composing screen ${stageIndex + 1}/${plan.screenCount}: ${screenPlan.name}…`);
-      await save();
-      const call = await requestTool("compose", screen);
-      if (call.action.tool !== "compose_design_program")
-        fail("provider_tool_contract_invalid", "The provider returned a non-composition action during screen generation.");
-      const normalized = normalizedProgram(call.action.program, plan, screenPlan);
-      const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
-      if (findings.length) {
-        screen.program = normalized;
-        screen.findings = findings;
-        screen.status = "repair_pending";
-        screen.errorCode = "program_preflight_failed";
-        task.pending = [];
-        task.recent = [];
-        transition("UNIVERSAL_REPAIR");
-        await save();
-      } else {
-        screen.program = normalized;
-        const allowedBrandAssetIds = pinnedBrandAssetIds(task);
-        const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds });
-        if (!parsed.success) fail("program_validation_failed", "The one-screen program did not pass its strict shared validator.");
-        screen.fingerprint = parsed.fingerprint;
-        screen.findings = compileDesignProgram(normalized, { allowedBrandAssetIds }).success
-          ? compileDesignProgram(normalized, { allowedBrandAssetIds }).findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }))
-          : undefined;
-        screen.status = "program_saved";
-        delete screen.errorCode;
-        task.pending = [];
-        task.recent = [];
-        await save();
-      }
-    }
-
-    if (screen.status === "repair_pending") {
-      if (!screen.program || !screen.findings?.length)
-        fail("repair_checkpoint_incomplete", "A semantic repair requires the saved program and bounded native preflight findings.");
-      if (screen.findings.every(isContrastFinding)) failContrast(screen.screenId, screen.findings);
-      if (screen.repairAttempts >= 1)
-        fail("program_repair_exhausted", `The saved screen program still fails preflight (${screen.findings.map(({ code }) => code).join(", ")}); native rendering was not started.`);
-      deps.onPhase?.("planning");
-      transition("UNIVERSAL_REPAIR");
-      deps.progress(`Universal design route v1 · repairing only ${screen.findings.length} bounded finding(s) on ${screenPlan.name}…`);
-      await save();
-      const call = await requestTool("repair", screen);
-      if (call.action.tool !== "repair_design_program" || call.action.screenId !== screen.screenId)
-        fail("repair_scope_mismatch", "The provider repair changed the saved screen scope.");
-      const supplied = new Set(screen.findings.map(({ code, path }) => `${code}:${path}`));
-      if (call.action.findings.some(({ code, path }) => !supplied.has(`${code}:${path}`)))
-        fail("repair_scope_mismatch", "The repair referenced findings outside the locally measured preflight report.");
-      if (JSON.stringify(call.action.program) === JSON.stringify(screen.program))
-        fail("program_repair_no_progress", "The bounded repair returned an unchanged program; further repair was stopped.");
-      const normalized = normalizedProgram(call.action.program, plan, screenPlan);
-      screen.repairAttempts++;
-      const findings = findingsForProgram(normalized, screen.screenId, plan, screenPlan, task);
-      screen.program = normalized;
-      const allowedBrandAssetIds = pinnedBrandAssetIds(task);
-      screen.findings = findings.length ? findings : compileDesignProgram(normalized, { allowedBrandAssetIds }).success
-        ? compileDesignProgram(normalized, { allowedBrandAssetIds }).findings.filter(({ severity }) => severity === "warning").slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }))
-        : [];
-      if (findings.length) {
-        screen.status = "repair_pending";
-        screen.errorCode = "program_preflight_failed";
-        await save();
-        failContrast(screen.screenId, findings);
-        fail("program_repair_exhausted", `The bounded repair left ${findings.map(({ code }) => code).join(", ")}; no native render was dispatched.`);
-      }
-      const parsed = parseDesignProgram(normalized, { allowedBrandAssetIds });
-      if (!parsed.success) fail("program_validation_failed", "The repaired one-screen program did not pass its strict shared validator.");
-      screen.fingerprint = parsed.fingerprint;
-      screen.status = "program_saved";
-      delete screen.errorCode;
-      task.pending = [];
-      task.recent = [];
-      transition("UNIVERSAL_COMPOSING");
-      await save();
-    }
 
     if (!screen.program || !screen.fingerprint)
       fail("program_checkpoint_incomplete", "A validated DesignProgramV1 must be durably saved before renderer dispatch.");
@@ -1892,7 +1812,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       await save();
     }
 
-    if (screen.status === "rendered") {
+    if (screen.status === "rendered" || previouslyVerified) {
       deps.onPhase?.("verification");
       transition("UNIVERSAL_COMPOSING");
       if (!screen.rootRef || !screen.fingerprint) fail("native_root_missing", "The rendered screen checkpoint has no verified root reference or fingerprint.");
@@ -1943,11 +1863,10 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
           screen.findings = inspection.geometry.findings.map(({ code, nodeId }) => ({
             code, path: `native.${nodeId}`, message: "Figma reported a native geometry or ownership discrepancy.",
           }));
-          await save();
         }
       }
       let verified: ReturnType<typeof verifyNativeReadback>;
-      const pendingSizingMismatch = FW5_VISUAL_QA_ENABLED && FW5_VISUAL_REVIEW_MODE === "review+bounded-repair" && FW4_GEOMETRY_ENABLED &&
+      const pendingSizingMismatch = !previouslyVerified && FW5_VISUAL_QA_ENABLED && FW5_VISUAL_REVIEW_MODE === "review+bounded-repair" && FW4_GEOMETRY_ENABLED &&
         inspection.geometry?.coverage === "complete" && inspection.geometry.findings.length === 1 &&
         inspection.geometry.findings[0]?.code === "native_layout_sizing_mismatch" &&
         Boolean(inspection.geometry.findings[0]?.nodeId && inspection.geometry.findings[0]?.parentId &&
@@ -1958,6 +1877,12 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       try {
         verified = verifyNativeReadback(inspection, screen, plan, Boolean(pendingSizingMismatch));
       } catch (error) {
+        if (previouslyVerified) {
+          screen.status = "rendered";
+          delete screen.verifiedNodeCount;
+          stage.completed = false;
+          stage.verified = false;
+        }
         screen.errorCode = safeErrorCode(error).replace(/[^a-z0-9_]/giu, "_").toLocaleLowerCase().slice(0, 80);
         if (FW5_VISUAL_QA_ENABLED && inspection.nativePageId && screen.nativeRootNodeId && screen.fingerprint) {
           const findingCodes = [...new Set([
@@ -1985,6 +1910,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(inspectRequestId), rootNodeHash: fw7CorrelationHash(screen.nativeRootNodeId), boundary: "task-owner", kind: "native_readback_result", stage: "native_readback", operation: "task-native-inspect", result: "confirmed", durationMs: readbackDurationMs, observedCount: verified.nodeCount });
       if (screens.some((other) => other !== screen && other.rootRef === screen.rootRef))
         fail("native_root_conflict", "Two planned screens resolve to the same task-owned native root.");
+      if (previouslyVerified) continue;
       let finalVerificationRequestId = inspectRequestId;
       let finalVerificationDurationMs = readbackDurationMs;
       if (FW5_VISUAL_QA_ENABLED) {

@@ -110,7 +110,14 @@ export async function handleChatTaskStorage(
   } catch {
     return performChatTaskStorage(api, message, options);
   }
-  const requestKey = `${api.fileKey ?? "local"}\u0000${api.currentPage.id}\u0000${message.documentId}\u0000${message.chatId ?? "legacy"}\u0000${message.task?.id ?? "delete"}\u0000${message.requestId}`;
+  // The request ID belongs to the storage slot. The task ID is part of its payload.
+  const requestKey = JSON.stringify([
+    api.fileKey ?? null,
+    api.currentPage.id,
+    message.documentId,
+    message.chatId ?? null,
+    message.requestId,
+  ]);
   const pending = inFlightSaves.get(requestKey);
   if (pending) {
     if (pending.signature === signature) return pending.result;
