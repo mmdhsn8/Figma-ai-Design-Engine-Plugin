@@ -176,6 +176,176 @@ function validateDependencies(program: DesignProgramV1, findings: DesignProgramF
   for (const id of ids) visit(id);
 }
 
+type LayoutAxisName = "width" | "height";
+
+function axisInsets(node: Extract<DesignProgramNode, { type: "container" }>, axis: LayoutAxisName): number {
+  return axis === "width"
+    ? node.layout.padding.left + node.layout.padding.right
+    : node.layout.padding.top + node.layout.padding.bottom;
+}
+
+function minimumNodeExtent(node: DesignProgramNode, axis: LayoutAxisName): number {
+  const dimension = node[axis];
+  const declaredMinimum = dimension.mode === "fixed" ? dimension.value : dimension.min ?? 0;
+  if (dimension.mode === "fixed") return declaredMinimum;
+  if (node.type === "text")
+    return Math.max(
+      declaredMinimum,
+      dimension.mode === "hug" ? dimension.value : 0,
+      axis === "height" ? node.fontSize * Math.max(1, node.text.split("\n").length) : 0,
+    );
+  if (node.type !== "container") return declaredMinimum;
+  return Math.max(declaredMinimum, requiredContainerExtent(node, axis));
+}
+
+function wrappedRowsHeight(node: Extract<DesignProgramNode, { type: "container" }>): number {
+  const availableWidth = Math.max(
+    0,
+    node.width.value - node.layout.padding.left - node.layout.padding.right,
+  );
+  let rows = 0;
+  let rowWidth = 0;
+  let rowHeight = 0;
+  let height = node.layout.padding.top + node.layout.padding.bottom;
+  for (const child of node.children) {
+    const width = minimumNodeExtent(child, "width");
+    const childHeight = minimumNodeExtent(child, "height");
+    if (rows > 0 && rowWidth + node.layout.gap + width > availableWidth + GEOMETRY_EPSILON) {
+      height += node.layout.gap + rowHeight;
+      rows++;
+      rowWidth = width;
+      rowHeight = childHeight;
+    } else if (rows === 0) {
+      rows = 1;
+      rowWidth = width;
+      rowHeight = childHeight;
+    } else {
+      rowWidth += node.layout.gap + width;
+      rowHeight = Math.max(rowHeight, childHeight);
+    }
+  }
+  return rows ? height + rowHeight : height;
+}
+
+function requiredContainerExtent(
+  node: Extract<DesignProgramNode, { type: "container" }>,
+  axis: LayoutAxisName,
+): number {
+  const horizontal = axis === "width";
+  const primary = (node.layout.axis === "row") === horizontal;
+  if (node.layout.wrap && node.layout.axis === "row") {
+    if (!horizontal) return wrappedRowsHeight(node);
+    return axisInsets(node, axis) + Math.max(0, ...node.children.map((child) => minimumNodeExtent(child, axis)));
+  }
+  if (primary)
+    return minimumAxisExtent(
+      node.children.map((child) => ({ mode: "fixed", value: minimumNodeExtent(child, axis) })),
+      node.layout.gap,
+      axisInsets(node, axis),
+    );
+  return axisInsets(node, axis) + Math.max(0, ...node.children.map((child) => minimumNodeExtent(child, axis)));
+}
+
+function layoutOverflowFinding(
+  node: Extract<DesignProgramNode, { type: "container" }>,
+  path: string,
+  axis: LayoutAxisName,
+): DesignProgramFinding | undefined {
+  const dimension = node[axis];
+  if (dimension.mode !== "fixed") return;
+  const required = requiredContainerExtent(node, axis);
+  if (required <= dimension.value + GEOMETRY_EPSILON) return;
+  const primary = (node.layout.axis === "row") === (axis === "width");
+  const padding = axis === "width"
+    ? `${node.layout.padding.left}+${node.layout.padding.right}`
+    : `${node.layout.padding.top}+${node.layout.padding.bottom}`;
+  const wrapRows = node.layout.wrap && node.layout.axis === "row" && axis === "height";
+  const childSizes = node.children.slice(0, 4).map((child) => `${child.id} ${minimumNodeExtent(child, axis)}`);
+  const omitted = node.children.length - childSizes.length;
+  const content = wrapRows
+    ? `wrapped row heights (${childSizes.join(", ")}${omitted > 0 ? `, +${omitted} more` : ""})`
+    : `child ${axis} minima [${childSizes.join(", ")}${omitted > 0 ? `, +${omitted} more` : ""}]`;
+  const gap = wrapRows
+    ? `; ${node.layout.gap} px between wrapped rows`
+    : primary && !node.layout.wrap
+      ? `; ${Math.max(0, node.children.length - 1) * node.layout.gap} px total child gap`
+      : "";
+  return {
+    code: primary ? "layout_axis_overflow" : "layout_cross_axis_overflow",
+    path,
+    message: `Container “${node.id}” (${node.layout.axis}${node.layout.wrap ? " wrap" : ""} Auto Layout; fixed ${axis} ${dimension.value} px) needs at least ${required} px: ${content}${gap}; ${padding} px axis padding; overflow ${Math.ceil(required - dimension.value)} px.`,
+    severity: "error",
+  };
+}
+
+function layoutSizingFindings(node: DesignProgramNode, path: string): DesignProgramFinding[] {
+  const findings: DesignProgramFinding[] = [];
+  for (const axis of ["width", "height"] as const) {
+    if (node[axis].mode === "hug" && node.type !== "container" && node.type !== "text")
+      findings.push({
+        code: "unsupported_hug_sizing",
+        path: `${path}.${axis}`,
+        message: `Figma HUG ${axis} requires editable text or an Auto Layout container; ${node.type} cannot hug on this axis.`,
+        severity: "error",
+      });
+    if (node.type === "container" && node[axis].mode === "hug") {
+      for (const child of node.children) {
+        if (child[axis].mode === "fill")
+          findings.push({
+            code: "fill_sizing_under_hug_parent",
+            path: `${path}.${child.id}.${axis}`,
+            message: `${child.id} cannot use FILL ${axis} inside HUG ${axis} on ${node.id}; the parent must have a bounded size on that axis.`,
+            severity: "error",
+          });
+      }
+    }
+  }
+  if (node.type === "text" && node.width.mode === "hug" && node.height.mode !== "hug")
+    findings.push({
+      code: "text_hug_width_requires_hug_height",
+      path: `${path}.width`,
+      message: "Figma text can hug width only when its height is content-sized too; use HUG on both text axes or a bounded width with HUG height.",
+      severity: "error",
+    });
+  return findings;
+}
+
+/** Repairs only measurable fixed-height flow overflow on a screen with an outer vertical scroll viewport. */
+export function normalizeDesignProgramLayout(program: DesignProgramV1): {
+  program: DesignProgramV1;
+  repairs: Array<{ path: string; before: number; after: number; required: number }>;
+} {
+  const repairs: Array<{ path: string; before: number; after: number; required: number }> = [];
+  const normalizeNode = (node: DesignProgramNode, screenId: string): DesignProgramNode => {
+    if (node.type !== "container") return node;
+    const children = node.children.map((child) => normalizeNode(child, screenId));
+    const next = children.some((child, index) => child !== node.children[index])
+      ? { ...node, children }
+      : node;
+    if (next.height.mode !== "fixed") return next;
+    const required = requiredContainerExtent(next, "height");
+    if (required <= next.height.value + GEOMETRY_EPSILON) return next;
+    const after = Math.ceil(required);
+    if (after > 20_000 || (next.height.max !== undefined && after > next.height.max)) return next;
+    repairs.push({
+      path: `screens.${screenId}.root.${next.id}.height`,
+      before: next.height.value,
+      after,
+      required,
+    });
+    return { ...next, height: { ...next.height, value: after } };
+  };
+  let changed = false;
+  const screens = program.screens.map((screen) => {
+    if (screen.scroll !== "vertical" || screen.root.type !== "container") return screen;
+    const root = normalizeNode(screen.root, screen.id);
+    if (root === screen.root) return screen;
+    changed = true;
+    return { ...screen, root };
+  });
+  return { program: changed ? { ...program, screens } : program, repairs };
+}
+
 export function parseDesignProgram(value: unknown, options: { allowedBrandAssetIds?: ReadonlySet<string> } = {}): DesignProgramParseResult {
   const parsed = DesignProgramV1Schema.safeParse(value);
   if (!parsed.success) return { success: false, findings: parsed.error.issues.slice(0, 100).map((issue) => ({ code: "invalid_schema", path: issue.path.map(String).join(".") || "program", message: issue.message, severity: "error" })) };
@@ -197,6 +367,12 @@ export function parseDesignProgram(value: unknown, options: { allowedBrandAssetI
       if (ids.has(node.id) || node.type === "instance" || node.type === "image" || depth > DESIGN_PROGRAM_LIMITS.depth)
         findings.push({ code: "invalid_local_component_node", path: `componentsV1.${id}.${node.id}`, message: "Use unique bounded native nodes without nested instances or image dependencies.", severity: "error" });
       ids.add(node.id);
+      findings.push(...layoutSizingFindings(node, `componentsV1.${id}.${node.id}`));
+      if (node.type === "container")
+        for (const axis of ["width", "height"] as const) {
+          const finding = layoutOverflowFinding(node, `componentsV1.${id}.${node.id}`, axis);
+          if (finding) findings.push(finding);
+        }
       if (node.type === "text" && hasUnrenderableProgramText(node.text))
         findings.push({ code: "invalid_native_text", path: `componentsV1.${id}.${node.id}`, message: "Text contains an invalid Unicode character or a directional override.", severity: "error" });
     });
@@ -213,6 +389,7 @@ export function parseDesignProgram(value: unknown, options: { allowedBrandAssetI
       nodeCount++;
       if (node.type === "text" && hasUnrenderableProgramText(node.text))
         findings.push({ code: "invalid_native_text", path: `screens.${screen.id}.${node.id}`, message: "Text contains an invalid Unicode character or a directional override.", severity: "error" });
+      findings.push(...layoutSizingFindings(node, `screens.${screen.id}.root.${node.id}`));
       if (node.type === "instance") {
         const component = components.get(node.componentId);
         if (!component || node.width.mode !== "fixed" || node.height.mode !== "fixed" ||
@@ -226,21 +403,11 @@ export function parseDesignProgram(value: unknown, options: { allowedBrandAssetI
       if (node.interaction !== "none" && (node.width.value < 44 || node.height.value < 44)) findings.push({ code: "touch_target_below_minimum", path: `screens.${screen.id}.root.${node.id}`, message: "Interactive native targets must be at least 44 × 44 px in this spike.", severity: "error" });
       if (node.type === "container" && node.layout.wrap && (node.layout.axis !== "row" || node.width.mode === "hug"))
         findings.push({ code: "unsupported_layout_wrap", path: `screens.${screen.id}.root.${node.id}`, message: "Wrap requires a horizontal row with a bounded width.", severity: "error" });
-      if ((screen.compositionV1 || (node.type === "container" && node.layout.wrap)) && node.type === "container") {
-        const horizontal = node.layout.axis === "row";
-        const dimension = horizontal ? node.width : node.height;
-        if (dimension.mode === "fixed" && node.children.length) {
-          const padding = horizontal
-            ? node.layout.padding.left + node.layout.padding.right
-            : node.layout.padding.top + node.layout.padding.bottom;
-          const sizes = node.children.map((child) => child[horizontal ? "width" : "height"]);
-          const required = node.layout.wrap
-            ? Math.max(...sizes.map((size) => minimumAxisExtent([size], 0, padding)))
-            : minimumAxisExtent(sizes, node.layout.gap, padding);
-          if (required > dimension.value + GEOMETRY_EPSILON)
-            findings.push({ code: "layout_axis_overflow", path: `screens.${screen.id}.root.${node.id}`, message: `Children require at least ${required} px but the ${horizontal ? "width" : "height"} is ${dimension.value} px.`, severity: "error" });
+      if (node.type === "container")
+        for (const axis of ["width", "height"] as const) {
+          const finding = layoutOverflowFinding(node, `screens.${screen.id}.root.${node.id}`, axis);
+          if (finding) findings.push(finding);
         }
-      }
       for (const value of node.type === "container" ? [node.background] : node.type === "text" ? [node.color] : node.type === "image" || node.type === "instance" ? [] : [node.fill]) {
         if (typeof value === "string" && value.startsWith("token:") && !(value.slice(6) in program.tokens.colors)) findings.push({ code: "missing_token", path: `screens.${screen.id}.root.${node.id}`, message: `Color token “${value.slice(6)}” is not defined.`, severity: "error" });
       }

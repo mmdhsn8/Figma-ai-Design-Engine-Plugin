@@ -3,7 +3,7 @@ import { ChatTaskSchema, chatTaskRetryLabel, chatTaskSafeDiagnostic, type ChatTa
 import { checkpointJson, checkpointRevision, decodeChatTaskStorageMessage } from "../src/shared/chat-checkpoint-wire";
 import { ChatFunctionCallValidationError, ChatInputItemSchema, parseResponsesFunctionCalls, validateChatRequestInput, type ChatInputItem, type ChatLifecycleState } from "../src/shared/chat-tools";
 import { parseChatGenerationIntent, isClearCreateRequest } from "../src/shared/chat-generation";
-import { UniversalDesignProgramV1Schema, parseDesignProgram, type DesignProgramNode, type DesignProgramV1 } from "../src/shared/design-program";
+import { normalizeDesignProgramLayout, UniversalDesignProgramV1Schema, parseDesignProgram, type DesignProgramNode, type DesignProgramV1 } from "../src/shared/design-program";
 import { compositionVariationSeed, createDefaultVisualLanguage, type ProjectVisualLanguageV1 } from "../src/shared/design-composition";
 import { ProjectPlanDraftSchema, parseProjectPlanDraft } from "../src/shared/universal-design";
 import { compileDesignProgram } from "../src/shared/design-program-adapter";
@@ -317,6 +317,14 @@ function programFor(input: Case, screenIndex: number, regionCount = 3): DesignPr
   });
 }
 
+function generatedOverflowProgram(input: Case, screenIndex: number): DesignProgramV1 {
+  const program = programFor(input, screenIndex);
+  const root = program.screens[0]!.root;
+  if (root.type !== "container") throw new Error("Expected a generated screen container.");
+  root.height.value = 360;
+  return program;
+}
+
 function compositionTopology(root: DesignProgramV1["screens"][number]["root"]): string {
   if (root.type !== "container") return root.type;
   return JSON.stringify([root.layout.axis, root.children.map((node) => node.type === "container"
@@ -401,6 +409,7 @@ function makeHarness(input: Case, options: {
   localComponent?: boolean;
   fw2?: "clean" | "rich" | "denied";
   lowContrast?: boolean;
+  generatedAxisOverflow?: boolean;
   providerDelayMs?: number;
   providerDelayForScreen?: (screenId: string) => number;
   maxConcurrentModelCalls?: 1 | 2;
@@ -498,7 +507,9 @@ function makeHarness(input: Case, options: {
       if (!Number.isInteger(screenIndex) || screenIndex < 0 || screenIndex >= input.screens.length)
         throw new Error("The compose fixture did not receive a stable screen identity.");
       modelCompletionScreenIds.push(screenId!);
-      const program = programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
+      const program = options.generatedAxisOverflow && screenIndex === 0
+        ? generatedOverflowProgram(input, screenIndex)
+        : programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
       if (options.fw2 === "rich") {
         const root = program.screens[0]!.root;
         if (root.type !== "container") throw new Error("Expected fixture container.");
@@ -545,7 +556,9 @@ function makeHarness(input: Case, options: {
       const findings = payload.context?.boundedFindings;
       if (!screenId || !findings) throw new Error("The repair request has no persisted finding scope.");
       const screenIndex = Number(screenId.slice("screen-".length)) - 1;
-      const program = programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
+      const program = options.generatedAxisOverflow && screenIndex === 0
+        ? generatedOverflowProgram(input, screenIndex)
+        : programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
       if (options.repairViewportMismatch) {
         program.screens[0]!.viewport = input.platform === "mobile"
           ? { preset: "desktop", width: 1440, height: 900 }
@@ -956,13 +969,13 @@ describe("universal design Chat route", () => {
     const region = root.children[0];
     if (region?.type !== "container" || region.children[0]?.type !== "text") throw new Error("Expected fixture region.");
     const label = region.children[0];
-    const fixed = { mode: "fixed" as const, value: 60 };
+    const fixed = { mode: "fixed" as const, value: 104 };
     const master: Extract<DesignProgramNode, { type: "container" }> = {
-      ...region, width: fixed, height: fixed, background: "#111111", children: [{ ...label, id: "master-label", color: "#333333" }],
+      ...region, width: fixed, height: { mode: "fixed", value: 76 }, background: "#111111", children: [{ ...label, id: "master-label", color: "#333333" }],
     };
     program.componentsV1 = [{ id: "status-chip", root: master }];
     program.tokens.colors = { page: "#FFFFFF", background: "#FFFFFF", text: "#17202A", muted: "#444444", surface: "#FFFFFF", "raised-surface": "#FFFFFF" };
-    root.children.push({ type: "instance", id: "status-instance", name: "Status chip", semanticRole: "status", interaction: "none", componentId: "status-chip", width: fixed, height: fixed });
+    root.children.push({ type: "instance", id: "status-instance", name: "Status chip", semanticRole: "status", interaction: "none", componentId: "status-chip", width: fixed, height: { mode: "fixed", value: 76 } });
     const normalized = normalizeDesignProgramContrast(program);
     expect(normalized.repairs).toContainEqual(expect.objectContaining({
       path: "componentsV1.status-chip.master-label.color", foreground: "#333333", background: "#111111", replacement: "#FFFFFF",
@@ -2090,6 +2103,86 @@ describe("universal design Chat route", () => {
     const audit = compileDesignProgram(lowContrast);
     expect(audit.success).toBe(true);
     if (audit.success) expect(audit.findings.some(({ code }) => code === "quality_low-contrast")).toBe(true);
+  });
+
+  it("normalizes a realistic generated overflow on screen 1 of the exact two-screen request before repair dispatch", async () => {
+    const input = onlineShopCase("create 2 random screen");
+    const generated = generatedOverflowProgram(input, 0);
+    const root = generated.screens[0]!.root;
+    if (root.type !== "container") throw new Error("Expected generated screen layout.");
+    const layout = normalizeDesignProgramLayout(generated);
+    expect(root).toMatchObject({
+      id: "screen-layout",
+      width: { mode: "fixed", value: 342 },
+      height: { mode: "fixed", value: 360 },
+      layout: {
+        axis: "column",
+        gap: 20,
+        padding: { top: 8, bottom: 8 },
+      },
+    });
+    expect(root.children.map((child) => child.height.value)).toEqual([148, 148, 88]);
+    expect(parseDesignProgram(generated)).toMatchObject({
+      success: false,
+      findings: [expect.objectContaining({
+        code: "layout_axis_overflow",
+        path: "screens.screen-01.root.screen-layout",
+        message: expect.stringContaining("needs at least 440 px"),
+      })],
+    });
+    expect(layout.repairs).toEqual([{
+      path: "screens.screen-01.root.screen-layout.height",
+      before: 360,
+      after: 440,
+      required: 440,
+    }]);
+    expect(parseDesignProgram(layout.program).success).toBe(true);
+    expect(normalizeDesignProgramLayout(layout.program)).toEqual({ program: layout.program, repairs: [] });
+
+    const h = makeHarness(input, { generatedAxisOverflow: true });
+    await runChatTask(h.task, h.deps);
+
+    expect(h.task.status).toBe("completed");
+    expect(h.model.mock.calls.filter(([, lifecycle]) => lifecycle === "UNIVERSAL_REPAIR")).toHaveLength(0);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(2);
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(2);
+    expect(h.task.universalScreens?.[0]?.program?.screens[0]?.root).toMatchObject({
+      id: "screen-layout",
+      height: { mode: "fixed", value: 440 },
+    });
+  });
+
+  it("normalizes a saved pre-render overflow on Resume without repeating composition or dispatching semantic repair", async () => {
+    const input = onlineShopCase("create 2 random screen");
+    const h = makeHarness(input, { generatedAxisOverflow: true });
+    const signal = new AbortController();
+    const originalSave = h.deps.save.getMockImplementation()!;
+    h.deps.save.mockImplementation(async (snapshot) => {
+      await originalSave(snapshot);
+      if (snapshot.universalScreens?.[0]?.status === "program_saved") signal.abort();
+    });
+    await expect(runChatTask(h.task, { ...h.deps, signal: signal.signal })).rejects.toThrow();
+    expect(h.deps.renderProgram).not.toHaveBeenCalled();
+
+    const saved = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    const first = saved.universalScreens![0]!;
+    const firstRoot = first.program?.screens[0]?.root;
+    if (!firstRoot || firstRoot.type !== "container") throw new Error("Expected a saved editable screen.");
+    firstRoot.height.value = 360;
+    h.deps.save.mockImplementation(originalSave);
+    h.model.mockClear();
+
+    await runChatTask(saved, h.deps);
+
+    expect(saved.status).toBe("completed");
+    expect(h.model.mock.calls.filter(([, lifecycle]) => lifecycle === "UNIVERSAL_COMPOSING")).toHaveLength(1);
+    expect(h.model.mock.calls.filter(([, lifecycle]) => lifecycle === "UNIVERSAL_REPAIR")).toHaveLength(0);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(2);
+    expect(saved.universalScreens?.[0]?.program?.screens[0]?.root).toMatchObject({
+      id: "screen-layout",
+      height: { mode: "fixed", value: 440 },
+    });
+    expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(2);
   });
 
   it("renders a hash-verified pinned Brand Kit image as an editable native image fill", async () => {

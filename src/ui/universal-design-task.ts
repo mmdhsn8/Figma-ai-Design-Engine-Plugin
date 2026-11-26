@@ -1,4 +1,4 @@
-import { DesignProgramV1Schema, parseDesignProgram, type DesignProgramV1 } from "../shared/design-program";
+import { DesignProgramV1Schema, normalizeDesignProgramLayout, parseDesignProgram, type DesignProgramV1 } from "../shared/design-program";
 import { compileDesignProgram } from "../shared/design-program-adapter";
 import { auditDesignProgramContrast, normalizeDesignProgramContrast } from "../shared/design-program-quality";
 import { ChatFunctionCallSchema, MAX_CHAT_PROVIDER_INPUT_BYTES, UNIVERSAL_CONTEXT_PREFIX, missingStructuredChatCall, type ChatFunctionCall, type ChatLifecycleState, type ChatInputItem } from "../shared/chat-tools";
@@ -85,6 +85,10 @@ export class UniversalDesignTaskError extends Error {
 
 function fail(code: string, message: string): never {
   throw new UniversalDesignTaskError(code, message);
+}
+
+function findingDetails(findings: Array<{ path: string; message: string }>): string {
+  return findings.slice(0, 3).map(({ path, message }) => `${path}: ${message}`).join(" ");
 }
 
 function checkpoint(value: UniversalScreenCheckpoint): UniversalScreenCheckpoint {
@@ -264,7 +268,7 @@ function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", sc
   const routeInstruction = purpose === "plan"
     ? "Return only one plan_universal_project tool call. Respect the exact count/device/language constraints in this context. Choose useful distinct screens if the brief did not provide a count. Declare a screen dependency only when the saved content of that screen is required to author another; navigation alone is not a generation dependency. Do not guess private document data."
     : purpose === "compose"
-      ? `Return only one compose_design_program call for currentScreen. Reuse visualLanguageV1 and choose an archetype that makes the screen's main task and entry/exit states clear. Map each planned region to an editable container; use real domain labels, illustrative example values where allowed, and an identifiable primary control when the plan calls for action. Use the shared navigation language across screens and keep sparse states sparse. For RTL, group controls in reading order and write UI copy in the requested language. Use semantic textRole values for typography, the stable variation seed ${compositionVariationSeed(task.id, screen!.screenId)}, and only pinned Brand Kit assets. Prefer useful editable content to large decorative placeholders. Do not force card grids, pad the tree, or add other screens.`
+      ? `Return only one compose_design_program call for currentScreen. Reuse visualLanguageV1 and choose an archetype that makes the screen's main task and entry/exit states clear. Map each planned region to an editable container; use real domain labels, illustrative example values where allowed, and an identifiable primary control when the plan calls for action. Use the shared navigation language across screens and keep sparse states sparse. For RTL, group controls in reading order and write UI copy in the requested language. Use semantic textRole values for typography, the stable variation seed ${compositionVariationSeed(task.id, screen!.screenId)}, and only pinned Brand Kit assets. Prefer useful editable content to large decorative placeholders. Do not force card grids, pad the tree, or add other screens. Layout contract: Figma lays out children in flow, not at authored x/y coordinates. For every FIXED parent axis, budget direct-child minimum sizes + (child count - 1) × gap + axis padding; include wrapped-row height. Use FILL only under a bounded parent axis, never under HUG on that axis. Use HUG for content-driven Auto Layout and HUG text height for variable-length copy; fixed text boxes must be deliberately sized. Screen-level vertical scrolling clips the viewport, not overflowing children inside a fixed content container.`
       : "Return only one repair_design_program tool call. Modify only the supplied invalid fields/findings in this saved one-screen program and preserve all other valid content.";
   const payload = {
     contract: purpose === "plan" ? "ProjectPlanDraftV1" : "DesignProgramV1",
@@ -515,6 +519,10 @@ function logContrastRepairs(screenId: string, repairs: ReturnType<typeof normali
   if (repairs.length) console.info("[universal-quality]", { screenId, repairCount: repairs.length, repairs: repairs.slice(0, 12) });
 }
 
+function logLayoutRepairs(screenId: string, repairs: ReturnType<typeof normalizeDesignProgramLayout>["repairs"]) {
+  if (repairs.length) console.info("[universal-layout]", { screenId, repairCount: repairs.length, repairs: repairs.slice(0, 12) });
+}
+
 function normalizedProgram(value: DesignProgramV1, plan: ProjectPlanV1, screenPlan: ProjectPlanV1["screens"][number]): DesignProgramV1 {
   const screen = value.screens[0];
   if (!screen || value.screens.length !== 1)
@@ -595,7 +603,9 @@ function normalizedProgram(value: DesignProgramV1, plan: ProjectPlanV1, screenPl
       dependsOn: [],
     }],
   });
-  const quality = normalizeDesignProgramContrast(normalized);
+  const layout = normalizeDesignProgramLayout(normalized);
+  logLayoutRepairs(screenPlan.screenId, layout.repairs);
+  const quality = normalizeDesignProgramContrast(layout.program);
   logContrastRepairs(screenPlan.screenId, quality.repairs);
   return quality.program;
 }
@@ -1449,9 +1459,38 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     }
   }
   for (const screen of screens) {
-    const awaitingRepair = screen.status === "repair_pending";
+    let awaitingRepair = screen.status === "repair_pending";
     if (!["repair_pending", "program_saved", "rendering", "rendered", "verified"].includes(screen.status)) continue;
-    const parsed = parseDesignProgram(screen.program, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+    let parsed = parseDesignProgram(screen.program, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+    const hasNativeRoot = Boolean(screen.renderAttempts || screen.nativeRootNodeId || screen.rootRef);
+    if (!parsed.success && !hasNativeRoot && screen.program) {
+      const screenPlan = plan.screens.find(({ screenId }) => screenId === screen.screenId);
+      if (!screenPlan) fail("checkpoint_incomplete", `The saved plan has no ${screen.screenId} screen definition.`);
+      const normalizeStartedAt = monotonicNow();
+      const layout = normalizeDesignProgramLayout(screen.program);
+      if (layout.repairs.length) {
+        const normalized = normalizedProgram(layout.program, plan, screenPlan);
+        const preflightStartedAt = monotonicNow();
+        const evaluation = evaluateProgram(normalized, plan, screenPlan, task);
+        const normalizeMs = Math.max(0, Math.round(preflightStartedAt - normalizeStartedAt));
+        const preflightMs = Math.max(0, Math.round(monotonicNow() - preflightStartedAt));
+        task.universalMetrics!.programNormalizationMs += normalizeMs;
+        task.universalMetrics!.programPreflightMs += preflightMs;
+        logLayoutRepairs(screen.screenId, layout.repairs);
+        recordTrace({ stageId: screen.screenId, stage: "normalize", event: "program_normalized", outcome: "completed", durationMs: normalizeMs, outputBytes: utf8Bytes(JSON.stringify(normalized)) });
+        recordTrace({ stageId: screen.screenId, stage: "preflight", event: "preflight_completed", outcome: evaluation.findings.length ? "failed" : "completed", durationMs: preflightMs, outputBytes: utf8Bytes(JSON.stringify(normalized)), qaFindingCodes: (evaluation.findings.length ? evaluation.findings : evaluation.warnings).slice(0, 8).map(({ code }) => code), qaCoverage: "complete" });
+        screen.program = normalized;
+        if (evaluation.fingerprint) screen.fingerprint = evaluation.fingerprint;
+        else delete screen.fingerprint;
+        screen.findings = evaluation.findings.length ? evaluation.findings : evaluation.warnings;
+        screen.status = evaluation.findings.length ? "repair_pending" : "program_saved";
+        if (evaluation.findings.length) screen.errorCode = "program_preflight_failed";
+        else delete screen.errorCode;
+        awaitingRepair = screen.status === "repair_pending";
+        await save();
+        parsed = parseDesignProgram(screen.program, { allowedBrandAssetIds: pinnedBrandAssetIds(task) });
+      }
+    }
     if (awaitingRepair && !parsed.success) continue;
     // Older repair checkpoints did not always record a fingerprint.
     if (!parsed.success || ((!awaitingRepair || screen.fingerprint) && parsed.fingerprint !== screen.fingerprint) ||
@@ -1622,7 +1661,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       if (!savedRepair && screen.findings.every(isContrastFinding)) failContrast(screen.screenId, screen.findings);
       if (screen.repairAttempts >= 1 || screen.repairDispatches >= 3) {
         failContrast(screen.screenId, screen.findings);
-        fail("program_repair_exhausted", `The saved ${screen.screenId} program exhausted its bounded semantic repair; native rendering was not started.`);
+        fail("program_repair_exhausted", `The saved ${screen.screenId} program has no remaining bounded repair. ${findingDetails(screen.findings)} No native render was dispatched.`);
       }
       deps.progress(`Universal design route v1 · repairing ${screen.findings.length} measured finding(s) on ${screenPlan.name}…`);
       const call = await getScreenCall(screen, "repair", schedulerController.signal, 0);
@@ -1657,7 +1696,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       });
       if (findings.length) {
         failContrast(screen.screenId, findings);
-        fail("program_repair_exhausted", `The bounded repair left ${findings.map(({ code }) => code).join(", ")} on ${screen.screenId}; no native render was dispatched.`);
+        fail("program_repair_exhausted", `The bounded repair left ${findingDetails(findings)} No native render was dispatched.`);
       }
     }
     if (screen.status !== "program_saved" && screen.status !== "rendering" && screen.status !== "rendered" && screen.status !== "verified")

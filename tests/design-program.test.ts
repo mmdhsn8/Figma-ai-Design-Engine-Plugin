@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canonicalDesignProgram, parseDesignProgram, fingerprintDesignProgram } from "../src/shared/design-program";
+import { canonicalDesignProgram, normalizeDesignProgramLayout, parseDesignProgram, fingerprintDesignProgram, type DesignProgramV1 } from "../src/shared/design-program";
 import { compileDesignProgram } from "../src/shared/design-program-adapter";
 import { compileDesignProgramOperations } from "../src/shared/design-program-operations";
 import { FigmaToolBatchSchema, FigmaToolOperationSchema } from "../src/shared/figma-tools";
@@ -133,7 +133,7 @@ describe("DesignProgramV1 local cross-domain spike", () => {
       width: { mode: "fixed", value: 100 }, height: { mode: "fixed", value: 100 }, layout: { axis: "column" },
       children: Array.from({ length: 80 }, (_, nodeIndex) => ({ type: "text", id: `dense-${groupIndex}-${nodeIndex}`, name: "Dense item", semanticRole: "data", width: { mode: "fixed", value: 80 }, height: { mode: "fixed", value: 16 }, text: "Value", color: "#111111" })),
     }));
-    expect(parseDesignProgram(dense)).toMatchObject({ success: false, findings: [{ code: "node_limit" }] });
+    expect(parseDesignProgram(dense)).toMatchObject({ success: false, findings: expect.arrayContaining([expect.objectContaining({ code: "node_limit" })]) });
 
     const unverified = copy(education) as unknown as Record<string, unknown>;
     unverified.references = [{ kind: "component", ref: "shared/button", verified: false, authorized: false }];
@@ -160,6 +160,80 @@ describe("DesignProgramV1 local cross-domain spike", () => {
     expect(parseDesignProgram(unsupportedAsset)).toMatchObject({ success: false, findings: expect.arrayContaining([expect.objectContaining({ code: "asset_provenance_unverified" }), expect.objectContaining({ code: "unsupported_asset_source" })]) });
   });
 
+  it("budgets fixed axes, wrapped rows and Figma HUG/FILL constraints without repairing intentional non-scroll overflow", () => {
+    const overflowing = copy(education) as unknown as DesignProgramV1;
+    const root = overflowing.screens[0]!.root;
+    if (root.type !== "container") throw new Error("Fixture needs a container.");
+    root.height = { ...root.height, value: 500 };
+    expect(parseDesignProgram(overflowing)).toMatchObject({
+      success: false,
+      findings: expect.arrayContaining([expect.objectContaining({
+        code: "layout_axis_overflow",
+        path: "screens.student-home.root.overview",
+        message: expect.stringContaining("needs at least 632 px"),
+      })]),
+    });
+    const normalized = normalizeDesignProgramLayout(overflowing);
+    expect(normalized.repairs).toEqual([{
+      path: "screens.student-home.root.overview.height",
+      before: 500,
+      after: 632,
+      required: 632,
+    }]);
+    expect(parseDesignProgram(normalized.program).success).toBe(true);
+    expect(normalizeDesignProgramLayout(normalized.program)).toEqual({ program: normalized.program, repairs: [] });
+
+    const intentional = copy(overflowing);
+    intentional.screens[0]!.scroll = "none";
+    expect(normalizeDesignProgramLayout(intentional)).toEqual({ program: intentional, repairs: [] });
+    expect(parseDesignProgram(intentional).findings).toContainEqual(expect.objectContaining({ code: "layout_axis_overflow" }));
+
+    const wrapped = copy(booking) as unknown as DesignProgramV1;
+    const wrappedRoot = wrapped.screens[0]!.root;
+    if (wrappedRoot.type !== "container") throw new Error("Fixture needs a container.");
+    const dates = wrappedRoot.children.find((node) => node.id === "dates");
+    if (dates?.type !== "container") throw new Error("Fixture needs wrapped date choices.");
+    dates.layout.wrap = true;
+    dates.height = { ...dates.height, value: 100 };
+    for (const child of dates.children) child.width = { mode: "fixed", value: 150 };
+    expect(parseDesignProgram(wrapped).findings).toContainEqual(expect.objectContaining({
+      code: "layout_cross_axis_overflow",
+      path: "screens.appointment.root.dates",
+      message: expect.stringContaining("wrapped row heights"),
+    }));
+
+    const invalidSizing = copy(education) as unknown as DesignProgramV1;
+    const sizingRoot = invalidSizing.screens[0]!.root;
+    if (sizingRoot.type !== "container") throw new Error("Fixture needs a container.");
+    sizingRoot.width = { mode: "hug", value: sizingRoot.width.value };
+    sizingRoot.children[0]!.width = { mode: "fill", value: 318 };
+    expect(parseDesignProgram(invalidSizing).findings).toContainEqual(expect.objectContaining({ code: "fill_sizing_under_hug_parent" }));
+    sizingRoot.width = { mode: "fixed", value: 342 };
+    sizingRoot.children[0]!.width = { mode: "hug", value: 318 };
+    expect(parseDesignProgram(invalidSizing).findings).toContainEqual(expect.objectContaining({ code: "text_hug_width_requires_hug_height" }));
+    sizingRoot.children[0]!.width = { mode: "fixed", value: 318 };
+    sizingRoot.children[2]!.width = { mode: "hug", value: 318 };
+    expect(parseDesignProgram(invalidSizing).findings).toContainEqual(expect.objectContaining({ code: "unsupported_hug_sizing" }));
+
+    const hugText = copy(education) as unknown as DesignProgramV1;
+    const hugRoot = hugText.screens[0]!.root;
+    if (hugRoot.type !== "container") throw new Error("Fixture needs a container.");
+    const heading = hugRoot.children[0]!;
+    heading.height = { mode: "hug", value: 80 };
+    hugRoot.children = [heading];
+    hugRoot.height = { mode: "fixed", value: 90 };
+    expect(parseDesignProgram(hugText).findings).toContainEqual(expect.objectContaining({
+      code: "layout_axis_overflow",
+      message: expect.stringContaining("needs at least 104 px"),
+    }));
+    expect(normalizeDesignProgramLayout(hugText).repairs).toEqual([{
+      path: "screens.student-home.root.overview.height",
+      before: 90,
+      after: 104,
+      required: 104,
+    }]);
+  });
+
   it.each([["rtl", "start", "end"], ["rtl", "end", "start"], ["ltr", "start", "start"]] as const)(
     "maps %s column cross-axis %s to native %s for a fixed-width child", (direction, crossAlign, expected) => {
       const parsed = parseDesignProgram(copy(direction === "rtl" ? education : analytics));
@@ -167,7 +241,7 @@ describe("DesignProgramV1 local cross-domain spike", () => {
       const root = parsed.data.screens[0]!.root;
       if (root.type !== "container") throw new Error("Fixture needs a container.");
       root.layout = { ...root.layout, axis: "column", crossAlign };
-      root.children[0]!.width = { mode: "fixed", value: 120 };
+      root.height = { ...root.height, value: 1_644 };
       const compiled = compileDesignProgram(parsed.data);
       if (!compiled.success) throw new Error(JSON.stringify(compiled.findings));
       const wrapper = compiled.batch.screens[0]!.children[0];
