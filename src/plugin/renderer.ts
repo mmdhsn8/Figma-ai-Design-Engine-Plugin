@@ -163,6 +163,7 @@ export interface MultiScreenRenderOptions {
   gap?: number;
   maxRowWidth?: number;
   onNativeApiCall?: (operation: string, screenId?: string) => void;
+  onRenderProgress?: (stage: string, details?: Record<string, unknown>) => void;
   onProgress?: (progress: MultiScreenProgress) => void;
 }
 
@@ -453,6 +454,7 @@ async function resolveFonts(
   spec: ResolvedDesignSpec,
   typography: ReadonlyMap<string, { fontFamily: string; fontStyle: string }>,
   programText = false,
+  onRenderProgress?: MultiScreenRenderOptions["onRenderProgress"],
 ): Promise<FontResolution> {
   const available = await api.listAvailableFontsAsync();
   const availableByKey = new Map(
@@ -492,7 +494,10 @@ async function resolveFonts(
     style: "Regular",
   };
 
+  let fontIndex = 0;
   for (const [key, request] of requested) {
+    fontIndex++;
+    onRenderProgress?.("font_load_started", { fontIndex, fontCount: requested.size });
     const exact = availableByKey.get(fontKey(request.family, request.style));
     const preferredFallback = preferredFallbacks.get(key);
     const preferred = preferredFallback
@@ -535,6 +540,7 @@ async function resolveFonts(
         `Figma could not load “${request.family} ${request.style}” or the configured Brand Kit/Inter fallback.`,
         { cause: lastError },
       );
+    onRenderProgress?.("font_load_completed", { fontIndex, fontCount: requested.size });
     const fellBack = fontKey(chosen.family, chosen.style) !== fontKey(request.family, request.style);
     fonts.set(key, chosen);
     for (const [token, typographyToken] of typography) {
@@ -1811,7 +1817,11 @@ export async function renderMultiScreenDesign(
         children: resolvedSpecs.flatMap((spec) => spec.document.children),
       },
     };
-    fontResolution = await resolveFonts(api, fontSpec, baseResolved.tables.typography, options.programText);
+    options.onRenderProgress?.("font_loading_started", { fontCount: collectTextNodes(fontSpec).length });
+    const fontStartedAt = Date.now();
+    fontResolution = await resolveFonts(api, fontSpec, baseResolved.tables.typography, options.programText, options.onRenderProgress);
+    options.onRenderProgress?.("font_loading_completed", { fontCount: fontResolution.fonts.size,
+      durationMs: Math.max(0, Date.now() - fontStartedAt) });
     options.beforeScreen?.();
 
     const designSystemId = batch.designSystem?.id ?? batch.id;
@@ -2274,6 +2284,8 @@ export async function renderMultiScreenDesign(
               }
             : undefined,
         );
+        options.onRenderProgress?.("native_children_attached", { screenId: screen.id, nativeRootNodeId: root.id,
+          nativeParentNodeId: root.parent?.id, childrenAttached: true });
         root.setPluginData(MULTI_SCREEN_BATCH_KEY, batch.id);
         root.setPluginData(MULTI_SCREEN_ID_KEY, screen.id);
         root.setPluginData(SEMANTIC_NODE_ID_KEY, `screen:${screen.id}`);

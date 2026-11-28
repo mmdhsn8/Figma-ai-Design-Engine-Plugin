@@ -261,6 +261,17 @@ export function fw7CorrelationHash(value: string | undefined): string | undefine
   return value ? safeHash(value) : undefined;
 }
 
+/** Stable, content-free correlation ID for a native render adoption receipt. */
+export function nativeRenderReceiptId(input: {
+  requestId: string;
+  taskId: string;
+  screenId: string;
+  rootNodeId: string;
+  operationIds: readonly string[];
+}): string {
+  return `nrr-${safeHash([input.requestId, input.taskId, input.screenId, input.rootNodeId, ...input.operationIds].join("\u0000"))}`;
+}
+
 export function exposeFw7DiagnosticsExport(
   target: Record<string, unknown>,
   exportEvents: () => Fw7EventSourceSnapshot[],

@@ -27,11 +27,16 @@ import { createDesignContextController } from "./design-context-controller";
 import { prepareContextReuse } from "./design-context-reuse";
 import { FW5_VISUAL_QA_ENABLED } from "../shared/fw5-visual-qa-feature";
 import { fw7Telemetry } from "./fw7-runtime";
-import { fw7CorrelationHash } from "../shared/fw7-observability";
+import { fw7CorrelationHash, nativeRenderReceiptId } from "../shared/fw7-observability";
 
 figma.showUI(__html__, { width: 440, height: 720, themeColors: true });
 const COMPANION_RESTORE_TICKET_KEY = "companion-restore-ticket-v1";
 let checkpointRuntimeCompatible = false;
+type RenderAckHeartbeat = {
+  taskId: string; taskGeneration?: string; screenId: string; pageId: string;
+  rootNodeId?: string; parentNodeId?: string; receiptId?: string; startedAtMs: number; stop(): void;
+};
+const renderAckHeartbeats = new Map<string, RenderAckHeartbeat>();
 
 function send(message: PluginToUIMessage, taskId?: string): void {
   figma.ui.postMessage(message);
@@ -227,6 +232,25 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
   }
   // Handshake handling above replies before schema-based operation dispatch.
   if (message.data.type === "plugin-runtime-handshake") return;
+  if (message.data.type === "design-program-render-ack-confirm") {
+    const confirmation = message.data;
+    const pending = renderAckHeartbeats.get(confirmation.requestId);
+    const identityMatches = Boolean(pending && pending.taskId === confirmation.taskId &&
+      pending.screenId === confirmation.screenId && (!pending.taskGeneration || pending.taskGeneration === confirmation.taskGeneration) &&
+      confirmation.pluginBuildId === FW7_BUILD_ID &&
+      (!pending.receiptId || !confirmation.receiptId || pending.receiptId === confirmation.receiptId));
+    console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "plugin", event: identityMatches ? "ui_ack_confirmation_received" : "ui_ack_confirmation_rejected",
+      eventAtMs: Date.now(), elapsedMs: pending ? Math.max(0, Date.now() - pending.startedAtMs) : undefined,
+      taskId: confirmation.taskId, taskGeneration: confirmation.taskGeneration,
+      taskGenerationHash: fw7CorrelationHash(confirmation.taskGeneration), requestId: confirmation.requestId,
+      requestIdHash: fw7CorrelationHash(confirmation.requestId), screenId: confirmation.screenId,
+      pageId: pending?.pageId, nativeRootNodeId: pending?.rootNodeId, nativeParentNodeId: pending?.parentNodeId,
+      receiptId: confirmation.receiptId, accepted: confirmation.accepted, uiBuildId: confirmation.uiBuildId,
+      pluginBuildId: FW7_BUILD_ID, rejectionStage: identityMatches ? "none" : "ack_confirmation_identity",
+      reason: identityMatches ? "ui_ack_confirmation" : "correlation_mismatch" }));
+    if (identityMatches) pending!.stop();
+    return;
+  }
   if (["design-program-render", "task-native-inspect", "task-native-visual-capture", "task-native-visual-repair"].includes(message.data.type)) {
     const request = message.data as UIToPluginMessage & { requestId?: string; taskId?: string };
     const runId = request.taskId ?? request.requestId ?? "plugin-unscoped";
@@ -271,24 +295,95 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     const page = figma.currentPage;
     const pageId = page.id;
     const screenId = request.program.screens[0]?.id;
+    const pluginStartedAt = Date.now();
+    let progressSequence = 0;
+    let nativeOperationCount = 0;
+    let activeRenderStage = "request_received";
+    let observedRootNodeId: string | undefined;
+    let observedParentNodeId: string | undefined;
+    let observedNodeCount: number | undefined;
+    let activeReceiptId: string | undefined;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    let heartbeatExpiry: ReturnType<typeof setTimeout> | undefined;
+    let heartbeatEntry: RenderAckHeartbeat | undefined;
+    let awaitingUiAck = false;
     const reportRenderAck = (data: Record<string, unknown>) => console.info("[FAD_NATIVE_RENDER_ACK] " + JSON.stringify({
-      stage: "plugin", atMs: Date.now(), taskId: request.taskId,
+      stage: "plugin", eventAtMs: Date.now(), elapsedMs: Math.max(0, Date.now() - pluginStartedAt),
+      taskId: request.taskId, taskGeneration: request.taskGeneration,
+      taskGenerationHash: fw7CorrelationHash(request.taskGeneration), requestId: request.requestId, pageId,
       requestIdHash: fw7CorrelationHash(request.requestId), screenId,
       requestType: request.type, responseType: "design-program-render-result",
       uiBuildId: request.uiBuildId ?? "missing", pluginBuildId: FW7_BUILD_ID,
+      nativeRootNodeId: observedRootNodeId, nativeParentNodeId: observedParentNodeId,
+      nativeNodeCount: observedNodeCount, receiptId: activeReceiptId,
       checkpointState: "pending_ui_checkpoint", ...data,
     }));
-    reportRenderAck({ event: "request_received", buildMatch: request.uiBuildId === FW7_BUILD_ID });
+    const emitRenderProgress = (stage: string, details: Record<string, unknown> = {}) => {
+      activeRenderStage = stage;
+      progressSequence++;
+      const eventAtMs = Date.now();
+      if (typeof details.nativeRootNodeId === "string") observedRootNodeId = details.nativeRootNodeId;
+      if (typeof details.nativeParentNodeId === "string") observedParentNodeId = details.nativeParentNodeId;
+      if (typeof details.nativeNodeCount === "number" && Number.isInteger(details.nativeNodeCount))
+        observedNodeCount = details.nativeNodeCount;
+      if (typeof details.operationCount === "number" && Number.isInteger(details.operationCount))
+        nativeOperationCount = details.operationCount;
+      const progressRootNodeId = typeof details.nativeRootNodeId === "string" ? details.nativeRootNodeId : observedRootNodeId;
+      const progressParentNodeId = typeof details.nativeParentNodeId === "string" ? details.nativeParentNodeId : observedParentNodeId;
+      const progressNodeCount = typeof details.nativeNodeCount === "number" ? details.nativeNodeCount : observedNodeCount;
+      const progressOperationCount = typeof details.operationCount === "number" ? details.operationCount : nativeOperationCount;
+      const progress = {
+        type: "design-program-render-progress" as const,
+        requestId: request.requestId,
+        taskId: request.taskId,
+        ...(request.taskGeneration ? { taskGeneration: request.taskGeneration } : {}),
+        screenId: screenId!, stage, sequence: progressSequence, eventAtMs,
+        elapsedMs: Math.max(0, eventAtMs - pluginStartedAt),
+        uiBuildId: request.uiBuildId ?? "missing", pluginBuildId: FW7_BUILD_ID,
+        pageId, ...(progressRootNodeId ? { nativeRootNodeId: progressRootNodeId } : {}),
+        ...(progressParentNodeId ? { nativeParentNodeId: progressParentNodeId } : {}),
+        ...(progressNodeCount !== undefined ? { nativeNodeCount: progressNodeCount } : {}),
+        ...(progressOperationCount ? { operationCount: progressOperationCount } : {}),
+        ...(activeReceiptId ? { receiptId: activeReceiptId } : {}),
+      };
+      reportRenderAck({ event: "render_progress", progressStage: stage, progressSequence, ...details });
+      send(progress);
+    };
+    const clearHeartbeat = () => {
+      if (heartbeat !== undefined) clearInterval(heartbeat);
+      if (heartbeatExpiry !== undefined) clearTimeout(heartbeatExpiry);
+      heartbeat = undefined;
+      heartbeatExpiry = undefined;
+      if (heartbeatEntry && renderAckHeartbeats.get(request.requestId) === heartbeatEntry)
+        renderAckHeartbeats.delete(request.requestId);
+      heartbeatEntry = undefined;
+    };
+    reportRenderAck({ event: "request_received", buildMatch: request.uiBuildId === FW7_BUILD_ID,
+      taskGenerationHash: fw7CorrelationHash(request.taskGeneration), dispatchState: "received" });
     if (!request.uiBuildId || request.uiBuildId !== FW7_BUILD_ID) {
       const errorCode = "runtime_build_mismatch";
       reportRenderAck({ event: "request_rejected", rejectionStage: "build_identity", reason: errorCode, attached: false, receiptProduced: false, ownershipValidated: false });
       send({
         type: "design-program-render-result", requestId: request.requestId, taskId: request.taskId,
+        ...(request.taskGeneration ? { taskGeneration: request.taskGeneration } : {}),
         success: false, errorCode, uiBuildId: request.uiBuildId ?? "missing", pluginBuildId: FW7_BUILD_ID,
         findings: [{ code: errorCode, path: "runtime.buildId", message: "Reload the UI and Figma plugin so both render runtimes use the same build.", severity: "error" }],
       });
       return;
     }
+    if (!screenId) {
+      send({ type: "design-program-render-result", requestId: request.requestId, taskId: request.taskId,
+        ...(request.taskGeneration ? { taskGeneration: request.taskGeneration } : {}), success: false,
+        errorCode: "screen_identity_missing", uiBuildId: request.uiBuildId, pluginBuildId: FW7_BUILD_ID,
+        findings: [{ code: "screen_identity_missing", path: "program.screens", message: "The render request has no screen identity.", severity: "error" }] });
+      return;
+    }
+    emitRenderProgress("request_received");
+    heartbeat = setInterval(() => emitRenderProgress("heartbeat", { heartbeatStage: activeRenderStage }), 10_000);
+    heartbeatExpiry = setTimeout(clearHeartbeat, 360_000);
+    heartbeatEntry = { taskId: request.taskId, taskGeneration: request.taskGeneration, screenId,
+      pageId, startedAtMs: pluginStartedAt, stop: clearHeartbeat };
+    renderAckHeartbeats.set(request.requestId, heartbeatEntry);
     const receiptKey = `fad.program-root.v1:${request.taskId}:${request.program.screens[0]?.id}`;
     const assertCurrentScope = () => {
       if (figma.currentPage.id !== pageId || activeDocumentId() !== request.documentId)
@@ -296,6 +391,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     };
     try {
       assertCurrentScope();
+      emitRenderProgress("asset_resolution_started");
       const referencedAssets = new Set<string>();
       const collectAssets = (node: typeof request.program.screens[number]["root"]) => {
         if (node.type === "image" && node.asset.source === "user-approved-brand-kit" && node.asset.assetRef)
@@ -304,6 +400,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       };
       request.program.screens.forEach(({ root }) => collectAssets(root));
       const assets = await resolvePinnedBrandVisualAssets(figma.clientStorage, request.brandKit, [...referencedAssets]);
+      emitRenderProgress("asset_resolution_completed", { assetCount: assets.length });
       const grant = FW2_ENABLED && request.contextTicket
         ? designContext.reuse(request.contextTicket, request.taskId, request.documentId) : undefined;
       const result = await renderDesignProgramLocal(figma, request.program, {
@@ -316,6 +413,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         assertCurrentScope,
         requestId: request.requestId,
         expectedRootNodeId: request.expectedRootNodeId,
+        onProgress: (stage, details) => emitRenderProgress(stage, details),
         rootReceipt: {
           read: () => page.getPluginData(receiptKey),
           write: (nodeId) => page.setPluginData(receiptKey, nodeId),
@@ -325,16 +423,21 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       if (!result.success) {
         const attachedRoot = result.nativeRootNodeId ? page.children.find(({ id }) => id === result.nativeRootNodeId) : undefined;
         const parentId = attachedRoot?.parent?.id;
+        observedRootNodeId = attachedRoot?.id ?? result.nativeRootNodeId;
+        observedParentNodeId = parentId;
+        observedNodeCount = result.attachedNodeCount;
         reportRenderAck({ event: "render_failed", rejectionStage: result.code, reason: result.code,
           nativeRootNodeId: result.nativeRootNodeId, nativeParentNodeId: parentId,
           attached: Boolean(attachedRoot && parentId === pageId),
           attachedNodeCount: result.attachedNodeCount, receiptProduced: false, receiptValid: false,
           ownershipValidated: false, rendererGeometryReadback: result.code.startsWith("native_geometry") ? "incomplete_or_failed" : "not_completed",
           taskNativeReadback: "pending" });
+        awaitingUiAck = true;
         send({
           type: "design-program-render-result",
           requestId: request.requestId,
           taskId: request.taskId,
+          ...(request.taskGeneration ? { taskGeneration: request.taskGeneration } : {}),
           success: false,
           errorCode: result.code,
           uiBuildId: request.uiBuildId,
@@ -348,6 +451,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
           ...(result.attachedNodeCount ? { attachedNodeCount: result.attachedNodeCount } : {}),
           findings: result.findings.slice(0, 20),
         });
+        clearHeartbeat();
         return;
       }
       const root = result.roots.find(({ screenId }) => screenId === request.program.screens[0]?.id);
@@ -358,15 +462,33 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         throw new Error("rendered_root_attachment_unverified");
       const receiptValid = result.operationIds.length === result.registeredRefs && result.registeredRefs > 0;
       if (!receiptValid) throw new Error("native_adoption_receipt_incomplete");
+      observedRootNodeId = root.nodeId;
+      observedParentNodeId = nativeRoot.parent.id;
+      observedNodeCount = result.registeredRefs;
+      activeReceiptId = nativeRenderReceiptId({ requestId: request.requestId, taskId: request.taskId,
+        screenId: root.screenId, rootNodeId: root.nodeId, operationIds: result.operationIds });
+      emitRenderProgress("ack_dispatching", { receiptId: activeReceiptId, nativeRootNodeId: root.nodeId,
+        nativeParentNodeId: nativeRoot.parent.id, nativeNodeCount: result.registeredRefs });
+      if (heartbeatEntry) {
+        heartbeatEntry.rootNodeId = root.nodeId;
+        heartbeatEntry.parentNodeId = nativeRoot.parent.id;
+        heartbeatEntry.receiptId = activeReceiptId;
+      }
       reportRenderAck({ event: "render_succeeded", nativeRootNodeId: root.nodeId,
-        nativeParentNodeId: nativeRoot.parent.id, attached: true, receiptProduced: true,
+        nativeParentNodeId: nativeRoot.parent.id, receiptId: activeReceiptId, pageId, attached: true, receiptProduced: true,
         receiptValid, ownershipValidated: true, nativeNodeCount: result.registeredRefs,
         adoptionOperationCount: result.operationIds.length, rendererGeometryReadback: "complete",
         taskNativeReadback: "pending" });
+      reportRenderAck({ event: "ack_dispatched", dispatchAtMs: Date.now(), receiptId: activeReceiptId,
+        nativeRootNodeId: root.nodeId, nativeParentNodeId: nativeRoot.parent.id, attached: true,
+        receiptProduced: true, receiptValid: true, ownershipValidated: true, pageId,
+        checkpointState: "awaiting_ui_and_task_checkpoint" });
+      awaitingUiAck = true;
       send({
         type: "design-program-render-result",
         requestId: request.requestId,
         taskId: request.taskId,
+        ...(request.taskGeneration ? { taskGeneration: request.taskGeneration } : {}),
         success: true,
         screenId: root.screenId,
         nativeRootNodeId: root.nodeId,
@@ -403,12 +525,14 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
                 : "A pinned Brand Kit asset failed local format or provenance validation; no screen was adopted."
           : "The local native renderer could not confirm this screen.";
       reportRenderAck({ event: "render_exception", rejectionStage: "plugin_renderer", reason: failureCode,
-        attached: false, receiptProduced: false, ownershipValidated: false,
+        attached: Boolean(observedRootNodeId), receiptProduced: Boolean(activeReceiptId), ownershipValidated: false,
         rendererGeometryReadback: "unknown", taskNativeReadback: "pending" });
+      awaitingUiAck = true;
       send({
         type: "design-program-render-result",
         requestId: request.requestId,
         taskId: request.taskId,
+        ...(request.taskGeneration ? { taskGeneration: request.taskGeneration } : {}),
         success: false,
         errorCode: failureCode,
         uiBuildId: request.uiBuildId,
@@ -420,6 +544,8 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
           severity: "error",
         }],
       });
+    } finally {
+      if (!awaitingUiAck) clearHeartbeat();
     }
     return;
   }

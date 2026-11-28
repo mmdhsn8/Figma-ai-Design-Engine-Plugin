@@ -1775,20 +1775,38 @@ export function createFigmaToolExecutor(
     const expectedId = message.geometry?.expectedRootNodeId;
     const expected = expectedId ? await api.getNodeByIdAsync(expectedId) : undefined;
     assertTaskPageScope(message.documentId, pageId);
+    const expectedRootParentNodeId = expected && !expected.removed ? expected.parent?.id : undefined;
     const expectedRootStatus = !expectedId ? undefined : expected?.removed ? "removed"
-      : !expected ? "missing" : expected.parent?.id !== pageId ? "unexpected_parent" : "present";
-    return { nodes, unresolvedRefs, expectedRootStatus, nativePageId: pageId, truncated: owned.length > visibleNodes.length, ...(geometry ? { geometry } : {}) } as const;
+      : !expected ? "missing" : expectedRootParentNodeId !== pageId ||
+        (message.geometry?.expectedParentNodeId && expectedRootParentNodeId !== message.geometry.expectedParentNodeId)
+        ? "unexpected_parent" : "present";
+    return { nodes, unresolvedRefs, expectedRootStatus, nativePageId: pageId, nativeRootParentNodeId: expectedRootParentNodeId,
+      truncated: owned.length > visibleNodes.length, ...(geometry ? { geometry } : {}) } as const;
   };
 
   const inspectTaskNativeNodes = async (
     message: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
   ) => {
     const startedAt = Date.now();
+    console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "plugin", event: "native_readback_started",
+      eventAtMs: startedAt, taskId: message.taskId, taskGeneration: message.taskGeneration,
+      taskGenerationHash: fw7CorrelationHash(message.taskGeneration), requestId: message.requestId,
+      requestIdHash: fw7CorrelationHash(message.requestId), pageId: api.currentPage.id,
+      nativeRootNodeId: message.geometry?.expectedRootNodeId, nativeParentNodeId: message.geometry?.expectedParentNodeId,
+      screenId: message.geometry?.screenId, expectedLayoutCount: message.geometry?.expectedLayout?.length }));
     fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId),
       boundary: "figma-api", kind: "native_readback_started", stage: "task_native_inspect", result: "started",
       counter: "nativeReadbackOperations" });
     try {
       const result = await inspectTaskNativeNodesInner(message);
+      console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "plugin", event: "native_readback_completed",
+        eventAtMs: Date.now(), elapsedMs: Math.max(0, Date.now() - startedAt), taskId: message.taskId,
+        taskGeneration: message.taskGeneration, taskGenerationHash: fw7CorrelationHash(message.taskGeneration),
+        requestId: message.requestId, requestIdHash: fw7CorrelationHash(message.requestId),
+        screenId: message.geometry?.screenId, pageId: result.nativePageId, nativeRootNodeId: message.geometry?.expectedRootNodeId,
+        nativeParentNodeId: result.nativeRootParentNodeId, expectedRootStatus: result.expectedRootStatus,
+        geometryCoverage: result.geometry?.coverage, measuredNodes: result.geometry?.measuredNodes,
+        readAttempts: result.geometry?.readAttempts }));
       const confirmed = result.expectedRootStatus === undefined || result.expectedRootStatus === "present";
       fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId),
         boundary: "figma-api", kind: "native_readback_result", stage: "task_native_inspect",
@@ -4140,6 +4158,7 @@ export function createFigmaToolExecutor(
     >,
   ): Promise<void> => {
     if (message.type === "task-native-inspect") {
+      const requestStartedAt = Date.now();
       try {
         const result = await inspectTaskNativeNodes(message);
         if (message.geometry) console.log("[FAD_NATIVE_PROGRAM] " + JSON.stringify({
@@ -4156,14 +4175,23 @@ export function createFigmaToolExecutor(
           requestId: message.requestId,
           success: true,
           taskId: message.taskId,
+          ...(message.taskGeneration ? { taskGeneration: message.taskGeneration } : {}),
           ...result,
         });
       } catch (error) {
+        console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "plugin", event: "native_readback_failed",
+          eventAtMs: Date.now(), elapsedMs: Math.max(0, Date.now() - requestStartedAt), taskId: message.taskId,
+          taskGeneration: message.taskGeneration, taskGenerationHash: fw7CorrelationHash(message.taskGeneration),
+          requestId: message.requestId, requestIdHash: fw7CorrelationHash(message.requestId),
+          screenId: message.geometry?.screenId, pageId: api.currentPage.id,
+          nativeRootNodeId: message.geometry?.expectedRootNodeId, nativeParentNodeId: message.geometry?.expectedParentNodeId,
+          reason: error instanceof Error ? error.name : "unknown" }));
         send({
           type: "task-native-inspection-result",
           requestId: message.requestId,
           success: false,
           taskId: message.taskId,
+          ...(message.taskGeneration ? { taskGeneration: message.taskGeneration } : {}),
           error: (error instanceof Error
             ? error.message
             : "Native layers could not be read."

@@ -44,7 +44,7 @@ const activeRenders = new WeakSet<RendererFigmaApi>();
 export async function renderDesignProgramLocal(
   api: RendererFigmaApi,
   value: unknown,
-  scope: { taskId: string; documentId: string; pageId: string; executor: Pick<FigmaToolExecutor, "registerRenderedGeneration">; assets?: VisualAsset[]; assertCurrentScope?: () => void; requestId?: string; expectedRootNodeId?: string; rootReceipt?: { read(): string; write(nodeId: string): void }; lookupNode?: (nodeId: string) => Promise<BaseNode | null>; contextReuse?: () => ReturnType<typeof prepareContextReuse> },
+  scope: { taskId: string; documentId: string; pageId: string; executor: Pick<FigmaToolExecutor, "registerRenderedGeneration">; assets?: VisualAsset[]; assertCurrentScope?: () => void; requestId?: string; expectedRootNodeId?: string; onProgress?: (stage: string, details?: Record<string, unknown>) => void; rootReceipt?: { read(): string; write(nodeId: string): void }; lookupNode?: (nodeId: string) => Promise<BaseNode | null>; contextReuse?: () => ReturnType<typeof prepareContextReuse> },
 ): Promise<LocalProgramRenderResult> {
   const { taskId, documentId, pageId, executor, assertCurrentScope } = scope;
   if (!/^[A-Za-z0-9_-]{8,60}$/u.test(taskId))
@@ -70,6 +70,7 @@ export async function renderDesignProgramLocal(
   const compiled = compileDesignProgram(normalizedProgram, { assets, allowedBrandAssetIds });
   const compileMs = Math.max(0, Date.now() - compileStarted);
   if (!compiled.success) return { success: false, code: "compile_rejected", findings: compiled.findings };
+  scope.onProgress?.("program_compiled", { nodeCount: compiled.nodeCount, parseMs, compileMs });
   const semanticRoles = new Map(compiled.semanticRoles.map(({ logicalRef, role }) => [logicalRef, role]));
   const geometryFindings: ProgramGeometryFinding[] = [];
   const freshlyCreatedScreenIds = new Set<string>();
@@ -96,6 +97,9 @@ export async function renderDesignProgramLocal(
       event, atMs: Date.now(), taskId, pageId, requestId: scope.requestId, batchId: compiled.batch.id,
       fingerprint: compiled.fingerprint, ...data,
     }));
+  };
+  const progress = (stage: string, details: Record<string, unknown> = {}) => {
+    scope.onProgress?.(stage, details);
   };
   const traceTree = (event: string, root: FrameNode, screenId: string) => {
     const queue: SceneNode[] = [root];
@@ -176,6 +180,8 @@ export async function renderDesignProgramLocal(
       confirmedRootId = node.id;
       confirmedScreenId = node.getPluginData("fad.multi-screen.screen-id") || compiled.batch.screens[0]?.id;
       attachedNodeCount = countAttachedNodes(node.id);
+      progress("resume_root_found", { screenId: confirmedScreenId, nativeRootNodeId: node.id,
+        nativeParentNodeId: node.parent?.id, nativeNodeCount: attachedNodeCount });
       if (node.getPluginData("fad.generation.commit") === "pending" && node.getPluginData(BUILT_KEY) !== "1")
         return fail("native_root_partial", "An interrupted native root is still on the page. Inspect it before resuming; no replacement was created.");
     }
@@ -192,6 +198,8 @@ export async function renderDesignProgramLocal(
       confirmedRootId = candidate.id;
       confirmedScreenId = screenId;
       attachedNodeCount = countAttachedNodes(candidate.id);
+      progress("resume_geometry_started", { screenId, nativeRootNodeId: candidate.id,
+        nativeParentNodeId: candidate.parent?.id, nativeNodeCount: attachedNodeCount });
       const report = await inspectProgramGeometrySettled(candidate, {
         taskId,
         pageId,
@@ -210,6 +218,10 @@ export async function renderDesignProgramLocal(
           findings: describeProgramGeometryFindings(candidate, value.findings, screenId),
         }),
       });
+      progress("resume_geometry_completed", { screenId, nativeRootNodeId: candidate.id,
+        nativeParentNodeId: candidate.parent?.id, nativeNodeCount: report.measuredNodes,
+        coverage: report.coverage, attempts: report.attempts, durationMs: report.durationMs,
+        findingCount: report.findings.length });
       geometryReadbacks += report.attempts;
       geometryMs += report.durationMs;
       if (report.coverage !== "complete")
@@ -224,6 +236,8 @@ export async function renderDesignProgramLocal(
     let linkedFills = 0;
     let contextualInstances = 0;
     const renderStarted = Date.now();
+    progress("renderer_started", { nodeCount: compiled.nodeCount });
+    let operationCount = 0;
     const rendered = await renderMultiScreenDesign(api, compiled.batch, {
       resume: true,
       preserveSelection: true,
@@ -231,7 +245,9 @@ export async function renderDesignProgramLocal(
       requireComponentMatch: true,
       preserveFailedProgramNodes: true,
       programText: true,
+      onRenderProgress: (stage, details) => progress(stage, details),
       onNativeApiCall: (operation, screenId) => {
+        operationCount++;
         const counter = operation.startsWith("create-") ? "figmaCreateCalls"
           : operation === "append-child" ? "figmaAppendCalls"
             : operation === "resize" ? "figmaResizeCalls"
@@ -241,6 +257,8 @@ export async function renderDesignProgramLocal(
           boundary: "figma-api", kind: "native_api_call", stage: "native_render", operation,
           result: "started", ...(counter ? { counter } : {}),
         });
+        if (operationCount === 1 || operationCount % 20 === 0)
+          progress("native_api_progress", { operationCount, lastOperation: operation, screenId });
       },
       contextRectangle: grounding?.instantiateRectangle,
       bindContextFills: grounding && (async (root) => { linkedFills += await grounding.bindFills(root, verifyScope); }),
@@ -251,7 +269,9 @@ export async function renderDesignProgramLocal(
         confirmedRootId = root.id;
         confirmedScreenId = screenId;
         scope.rootReceipt?.write(root.id);
+        progress("native_frame_created", { screenId, nativeRootNodeId: root.id, nativeParentNodeId: root.parent?.id });
         if (root.parent?.id === pageId) {
+          progress("native_root_attached", { screenId, nativeRootNodeId: root.id, nativeParentNodeId: root.parent.id });
           fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_root_attached",
             stage: "native_render", result: "applied", rootNodeHash: fw7CorrelationHash(root.id) });
         }
@@ -266,6 +286,8 @@ export async function renderDesignProgramLocal(
         confirmedRootId = root.id;
         confirmedScreenId = screenId;
         attachedNodeCount = countAttachedNodes(root.id);
+        progress("native_children_attached", { screenId, nativeRootNodeId: root.id,
+          nativeParentNodeId: root.parent?.id, nativeNodeCount: attachedNodeCount });
         traceTree("root_built", root, screenId);
       },
       canRecoverPendingScreen: (root) => hasIdentity(root) && !root.getPluginData(TASK_KEY) && root.getPluginData(BUILT_KEY) === "1",
@@ -305,9 +327,17 @@ export async function renderDesignProgramLocal(
         };
         fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_started",
           stage: "program_geometry", result: "started", rootNodeHash: fw7CorrelationHash(root.id), counter: "nativeReadbackOperations" });
+        const geometryStartedAt = Date.now();
+        progress("geometry_verification_started", { screenId, nativeRootNodeId: root.id,
+          nativeParentNodeId: root.parent?.id, nativeNodeCount: attachedNodeCount });
         let report: ProgramGeometryReport & { receipt: string; attempts?: number } = await inspectProgramGeometrySettled(root, options, {
           assertCurrentScope: verifyScope,
-          onAttempt: recordGeometryAttempt,
+          onAttempt: (attempt, value) => {
+            recordGeometryAttempt(attempt, value);
+            progress("geometry_readback_attempt", { screenId, nativeRootNodeId: root.id,
+              nativeParentNodeId: root.parent?.id, nativeNodeCount: value.measuredNodes,
+              coverage: value.coverage, attempt, durationMs: value.durationMs, findingCount: value.findings.length });
+          },
         });
         if (FW4_GEOMETRY_ENABLED)
           trace("fw4_geometry_readback", { screenId, rootNodeId: root.id, gate: FW4_GEOMETRY_FEATURE,
@@ -322,7 +352,12 @@ export async function renderDesignProgramLocal(
             stage: "program_geometry_recheck", result: "started", rootNodeHash: fw7CorrelationHash(root.id), counter: "nativeReadbackOperations" });
           report = await inspectProgramGeometrySettled(root, options, {
             assertCurrentScope: verifyScope,
-            onAttempt: recordGeometryAttempt,
+            onAttempt: (attempt, value) => {
+              recordGeometryAttempt(attempt, value);
+              progress("geometry_readback_attempt", { screenId, nativeRootNodeId: root.id,
+                nativeParentNodeId: root.parent?.id, nativeNodeCount: value.measuredNodes,
+                coverage: value.coverage, attempt, durationMs: value.durationMs, findingCount: value.findings.length });
+            },
           });
           fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_result",
             stage: "program_geometry_recheck", result: report.coverage === "complete" && report.findings.length === 0 ? "confirmed" : "unverified",
@@ -350,6 +385,10 @@ export async function renderDesignProgramLocal(
             beforeFindingCodes: convergence.beforeCodes.slice(0, 8), coverage: report.coverage,
             afterFindingCodes: report.findings.filter(({ code }) => code.startsWith("native_layout_")).map(({ code }) => code).slice(0, 8) });
         }
+        progress("geometry_verification_completed", { screenId, nativeRootNodeId: root.id,
+          nativeParentNodeId: root.parent?.id, nativeNodeCount: report.measuredNodes,
+          coverage: report.coverage, attempts: report.attempts, findingCount: report.findings.length,
+          durationMs: Math.max(0, Date.now() - geometryStartedAt) });
         const sizingCandidate = report.findings.length === 1 && report.findings[0]?.code === "native_layout_sizing_mismatch"
           ? report.findings[0] : undefined;
         const sizingTarget = sizingCandidate?.nodeId
@@ -384,6 +423,7 @@ export async function renderDesignProgramLocal(
     });
     verifyScope();
     const renderMs = Math.max(0, Date.now() - renderStarted);
+    progress("renderer_completed", { renderMs, nodeCount: compiled.nodeCount, operationCount });
     if (incompleteGeometry) {
       const failureRoot = confirmedRootId
         ? api.currentPage.children.find((node) => node.id === confirmedRootId)
@@ -460,6 +500,8 @@ export async function renderDesignProgramLocal(
     if (collision.length)
       return { success: false, code: "reference_collision", findings: [{ code: "reference_collision", path: "screens", message: "A stable task ref already belongs to another native node.", severity: "error" }] };
     const registrationStarted = Date.now();
+    progress("adoption_registration_started", { nativeRootNodeId: roots[0]?.nodeId,
+      nativeParentNodeId: pageId, nativeNodeCount: adoptionRoots.reduce((count, root) => count + root.nodes.length, 0) });
     assertCurrentScope?.();
     if (activePageId(api) !== pageId) throw new Error("page_scope_changed");
     const registration = await executor.registerRenderedGeneration({
@@ -470,6 +512,12 @@ export async function renderDesignProgramLocal(
       roots: adoptionRoots,
     });
     const registrationMs = Math.max(0, Date.now() - registrationStarted);
+    progress("adoption_registration_completed", { nativeRootNodeId: roots[0]?.nodeId,
+      nativeParentNodeId: pageId, nativeNodeCount: registration.registeredRefs,
+      operationCount: registration.operationIds.length, durationMs: registrationMs });
+    progress("adoption_persistence_completed", { nativeRootNodeId: roots[0]?.nodeId,
+      nativeParentNodeId: pageId, nativeNodeCount: registration.registeredRefs,
+      durationMs: registration.persistenceMs });
     trace("adoption_acknowledged", { roots, operationIds: registration.operationIds });
     if (registration.registeredRefs !== adoptionRoots.reduce((count, root) => count + root.nodes.length, 0))
       return { success: false, code: "incomplete_ownership_registration", findings: [{ code: "incomplete_ownership_registration", path: "screens", message: "The scoped tool executor did not register every verified renderer node.", severity: "error" }] };

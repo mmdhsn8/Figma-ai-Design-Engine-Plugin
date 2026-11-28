@@ -21,6 +21,9 @@ type VisualRepairResponse = Extract<PluginToUIMessage, { type: "task-native-visu
 export function taskNativeBridge(message: Request): Promise<Response> {
   return new Promise((resolve, reject) => {
     const inspecting = message.type === "task-native-inspect";
+    const startedAt = Date.now();
+    const startedMonotonic = typeof performance !== "undefined" ? performance.now() : startedAt;
+    const elapsed = () => Math.max(0, Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedMonotonic));
     const finish = () => {
       window.clearTimeout(timer);
       window.removeEventListener("message", receive);
@@ -39,6 +42,25 @@ export function taskNativeBridge(message: Request): Promise<Response> {
       }
       if (message.type === "task-native-inspect") {
         if (parsed.data.type !== "task-native-inspection-result" || parsed.data.requestId !== message.requestId) return;
+        if (message.taskGeneration && parsed.data.taskGeneration !== message.taskGeneration) {
+          console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "ui", event: "native_readback_rejected",
+            eventAtMs: Date.now(), elapsedMs: elapsed(), taskId: message.taskId,
+            taskGeneration: message.taskGeneration, taskGenerationHash: fw7CorrelationHash(message.taskGeneration),
+            responseTaskGenerationHash: fw7CorrelationHash(parsed.data.taskGeneration), requestId: message.requestId,
+            requestIdHash: fw7CorrelationHash(message.requestId), screenId: message.geometry?.screenId,
+            nativeRootNodeId: message.geometry?.expectedRootNodeId, rejectionStage: "task_generation", reason: "generation_mismatch" }));
+          finish();
+          reject(Object.assign(new Error("Native readback response belongs to a different task generation."), { code: "native_readback_generation_mismatch" }));
+          return;
+        }
+        console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "ui", event: "native_readback_ack_received",
+          eventAtMs: Date.now(), elapsedMs: elapsed(), taskId: message.taskId,
+          taskGeneration: message.taskGeneration, taskGenerationHash: fw7CorrelationHash(message.taskGeneration),
+          requestId: message.requestId, requestIdHash: fw7CorrelationHash(message.requestId),
+          screenId: message.geometry?.screenId, nativeRootNodeId: message.geometry?.expectedRootNodeId,
+          nativeParentNodeId: parsed.data.nativeRootParentNodeId, pageId: parsed.data.nativePageId,
+          expectedRootStatus: parsed.data.expectedRootStatus, geometryCoverage: parsed.data.geometry?.coverage,
+          measuredNodes: parsed.data.geometry?.measuredNodes, readAttempts: parsed.data.geometry?.readAttempts }));
         fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "bridge_ack_received", stage: "native_readback", operation: parsed.data.type, result: "received", counter: "uiPluginAcksReceived" });
         finish();
         fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "native_readback_result", stage: "native_readback", operation: "task-native-inspect", result: parsed.data.success ? parsed.data.geometry?.coverage === "complete" ? "confirmed" : "unverified" : "failed", observedCount: parsed.data.success ? parsed.data.nodes?.length ?? 0 : undefined, reasonCode: !parsed.data.success ? "native_readback_failed" : parsed.data.geometry?.coverage !== "complete" ? "readback_coverage_incomplete" : undefined });
@@ -53,6 +75,14 @@ export function taskNativeBridge(message: Request): Promise<Response> {
       }
     };
     const timer = window.setTimeout(() => {
+      console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "ui", event: "native_readback_timeout",
+        eventAtMs: Date.now(), elapsedMs: elapsed(), taskId: inspecting ? message.taskId : undefined,
+        taskGeneration: inspecting ? message.taskGeneration : undefined,
+        taskGenerationHash: inspecting ? fw7CorrelationHash(message.taskGeneration) : undefined,
+        requestId: message.requestId, requestIdHash: fw7CorrelationHash(message.requestId), screenId: inspecting ? message.geometry?.screenId : undefined,
+        nativeRootNodeId: inspecting ? message.geometry?.expectedRootNodeId : undefined,
+        nativeParentNodeId: inspecting ? message.geometry?.expectedParentNodeId : undefined,
+        rejectionStage: "ack_deadline", reason: "native_readback_timeout" }));
       finish();
       reject(Object.assign(new Error("Figma did not respond to the task-layer request. Resume to retry native readback."), { code: "native_readback_timeout" }));
     }, 15_000);
@@ -63,6 +93,11 @@ export function taskNativeBridge(message: Request): Promise<Response> {
       reject(Object.assign(new Error("Figma could not receive the task-layer request. Reopen the plugin and retry."), { code: "native_readback_transport_failed" }));
       return;
     }
+    if (inspecting) console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "ui", event: "native_readback_dispatched",
+      eventAtMs: startedAt, taskId: message.taskId, taskGeneration: message.taskGeneration,
+      taskGenerationHash: fw7CorrelationHash(message.taskGeneration), requestId: message.requestId,
+      requestIdHash: fw7CorrelationHash(message.requestId), screenId: message.geometry?.screenId,
+      nativeRootNodeId: message.geometry?.expectedRootNodeId, nativeParentNodeId: message.geometry?.expectedParentNodeId }));
     fw7Telemetry.record({ runId: message.taskId, taskId: message.taskId, requestIdHash: fw7CorrelationHash(message.requestId), boundary: "ui-plugin", kind: "bridge_dispatch", stage: message.type === "task-native-inspect" ? "native_readback" : "native_focus", operation: message.type, result: "started", counter: "uiPluginDispatches" });
   });
 }

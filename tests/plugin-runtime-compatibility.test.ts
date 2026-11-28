@@ -16,6 +16,7 @@ import { designProgramFixtures } from "./fixtures/design-programs";
 import { projectNativeLayoutExpectations } from "../src/shared/fw4-geometry";
 import type { taskNativeBridge as taskNativeBridgeType } from "../src/ui/task-native-bridge";
 import { DesignProgramV1Schema } from "../src/shared/design-program";
+import { nativeRenderAckBudgetMs } from "../src/ui/design-program-bridge";
 import type { renderDesignProgramBridge as renderDesignProgramBridgeType } from "../src/ui/design-program-bridge";
 
 const pluginBundle = readFileSync(new URL("../dist/plugin.js", import.meta.url), "utf8");
@@ -112,6 +113,7 @@ describe("Figma main sandbox runtime compatibility", () => {
       setPluginData: (key: string, value: string) => pageData.set(key, value),
     });
     const messages: Array<Record<string, unknown>> = [];
+    const uiRequests: Array<Record<string, unknown>> = [];
     const events = new EventTarget();
     const pluginLog = vi.fn();
     const figma = mock.api as unknown as {
@@ -142,6 +144,8 @@ describe("Figma main sandbox runtime compatibility", () => {
       __html__: uiHtml,
       setTimeout,
       clearTimeout,
+      setInterval,
+      clearInterval,
       console: { log: pluginLog, info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     }, { codeGeneration: { strings: false, wasm: false } });
     runInContext(pluginBundle, context);
@@ -161,10 +165,17 @@ describe("Figma main sandbox runtime compatibility", () => {
         removeEventListener: events.removeEventListener.bind(events),
         setTimeout: globalThis.setTimeout.bind(globalThis),
         clearTimeout: globalThis.clearTimeout.bind(globalThis),
+        setInterval: globalThis.setInterval.bind(globalThis),
+        clearInterval: globalThis.clearInterval.bind(globalThis),
       },
-      parent: { postMessage: ({ pluginMessage }: { pluginMessage: unknown }) => { void pluginRequest(pluginMessage); } },
+      parent: { postMessage: ({ pluginMessage }: { pluginMessage: unknown }) => {
+        uiRequests.push(pluginMessage as Record<string, unknown>);
+        void pluginRequest(pluginMessage);
+      } },
       setTimeout,
       clearTimeout,
+      setInterval,
+      clearInterval,
       console: { info: vi.fn(), log: vi.fn() },
       MessageEvent,
     });
@@ -197,6 +208,8 @@ describe("Figma main sandbox runtime compatibility", () => {
     expect(rendered, JSON.stringify({ rendered, logs: pluginLog.mock.calls })).toMatchObject({ success: true, screenId: "screen-01" });
     const originalRootId = rendered!.nativeRootNodeId!;
     expect(rendered).toMatchObject({ nativeParentNodeId: mock.page.id, uiBuildId: bundledBuildId, pluginBuildId: bundledBuildId });
+    expect(uiRequests).toContainEqual(expect.objectContaining({ type: "design-program-render-ack-confirm", accepted: true,
+      requestId: "compiled-render-request-01", taskId }));
     injectedRepairCount = 14;
     const invalidAckOutcome = await renderBridge({
       type: "design-program-render", requestId: "compiled-render-request-02", taskId, documentId, program,
@@ -205,6 +218,8 @@ describe("Figma main sandbox runtime compatibility", () => {
       code: "native_render_ack_invalid_with_attachment",
       attachmentEvidence: { nativeRootNodeId: originalRootId, nativeParentNodeId: mock.page.id, nativeNodeCount: rendered!.nativeNodeCount },
     } });
+    expect(uiRequests).toContainEqual(expect.objectContaining({ type: "design-program-render-ack-confirm", accepted: false,
+      requestId: "compiled-render-request-02", taskId }));
     const screenRootsAfterInvalidAck = mock.page.children.filter((node) => node.getPluginData("fad.multi-screen.batch-id") === program.id &&
       node.getPluginData("fad.multi-screen.screen-id") === "screen-01");
     expect(screenRootsAfterInvalidAck.map(({ id }) => id)).toEqual([originalRootId]);
@@ -239,6 +254,8 @@ describe("Figma main sandbox runtime compatibility", () => {
       },
       setTimeout,
       clearTimeout,
+      setInterval,
+      clearInterval,
       console: { info: vi.fn(), log: vi.fn() },
       MessageEvent,
     });
@@ -274,6 +291,277 @@ describe("Figma main sandbox runtime compatibility", () => {
     expect(messages.filter((message) => message.type === "design-program-render-result")).toHaveLength(3);
     expect(messages.filter((message) => message.type === "task-native-inspection-result")).toHaveLength(1);
   });
+
+  it("keeps the compiled native root across slow, late, and lost acknowledgements and Resume", async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createMockApi();
+      const pageData = new Map<string, string>();
+      Object.assign(mock.page, {
+        getPluginData: (key: string) => pageData.get(key) ?? "",
+        setPluginData: (key: string, value: string) => pageData.set(key, value),
+      });
+      const events = new EventTarget();
+      const pluginMessages: Array<Record<string, unknown>> = [];
+      const uiLogs: unknown[][] = [];
+      let delivery: { mode: "immediate" | "delayed" | "lost" | "duplicate"; delayMs?: number } = { mode: "immediate" };
+      let heldResultCount = 0;
+      let successfulResultCount = 0;
+      let silenceProgress = false;
+      const figma = mock.api as unknown as {
+        showUI: ReturnType<typeof vi.fn>;
+        ui: { onmessage?: unknown; postMessage: (message: unknown) => void };
+        fileKey: string;
+        currentPage: { id: string };
+      };
+      figma.showUI = vi.fn();
+      const dispatchPluginMessage = (message: Record<string, unknown>) =>
+        events.dispatchEvent(new MessageEvent("message", { data: { pluginMessage: message } }));
+      figma.ui = {
+        onmessage: undefined,
+        postMessage: (message) => {
+          const reply = message as Record<string, unknown>;
+          pluginMessages.push(reply);
+          if (silenceProgress && reply.type === "design-program-render-progress") return;
+          if (reply.type === "design-program-render-result" && reply.success === true) {
+            successfulResultCount++;
+            const next = delivery;
+            delivery = { mode: "immediate" };
+            if (next.mode === "lost") return;
+            if (next.mode === "duplicate") {
+              dispatchPluginMessage({ ...reply, requestId: "compiled-stale-out-of-order-request" });
+              dispatchPluginMessage(reply);
+              dispatchPluginMessage(reply);
+              return;
+            }
+            if (next.mode === "delayed") {
+              heldResultCount++;
+              setTimeout(() => dispatchPluginMessage(reply), next.delayMs ?? 0);
+              return;
+            }
+          }
+          dispatchPluginMessage(reply);
+        },
+      };
+      const bootPluginController = () => {
+        const context = createContext({
+          figma, __html__: uiHtml, setTimeout, clearTimeout, setInterval, clearInterval,
+          console: { log: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        }, { codeGeneration: { strings: false, wasm: false } });
+        runInContext(pluginBundle, context);
+        return context;
+      };
+      let pluginContext = bootPluginController();
+      let pluginRequest = (pluginContext as unknown as {
+        figma: { ui: { onmessage: (message: unknown) => Promise<void> } };
+      }).figma.ui.onmessage;
+
+      const source = designProgramFixtures[0]!;
+      const program = DesignProgramV1Schema.parse({
+        ...source, id: "compiled-ack-recovery",
+        screens: source.screens.map((screen) => ({ ...screen, id: "screen-01" })),
+      });
+      const taskId = "compiled-ack-recovery-task";
+      const taskGeneration = "generation-compiled-ack-01";
+      const documentId = `${figma.fileKey}-${figma.currentPage.id.replaceAll(":", "_")}`;
+      const createBridge = () => {
+        const context = createContext({
+          window: {
+            addEventListener: events.addEventListener.bind(events),
+            removeEventListener: events.removeEventListener.bind(events),
+            setTimeout: globalThis.setTimeout.bind(globalThis),
+            clearTimeout: globalThis.clearTimeout.bind(globalThis),
+          },
+          parent: { postMessage: ({ pluginMessage }: { pluginMessage: unknown }) => { void pluginRequest(pluginMessage); } },
+          setTimeout, clearTimeout, console: { info: (...args: unknown[]) => uiLogs.push(args), log: vi.fn() }, MessageEvent,
+        });
+        runInContext(compiledDesignProgramBridge, context);
+        return (context as unknown as {
+          FadCompiledDesignProgramBridge: { renderDesignProgramBridge: typeof renderDesignProgramBridgeType };
+        }).FadCompiledDesignProgramBridge.renderDesignProgramBridge;
+      };
+      const renderBridge = createBridge();
+      const baseRequest = {
+        type: "design-program-render" as const, taskId, taskGeneration, documentId, program,
+      };
+      const rootFor = () => mock.page.children.find((node) =>
+        node.getPluginData("fad.multi-screen.batch-id") === program.id &&
+        node.getPluginData("fad.multi-screen.screen-id") === "screen-01");
+      const waitForHeldResult = async (expectedCount: number) => {
+        for (let attempt = 0; attempt < 1_000 && heldResultCount < expectedCount; attempt++) {
+          await Promise.resolve();
+          await vi.advanceTimersByTimeAsync(5);
+        }
+        expect(heldResultCount).toBe(expectedCount);
+      };
+      const waitForSuccessfulResult = async (expectedCount: number) => {
+        for (let attempt = 0; attempt < 1_000 && successfulResultCount < expectedCount; attempt++) {
+          await Promise.resolve();
+          await vi.advanceTimersByTimeAsync(5);
+        }
+        expect(successfulResultCount).toBe(expectedCount);
+      };
+      const budgetMs = nativeRenderAckBudgetMs(program);
+
+      // A slow response just before the bounded deadline still resolves normally.
+      delivery = { mode: "delayed", delayMs: Math.max(1, budgetMs - 100) };
+      const slowPromise = renderBridge({ ...baseRequest, requestId: "compiled-ack-slow-before-deadline" })
+        .then((response) => ({ response }), (error: unknown) => ({ error }));
+      await waitForHeldResult(1);
+      await vi.advanceTimersByTimeAsync(Math.max(1, budgetMs - 100));
+      const slowOutcome = await slowPromise;
+      if ("error" in slowOutcome) throw new Error(JSON.stringify({ error: slowOutcome.error,
+        result: pluginMessages.find((message) => message.type === "design-program-render-result"), uiLogs }));
+      const slowResult = slowOutcome.response;
+      expect(slowResult).toMatchObject({ success: true, screenId: "screen-01" });
+      const originalRootId = slowResult.nativeRootNodeId;
+      expect(rootFor()?.id).toBe(originalRootId);
+
+      // Lost progress heartbeats are observable but do not pre-empt a legal render deadline.
+      silenceProgress = true;
+      delivery = { mode: "delayed", delayMs: 40_000 };
+      const silentPromise = renderBridge({ ...baseRequest, requestId: "compiled-ack-silent-progress",
+        expectedRootNodeId: originalRootId }).then((response) => ({ response }), (error: unknown) => ({ error }));
+      await waitForHeldResult(2);
+      await vi.advanceTimersByTimeAsync(40_000);
+      silenceProgress = false;
+      const silentOutcome = await silentPromise;
+      expect(silentOutcome).toMatchObject({ response: { success: true, nativeRootNodeId: originalRootId } });
+      expect(uiLogs.flat().join(" ")).toContain("progress_silence_detected");
+
+      // An acknowledgement after the deadline is diagnostic only; Resume uses the same attached root.
+      delivery = { mode: "delayed", delayMs: budgetMs + 100 };
+      const latePromise = renderBridge({ ...baseRequest, requestId: "compiled-ack-after-deadline", expectedRootNodeId: originalRootId });
+      const lateOutcomePromise = latePromise.then((response) => ({ response }), (error: unknown) => ({ error }));
+      await waitForHeldResult(3);
+      const rootBeforeControllerReload = rootFor()?.id;
+      expect(rootBeforeControllerReload).toBe(originalRootId);
+      pluginContext = bootPluginController();
+      pluginRequest = (pluginContext as unknown as {
+        figma: { ui: { onmessage: (message: unknown) => Promise<void> } };
+      }).figma.ui.onmessage;
+      expect(rootFor()?.id).toBe(rootBeforeControllerReload);
+      await vi.advanceTimersByTimeAsync(budgetMs);
+      const lateOutcome = await lateOutcomePromise;
+      expect(lateOutcome).toMatchObject({ error: { code: "native_render_ack_timeout" } });
+      await vi.advanceTimersByTimeAsync(200);
+      expect(uiLogs.flat().join(" ")).toContain("late_ack_observed");
+      expect(rootFor()?.id).toBe(originalRootId);
+
+      // A dropped acknowledgement also leaves the root in place; the next bridge call reconciles it.
+      delivery = { mode: "lost" };
+      const lostPromise = renderBridge({ ...baseRequest, requestId: "compiled-ack-lost", expectedRootNodeId: originalRootId })
+        .then((response) => ({ response }), (error: unknown) => ({ error }));
+      await waitForSuccessfulResult(successfulResultCount + 1);
+      await vi.advanceTimersByTimeAsync(budgetMs);
+      expect(await lostPromise).toMatchObject({ error: { code: "native_render_ack_timeout" } });
+      expect(rootFor()?.id).toBe(originalRootId);
+
+      const resumeBridge = createBridge();
+      const resumeOrdinal = successfulResultCount + 1;
+      const resumePromise = resumeBridge({ ...baseRequest, requestId: "compiled-ack-resume",
+        expectedRootNodeId: originalRootId });
+      await waitForSuccessfulResult(resumeOrdinal);
+      const resumed = await resumePromise;
+      expect(resumed).toMatchObject({ success: true, nativeRootNodeId: originalRootId });
+      expect(rootFor()?.id).toBe(originalRootId);
+      expect(mock.page.children.filter((node) => node.getPluginData("fad.multi-screen.batch-id") === program.id))
+        .toHaveLength(1);
+
+      // Stop while an attached root is awaiting acknowledgement; the late result remains diagnostic.
+      delivery = { mode: "delayed", delayMs: 100_000 };
+      const stopController = new AbortController();
+      const stoppedPromise = renderBridge({ ...baseRequest, requestId: "compiled-ack-stopped",
+        expectedRootNodeId: originalRootId }, { signal: stopController.signal })
+        .then((response) => ({ response }), (error: unknown) => ({ error }));
+      await waitForHeldResult(4);
+      stopController.abort();
+      expect(await stoppedPromise).toMatchObject({ error: { code: "native_render_cancelled" } });
+      await vi.advanceTimersByTimeAsync(100_100);
+      expect(rootFor()?.id).toBe(originalRootId);
+
+      // Exercise the compiled protocol's full supported task size range and both text directions.
+      let successOrdinal = successfulResultCount;
+      for (const screenCount of [1, 2, 3, 10]) {
+        const sourceProgram = designProgramFixtures[screenCount % 2 === 0 ? 2 : 0]!;
+        const matrixTaskId = `compiled-matrix-task-${screenCount}`;
+        const batchId = `compiled-matrix-batch-${screenCount}`;
+        const createdRootIds: string[] = [];
+        for (let index = 0; index < screenCount; index++) {
+          const screenId = `screen-${String(index + 1).padStart(2, "0")}`;
+          const matrixProgram = DesignProgramV1Schema.parse({
+            ...sourceProgram, id: batchId,
+            screens: [{ ...sourceProgram.screens[0]!, id: screenId, order: index }],
+          });
+          const matrixBridge = createBridge();
+          const expectedOrdinal = ++successOrdinal;
+          const matrixPromise = matrixBridge({ type: "design-program-render", requestId: `compiled-matrix-${screenCount}-${index + 1}`,
+            taskId: matrixTaskId, taskGeneration, documentId, program: matrixProgram });
+          await waitForSuccessfulResult(expectedOrdinal);
+          const matrixResult = await matrixPromise;
+          expect(matrixResult).toMatchObject({ success: true, screenId });
+          createdRootIds.push(matrixResult.nativeRootNodeId!);
+        }
+        const batchRoots = mock.page.children.filter((node) => node.getPluginData("fad.multi-screen.batch-id") === batchId);
+        expect(batchRoots.map(({ id }) => id)).toEqual(createdRootIds);
+        expect(new Set(createdRootIds).size).toBe(screenCount);
+      }
+
+      // Stop during font loading before root attachment; the renderer may finish late, and Resume must adopt that root.
+      const fontApi = mock.api as unknown as { loadFontAsync: (font: unknown) => Promise<void> };
+      const originalLoadFontAsync = fontApi.loadFontAsync;
+      let releaseFontLoad!: () => void;
+      const delayedFontLoad = new Promise<void>((resolve) => { releaseFontLoad = resolve; });
+      fontApi.loadFontAsync = () => delayedFontLoad;
+      const stoppedProgram = DesignProgramV1Schema.parse({ ...program, id: "compiled-stop-during-font-load" });
+      const stoppedTaskId = "compiled-stop-font-task";
+      const stopBeforeAttachment = new AbortController();
+      const stoppedRenderPromise = createBridge()({ type: "design-program-render", requestId: "compiled-stop-during-font",
+        taskId: stoppedTaskId, taskGeneration, documentId, program: stoppedProgram }, { signal: stopBeforeAttachment.signal })
+        .then((response) => ({ response }), (error: unknown) => ({ error }));
+      for (let attempt = 0; attempt < 1_000 && !pluginMessages.some((message) => message.type === "design-program-render-progress" &&
+          message.requestId === "compiled-stop-during-font" && message.stage === "font_load_started"); attempt++) {
+        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      expect(pluginMessages.some((message) => message.type === "design-program-render-progress" &&
+        message.requestId === "compiled-stop-during-font" && message.stage === "font_load_started")).toBe(true);
+      expect(mock.page.children.some((node) => node.getPluginData("fad.multi-screen.batch-id") === stoppedProgram.id)).toBe(false);
+      stopBeforeAttachment.abort();
+      expect(await stoppedRenderPromise).toMatchObject({ error: { code: "native_render_cancelled" } });
+      releaseFontLoad();
+      await waitForSuccessfulResult(++successOrdinal);
+      fontApi.loadFontAsync = originalLoadFontAsync;
+      const stoppedRoot = mock.page.children.find((node) => node.getPluginData("fad.multi-screen.batch-id") === stoppedProgram.id);
+      expect(stoppedRoot).toBeTruthy();
+      const stopResumeOrdinal = ++successOrdinal;
+      const stopResumePromise = createBridge()({ type: "design-program-render", requestId: "compiled-stop-font-resume",
+        taskId: stoppedTaskId, taskGeneration, documentId, program: stoppedProgram, expectedRootNodeId: stoppedRoot!.id });
+      await waitForSuccessfulResult(stopResumeOrdinal);
+      const stopResume = await stopResumePromise;
+      expect(stopResume).toMatchObject({ success: true, nativeRootNodeId: stoppedRoot!.id });
+      expect(mock.page.children.filter((node) => node.getPluginData("fad.multi-screen.batch-id") === stoppedProgram.id))
+        .toHaveLength(1);
+
+      // Duplicate and out-of-order receipts cannot change the one committed root.
+      delivery = { mode: "duplicate" };
+      const duplicatePromise = createBridge()({ ...baseRequest, requestId: "compiled-ack-duplicate" });
+      await waitForSuccessfulResult(++successOrdinal);
+      expect(await duplicatePromise).toMatchObject({ success: true, nativeRootNodeId: originalRootId });
+      expect(rootFor()?.id).toBe(originalRootId);
+      const timeoutEvents = uiLogs.flat().filter((entry) => typeof entry === "string").join("\n");
+      expect(timeoutEvents).toContain("ack_timeout");
+      expect(timeoutEvents).toContain("late_ack_observed");
+      expect(timeoutEvents).toContain("out_of_order_response_ignored");
+      expect(timeoutEvents).not.toContain("progress_rejected");
+      expect(pluginMessages.filter((message) => message.type === "design-program-render-result" && message.success === true))
+        .toHaveLength(successfulResultCount);
+      expect(pluginMessages.filter((message) => message.type === "design-program-render-progress").length).toBeGreaterThan(0);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  }, 30_000);
 
   it("executes the built plugin and verifies checkpoint receipts across a controller reload", async () => {
     const page = {

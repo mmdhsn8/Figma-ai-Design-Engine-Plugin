@@ -23,7 +23,7 @@ import {
   type UniversalScreenCheckpoint,
 } from "../shared/universal-design";
 import type { AuthorizedChatTurn } from "./companion-client";
-import { NativeRenderBridgeError, type ContextResponse, type DesignProgramRenderResponse } from "./design-program-bridge";
+import { NativeRenderBridgeError, type ContextResponse, type DesignProgramRenderProgress, type DesignProgramRenderResponse } from "./design-program-bridge";
 import { CONTEXT_PRECEDENCE, plannerDesignContext, type ContextTicket } from "../shared/design-context";
 import { FW4_GEOMETRY_ENABLED, FW4_GEOMETRY_FEATURE, projectNativeLayoutExpectations } from "../shared/fw4-geometry";
 import { FW5_VISUAL_QA_ENABLED, FW5_VISUAL_REVIEW_MODE } from "../shared/fw5-visual-qa-feature";
@@ -48,16 +48,19 @@ import {
   type VisualQaOutcomeV1,
 } from "../shared/fw5-visual-qa";
 import { fw7Telemetry } from "./fw7-runtime";
-import { fw7CorrelationHash } from "../shared/fw7-observability";
+import { fw7CorrelationHash, nativeRenderReceiptId } from "../shared/fw7-observability";
 
 type NativeInspection = Extract<PluginToUIMessage, { type: "task-native-inspection-result" }>;
 
 export type UniversalDesignDependencies = {
   model(input: ChatInputItem[], lifecycle: ChatLifecycleState, requestId: string, signal?: AbortSignal): Promise<AuthorizedChatTurn>;
-  save(task: ChatTask): Promise<void>;
+  save(task: ChatTask): Promise<void | { revision?: { hash: string; bytes: number } }>;
   progress(message: string): void;
   assertAuthorized(): Promise<void>;
-  renderProgram(program: DesignProgramV1, requestId: string, expectedRootNodeId?: string, contextTicket?: ContextTicket): Promise<DesignProgramRenderResponse>;
+  renderProgram(program: DesignProgramV1, requestId: string, expectedRootNodeId: string | undefined,
+    contextTicket: ContextTicket | undefined, taskGeneration: string, signal: AbortSignal,
+    onProgress?: (progress: DesignProgramRenderProgress) => void): Promise<DesignProgramRenderResponse>;
+  onNativeRenderProgress?(screenId: string, progress: DesignProgramRenderProgress): void;
   readContext?(): Promise<ContextResponse | undefined>;
   inspectProgram(request: Extract<UIToPluginMessage, { type: "task-native-inspect" }>): Promise<NativeInspection>;
   captureVisual?(request: Extract<UIToPluginMessage, { type: "task-native-visual-capture" }>, signal: AbortSignal): Promise<Extract<PluginToUIMessage, { type: "task-native-visual-capture-result" }>>;
@@ -982,6 +985,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       }));
     }
   };
+  let activeNativeCheckpoint: { requestId: string; screenId: string; taskGeneration: string } | undefined;
   const save = async (snapshot: ChatTask = task) => {
     check();
     const parsed = ChatTaskSchema.safeParse(snapshot);
@@ -990,24 +994,59 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
     if (utf8Bytes(JSON.stringify(parsed.data)) > CHAT_TASK_MAX_BYTES)
       fail("checkpoint_size_limit", "The task checkpoint reached its 512 KiB safety budget; existing canvas work is retained and no further native work was started.");
     const startedAt = monotonicNow();
+    const saveStartedAtMs = Date.now();
+    const screenCheckpoints = snapshot.universalScreens ?? [];
+    const correlatedScreen = activeNativeCheckpoint
+      ? screenCheckpoints.find((screen) => screen.screenId === activeNativeCheckpoint?.screenId)
+      : undefined;
+    const correlatedReceiptId = activeNativeCheckpoint && correlatedScreen?.nativeRootNodeId && correlatedScreen.adoptionOperationIds?.length
+      ? nativeRenderReceiptId({ requestId: activeNativeCheckpoint.requestId, taskId: task.id,
+          screenId: correlatedScreen.screenId, rootNodeId: correlatedScreen.nativeRootNodeId,
+          operationIds: correlatedScreen.adoptionOperationIds })
+      : undefined;
+    const nativeAttachedCount = screenCheckpoints.filter((screen) => Boolean(screen.nativeRootNodeId && screen.nativeAttachmentStatus)).length;
+    const nativeAckCount = screenCheckpoints.filter((screen) => (screen.status === "rendered" || screen.status === "verified") && Boolean(screen.nativeRootNodeId)).length;
+    const nativeVerifiedCount = screenCheckpoints.filter((screen) => screen.status === "verified" && Boolean(screen.nativeReadbackRevision)).length;
+    console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({
+      stage: "ui", event: "checkpoint_save_started", eventAtMs: saveStartedAtMs,
+      taskId: task.id, taskGeneration: activeNativeCheckpoint?.taskGeneration,
+      taskGenerationHash: fw7CorrelationHash(activeNativeCheckpoint?.taskGeneration),
+      requestId: activeNativeCheckpoint?.requestId, requestIdHash: fw7CorrelationHash(activeNativeCheckpoint?.requestId),
+      screenId: activeNativeCheckpoint?.screenId, nativeRootNodeId: correlatedScreen?.nativeRootNodeId,
+      nativeParentNodeId: correlatedScreen?.nativeParentNodeId, pageId: correlatedScreen?.nativePageId ?? correlatedScreen?.nativeParentNodeId,
+      receiptId: correlatedReceiptId,
+      checkpointState: "write_pending", nativeAttachedCount, nativeAckCount, nativeVerifiedCount,
+    }));
     const pendingWrite = saveQueue.then(async () => {
       if (saveFailure) throw saveFailure.error;
       check();
       try {
-        await deps.save(parsed.data);
+        return await deps.save(parsed.data);
       } catch (error) {
         saveFailure = { error };
         throw error;
       }
     });
     saveQueue = pendingWrite.then(() => undefined, () => undefined);
-    await pendingWrite;
+    const confirmation = await pendingWrite;
     check();
     const durationMs = Math.max(0, Math.round(monotonicNow() - startedAt));
     if (task.universalMetrics) {
       task.universalMetrics.persistenceMs += durationMs;
-      recordTrace({ stageId: "task", stage: "persistence", event: "checkpoint_saved", outcome: "completed", durationMs });
+      recordTrace({ stageId: activeNativeCheckpoint?.screenId ?? "task", stage: "persistence", event: "checkpoint_saved", outcome: "completed",
+        nativeOperationId: activeNativeCheckpoint?.requestId, durationMs });
     }
+    console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({
+      stage: "ui", event: "checkpoint_confirmed", eventAtMs: Date.now(), elapsedMs: durationMs,
+      taskId: task.id, taskGeneration: activeNativeCheckpoint?.taskGeneration,
+      taskGenerationHash: fw7CorrelationHash(activeNativeCheckpoint?.taskGeneration),
+      requestId: activeNativeCheckpoint?.requestId, requestIdHash: fw7CorrelationHash(activeNativeCheckpoint?.requestId),
+      screenId: activeNativeCheckpoint?.screenId, nativeRootNodeId: correlatedScreen?.nativeRootNodeId,
+      nativeParentNodeId: correlatedScreen?.nativeParentNodeId, pageId: correlatedScreen?.nativePageId ?? correlatedScreen?.nativeParentNodeId,
+      receiptId: correlatedReceiptId,
+      checkpointRevisionHash: confirmation?.revision?.hash, checkpointBytes: confirmation?.revision?.bytes,
+      checkpointState: "confirmed", nativeAttachedCount, nativeAckCount, nativeVerifiedCount,
+    }));
   };
   if (task.executionRoute !== "universal-design-v1" || task.intent !== "create")
     fail("route_intent_conflict", "Only the checkpointed universal create route can run this planner.");
@@ -1790,6 +1829,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       screen.errorCode = "render_in_flight";
       task.universalMetrics!.nativeBatches++;
       const renderRequestId = `${task.id}_render_${screen.screenId}_${screen.renderAttempts}`;
+      const taskGeneration = task.generationLink?.generationId ?? `generation-${task.universalManifest?.fingerprint ?? task.id}`;
+      activeNativeCheckpoint = { requestId: renderRequestId, screenId: screen.screenId, taskGeneration };
       recordTrace({ stageId: screen.screenId, stage: "native_render", event: "render_dispatched", outcome: "started", nativeOperationId: renderRequestId, attempt: screen.renderAttempts, nodeCount: estimated });
       await save();
       await deps.assertAuthorized();
@@ -1799,7 +1840,10 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(renderRequestId), boundary: "task-owner", kind: "native_render_started", stage: "native_render", operation: "design-program-render", result: "started", observedCount: estimated });
       let response: DesignProgramRenderResponse;
       try {
-        response = await deps.renderProgram(screen.program, renderRequestId, screen.nativeRootNodeId, contextTicket);
+        response = await deps.renderProgram(screen.program, renderRequestId, screen.nativeRootNodeId,
+          contextTicket, taskGeneration, deps.signal, (progress) => {
+            deps.onNativeRenderProgress?.(screen.screenId, progress);
+          });
       } catch (error) {
         const durationMs = Math.max(0, Math.round(monotonicNow() - renderStarted));
         const attachment = error instanceof NativeRenderBridgeError ? error.attachmentEvidence : undefined;
@@ -1912,7 +1956,19 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       await deps.assertAuthorized();
       check();
       const inspectRequestId = `${task.id}_inspect_${screen.screenId}_${Math.random().toString(36).slice(2, 10)}`;
+      const taskGeneration = task.generationLink?.generationId ?? `generation-${task.universalManifest?.fingerprint ?? task.id}`;
+      const renderReceiptId = activeNativeCheckpoint && screen.nativeRootNodeId && screen.adoptionOperationIds?.length
+        ? nativeRenderReceiptId({ requestId: activeNativeCheckpoint.requestId, taskId: task.id,
+            screenId: screen.screenId, rootNodeId: screen.nativeRootNodeId, operationIds: screen.adoptionOperationIds })
+        : undefined;
       const readbackStartedAt = monotonicNow();
+      console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "ui", event: "native_readback_dispatched",
+        eventAtMs: Date.now(), taskId: task.id, taskGeneration, taskGenerationHash: fw7CorrelationHash(taskGeneration),
+        requestId: inspectRequestId, requestIdHash: fw7CorrelationHash(inspectRequestId),
+        renderRequestId: activeNativeCheckpoint?.requestId, receiptId: renderReceiptId, screenId: screen.screenId,
+        nativeRootNodeId: screen.nativeRootNodeId, nativeParentNodeId: screen.nativeParentNodeId,
+        pageId: screen.nativeParentNodeId, expectedLayoutCount: expectedLayout?.length,
+        checkpointState: "render_ack_checkpoint_confirmed" }));
       fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(inspectRequestId), rootNodeHash: fw7CorrelationHash(screen.nativeRootNodeId), boundary: "task-owner", kind: "native_readback_started", stage: "native_readback", operation: "task-native-inspect", result: "started" });
       recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "request_started", outcome: "started", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId,
         ...(expectedLayout ? { code: FW4_GEOMETRY_FEATURE, nodeCount: expectedLayout.length } : {}) });
@@ -1922,10 +1978,12 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         type: "task-native-inspect",
         requestId: inspectRequestId,
         taskId: task.id,
+        taskGeneration,
         documentId: task.documentId,
         refs: [screen.rootRef],
         geometry: { programFingerprint: screen.fingerprint, requireReceipt: screen.geometryVersion === 1, screenId: screen.screenId,
-          expectedRootNodeId: screen.nativeRootNodeId, ...(expectedLayout ? { expectedLayout } : {}) },
+          expectedRootNodeId: screen.nativeRootNodeId, expectedParentNodeId: screen.nativeParentNodeId,
+          ...(expectedLayout ? { expectedLayout } : {}) },
         });
       } catch (error) {
         const durationMs = Math.max(0, Math.round(monotonicNow() - readbackStartedAt));
@@ -1933,11 +1991,27 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         screen.errorCode = safeErrorCode(error);
         task.universalMetrics!.readbackRoundTripMs += durationMs;
         recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "request_failed", outcome: "failed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs, code: safeErrorCode(error), qaCoverage: "incomplete" });
+        console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "ui", event: "native_readback_failed",
+          eventAtMs: Date.now(), elapsedMs: durationMs, taskId: task.id, taskGeneration,
+          taskGenerationHash: fw7CorrelationHash(taskGeneration), requestId: inspectRequestId,
+          requestIdHash: fw7CorrelationHash(inspectRequestId), renderRequestId: activeNativeCheckpoint?.requestId,
+          receiptId: renderReceiptId, screenId: screen.screenId,
+          nativeRootNodeId: screen.nativeRootNodeId, nativeParentNodeId: screen.nativeParentNodeId,
+          rejectionStage: "native_readback", reason: safeErrorCode(error) }));
         if (!deps.signal.aborted) await save();
         throw error;
       }
-      check();
       const readbackDurationMs = Math.max(0, Math.round(monotonicNow() - readbackStartedAt));
+      console.info("[FAD_NATIVE_RENDER_TIMING] " + JSON.stringify({ stage: "ui", event: "native_readback_received",
+        eventAtMs: Date.now(), elapsedMs: readbackDurationMs, taskId: task.id, taskGeneration,
+        taskGenerationHash: fw7CorrelationHash(taskGeneration), requestId: inspectRequestId,
+        requestIdHash: fw7CorrelationHash(inspectRequestId), renderRequestId: activeNativeCheckpoint?.requestId,
+        receiptId: renderReceiptId, screenId: screen.screenId, nativeRootNodeId: screen.nativeRootNodeId,
+        nativeParentNodeId: inspection.nodes?.find(({ ref }) => ref === screen.rootRef)?.parentId,
+        pageId: inspection.nativePageId, expectedRootStatus: inspection.expectedRootStatus,
+        geometryCoverage: inspection.geometry?.coverage, measuredNodes: inspection.geometry?.measuredNodes,
+        readAttempts: inspection.geometry?.readAttempts, rejectionStage: "none", reason: "response_received" }));
+      check();
       task.universalMetrics!.readbackRoundTripMs += readbackDurationMs;
       const readbackFindingCodes = inspection.geometry?.findings.map(({ code }) => code).slice(0, 8) ?? [];
       recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "readback_completed", outcome: inspection.geometry?.coverage === "complete" ? "completed" : "failed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs: readbackDurationMs, nodeCount: inspection.geometry?.measuredNodes, qaFindingCodes: readbackFindingCodes, qaCoverage: inspection.geometry?.coverage === "complete" ? "complete" : "incomplete",

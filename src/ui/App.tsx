@@ -55,6 +55,18 @@ import { HomeDashboard } from "./home-dashboard";
 import { MoreMenu, MoreOptionsAccordion, NavigationDrawer } from "./workspace-navigation";
 import { WorkspaceDetailView } from "./workspace-detail-view";
 import type { PluginView } from "./workspace-routes";
+
+type LiveNativeRenderProgress = {
+  taskId: string;
+  taskGeneration: string;
+  screenId: string;
+  nativeRootNodeId: string;
+  nativeParentNodeId: string;
+  pageId: string;
+  attached: boolean;
+  acknowledged: boolean;
+};
+
 export type { PluginView } from "./workspace-routes";
 import {
   chatTaskDiagnosticJson,
@@ -717,6 +729,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const [chatBusy, setChatBusy] = useState(false);
   const [chatInspectionBatchActive, setChatInspectionBatchActive] = useState(false);
   const [chatActivity, setChatActivity] = useState("");
+  const [liveNativeRenderProgress, setLiveNativeRenderProgress] = useState<LiveNativeRenderProgress | null>(null);
   const [chatPendingTool, setChatPendingTool] = useState(false);
   const [chatRetryMessageId, setChatRetryMessageId] = useState<string | null>(null);
   const chatAbort = useRef<AbortController | null>(null);
@@ -1315,6 +1328,9 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
         message.type === "design-engine-preference-saved"
       ) {
         // The Design Engine preference bridge owns these request-scoped responses.
+        return;
+      } else if (message.type === "design-program-render-progress") {
+        // The active Universal render bridge owns this correlated progress event.
         return;
       } else {
         const counts = message.counts;
@@ -2352,7 +2368,7 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           });
         },
         save: async (checkpoint) => {
-          await chatTaskBridge({
+          const confirmation = await chatTaskBridge({
             type: "chat-task-save",
             requestId: nextRequestId(),
             documentId: checkpoint.documentId,
@@ -2360,6 +2376,13 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
             task: checkpoint,
           });
           setChatTaskSnapshot(structuredClone(checkpoint));
+          if (confirmation.success) setLiveNativeRenderProgress((current) => {
+            const committed = checkpoint.universalScreens?.some((screen) => screen.screenId === current?.screenId &&
+              screen.nativeRootNodeId === current.nativeRootNodeId && screen.rootRef && screen.nativeBatchId &&
+              screen.adoptionOperationIds?.length === screen.nativeNodeCount);
+            return current?.taskId === checkpoint.id && committed ? null : current;
+          });
+          return confirmation.success ? { revision: confirmation.revision } : undefined;
         },
         progress: setChatActivity,
         assertAuthorized: async () => {
@@ -2381,19 +2404,37 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
           checkChatSession();
           return response;
         } : undefined,
-        renderProgram: async (program, requestId, expectedRootNodeId, contextTicket) => {
+        onNativeRenderProgress: (screenId, progress) => {
+          if (!progress.nativeRootNodeId || !progress.nativeParentNodeId || !progress.pageId ||
+              progress.nativeParentNodeId !== progress.pageId) return;
+          const progressGeneration = progress.taskGeneration ?? task.generationLink?.generationId ??
+            `generation-${task.universalManifest?.fingerprint ?? task.id}`;
+          setLiveNativeRenderProgress({ taskId: task.id, taskGeneration: progressGeneration, screenId,
+            nativeRootNodeId: progress.nativeRootNodeId, nativeParentNodeId: progress.nativeParentNodeId,
+            pageId: progress.pageId, attached: true, acknowledged: false });
+          setChatActivity(`Native screen ${screenId} is attached on its planned page; waiting for the render acknowledgement.`);
+        },
+        renderProgram: async (program, requestId, expectedRootNodeId, contextTicket, taskGeneration, signal, onProgress) => {
           checkChatSession();
           const response = await renderDesignProgramBridge({
             type: "design-program-render",
             requestId,
             taskId: task.id,
+            taskGeneration,
             documentId: task.documentId,
             brandKit: task.brandKit,
             expectedRootNodeId,
             contextTicket,
             program,
-          });
+          }, { signal, onProgress });
           checkChatSession();
+          if (response.success && response.nativeRootNodeId && response.nativeParentNodeId) {
+            const screenId = response.screenId ?? program.screens[0]!.id;
+            setLiveNativeRenderProgress({ taskId: task.id, taskGeneration, screenId,
+              nativeRootNodeId: response.nativeRootNodeId, nativeParentNodeId: response.nativeParentNodeId,
+              pageId: response.nativeParentNodeId, attached: true, acknowledged: true });
+            setChatActivity(`Native screen ${screenId} was acknowledged; saving its task checkpoint before geometry readback.`);
+          }
           return response;
         },
         inspectProgram: async (request) => {
@@ -4269,10 +4310,25 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const chatCanSubmit = chatReady && chatTaskLoaded && !toolBusy && !chatPendingTool;
   const taskCapacity = chatTaskSnapshot ? chatTaskCapacityUsage(chatTaskSnapshot) : null;
   const universalScreens = chatTaskSnapshot?.universalScreens ?? [];
-  const nativeScreensAttached = universalScreens.filter((screen) => Boolean(screen.nativeRootNodeId) &&
-    (screen.nativeAttachmentStatus === "attached_unverified" || screen.nativeAttachmentStatus === "verified")).length;
+  const activeLiveNativeRender = liveNativeRenderProgress?.taskId === chatTaskSnapshot?.id ? liveNativeRenderProgress : undefined;
+  const attachedNativeScreenIds = new Set(universalScreens.filter((screen) => Boolean(screen.nativeRootNodeId) &&
+    (screen.nativeAttachmentStatus === "attached_unverified" || screen.nativeAttachmentStatus === "verified"))
+    .map(({ screenId }) => screenId));
+  if (activeLiveNativeRender?.attached) attachedNativeScreenIds.add(activeLiveNativeRender.screenId);
+  const nativeScreensAttached = attachedNativeScreenIds.size;
+  const acknowledgedNativeScreenIds = new Set(universalScreens.filter((screen) =>
+    (screen.status === "rendered" || screen.status === "verified") && Boolean(screen.nativeRootNodeId))
+    .map(({ screenId }) => screenId));
+  if (activeLiveNativeRender?.acknowledged) acknowledgedNativeScreenIds.add(activeLiveNativeRender.screenId);
+  const nativeScreensAcknowledged = acknowledgedNativeScreenIds.size;
   const nativeScreensVerified = universalScreens.filter((screen) => screen.status === "verified" &&
     screen.nativeAttachmentStatus === "verified" && Boolean(screen.nativeReadbackRevision)).length;
+  const nativeRootsCheckpointed = universalScreens.filter((screen) => Boolean(screen.nativeRootNodeId &&
+    screen.nativeBatchId && screen.rootRef && screen.nativeNodeCount &&
+    screen.adoptionOperationIds?.length === screen.nativeNodeCount)).length;
+  const nativeRenderUnresolved = universalScreens.filter((screen) => screen.status === "rendering" &&
+    (!screen.nativeRootNodeId || !screen.nativeBatchId || !screen.rootRef ||
+      screen.adoptionOperationIds?.length !== screen.nativeNodeCount)).length;
   const taskStageTotal = chatTaskSnapshot?.stages.length ?? 0;
   const taskStageCompleted =
     chatTaskSnapshot?.stages.filter((stage) => stage.completed).length ?? 0;
@@ -4684,6 +4740,34 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                       <span>Pending</span>
                       <strong>{Math.max(taskStageTotal - taskStageCompleted, 0)}</strong>
                     </div>
+                    {universalScreens.length > 0 && (
+                      <>
+                        <div title="Screens saved in the current plan checkpoint">
+                          <span>Planned</span>
+                          <strong>{universalScreens.length}</strong>
+                        </div>
+                        <div title="Native root IDs currently recorded in the task checkpoint">
+                          <span>Attached</span>
+                          <strong>{nativeScreensAttached}/{universalScreens.length}</strong>
+                        </div>
+                        <div title="Render acknowledgements accepted by the UI and saved in the task checkpoint">
+                          <span>ACKed</span>
+                          <strong>{nativeScreensAcknowledged}/{universalScreens.length}</strong>
+                        </div>
+                        <div title="Screens with complete native geometry readback">
+                          <span>Verified</span>
+                          <strong>{nativeScreensVerified}/{universalScreens.length}</strong>
+                        </div>
+                        <div title="Attached root identity and ownership receipt saved in the checkpoint">
+                          <span>Checkpointed</span>
+                          <strong>{nativeRootsCheckpointed}/{universalScreens.length}</strong>
+                        </div>
+                        <div title="Render dispatched, but no attached root identity has been reconciled yet">
+                          <span>Unresolved</span>
+                          <strong>{nativeRenderUnresolved}</strong>
+                        </div>
+                      </>
+                    )}
                     <div>
                       <span>Tool ops</span>
                       <strong>{taskCapacity?.mutations ?? 0}</strong>
@@ -4692,12 +4776,6 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                       <span>Read-only</span>
                       <strong>{taskCapacity?.readOnlyOperations ?? 0}</strong>
                     </div>
-                    {universalScreens.length > 0 && (
-                      <div title="Attached native roots / geometry-verified screens">
-                        <span>Native screens</span>
-                        <strong>{nativeScreensAttached}/{nativeScreensVerified}</strong>
-                      </div>
-                    )}
                   </div>
                   <ul className="chat-task-stages" aria-label="Task stages">
                     {chatTaskSnapshot.stages.map((stage, index) => (

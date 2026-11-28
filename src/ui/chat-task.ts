@@ -77,7 +77,7 @@ import {
 } from "../shared/chat-generation";
 import { runUniversalDesignTask, UniversalDesignTaskError, type UniversalDesignDependencies } from "./universal-design-task";
 import type { DesignProgramV1 } from "../shared/design-program";
-import type { ContextResponse, DesignProgramRenderResponse } from "./design-program-bridge";
+import type { ContextResponse, DesignProgramRenderProgress, DesignProgramRenderResponse } from "./design-program-bridge";
 import { CONTEXT_PRECEDENCE, EDIT_CONTEXT_PREFIX, plannerDesignContext, type ContextTicket } from "../shared/design-context";
 import type { UIToPluginMessage } from "../shared/messages";
 
@@ -156,14 +156,17 @@ function resolveChatBrandColorTokens(actionValue: unknown, task: ChatTask): Figm
 type Dependencies = {
   model(input: ChatInputItem[], lifecycle: ChatLifecycleState, requestId?: string, signal?: AbortSignal): Promise<AuthorizedChatTurn>;
   execute(operations: FigmaToolOperation[]): Promise<Result>;
-  save(task: ChatTask): Promise<void>;
+  save(task: ChatTask): Promise<void | { revision?: { hash: string; bytes: number } }>;
   progress(message: string): void;
   generateMultiScreen?(
     request: MultiScreenDesignRequest,
     progress: (event: MultiScreenProgressEvent) => Promise<void>,
   ): Promise<unknown>;
   assertAuthorized?(): Promise<void>;
-  renderProgram?(program: DesignProgramV1, requestId: string, expectedRootNodeId?: string, contextTicket?: ContextTicket): Promise<DesignProgramRenderResponse>;
+  renderProgram?(program: DesignProgramV1, requestId: string, expectedRootNodeId: string | undefined,
+    contextTicket: ContextTicket | undefined, taskGeneration: string, signal: AbortSignal,
+    onProgress?: (progress: DesignProgramRenderProgress) => void): Promise<DesignProgramRenderResponse>;
+  onNativeRenderProgress?(screenId: string, progress: DesignProgramRenderProgress): void;
   readContext?(intent: "create" | "edit", target?: { nodeId: string; pageId: string }): Promise<ContextResponse | undefined>;
   inspectProgram?(
     request: Extract<UIToPluginMessage, { type: "task-native-inspect" }>,
@@ -3868,6 +3871,7 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
           progress: deps.progress,
           assertAuthorized: deps.assertAuthorized,
           renderProgram: deps.renderProgram,
+          onNativeRenderProgress: deps.onNativeRenderProgress,
           readContext: deps.readContext ? () => deps.readContext!("create") : undefined,
           inspectProgram: deps.inspectProgram,
           captureVisual: deps.captureVisual,

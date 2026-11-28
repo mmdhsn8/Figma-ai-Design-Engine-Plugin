@@ -207,8 +207,10 @@ describe("plugin UI navigation and capability states", () => {
     expect(chatStart).toBeGreaterThan(-1);
     expect(chatEnd).toBeGreaterThan(chatStart);
     expect(createHash("sha256").update(appSource.slice(chatStart, chatEnd)).digest("hex")).toBe(
-      "fbe9d27bd273ff036b64acfd1ce1c0db9d635fd84f868d8565c76ead77d79e38",
+      "150eef99b9cd485ad0e2157a0568c8f3fff6968f6c4545f4b8f352f3cf375c86",
     );
+    for (const progressLabel of ["Planned", "Attached", "ACKed", "Verified", "Checkpointed", "Unresolved"])
+      expect(appSource.slice(chatStart, chatEnd)).toContain(`<span>${progressLabel}</span>`);
     expect(appSource).toContain(
       "const executionModel = taskModelForExecution(task.model, selectedCompanionModel);",
     );
