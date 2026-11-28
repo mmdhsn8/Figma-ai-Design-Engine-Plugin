@@ -23,7 +23,7 @@ import { selectChatExecutionRoute } from "../src/ui/universal-design-route";
 import { createDesignContextController } from "../src/plugin/design-context-controller";
 import { CONTEXT_COMPONENT_KEY, prepareContextReuse } from "../src/plugin/design-context-reuse";
 import { FW2_FEATURE, type ContextTicket } from "../src/shared/design-context";
-import { taskContextRequest } from "../src/ui/design-program-bridge";
+import { NativeRenderBridgeError, taskContextRequest } from "../src/ui/design-program-bridge";
 import { utf8Bytes } from "../src/shared/generation-limits";
 import {
   DEFAULT_DESIGN_ENGINE,
@@ -630,12 +630,15 @@ function makeHarness(input: Case, options: {
         success: true,
         screenId: root.screenId,
         nativeRootNodeId: root.nodeId,
+        nativeParentNodeId: mock.page.id,
         rootRef: root.ref,
         nativeBatchId: rendered.batchId,
         adoptionOperationIds: rendered.operationIds,
         programFingerprint: rendered.fingerprint,
         nativeNodeCount: rendered.registeredRefs,
         geometryVersion: rendered.geometryVersion,
+        uiBuildId: FW7_BUILD_ID,
+        pluginBuildId: FW7_BUILD_ID,
         geometryRepairs: rendered.geometryRepairs,
         geometryDurationMs: rendered.timingsMs.geometry,
         findings: rendered.contextFindings,
@@ -2017,17 +2020,29 @@ describe("universal design Chat route", () => {
       await rememberSnapshot(snapshot);
     });
     h.deps.renderProgram.mockImplementationOnce(async (program, requestId) => {
-      await actualRender!(program, requestId);
-      throw new Error("Simulated lost native render acknowledgement");
+      const response = await actualRender!(program, requestId);
+      if (!response.success || !response.nativeRootNodeId || !response.nativeParentNodeId ||
+          !response.rootRef || !response.nativeBatchId || !response.adoptionOperationIds ||
+          !response.nativeNodeCount || !response.programFingerprint)
+        throw new Error("The fixture renderer did not produce complete adoption evidence.");
+      throw new NativeRenderBridgeError("Simulated malformed native render acknowledgement", "native_render_ack_invalid_with_attachment", {
+        requestId, taskId: h.task.id, screenId: response.screenId!, rootRef: response.rootRef,
+        nativeRootNodeId: response.nativeRootNodeId, nativeParentNodeId: response.nativeParentNodeId,
+        nativeBatchId: response.nativeBatchId, programFingerprint: response.programFingerprint,
+        uiBuildId: FW7_BUILD_ID, pluginBuildId: FW7_BUILD_ID,
+        adoptionOperationIds: response.adoptionOperationIds, nativeNodeCount: response.nativeNodeCount,
+      });
     });
-    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("lost native render acknowledgement");
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("malformed native render acknowledgement");
     const loaded = await handleChatTaskStorage(h.mock.api, {
       type: "chat-task-load", requestId: "ambiguous-render-reload", documentId: h.task.documentId, chatId,
     });
     const persisted = ChatTaskSchema.parse(loaded.task);
     expect(persisted.id).toBe(h.task.id);
     expect(persisted.projectPlan).toBeDefined();
-    expect(persisted.universalScreens?.[0]).toMatchObject({ status: "rendering", program: expect.any(Object) });
+    expect(persisted.universalScreens?.[0]).toMatchObject({ status: "rendering", program: expect.any(Object),
+      nativeAttachmentStatus: "attached_unverified", nativeRootNodeId: expect.any(String),
+      nativeParentNodeId: "page:current", nativeBatchId: expect.any(String), rootRef: expect.any(String) });
     const rootsBefore = h.mock.nodes.filter((node) => node.parent?.type === "PAGE" && node.getPluginData("fad.generation.commit") === "complete");
     expect(rootsBefore).toHaveLength(1);
     const providerCallsBeforeResume = h.model.mock.calls.length;
@@ -2037,6 +2052,61 @@ describe("universal design Chat route", () => {
     expect(h.model.mock.calls).toHaveLength(providerCallsBeforeResume);
     expect(rootsAfterResume[0]?.id).toBe(rootsBefore[0]?.id);
     expect(persisted.status).toBe("completed");
+  });
+
+  it("resumes a two-screen task from a malformed compiled-style render ack without recreating screen 01", async () => {
+    const input = { ...onlineShopCase(), brief: "create 2 random screen" };
+    const h = makeHarness(input, { maxConcurrentModelCalls: 1 });
+    const nativeRender = h.deps.renderProgram.getMockImplementation();
+    if (!nativeRender) throw new Error("The native test renderer is not configured.");
+    let rejectFirstAck = true;
+    h.deps.renderProgram.mockImplementation(async (program, requestId, expectedRootNodeId, ticket) => {
+      const response = await nativeRender(program, requestId, expectedRootNodeId, ticket);
+      if (rejectFirstAck && program.screens[0]?.id === "screen-01") {
+        rejectFirstAck = false;
+        if (!response.success || !response.nativeRootNodeId || !response.nativeParentNodeId ||
+            !response.rootRef || !response.nativeBatchId || !response.adoptionOperationIds ||
+            !response.nativeNodeCount || !response.programFingerprint)
+          throw new Error("The first screen did not produce complete native adoption evidence.");
+        throw new NativeRenderBridgeError("Simulated malformed native render acknowledgement", "native_render_ack_invalid_with_attachment", {
+          requestId, taskId: h.task.id, screenId: response.screenId!, rootRef: response.rootRef,
+          nativeRootNodeId: response.nativeRootNodeId, nativeParentNodeId: response.nativeParentNodeId,
+          nativeBatchId: response.nativeBatchId, programFingerprint: response.programFingerprint,
+          uiBuildId: FW7_BUILD_ID, pluginBuildId: FW7_BUILD_ID,
+          adoptionOperationIds: response.adoptionOperationIds, nativeNodeCount: response.nativeNodeCount,
+        });
+      }
+      return response;
+    });
+
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("malformed native render acknowledgement");
+    const interrupted = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    const first = interrupted.universalScreens?.find(({ screenId }) => screenId === "screen-01");
+    expect(first).toMatchObject({ status: "rendering", nativeAttachmentStatus: "attached_unverified",
+      nativeRootNodeId: expect.any(String), nativeParentNodeId: "page:current", rootRef: expect.any(String),
+      adoptionOperationIds: expect.any(Array) });
+    expect(interrupted.universalScreens?.find(({ screenId }) => screenId === "screen-02")?.nativeRootNodeId).toBeUndefined();
+    const rootId = first!.nativeRootNodeId!;
+    const modelCalls = h.model.mock.calls.length;
+    const repairsBeforeResume = h.lifecycles.filter((lifecycle) => lifecycle === "UNIVERSAL_REPAIR").length;
+
+    await runChatTask(interrupted, h.deps);
+    const complete = interrupted.universalScreens!;
+    const roots = h.mock.page.children.filter((node) => node.type === "FRAME" && node.getPluginData("fad.multi-screen.batch-id"));
+    expect(interrupted.status).toBe("completed");
+    expect(complete.map(({ status }) => status)).toEqual(["verified", "verified"]);
+    expect(complete.every(({ nativeReadbackRevision }) => Boolean(nativeReadbackRevision))).toBe(true);
+    expect(complete[0]?.nativeRootNodeId).toBe(rootId);
+    expect(roots).toHaveLength(2);
+    expect(new Set(roots.map(({ id }) => id)).size).toBe(2);
+    expect(roots.find((node) => node.getPluginData("fad.multi-screen.screen-id") === "screen-01")?.id).toBe(rootId);
+    expect(h.model.mock.calls).toHaveLength(modelCalls);
+    expect(h.lifecycles.filter((lifecycle) => lifecycle === "UNIVERSAL_REPAIR")).toHaveLength(repairsBeforeResume);
+    const firstScreenRenders = h.deps.renderProgram.mock.calls.filter(([program]) => program.screens[0]?.id === "screen-01");
+    expect(firstScreenRenders).toHaveLength(2);
+    expect(firstScreenRenders[1]?.[2]).toBe(rootId);
+    expect(h.checkpoints.at(-1)?.universalScreens?.every(({ status, nativeReadbackRevision }) =>
+      status === "verified" && Boolean(nativeReadbackRevision))).toBe(true);
   });
 
   it("reports attached versus verified progress and resumes the same incomplete root through screen 02", async () => {

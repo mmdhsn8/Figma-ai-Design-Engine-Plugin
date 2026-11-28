@@ -1777,7 +1777,7 @@ export function createFigmaToolExecutor(
     assertTaskPageScope(message.documentId, pageId);
     const expectedRootStatus = !expectedId ? undefined : expected?.removed ? "removed"
       : !expected ? "missing" : expected.parent?.id !== pageId ? "unexpected_parent" : "present";
-    return { nodes, unresolvedRefs, expectedRootStatus, ...(FW5_VISUAL_QA_ENABLED ? { nativePageId: pageId } : {}), truncated: owned.length > visibleNodes.length, ...(geometry ? { geometry } : {}) } as const;
+    return { nodes, unresolvedRefs, expectedRootStatus, nativePageId: pageId, truncated: owned.length > visibleNodes.length, ...(geometry ? { geometry } : {}) } as const;
   };
 
   const inspectTaskNativeNodes = async (

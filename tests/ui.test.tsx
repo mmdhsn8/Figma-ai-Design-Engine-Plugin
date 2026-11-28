@@ -207,7 +207,7 @@ describe("plugin UI navigation and capability states", () => {
     expect(chatStart).toBeGreaterThan(-1);
     expect(chatEnd).toBeGreaterThan(chatStart);
     expect(createHash("sha256").update(appSource.slice(chatStart, chatEnd)).digest("hex")).toBe(
-      "56d6d0c34d076ab32942bfcd8feb754f951d67593311864946298383b2e50522",
+      "fbe9d27bd273ff036b64acfd1ce1c0db9d635fd84f868d8565c76ead77d79e38",
     );
     expect(appSource).toContain(
       "const executionModel = taskModelForExecution(task.model, selectedCompanionModel);",

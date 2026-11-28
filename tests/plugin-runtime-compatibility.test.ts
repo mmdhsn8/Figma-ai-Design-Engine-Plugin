@@ -16,6 +16,7 @@ import { designProgramFixtures } from "./fixtures/design-programs";
 import { projectNativeLayoutExpectations } from "../src/shared/fw4-geometry";
 import type { taskNativeBridge as taskNativeBridgeType } from "../src/ui/task-native-bridge";
 import { DesignProgramV1Schema } from "../src/shared/design-program";
+import type { renderDesignProgramBridge as renderDesignProgramBridgeType } from "../src/ui/design-program-bridge";
 
 const pluginBundle = readFileSync(new URL("../dist/plugin.js", import.meta.url), "utf8");
 const uiHtml = readFileSync(new URL("../dist/ui.html", import.meta.url), "utf8");
@@ -25,6 +26,7 @@ const bundledBuildId = uiHtml.match(/__fadBuildId=["']([^"']{1,100})["']/u)?.[1]
   ?? "source-unknown";
 let compiledUiBridge = "";
 let compiledTaskNativeBridge = "";
+let compiledDesignProgramBridge = "";
 
 beforeAll(async () => {
   const output = await build({
@@ -66,6 +68,26 @@ beforeAll(async () => {
     : "output" in taskOutput ? taskOutput.output : [];
   compiledTaskNativeBridge = taskChunks.find((chunk) => chunk.type === "chunk")?.code ?? "";
   if (!compiledTaskNativeBridge) throw new Error("Vite did not emit the compiled native task bridge harness.");
+
+  const designOutput = await build({
+    configFile: fileURLToPath(new URL("../vite.ui.config.ts", import.meta.url)),
+    define: { "import.meta.env.VITE_FW7_BUILD_ID": JSON.stringify(bundledBuildId) },
+    build: {
+      write: false,
+      emptyOutDir: false,
+      lib: {
+        entry: fileURLToPath(new URL("../src/ui/design-program-bridge.ts", import.meta.url)),
+        name: "FadCompiledDesignProgramBridge",
+        formats: ["iife"],
+        fileName: () => "design-program-bridge.js",
+      },
+    },
+  });
+  const designChunks = Array.isArray(designOutput)
+    ? designOutput.flatMap((result) => "output" in result ? result.output : [])
+    : "output" in designOutput ? designOutput.output : [];
+  compiledDesignProgramBridge = designChunks.find((chunk) => chunk.type === "chunk")?.code ?? "";
+  if (!compiledDesignProgramBridge) throw new Error("Vite did not emit the compiled DesignProgram bridge harness.");
 });
 
 function savedFingerprint(value: unknown): string {
@@ -99,11 +121,20 @@ describe("Figma main sandbox runtime compatibility", () => {
       currentPage: { id: string };
     };
     figma.showUI = vi.fn();
+    let injectedRepairCount: number | undefined = 2;
     figma.ui = {
       onmessage: undefined,
       postMessage: (message) => {
-        messages.push(message as Record<string, unknown>);
-        events.dispatchEvent(new MessageEvent("message", { data: { pluginMessage: message } }));
+        const reply = message as Record<string, unknown>;
+        if (injectedRepairCount !== undefined && reply.type === "design-program-render-result" && reply.success === true) {
+          // The renderer may combine a scroll-body fit with bounded sizing
+          // convergence. The schema's old maximum of one rejected this real
+          // producer shape after native attachment and ownership adoption.
+          reply.geometryRepairs = injectedRepairCount;
+          injectedRepairCount = undefined;
+        }
+        messages.push(reply);
+        events.dispatchEvent(new MessageEvent("message", { data: { pluginMessage: reply } }));
       },
     };
     const context = createContext({
@@ -124,18 +155,66 @@ describe("Figma main sandbox runtime compatibility", () => {
     });
     const taskId = "compiled-native-task-01";
     const documentId = `${figma.fileKey}-${figma.currentPage.id.replaceAll(":", "_")}`;
-    await pluginRequest({
+    const renderUiContext = createContext({
+      window: {
+        addEventListener: events.addEventListener.bind(events),
+        removeEventListener: events.removeEventListener.bind(events),
+        setTimeout: globalThis.setTimeout.bind(globalThis),
+        clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      },
+      parent: { postMessage: ({ pluginMessage }: { pluginMessage: unknown }) => { void pluginRequest(pluginMessage); } },
+      setTimeout,
+      clearTimeout,
+      console: { info: vi.fn(), log: vi.fn() },
+      MessageEvent,
+    });
+    runInContext(compiledDesignProgramBridge, renderUiContext);
+    const renderBridge = (renderUiContext as unknown as {
+      FadCompiledDesignProgramBridge: { renderDesignProgramBridge: typeof renderDesignProgramBridgeType };
+    }).FadCompiledDesignProgramBridge.renderDesignProgramBridge;
+    const renderPromise = renderBridge({
       type: "design-program-render",
       requestId: "compiled-render-request-01",
       taskId,
       documentId,
       program,
     });
+    const renderOutcome = await renderPromise.then(
+      (response) => ({ response }),
+      (error: unknown) => ({ error }),
+    );
     const rendered = messages.find((message) => message.type === "design-program-render-result") as {
       success?: boolean; nativeRootNodeId?: string; rootRef?: string; screenId?: string; programFingerprint?: string;
+      nativeNodeCount?: number; geometryRepairs?: number; nativeParentNodeId?: string; uiBuildId?: string; pluginBuildId?: string;
     } | undefined;
+    expect(rendered).toMatchObject({ success: true, geometryRepairs: 2 });
+    expect(mock.nodes.find(({ id }) => id === rendered?.nativeRootNodeId)?.parent?.id).toBe(mock.page.id);
+    expect(mock.nodes.find(({ id }) => id === rendered?.nativeRootNodeId)?.getPluginData("fad.tool.task-id.v1")).toBe(taskId);
+    expect("error" in renderOutcome ? renderOutcome.error : undefined,
+      JSON.stringify("error" in renderOutcome ? renderOutcome.error : undefined)).toBeUndefined();
+    if (!("response" in renderOutcome)) throw new Error("The compiled render bridge returned no acknowledgement.");
+    expect(renderOutcome.response).toMatchObject({ success: true, geometryRepairs: 2 });
     expect(rendered, JSON.stringify({ rendered, logs: pluginLog.mock.calls })).toMatchObject({ success: true, screenId: "screen-01" });
     const originalRootId = rendered!.nativeRootNodeId!;
+    expect(rendered).toMatchObject({ nativeParentNodeId: mock.page.id, uiBuildId: bundledBuildId, pluginBuildId: bundledBuildId });
+    injectedRepairCount = 14;
+    const invalidAckOutcome = await renderBridge({
+      type: "design-program-render", requestId: "compiled-render-request-02", taskId, documentId, program,
+    }).then((response) => ({ response }), (error: unknown) => ({ error }));
+    expect(invalidAckOutcome).toMatchObject({ error: {
+      code: "native_render_ack_invalid_with_attachment",
+      attachmentEvidence: { nativeRootNodeId: originalRootId, nativeParentNodeId: mock.page.id, nativeNodeCount: rendered!.nativeNodeCount },
+    } });
+    const screenRootsAfterInvalidAck = mock.page.children.filter((node) => node.getPluginData("fad.multi-screen.batch-id") === program.id &&
+      node.getPluginData("fad.multi-screen.screen-id") === "screen-01");
+    expect(screenRootsAfterInvalidAck.map(({ id }) => id)).toEqual([originalRootId]);
+    const rootsBeforeStaleBuild = mock.page.children.filter((node) => node.getPluginData("fad.multi-screen.batch-id") === program.id);
+    await pluginRequest({ type: "design-program-render", requestId: "compiled-render-request-03", taskId,
+      documentId, uiBuildId: "stale-ui-build", program });
+    expect(messages.at(-1)).toMatchObject({ type: "design-program-render-result", requestId: "compiled-render-request-03",
+      taskId, success: false, errorCode: "runtime_build_mismatch", pluginBuildId: bundledBuildId });
+    expect(mock.page.children.filter((node) => node.getPluginData("fad.multi-screen.batch-id") === program.id)
+      .map(({ id }) => id)).toEqual(rootsBeforeStaleBuild.map(({ id }) => id));
     const originalNodeIds = mock.nodes.map(({ id }) => id).sort();
     const textNode = mock.nodes.find((node) => node.type === "TEXT")!;
     const originalBounds = Object.getOwnPropertyDescriptor(textNode, "absoluteRenderBounds")!;
@@ -192,7 +271,7 @@ describe("Figma main sandbox runtime compatibility", () => {
     expect(mock.page.children.filter((node) => node.getPluginData("fad.multi-screen.batch-id")).map(({ id }) => id))
       .toEqual([originalRootId]);
     expect(unrelated.parent?.id).toBe(mock.page.id);
-    expect(messages.filter((message) => message.type === "design-program-render-result")).toHaveLength(1);
+    expect(messages.filter((message) => message.type === "design-program-render-result")).toHaveLength(3);
     expect(messages.filter((message) => message.type === "task-native-inspection-result")).toHaveLength(1);
   });
 

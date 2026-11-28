@@ -14,6 +14,18 @@ export const DESIGN_PROGRAM_LIMITS = {
   labelChars: 500,
 } as const;
 
+/** Stable root reference shared by the native renderer and UI receipt validator. */
+export function designProgramNativeRootRef(programId: string, screenId: string): string {
+  const logicalRef = `${programId}.${screenId}.root`;
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < logicalRef.length; index++) {
+    hash ^= logicalRef.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  const readable = logicalRef.replace(/[^A-Za-z0-9._-]/gu, "-").slice(0, 48);
+  return `dp-${readable}-${(hash >>> 0).toString(16)}`;
+}
+
 const idSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,59}$/u);
 const colorSchema = z.union([
   z.string().regex(/^#[0-9a-fA-F]{6}$/u),

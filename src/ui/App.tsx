@@ -4268,6 +4268,11 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
   const connectionSummary = getConnectionSummary(companionConnectionState, companionStatus);
   const chatCanSubmit = chatReady && chatTaskLoaded && !toolBusy && !chatPendingTool;
   const taskCapacity = chatTaskSnapshot ? chatTaskCapacityUsage(chatTaskSnapshot) : null;
+  const universalScreens = chatTaskSnapshot?.universalScreens ?? [];
+  const nativeScreensAttached = universalScreens.filter((screen) => Boolean(screen.nativeRootNodeId) &&
+    (screen.nativeAttachmentStatus === "attached_unverified" || screen.nativeAttachmentStatus === "verified")).length;
+  const nativeScreensVerified = universalScreens.filter((screen) => screen.status === "verified" &&
+    screen.nativeAttachmentStatus === "verified" && Boolean(screen.nativeReadbackRevision)).length;
   const taskStageTotal = chatTaskSnapshot?.stages.length ?? 0;
   const taskStageCompleted =
     chatTaskSnapshot?.stages.filter((stage) => stage.completed).length ?? 0;
@@ -4680,13 +4685,19 @@ export default function App({ initialView = "home" }: { initialView?: PluginView
                       <strong>{Math.max(taskStageTotal - taskStageCompleted, 0)}</strong>
                     </div>
                     <div>
-                      <span>Mutations</span>
+                      <span>Tool ops</span>
                       <strong>{taskCapacity?.mutations ?? 0}</strong>
                     </div>
                     <div>
                       <span>Read-only</span>
                       <strong>{taskCapacity?.readOnlyOperations ?? 0}</strong>
                     </div>
+                    {universalScreens.length > 0 && (
+                      <div title="Attached native roots / geometry-verified screens">
+                        <span>Native screens</span>
+                        <strong>{nativeScreensAttached}/{nativeScreensVerified}</strong>
+                      </div>
+                    )}
                   </div>
                   <ul className="chat-task-stages" aria-label="Task stages">
                     {chatTaskSnapshot.stages.map((stage, index) => (

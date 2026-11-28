@@ -10,7 +10,8 @@ import { createMockApi } from "./figma-mock";
 import { designProgramFixtures } from "./fixtures/design-programs";
 import { UIToPluginSchema, type PluginToUIMessage } from "../src/shared/messages";
 import { projectNativeLayoutExpectations } from "../src/shared/fw4-geometry";
-import { DesignProgramV1Schema } from "../src/shared/design-program";
+import { designProgramNativeRootRef, DesignProgramV1Schema, fingerprintDesignProgram } from "../src/shared/design-program";
+import { FW7_BUILD_ID } from "../src/shared/fw7-feature";
 
 const taskId = "chat-task-0001";
 const requestId = "native-request-0001";
@@ -74,6 +75,66 @@ it("ignores a readback for another task even if its request ID matches", async (
   harness.send({ ...response, taskId: "another-task" });
   harness.send({ ...response, taskId });
   await expect(pending).resolves.toMatchObject({ ...response, taskId });
+});
+
+it("accepts the renderer's upper bounded repair count and ignores duplicate acknowledgements", async () => {
+  const harness = bridgeHarness();
+  const fixture = designProgramFixtures[0]!;
+  const program = DesignProgramV1Schema.parse({
+    ...fixture, id: "bridge-repair-bound", screens: fixture.screens.map((screen) => ({ ...screen, id: "screen-01" })),
+  });
+  const renderRequest = { type: "design-program-render" as const, requestId, taskId, documentId: "native-doc-0001", program };
+  const pending = renderDesignProgramBridge(renderRequest);
+  const acknowledgement = {
+    type: "design-program-render-result", requestId, taskId, success: true,
+    screenId: "screen-01", rootRef: designProgramNativeRootRef(program.id, "screen-01"),
+    nativeRootNodeId: "native-root-001", nativeParentNodeId: "page-001", nativeBatchId: program.id,
+    programFingerprint: fingerprintDesignProgram(program), uiBuildId: FW7_BUILD_ID, pluginBuildId: FW7_BUILD_ID,
+    adoptionOperationIds: ["adopt-operation-001"], nativeNodeCount: 1, geometryVersion: 1,
+    geometryRepairs: 13,
+  };
+  harness.send(acknowledgement);
+  harness.send({ ...acknowledgement, geometryRepairs: 14 });
+  await expect(pending).resolves.toMatchObject({ success: true, geometryRepairs: 13 });
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("rejects a stale plugin build before accepting otherwise complete ownership evidence", async () => {
+  const harness = bridgeHarness();
+  const fixture = designProgramFixtures[0]!;
+  const program = DesignProgramV1Schema.parse({
+    ...fixture, id: "bridge-stale-build", screens: fixture.screens.map((screen) => ({ ...screen, id: "screen-01" })),
+  });
+  const pending = renderDesignProgramBridge({ type: "design-program-render", requestId, taskId, documentId: "native-doc-0001", program });
+  const outcome = pending.catch((error: unknown) => error);
+  harness.send({
+    type: "design-program-render-result", requestId, taskId, success: true, screenId: "screen-01",
+    rootRef: designProgramNativeRootRef(program.id, "screen-01"), nativeRootNodeId: "native-root-001",
+    nativeParentNodeId: "page-001", nativeBatchId: program.id, programFingerprint: fingerprintDesignProgram(program),
+    uiBuildId: FW7_BUILD_ID, pluginBuildId: "old-plugin-build", adoptionOperationIds: ["adopt-operation-001"],
+    nativeNodeCount: 1, geometryVersion: 1, geometryRepairs: 0,
+  });
+  await expect(outcome).resolves.toMatchObject({ code: "native_render_build_mismatch", attachmentEvidence: undefined });
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("does not checkpoint a root when its parent and adoption receipt are missing", async () => {
+  const harness = bridgeHarness();
+  const fixture = designProgramFixtures[0]!;
+  const program = DesignProgramV1Schema.parse({
+    ...fixture, id: "bridge-missing-receipt", screens: fixture.screens.map((screen) => ({ ...screen, id: "screen-01" })),
+  });
+  const pending = renderDesignProgramBridge({ type: "design-program-render", requestId, taskId, documentId: "native-doc-0001", program });
+  const outcome = pending.catch((error: unknown) => error);
+  harness.send({
+    type: "design-program-render-result", requestId, taskId, success: true, screenId: "screen-01",
+    rootRef: designProgramNativeRootRef(program.id, "screen-01"), nativeRootNodeId: "unknown-root",
+    nativeBatchId: program.id, programFingerprint: fingerprintDesignProgram(program),
+    uiBuildId: FW7_BUILD_ID, pluginBuildId: FW7_BUILD_ID,
+    adoptionOperationIds: [], nativeNodeCount: 1, geometryVersion: 1, geometryRepairs: 0,
+  });
+  await expect(outcome).resolves.toMatchObject({ code: "native_render_protocol_error", attachmentEvidence: undefined });
+  expect(vi.getTimerCount()).toBe(0);
 });
 
 it("carries a transient native geometry retry through the UI/plugin task-inspection boundary", async () => {

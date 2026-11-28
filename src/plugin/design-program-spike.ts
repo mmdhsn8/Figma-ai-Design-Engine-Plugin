@@ -1,4 +1,4 @@
-import { DesignProgramV1Schema, normalizeDesignProgramLayout, parseDesignProgram } from "../shared/design-program";
+import { DesignProgramV1Schema, designProgramNativeRootRef, normalizeDesignProgramLayout, parseDesignProgram } from "../shared/design-program";
 import { compileDesignProgram } from "../shared/design-program-adapter";
 import type { FigmaToolExecutor, NativeGenerationAdoption } from "./figma-tool-executor";
 import { renderMultiScreenDesign, type RendererFigmaApi } from "./renderer";
@@ -448,7 +448,7 @@ export async function renderDesignProgramLocal(
           }
       }
       const freshlyCreated = freshlyCreatedScreenIds.has(screen.id);
-      roots.push({ screenId: screen.id, nodeId: root.id, ref: stableToolRef(`${parsedProgram.data.id}.${screen.id}.root`),
+      roots.push({ screenId: screen.id, nodeId: root.id, ref: designProgramNativeRootRef(parsedProgram.data.id, screen.id),
         ...(FW5_VISUAL_QA_ENABLED ? { freshlyCreated } : {}) });
       adoptionRoots.push({ screenId: screen.id, rootNodeId: root.id, nodes: screenNodes,
         ...(FW5_VISUAL_QA_ENABLED ? { freshlyCreated, expectedLayout: projectNativeLayoutExpectations(parsedProgram.data, screen.id) } : {}) });

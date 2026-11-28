@@ -5,6 +5,7 @@ import {
   type PluginToUIMessage,
   type UIToPluginMessage,
 } from "../shared/messages";
+import { designProgramNativeRootRef } from "../shared/design-program";
 import { FigmaToolStateDiagnosticSchema } from "../shared/figma-tools";
 import type { DesignSpec } from "../shared/schema";
 import type { MultiScreenSpec } from "../shared/multi-screen-schema";
@@ -147,7 +148,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     const handshake = UIToPluginSchema.safeParse(rawMessage);
     if (!handshake.success) {
       checkpointRuntimeCompatible = false;
-      send({ type: "protocol-error", requestId: toolRequestId(rawMessage), message: "The plugin runtime handshake was invalid. Reload the development plugin." });
+      send({ type: "protocol-error", requestId: toolRequestId(rawMessage), pluginBuildId: FW7_BUILD_ID, message: "The plugin runtime handshake was invalid. Reload the development plugin." });
       return;
     }
     if (handshake.data.type !== "plugin-runtime-handshake") return;
@@ -219,6 +220,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     send({
       type: "protocol-error",
       ...(toolRequestId(rawMessage) ? { requestId: toolRequestId(rawMessage) } : {}),
+      pluginBuildId: FW7_BUILD_ID,
       message: "The plugin received an invalid request. Reload the plugin and try again.",
     });
     return;
@@ -268,6 +270,25 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
     const request = message.data;
     const page = figma.currentPage;
     const pageId = page.id;
+    const screenId = request.program.screens[0]?.id;
+    const reportRenderAck = (data: Record<string, unknown>) => console.info("[FAD_NATIVE_RENDER_ACK] " + JSON.stringify({
+      stage: "plugin", atMs: Date.now(), taskId: request.taskId,
+      requestIdHash: fw7CorrelationHash(request.requestId), screenId,
+      requestType: request.type, responseType: "design-program-render-result",
+      uiBuildId: request.uiBuildId ?? "missing", pluginBuildId: FW7_BUILD_ID,
+      checkpointState: "pending_ui_checkpoint", ...data,
+    }));
+    reportRenderAck({ event: "request_received", buildMatch: request.uiBuildId === FW7_BUILD_ID });
+    if (!request.uiBuildId || request.uiBuildId !== FW7_BUILD_ID) {
+      const errorCode = "runtime_build_mismatch";
+      reportRenderAck({ event: "request_rejected", rejectionStage: "build_identity", reason: errorCode, attached: false, receiptProduced: false, ownershipValidated: false });
+      send({
+        type: "design-program-render-result", requestId: request.requestId, taskId: request.taskId,
+        success: false, errorCode, uiBuildId: request.uiBuildId ?? "missing", pluginBuildId: FW7_BUILD_ID,
+        findings: [{ code: errorCode, path: "runtime.buildId", message: "Reload the UI and Figma plugin so both render runtimes use the same build.", severity: "error" }],
+      });
+      return;
+    }
     const receiptKey = `fad.program-root.v1:${request.taskId}:${request.program.screens[0]?.id}`;
     const assertCurrentScope = () => {
       if (figma.currentPage.id !== pageId || activeDocumentId() !== request.documentId)
@@ -302,14 +323,26 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         lookupNode: (nodeId) => figma.getNodeByIdAsync(nodeId),
       });
       if (!result.success) {
+        const attachedRoot = result.nativeRootNodeId ? page.children.find(({ id }) => id === result.nativeRootNodeId) : undefined;
+        const parentId = attachedRoot?.parent?.id;
+        reportRenderAck({ event: "render_failed", rejectionStage: result.code, reason: result.code,
+          nativeRootNodeId: result.nativeRootNodeId, nativeParentNodeId: parentId,
+          attached: Boolean(attachedRoot && parentId === pageId),
+          attachedNodeCount: result.attachedNodeCount, receiptProduced: false, receiptValid: false,
+          ownershipValidated: false, rendererGeometryReadback: result.code.startsWith("native_geometry") ? "incomplete_or_failed" : "not_completed",
+          taskNativeReadback: "pending" });
         send({
           type: "design-program-render-result",
           requestId: request.requestId,
           taskId: request.taskId,
           success: false,
           errorCode: result.code,
+          uiBuildId: request.uiBuildId,
+          pluginBuildId: FW7_BUILD_ID,
           ...(result.screenId && /^screen-(?:0[1-9]|10)$/u.test(result.screenId) ? { screenId: result.screenId } : {}),
           ...(result.nativeRootNodeId ? { nativeRootNodeId: result.nativeRootNodeId } : {}),
+          ...(parentId ? { nativeParentNodeId: parentId } : {}),
+          ...(result.screenId && result.nativeRootNodeId ? { rootRef: designProgramNativeRootRef(request.program.id, result.screenId) } : {}),
           ...(result.nativeBatchId ? { nativeBatchId: result.nativeBatchId } : {}),
           ...(result.programFingerprint ? { programFingerprint: result.programFingerprint } : {}),
           ...(result.attachedNodeCount ? { attachedNodeCount: result.attachedNodeCount } : {}),
@@ -319,6 +352,17 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
       }
       const root = result.roots.find(({ screenId }) => screenId === request.program.screens[0]?.id);
       if (!root) throw new Error("rendered_root_missing");
+      const nativeRoot = page.children.find(({ id }) => id === root.nodeId);
+      assertCurrentScope();
+      if (!nativeRoot || nativeRoot.type !== "FRAME" || nativeRoot.parent?.id !== pageId)
+        throw new Error("rendered_root_attachment_unverified");
+      const receiptValid = result.operationIds.length === result.registeredRefs && result.registeredRefs > 0;
+      if (!receiptValid) throw new Error("native_adoption_receipt_incomplete");
+      reportRenderAck({ event: "render_succeeded", nativeRootNodeId: root.nodeId,
+        nativeParentNodeId: nativeRoot.parent.id, attached: true, receiptProduced: true,
+        receiptValid, ownershipValidated: true, nativeNodeCount: result.registeredRefs,
+        adoptionOperationCount: result.operationIds.length, rendererGeometryReadback: "complete",
+        taskNativeReadback: "pending" });
       send({
         type: "design-program-render-result",
         requestId: request.requestId,
@@ -326,6 +370,7 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         success: true,
         screenId: root.screenId,
         nativeRootNodeId: root.nodeId,
+        nativeParentNodeId: nativeRoot.parent.id,
         rootRef: root.ref,
         nativeBatchId: result.batchId,
         adoptionOperationIds: result.operationIds,
@@ -333,6 +378,8 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
         nativeNodeCount: result.registeredRefs,
         ...(FW5_VISUAL_QA_ENABLED ? { visualCaptureEligible: root.freshlyCreated === true } : {}),
         geometryVersion: result.geometryVersion,
+        uiBuildId: request.uiBuildId,
+        pluginBuildId: FW7_BUILD_ID,
         geometryRepairs: result.geometryRepairs,
         geometryDurationMs: result.timingsMs.geometry,
         ...((result.fontFallback || result.contextFindings?.length) ? { findings: [
@@ -355,12 +402,17 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
                 ? "The referenced pinned assets exceed the local renderer's safe bundle limit. Use fewer or smaller assets, then resume; no screen was adopted."
                 : "A pinned Brand Kit asset failed local format or provenance validation; no screen was adopted."
           : "The local native renderer could not confirm this screen.";
+      reportRenderAck({ event: "render_exception", rejectionStage: "plugin_renderer", reason: failureCode,
+        attached: false, receiptProduced: false, ownershipValidated: false,
+        rendererGeometryReadback: "unknown", taskNativeReadback: "pending" });
       send({
         type: "design-program-render-result",
         requestId: request.requestId,
         taskId: request.taskId,
         success: false,
         errorCode: failureCode,
+        uiBuildId: request.uiBuildId,
+        pluginBuildId: FW7_BUILD_ID,
         findings: [{
           code: failureCode,
           path: "renderer",

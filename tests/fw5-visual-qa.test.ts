@@ -20,6 +20,7 @@ import { createDefaultVisualLanguage } from "../src/shared/design-composition";
 import { parseDesignProgram } from "../src/shared/design-program";
 import { ProjectPlanDraftSchema, parseProjectPlanDraft, projectPlanFingerprint } from "../src/shared/universal-design";
 import { designProgramFixtures } from "./fixtures/design-programs";
+import { FW7_BUILD_ID } from "../src/shared/fw7-feature";
 import { projectNativeLayoutExpectations } from "../src/shared/fw4-geometry";
 import { inspectProgramGeometry, PROGRAM_GEOMETRY_KEY } from "../src/plugin/design-program-geometry";
 import { visualReviewCapability } from "../src/shared/fw5-provider-visual-review";
@@ -268,6 +269,7 @@ async function runTaskCheckpointCapture(captureFails = false, reviewOptions?: {
         return {
           type: "design-program-render-result" as const, requestId, taskId, success: true,
           screenId: root.screenId, nativeRootNodeId: root.nodeId, rootRef: root.ref, nativeBatchId: result.batchId,
+          nativeParentNodeId: mock.page.id, uiBuildId: FW7_BUILD_ID, pluginBuildId: FW7_BUILD_ID,
           adoptionOperationIds: result.operationIds, programFingerprint: result.fingerprint,
           nativeNodeCount: result.registeredRefs, visualCaptureEligible: root.freshlyCreated === true,
           geometryVersion: result.geometryVersion,
@@ -361,6 +363,7 @@ async function runTaskCheckpointCapture(captureFails = false, reviewOptions?: {
       success: true,
       screenId: "screen-01",
       nativeRootNodeId: "mock-fw5-root-01",
+      nativeParentNodeId: "page:current",
       rootRef: screenRef,
       nativeBatchId: "batch-fw5-task-01",
       adoptionOperationIds: ["adopt-fw5-root-01", "adopt-fw5-frame-01", "adopt-fw5-copy-01"],
@@ -368,6 +371,8 @@ async function runTaskCheckpointCapture(captureFails = false, reviewOptions?: {
       nativeNodeCount: 3,
       visualCaptureEligible: true,
       geometryVersion: 1 as const,
+      uiBuildId: FW7_BUILD_ID,
+      pluginBuildId: FW7_BUILD_ID,
     })),
     inspectProgram: native ? async (request) => {
       const response = await native.inspect(request);

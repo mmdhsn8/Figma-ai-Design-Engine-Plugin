@@ -276,6 +276,7 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       requestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
       taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
       documentId: z.string().min(1).max(300),
+      uiBuildId: z.string().min(1).max(100).optional(),
       brandKit: PinnedBrandKitSchema.optional(),
       expectedRootNodeId: z.string().min(1).max(100).optional(),
       contextTicket: ContextTicketSchema.optional(),
@@ -479,6 +480,26 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
   }).strict(),
 ]);
 
+/** Whitelisted evidence that may be checkpointed after an invalid render ACK. */
+export const NativeRenderAttachmentEvidenceSchema = z.object({
+  requestId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+  taskId: z.string().regex(/^[A-Za-z0-9_-]{8,60}$/u),
+  screenId: z.string().regex(/^screen-(?:0[1-9]|10)$/u),
+  rootRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u),
+  nativeRootNodeId: z.string().min(1).max(100),
+  nativeParentNodeId: z.string().min(1).max(100),
+  nativeBatchId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u),
+  programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u),
+  uiBuildId: z.string().min(1).max(100),
+  pluginBuildId: z.string().min(1).max(100),
+  adoptionOperationIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u)).min(1).max(200),
+  nativeNodeCount: z.number().int().min(1).max(200),
+}).strict().superRefine((evidence, context) => {
+  if (evidence.adoptionOperationIds.length !== evidence.nativeNodeCount)
+    context.addIssue({ code: "custom", path: ["adoptionOperationIds"], message: "The adoption receipt does not cover the complete native subtree." });
+});
+export type NativeRenderAttachmentEvidence = z.infer<typeof NativeRenderAttachmentEvidenceSchema>;
+
 export const PluginToUISchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("plugin-runtime-handshake-result"),
@@ -558,22 +579,32 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       screenId: z.string().regex(/^screen-(?:0[1-9]|10)$/u).optional(),
       rootRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u).optional(),
       nativeRootNodeId: z.string().min(1).max(100).optional(),
+      nativeParentNodeId: z.string().min(1).max(100).optional(),
       nativeBatchId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
       programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u).optional(),
+      uiBuildId: z.string().min(1).max(100).optional(),
+      pluginBuildId: z.string().min(1).max(100).optional(),
       attachedNodeCount: z.number().int().min(1).max(300).optional(),
       adoptionOperationIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u)).max(200).optional(),
       nativeNodeCount: z.number().int().nonnegative().max(300).optional(),
       visualCaptureEligible: z.boolean().optional(),
       geometryVersion: z.literal(NATIVE_GEOMETRY_VERSION).optional(),
-      geometryRepairs: z.number().int().min(0).max(1).optional(),
+      // A screen may need one scroll-body fit plus up to twelve sizing
+      // convergence repairs (the geometry inspector caps findings at twelve).
+      geometryRepairs: z.number().int().min(0).max(13).optional(),
       geometryDurationMs: z.number().finite().nonnegative().optional(),
       errorCode: z.string().regex(/^[a-z_]{1,80}$/u).optional(),
       findings: z.array(z.object({ code: z.string().regex(/^[a-z0-9_-]{1,80}$/u), path: z.string().max(200), message: z.string().max(240), severity: z.enum(["error", "warning"]) }).strict()).max(20).optional(),
     })
     .strict()
     .superRefine((result, context) => {
-      if (result.success && (!result.screenId || !result.rootRef || !result.nativeBatchId || !result.adoptionOperationIds?.length || !result.programFingerprint || result.nativeNodeCount === undefined))
+      if (result.success && (!result.screenId || !result.rootRef || !result.nativeRootNodeId || !result.nativeParentNodeId ||
+          !result.nativeBatchId || !result.adoptionOperationIds?.length || !result.programFingerprint ||
+          result.nativeNodeCount === undefined || !result.uiBuildId || !result.pluginBuildId))
         context.addIssue({ code: "custom", path: [], message: "A successful render result needs complete native ownership evidence." });
+      if (result.success && result.adoptionOperationIds && result.nativeNodeCount !== undefined &&
+          result.adoptionOperationIds.length !== result.nativeNodeCount)
+        context.addIssue({ code: "custom", path: ["adoptionOperationIds"], message: "Adoption receipts must cover every registered native node." });
       if (!result.success && !result.errorCode)
         context.addIssue({ code: "custom", path: ["errorCode"], message: "A failed render result needs a safe failure code." });
     }),
@@ -705,6 +736,7 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("protocol-error"),
       requestId: z.string().min(1).max(100).optional(),
+      pluginBuildId: z.string().min(1).max(100).optional(),
       message: z.string(),
     })
     .strict(),

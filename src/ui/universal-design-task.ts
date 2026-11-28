@@ -1,4 +1,4 @@
-import { DesignProgramV1Schema, normalizeDesignProgramLayout, parseDesignProgram, type DesignProgramV1 } from "../shared/design-program";
+import { DesignProgramV1Schema, designProgramNativeRootRef, normalizeDesignProgramLayout, parseDesignProgram, type DesignProgramV1 } from "../shared/design-program";
 import { compileDesignProgram } from "../shared/design-program-adapter";
 import { auditDesignProgramContrast, normalizeDesignProgramContrast } from "../shared/design-program-quality";
 import { ChatFunctionCallSchema, MAX_CHAT_PROVIDER_INPUT_BYTES, UNIVERSAL_CONTEXT_PREFIX, missingStructuredChatCall, type ChatFunctionCall, type ChatLifecycleState, type ChatInputItem } from "../shared/chat-tools";
@@ -23,7 +23,7 @@ import {
   type UniversalScreenCheckpoint,
 } from "../shared/universal-design";
 import type { AuthorizedChatTurn } from "./companion-client";
-import type { ContextResponse, DesignProgramRenderResponse } from "./design-program-bridge";
+import { NativeRenderBridgeError, type ContextResponse, type DesignProgramRenderResponse } from "./design-program-bridge";
 import { CONTEXT_PRECEDENCE, plannerDesignContext, type ContextTicket } from "../shared/design-context";
 import { FW4_GEOMETRY_ENABLED, FW4_GEOMETRY_FEATURE, projectNativeLayoutExpectations } from "../shared/fw4-geometry";
 import { FW5_VISUAL_QA_ENABLED, FW5_VISUAL_REVIEW_MODE } from "../shared/fw5-visual-qa-feature";
@@ -824,6 +824,12 @@ function verifyNativeReadback(
     fail("native_root_missing", "Figma could not locate the acknowledged native root. Its deletion is unconfirmed.");
   if (response.expectedRootStatus === "unexpected_parent")
     fail("native_root_moved_or_retagged", "The acknowledged root has a different parent. It was retained in place.");
+  if (response.expectedRootStatus !== "present")
+    fail("native_root_parent_unverified", "Figma did not confirm that the task-owned root remains attached to its original page.");
+  if (!response.nativePageId)
+    fail("native_root_page_unverified", "Figma did not return the page identity used to verify the native root parent.");
+  if (screen.nativeParentNodeId && response.nativePageId && screen.nativeParentNodeId !== response.nativePageId)
+    fail("native_root_parent_mismatch", "The native root is attached to a different page than the render receipt recorded.");
   if (!response.success || !response.nodes || response.truncated)
     fail("native_readback_incomplete", "The task-owned native readback was failed, missing nodes, or truncated; this screen stays unverified.");
   if ((response.unresolvedRefs ?? []).some(({ ref }) => ref === screen.rootRef))
@@ -1796,10 +1802,33 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         response = await deps.renderProgram(screen.program, renderRequestId, screen.nativeRootNodeId, contextTicket);
       } catch (error) {
         const durationMs = Math.max(0, Math.round(monotonicNow() - renderStarted));
+        const attachment = error instanceof NativeRenderBridgeError ? error.attachmentEvidence : undefined;
+        const attachmentMatches = Boolean(attachment && !deps.signal.aborted && screen.program && screen.fingerprint &&
+          attachment.requestId === renderRequestId && attachment.taskId === task.id &&
+          attachment.screenId === screen.screenId && attachment.nativeBatchId === screen.program.id &&
+          attachment.programFingerprint === screen.fingerprint &&
+          attachment.rootRef === designProgramNativeRootRef(screen.program.id, screen.screenId) &&
+          attachment.adoptionOperationIds.length === attachment.nativeNodeCount &&
+          (!screen.nativeRootNodeId || screen.nativeRootNodeId === attachment.nativeRootNodeId));
+        if (attachmentMatches && attachment) {
+          screen.nativeRootNodeId = attachment.nativeRootNodeId;
+          screen.nativeParentNodeId = attachment.nativeParentNodeId;
+          screen.rootRef = attachment.rootRef;
+          screen.nativeBatchId = attachment.nativeBatchId;
+          screen.nativeNodeCount = attachment.nativeNodeCount;
+          screen.attachedNodeCount = attachment.nativeNodeCount;
+          screen.adoptionOperationIds = attachment.adoptionOperationIds;
+          screen.nativeAttachmentStatus = "attached_unverified";
+          recordTrace({ stageId: screen.screenId, stage: "native_render", event: "request_failed", outcome: "failed",
+            nativeOperationId: renderRequestId, attempt: screen.renderAttempts, durationMs,
+            nodeCount: attachment.nativeNodeCount, code: safeErrorCode(error), qaCoverage: "incomplete" });
+        } else {
+          recordTrace({ stageId: screen.screenId, stage: "native_render", event: "request_failed", outcome: "failed",
+            nativeOperationId: renderRequestId, attempt: screen.renderAttempts, durationMs, code: safeErrorCode(error) });
+        }
         fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(renderRequestId), boundary: "task-owner", kind: "native_render_result", stage: "native_render", operation: "design-program-render", result: deps.signal.aborted ? "cancelled" : "failed", durationMs, reasonCode: safeErrorCode(error) });
         screen.errorCode = safeErrorCode(error);
         task.universalMetrics!.nativeDurationMs += durationMs;
-        recordTrace({ stageId: screen.screenId, stage: "native_render", event: "request_failed", outcome: "failed", nativeOperationId: renderRequestId, attempt: screen.renderAttempts, durationMs, code: safeErrorCode(error) });
         if (!deps.signal.aborted) await save();
         throw error;
       }
@@ -1812,7 +1841,11 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
             (response.programFingerprint && response.programFingerprint !== screen.fingerprint))
           fail("native_acknowledgement_invalid", "The failed render receipt did not match this saved screen and program fingerprint; no root was adopted.");
         screen.nativeRootNodeId ??= response.nativeRootNodeId;
+        if (response.nativeParentNodeId) screen.nativeParentNodeId = response.nativeParentNodeId;
         if (response.nativeBatchId) screen.nativeBatchId = response.nativeBatchId;
+        if (response.rootRef === designProgramNativeRootRef(screen.program.id, screen.screenId) &&
+            response.nativeBatchId === screen.program.id && response.nativeRootNodeId)
+          screen.rootRef = response.rootRef;
         if (response.attachedNodeCount && response.nativeRootNodeId) {
           screen.attachedNodeCount = response.attachedNodeCount;
           screen.nativeAttachmentStatus = "attached_unverified";
@@ -1827,7 +1860,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       if (
         response.screenId !== screen.screenId ||
         response.programFingerprint !== screen.fingerprint ||
-        !response.rootRef || !response.nativeBatchId ||
+        !response.rootRef || !response.nativeRootNodeId || !response.nativeParentNodeId || !response.nativeBatchId ||
         (screen.nativeRootNodeId !== undefined && response.nativeRootNodeId !== screen.nativeRootNodeId) ||
         !response.adoptionOperationIds?.length ||
         response.nativeNodeCount === undefined ||
@@ -1841,6 +1874,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       screen.status = "rendered";
       screen.rootRef = response.rootRef;
       screen.nativeRootNodeId = response.nativeRootNodeId;
+      screen.nativeParentNodeId = response.nativeParentNodeId;
       screen.nativeBatchId = response.nativeBatchId;
       screen.nativeAttachmentStatus = "attached_unverified";
       screen.attachedNodeCount = response.nativeNodeCount;
@@ -2296,6 +2330,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       }
       screen.status = "verified";
       screen.nativeAttachmentStatus = "verified";
+      screen.nativeParentNodeId ??= inspection.nativePageId;
       screen.verifiedNodeCount = verified.nodeCount;
       screen.attachedNodeCount = verified.nodeCount;
       screen.nativeReadbackRevision = inspection.geometry!.receipt!;

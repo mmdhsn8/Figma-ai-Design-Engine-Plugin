@@ -394,6 +394,7 @@ export const UniversalScreenCheckpointSchema = z
     fingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u).optional(),
     rootRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u).optional(),
     nativeRootNodeId: z.string().min(1).max(100).optional(),
+    nativeParentNodeId: z.string().min(1).max(100).optional(),
     nativePageId: z.string().min(1).max(200).optional(),
     nativeBatchId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
     nativeAttachmentStatus: z.enum(["attached_unverified", "verified"]).optional(),
