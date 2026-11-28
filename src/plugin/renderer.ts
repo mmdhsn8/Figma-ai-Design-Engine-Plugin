@@ -146,7 +146,7 @@ export interface MultiScreenRenderOptions {
   scrollMobileSections?: boolean;
   beforeScreen?: () => void;
   prepareScreen?: (root: FrameNode, screenId: string) => void;
-  verifyScreen?: (root: FrameNode, screenId: string, reused: boolean, recovering?: boolean) => void;
+  verifyScreen?: (root: FrameNode, screenId: string, reused: boolean, recovering?: boolean) => void | Promise<void>;
   canRecoverPendingScreen?: (root: FrameNode) => boolean;
   preserveFailedProgramNodes?: boolean;
   markScreenBuilt?: (root: FrameNode, screenId: string) => void;
@@ -2012,7 +2012,7 @@ export async function renderMultiScreenDesign(
           root.getPluginData("fad.generation.commit") === "complete"
         ) {
           if (options.verifyTouchTargets) verifyNativeTouchTargets(root);
-          options.verifyScreen?.(root, screen.id, true);
+          await options.verifyScreen?.(root, screen.id, true);
           successfulRoots.push(root);
           screenResults.push({
             id: screen.id,
@@ -2301,7 +2301,7 @@ export async function renderMultiScreenDesign(
         }
         options.beforeScreen?.();
         if (options.verifyTouchTargets) verifyNativeTouchTargets(root);
-        options.verifyScreen?.(root, screen.id, false, Boolean(recoveringRoot));
+        await options.verifyScreen?.(root, screen.id, false, Boolean(recoveringRoot));
         const measuredBounds = getCanvasNodeBounds(root);
         let actualPlacement = plannedScreen;
         const latestObstacles = options.verifyPlacement

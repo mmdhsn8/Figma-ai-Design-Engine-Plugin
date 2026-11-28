@@ -2,6 +2,7 @@ import { z } from "zod";
 import { CHAT_TASK_MAX_BYTES } from "./chat-task";
 import { DESIGN_PROGRAM_LIMITS, parseDesignProgram, type DesignProgramNode, type DesignProgramV1 } from "./design-program";
 import { programPageColor } from "./design-program-quality";
+import { programTextAutoResize } from "./program-text-layout";
 import { utf8Bytes } from "./generation-limits";
 import { FW3_NATIVE_BATCH_ENABLED } from "./native-batch-feature";
 
@@ -337,13 +338,15 @@ export function planNativeBatchV1(
       return creationId;
     }
     if (node.type === "text") {
+      const textAutoResize = programTextAutoResize(node.width.mode, node.height.mode);
+      if (!textAutoResize) throw new Error("unsupported_operation:text_requires_content_sized_height");
       const style = node.weight === "bold" ? "Bold" : node.weight === "semibold" ? "Semi Bold" : node.weight === "medium" ? "Medium" : "Regular";
       const family = node.weight === "bold" || node.weight === "semibold" ? program.tokens.headingFont : program.tokens.bodyFont;
       fonts.set(`${family}:${style}`, { family, style });
       add({ kind: "create-text", opId: creationId, parent, spec: {
         name: node.name, text: node.text, ...size, fontFamily: family, fontStyle: style, fontSize: node.fontSize,
         textAlign: node.align ?? (program.locale.direction === "rtl" ? "right" : "left"),
-        textAutoResize: node.width.mode === "hug" && node.height.mode === "hug" ? "width-and-height" : "height",
+        textAutoResize,
       } });
       const color = programColor(program, node.color);
       if (!color) throw new Error("unsupported_operation:unresolved token color");

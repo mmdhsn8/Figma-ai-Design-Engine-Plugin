@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { canonicalDesignProgram, normalizeDesignProgramLayout, parseDesignProgram, fingerprintDesignProgram, type DesignProgramV1 } from "../src/shared/design-program";
+import { canonicalDesignProgram, normalizeDesignProgramLayout, parseDesignProgram, fingerprintDesignProgram, type DesignProgramNode, type DesignProgramV1 } from "../src/shared/design-program";
 import { compileDesignProgram } from "../src/shared/design-program-adapter";
+import type { DesignNode } from "../src/shared/schema";
 import { compileDesignProgramOperations } from "../src/shared/design-program-operations";
 import { FigmaToolBatchSchema, FigmaToolOperationSchema } from "../src/shared/figma-tools";
 import { parseMultiScreenValue } from "../src/shared/multi-screen-schema";
@@ -9,6 +10,7 @@ import { UIToPluginSchema, type PluginToUIMessage, type UIToPluginMessage } from
 import { createFigmaToolExecutor } from "../src/plugin/figma-tool-executor";
 import { renderDesignProgramLocal } from "../src/plugin/design-program-spike";
 import { renderMultiScreenDesign } from "../src/plugin/renderer";
+import { inspectProgramGeometry, inspectProgramGeometrySettled } from "../src/plugin/design-program-geometry";
 import { createMockApi, type MockNode } from "./figma-mock";
 import { designProgramFixtures } from "./fixtures/design-programs";
 
@@ -131,7 +133,7 @@ describe("DesignProgramV1 local cross-domain spike", () => {
     dense.screens[0]!.root.children = Array.from({ length: 4 }, (_, groupIndex) => ({
       type: "container", id: `dense-${groupIndex}`, name: `Dense ${groupIndex}`, semanticRole: "region",
       width: { mode: "fixed", value: 100 }, height: { mode: "fixed", value: 100 }, layout: { axis: "column" },
-      children: Array.from({ length: 80 }, (_, nodeIndex) => ({ type: "text", id: `dense-${groupIndex}-${nodeIndex}`, name: "Dense item", semanticRole: "data", width: { mode: "fixed", value: 80 }, height: { mode: "fixed", value: 16 }, text: "Value", color: "#111111" })),
+      children: Array.from({ length: 80 }, (_, nodeIndex) => ({ type: "text", id: `dense-${groupIndex}-${nodeIndex}`, name: "Dense item", semanticRole: "data", width: { mode: "fixed", value: 80 }, height: { mode: "hug", value: 16, min: 16 }, text: "Value", color: "#111111" })),
     }));
     expect(parseDesignProgram(dense)).toMatchObject({ success: false, findings: expect.arrayContaining([expect.objectContaining({ code: "node_limit" })]) });
 
@@ -210,6 +212,7 @@ describe("DesignProgramV1 local cross-domain spike", () => {
     expect(parseDesignProgram(invalidSizing).findings).toContainEqual(expect.objectContaining({ code: "fill_sizing_under_hug_parent" }));
     sizingRoot.width = { mode: "fixed", value: 342 };
     sizingRoot.children[0]!.width = { mode: "hug", value: 318 };
+    sizingRoot.children[0]!.height = { mode: "fixed", value: 32 };
     expect(parseDesignProgram(invalidSizing).findings).toContainEqual(expect.objectContaining({ code: "text_hug_width_requires_hug_height" }));
     sizingRoot.children[0]!.width = { mode: "fixed", value: 318 };
     sizingRoot.children[2]!.width = { mode: "hug", value: 318 };
@@ -219,7 +222,7 @@ describe("DesignProgramV1 local cross-domain spike", () => {
     const hugRoot = hugText.screens[0]!.root;
     if (hugRoot.type !== "container") throw new Error("Fixture needs a container.");
     const heading = hugRoot.children[0]!;
-    heading.height = { mode: "hug", value: 80 };
+    heading.height = { mode: "hug", value: 80, min: 80 };
     hugRoot.children = [heading];
     hugRoot.height = { mode: "fixed", value: 90 };
     expect(parseDesignProgram(hugText).findings).toContainEqual(expect.objectContaining({
@@ -232,6 +235,144 @@ describe("DesignProgramV1 local cross-domain spike", () => {
       after: 104,
       required: 104,
     }]);
+  });
+
+  it("uses one text-sizing contract across axes, languages, screen counts, bounds and scrolling", () => {
+    const getFirstText = (nodes: DesignProgramNode[]): Extract<DesignProgramNode, { type: "text" }> => {
+      for (const node of nodes) {
+        if (node.type === "text") return node;
+        if (node.type === "container") {
+          const nested = getFirstText(node.children);
+          if (nested) return nested;
+        }
+      }
+      throw new Error("Fixture needs native text.");
+    };
+    for (const direction of ["rtl", "ltr"] as const) {
+      for (const screenCount of [1, 2, 3, 10] as const) {
+        const program = copy(education) as unknown as DesignProgramV1;
+        program.locale = { language: direction === "rtl" ? "fa-IR" : "en-US", direction };
+        const sourceScreen = copy(education.screens[0]!) as unknown as DesignProgramV1["screens"][number];
+        program.screens = Array.from({ length: screenCount }, (_, index) => ({
+          ...sourceScreen, id: `screen-${String(index + 1).padStart(2, "0")}`, title: `Learning overview ${index + 1}`, order: index, dependsOn: [],
+        }));
+        const title = getFirstText([program.screens[0]!.root]);
+        title.text = direction === "rtl" ? "سلام و خوش آمدید" : "Welcome home";
+        expect(parseDesignProgram(program).success, `${direction}/${screenCount}`).toBe(true);
+        const compiled = compileDesignProgram(program);
+        expect(compiled.success, `${direction}/${screenCount}: ${JSON.stringify(compiled.success ? [] : compiled.findings)}`).toBe(true);
+        if (!compiled.success) continue;
+        expect(compiled.batch.screens).toHaveLength(screenCount);
+        expect(compiled.batch.screens[0]?.metadata).toMatchObject({ direction });
+      }
+    }
+
+    for (const parentAxis of ["row", "column"] as const) {
+      for (const direction of ["rtl", "ltr"] as const) {
+        for (const widthMode of ["fixed", "hug", "fill"] as const) {
+          for (const heightMode of ["fixed", "hug", "fill"] as const) {
+            const program = copy(education) as unknown as DesignProgramV1;
+            program.locale = { language: direction === "rtl" ? "fa-IR" : "en-US", direction };
+            const screen = program.screens[0]!;
+            if (screen.root.type !== "container") throw new Error("Fixture needs a screen container.");
+            screen.root.layout.axis = parentAxis;
+            const text = getFirstText([screen.root]);
+            screen.root.children = [text];
+            const multiline = widthMode === "fixed" && heightMode === "fixed";
+            text.text = direction === "rtl"
+              ? multiline ? "خانه\nخوش آمدید" : "خانه"
+              : multiline ? "Home\nWelcome" : "Home";
+            text.align = undefined;
+            text.fontSize = 12;
+            text.width = { mode: widthMode, value: widthMode === "hug" ? 64 : 120 };
+            text.height = heightMode === "fixed"
+              ? { mode: "fixed", value: 24, max: multiline ? 32 : 24 }
+              : { mode: heightMode, value: 24 };
+
+            const normalized = normalizeDesignProgramLayout(program);
+            if (heightMode === "fixed") {
+              expect(normalized.repairs).toContainEqual(expect.objectContaining({
+                kind: "text-height", path: `screens.${screen.id}.root.overview.${text.id}.height`, before: "fixed", after: "hug", preservedMinimum: 24,
+              }));
+              expect(getFirstText([normalized.program.screens[0]!.root])).toMatchObject({ height: { mode: "hug", min: 24 } });
+            } else if (heightMode === "fill") {
+              expect(normalized.repairs).toEqual([]);
+              expect(parseDesignProgram(normalized.program).findings).toContainEqual(expect.objectContaining({ code: "text_height_fill_unsupported" }));
+              continue;
+            } else {
+              expect(normalized.repairs).toEqual([]);
+            }
+            expect(parseDesignProgram(normalized.program).success, `${parentAxis}/${direction}/${widthMode}/${heightMode}`).toBe(true);
+            expect(normalizeDesignProgramLayout(normalized.program)).toEqual({ program: normalized.program, repairs: [] });
+            const compiled = compileDesignProgram(normalized.program);
+            expect(compiled.success, `${parentAxis}/${direction}/${widthMode}/${heightMode}`).toBe(true);
+            if (!compiled.success) continue;
+            const allNative = compiled.batch.screens[0]!.children.flatMap((root) => root.type === "frame" ? root.children : []);
+            const findText = (nodes: readonly DesignNode[]): Extract<DesignNode, { type: "text" }> | undefined => {
+              for (const node of nodes) {
+                if (node.type === "text") return node;
+                if (node.type === "frame") {
+                  const nested = findText(node.children);
+                  if (nested) return nested;
+                }
+              }
+              return undefined;
+            };
+            expect(findText(allNative), `${parentAxis}/${direction}/${widthMode}/${heightMode}`).toMatchObject({
+              textAutoResize: widthMode === "hug" ? "width-and-height" : "height",
+              textAlign: direction === "rtl" ? "right" : "left",
+              sizing: { width: widthMode, height: "hug" },
+            });
+          }
+        }
+      }
+    }
+
+    const boundedParent = copy(education) as unknown as DesignProgramV1;
+    const boundedRoot = boundedParent.screens[0]!.root;
+    if (boundedRoot.type !== "container") throw new Error("Fixture needs a screen container.");
+    const fillText = getFirstText([boundedRoot]);
+    boundedRoot.width = { mode: "hug", value: boundedRoot.width.value };
+    fillText.width = { mode: "fill", value: 120 };
+    fillText.height = { mode: "hug", value: 24 };
+    expect(parseDesignProgram(boundedParent).findings).toContainEqual(expect.objectContaining({ code: "fill_sizing_under_hug_parent" }));
+
+    const capped = copy(education) as unknown as DesignProgramV1;
+    const cappedText = getFirstText([capped.screens[0]!.root]);
+    cappedText.width = { mode: "hug", value: 8, max: 8 };
+    cappedText.height = { mode: "hug", value: 24 };
+    expect(parseDesignProgram(capped).findings).toContainEqual(expect.objectContaining({ code: "text_content_exceeds_max_width" }));
+
+    const cappedHeight = copy(education) as unknown as DesignProgramV1;
+    const cappedHeightText = getFirstText([cappedHeight.screens[0]!.root]);
+    cappedHeightText.text = "This paragraph must wrap into several lines inside its bounded text width.";
+    cappedHeightText.width = { mode: "fixed", value: 48 };
+    cappedHeightText.height = { mode: "hug", value: 24, max: 24 };
+    expect(parseDesignProgram(cappedHeight).findings).toContainEqual(expect.objectContaining({ code: "text_content_exceeds_max_height" }));
+
+    const longContent = copy(education) as unknown as DesignProgramV1;
+    longContent.screens[0]!.scroll = "vertical";
+    const longRoot = longContent.screens[0]!.root;
+    if (longRoot.type !== "container") throw new Error("Fixture needs a screen container.");
+    longRoot.height = { mode: "fixed", value: 180 };
+    const paragraph = getFirstText([longRoot]);
+    paragraph.text = longContent.locale.direction === "rtl"
+      ? "هذا نص طويل للتأكد من التفاف السطر وامتداد المحتوى داخل منطقة قابلة للتمرير مع بقاء جميع الكلمات قابلة للتحرير والقراءة."
+      : "This deliberately long paragraph checks that wrapping can grow inside a vertical scroll body while preserving the full editable copy.";
+    paragraph.width = { mode: "fill", value: 318 };
+    paragraph.height = { mode: "hug", value: 24 };
+    const scrolled = normalizeDesignProgramLayout(longContent);
+    expect(scrolled.repairs.some((repair) => "required" in repair && repair.after > repair.before)).toBe(true);
+    expect(parseDesignProgram(scrolled.program).success).toBe(true);
+    const scrollCompile = compileDesignProgram(scrolled.program);
+    expect(scrollCompile.success).toBe(true);
+    if (scrollCompile.success) {
+      const screen = scrollCompile.batch.screens[0]!;
+      const wrapper = screen.children[0];
+      if (wrapper?.type !== "frame") throw new Error("Expected scroll content wrapper.");
+      expect(wrapper.children[0]).toMatchObject({ type: "frame" });
+      expect(screen.metadata?.scroll).toBe("vertical");
+    }
   });
 
   it.each([["rtl", "start", "end"], ["rtl", "end", "start"], ["ltr", "start", "start"]] as const)(
@@ -293,6 +434,13 @@ describe("DesignProgramV1 local cross-domain spike", () => {
       const plan = compileDesignProgramOperations(fixture, { documentId, pageId: "page:current", taskId });
       expect(plan.success, JSON.stringify(plan.success ? [] : plan.findings)).toBe(true);
       if (!plan.success) continue;
+      for (const operation of plan.operations) {
+        if (operation.action.tool !== "create_text") continue;
+        expect(operation.action.verticalSizing).toBe("HUG");
+        expect(operation.action.textAutoResize).toBe(
+          operation.action.horizontalSizing === "HUG" ? "WIDTH_AND_HEIGHT" : "HEIGHT",
+        );
+      }
       expect(plan.batches.every((batch) => batch.length <= 10)).toBe(true);
       const mock = createMockApi();
       const messages: PluginToUIMessage[] = [];
@@ -394,6 +542,115 @@ describe("DesignProgramV1 local cross-domain spike", () => {
     expect(rootsAfterResume).toHaveLength(1);
     expect(mock.nodes.filter((node) => node.getPluginData("fad.tool.task-id.v1") === taskId).length).toBeGreaterThan(0);
     expect(mock.storage.size).toBe(1);
+  });
+
+  it("treats Figma's null render bounds for intentionally invisible text as non-rendered ink, not incomplete geometry", async () => {
+    const mock = createMockApi();
+    const executor = createFigmaToolExecutor(mock.api, () => undefined);
+    const compiled = compileDesignProgram(education);
+    expect(compiled.success).toBe(true);
+    if (!compiled.success) return;
+    const result = await renderDesignProgramLocal(mock.api, education, { taskId, documentId, pageId: "page:current", executor });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const root = mock.nodes.find(({ id }) => id === result.roots[0]!.nodeId)!;
+    const text = mock.nodes.find((node) => node.type === "TEXT")!;
+    text.visible = false;
+    Object.defineProperty(text, "absoluteRenderBounds", { configurable: true, get: () => null });
+    const native = compiled.batch.screens[0]!;
+    const report = inspectProgramGeometry(root as unknown as FrameNode, {
+      taskId, pageId: "page:current",
+      expected: { width: native.width, height: native.height, scroll: true, children: native.children, assets: [], compareText: true },
+      verifyLayoutSizing: true,
+    });
+    expect(report.coverage).toBe("complete");
+    expect(report.findings.map(({ code }) => code)).not.toContain("native_text_bounds_unavailable");
+  });
+
+  it("waits for the same attached root's text bounds to settle instead of failing a new render", async () => {
+    const mock = createMockApi();
+    const originalCreateText = mock.api.createText.bind(mock.api);
+    mock.api.createText = (() => {
+      const text = originalCreateText();
+      const bounds = Object.getOwnPropertyDescriptor(text, "absoluteRenderBounds")!;
+      let unavailableReads = 2;
+      Object.defineProperty(text, "absoluteRenderBounds", {
+        configurable: true,
+        get() {
+          if (unavailableReads > 0) { unavailableReads--; return null; }
+          return bounds.get!.call(text);
+        },
+      });
+      return text;
+    }) as typeof mock.api.createText;
+    const executor = createFigmaToolExecutor(mock.api, () => undefined);
+    const result = await renderDesignProgramLocal(mock.api, education, { taskId, documentId, pageId: "page:current", executor });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.geometryReadbacks).toBeGreaterThan(1);
+    const roots = mock.nodes.filter((node) => node.type === "FRAME" && node.parent?.type === "PAGE" && node.getPluginData("fad.multi-screen.batch-id"));
+    expect(roots).toHaveLength(1);
+    expect(roots[0]!.id).toBe(result.roots[0]!.nodeId);
+  });
+
+  it("retains a permanently unmeasurable root with exact diagnostics and reuses the same ID on Resume", async () => {
+    const mock = createMockApi();
+    const originalCreateText = mock.api.createText.bind(mock.api);
+    mock.api.createText = (() => {
+      const text = originalCreateText();
+      Object.defineProperty(text, "absoluteRenderBounds", { configurable: true, get: () => null });
+      return text;
+    }) as typeof mock.api.createText;
+    const executor = createFigmaToolExecutor(mock.api, () => undefined);
+    const first = await renderDesignProgramLocal(mock.api, education, { taskId, documentId, pageId: "page:current", executor });
+    expect(first).toMatchObject({ success: false, code: "native_geometry_incomplete", screenId: "student-home", attachedNodeCount: expect.any(Number) });
+    if (first.success) return;
+    const originalRootId = first.nativeRootNodeId;
+    expect(first.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "native_text_bounds_unavailable", path: expect.stringContaining("student-home"), message: expect.stringContaining("nodeId=") }),
+    ]));
+    const originalNodeIds = mock.nodes.map(({ id }) => id).sort();
+    const retried = await renderDesignProgramLocal(mock.api, education, { taskId, documentId, pageId: "page:current", executor, expectedRootNodeId: originalRootId });
+    expect(retried).toMatchObject({ success: false, code: "native_geometry_incomplete", nativeRootNodeId: originalRootId });
+    expect(mock.nodes.filter((node) => node.parent?.type === "PAGE" && node.getPluginData("fad.multi-screen.batch-id"))).toHaveLength(1);
+    expect(mock.nodes.map(({ id }) => id).sort()).toEqual(originalNodeIds);
+  });
+
+  it.each(["moved", "removed"] as const)("fails same-root re-read if a native child is %s after creation", async (mutation) => {
+    const mock = createMockApi();
+    const executor = createFigmaToolExecutor(mock.api, () => undefined);
+    const compiled = compileDesignProgram(education);
+    expect(compiled.success).toBe(true);
+    if (!compiled.success) return;
+    const rendered = await renderDesignProgramLocal(mock.api, education, { taskId, documentId, pageId: "page:current", executor });
+    expect(rendered.success).toBe(true);
+    if (!rendered.success) return;
+    const root = mock.nodes.find(({ id }) => id === rendered.roots[0]!.nodeId)!;
+    const native = compiled.batch.screens[0]!;
+    const target = mock.nodes.find((node) => node.type === "TEXT")!;
+    const bounds = Object.getOwnPropertyDescriptor(target, "absoluteRenderBounds")!;
+    let unavailable = true;
+    Object.defineProperty(target, "absoluteRenderBounds", {
+      configurable: true,
+      get() { if (unavailable) { unavailable = false; return null; } return bounds.get!.call(target); },
+    });
+    const report = await inspectProgramGeometrySettled(root as unknown as FrameNode, {
+      taskId, pageId: "page:current",
+      expected: { width: native.width, height: native.height, scroll: true, children: native.children, assets: [], compareText: false },
+      verifyLayoutSizing: true,
+    }, {
+      delaysMs: [0],
+      wait: async () => {
+        if (mutation === "removed") target.remove();
+        else {
+          const frame = mock.nodes.find((node) => node.type === "FRAME" && node.id !== target.parent?.id && node.parent?.id === target.parent?.id)!;
+          frame.appendChild(target);
+        }
+      },
+    });
+    expect(report.coverage).toBe("incomplete");
+    expect(report.findings).toEqual([expect.objectContaining({ code: "native_tree_changed", nodeId: target.id })]);
+    expect(root.removed).toBe(false);
   });
 
   it("renders A through the native mock, resumes without duplicate roots, and H edits one scoped heading only", async () => {

@@ -9,6 +9,7 @@ import {
 import { auditVisualQuality } from "./visual-quality";
 import { auditDesignProgramComposition, auditDesignProgramContrast, programColor, programPageColor } from "./design-program-quality";
 import type { VisualAsset } from "./visual-schema";
+import { programTextAutoResize } from "./program-text-layout";
 import {
   designProgramTokens,
   parseDesignProgram,
@@ -90,12 +91,14 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
         : node.textRole === "caption" || node.textRole === "label" ? language?.captionSize
           : node.textRole === "body" || node.textRole === "action" ? language?.bodySize : undefined;
     const headingRole = node.textRole === "display" || node.textRole === "title" || node.textRole === "heading";
+    const textAutoResize = programTextAutoResize(node.width.mode, node.height.mode);
+    if (!textAutoResize) throw new Error(`Unsupported Universal text sizing for ${node.id}.`);
     return {
       ...common, type: "text", text: node.text, fontSize: roleSize ?? node.fontSize, color: programColor(program, node.color),
       fontFamily: headingRole || node.weight === "bold" || node.weight === "semibold" ? program.tokens.headingFont : program.tokens.bodyFont,
       fontStyle: node.weight === "bold" ? "Bold" : node.weight === "semibold" ? "Semi Bold" : node.weight === "medium" ? "Medium" : "Regular",
       textAlign: node.align ?? (direction === "rtl" ? "right" : "left"),
-      textAutoResize: node.width.mode === "hug" && node.height.mode === "hug" ? "width-and-height" : "height",
+      textAutoResize: textAutoResize === "width-and-height" ? "width-and-height" : "height",
     };
   }
   if (node.type === "rectangle") return { ...common, type: "rectangle", fill: programColor(program, node.fill), cornerRadius: node.cornerRadius ?? semanticRadius(node.semanticRole, program) ?? 0 };
@@ -109,7 +112,7 @@ function nodeToNative(node: DesignProgramNode, program: DesignProgramV1, screenI
     : `Placeholder · ${node.asset.label}`;
   return {
     ...common, type: "frame", background: "#EEF1F5", layout: { mode: "vertical", primaryAxisAlign: "center", counterAxisAlign: "center" },
-    children: [{ type: "text", name: "Placeholder disclosure", text: placeholderLabel, width: Math.min(node.width.value, 300), height: 32, sizing: { width: "fixed", height: "fixed" }, fontSize: 14, color: "#475569", textAlign: "center", textAutoResize: "height", logicalRef: `${program.id}.${screenId}.${node.id}.label`.slice(0, 120) }],
+    children: [{ type: "text", name: "Placeholder disclosure", text: placeholderLabel, width: Math.min(node.width.value, 300), height: 32, sizing: { width: "fixed", height: "hug", minHeight: 32 }, fontSize: 14, color: "#475569", textAlign: "center", textAutoResize: "height", logicalRef: `${program.id}.${screenId}.${node.id}.label`.slice(0, 120) }],
   };
 }
 

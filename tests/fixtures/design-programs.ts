@@ -4,7 +4,7 @@ const frame = (id: string, name: string, role: string, width: number, height: nu
   layout: { axis, gap: 12, padding: { top: 12, right: 12, bottom: 12, left: 12 }, crossAlign: "stretch" }, children, ...options,
 });
 const text = (id: string, name: string, role: string, value: string, width: number, height: number, options: Record<string, unknown> = {}) => ({
-  type: "text", id, name, semanticRole: role, width: fixed(width), height: fixed(height), text: value, color: "token:ink", fontSize: 16, ...options,
+  type: "text", id, name, semanticRole: role, width: fixed(width), height: { mode: "hug", value: height, min: height }, text: value, color: "token:ink", fontSize: 16, ...options,
 });
 const card = (id: string, name: string, width: number, height: number, fillColor = "token:surface") => ({
   type: "rectangle", id, name, semanticRole: "content-card", width: fixed(width), height: fixed(height), fill: fillColor, cornerRadius: 16,

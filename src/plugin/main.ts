@@ -308,7 +308,11 @@ figma.ui.onmessage = async (rawMessage: unknown) => {
           taskId: request.taskId,
           success: false,
           errorCode: result.code,
+          ...(result.screenId && /^screen-(?:0[1-9]|10)$/u.test(result.screenId) ? { screenId: result.screenId } : {}),
           ...(result.nativeRootNodeId ? { nativeRootNodeId: result.nativeRootNodeId } : {}),
+          ...(result.nativeBatchId ? { nativeBatchId: result.nativeBatchId } : {}),
+          ...(result.programFingerprint ? { programFingerprint: result.programFingerprint } : {}),
+          ...(result.attachedNodeCount ? { attachedNodeCount: result.attachedNodeCount } : {}),
           findings: result.findings.slice(0, 20),
         });
         return;

@@ -3,6 +3,7 @@ import { DesignSystemTokensSchema } from "./design-system-schema.js";
 import { ProjectVisualLanguageV1Schema, ScreenCompositionV1Schema } from "./design-composition.js";
 import { GEOMETRY_EPSILON, minimumAxisExtent } from "./native-geometry.js";
 import { hasUnrenderableProgramText } from "./program-text.js";
+import { estimateProgramTextHeight, estimateProgramTextWidth } from "./program-text-layout.js";
 
 export const DESIGN_PROGRAM_VERSION = 1 as const;
 export const DESIGN_PROGRAM_LIMITS = {
@@ -150,9 +151,14 @@ export function fingerprintDesignProgram(program: DesignProgramV1): string {
   return `dpv1-${hash.toString(16).padStart(16, "0")}`;
 }
 
-function walkNodes(root: DesignProgramNode, visit: (node: DesignProgramNode, depth: number) => void, depth = 1): void {
-  visit(root, depth);
-  if (root.type === "container") root.children.forEach((child) => walkNodes(child, visit, depth + 1));
+function walkNodes(
+  root: DesignProgramNode,
+  visit: (node: DesignProgramNode, depth: number, parent?: Extract<DesignProgramNode, { type: "container" }>) => void,
+  depth = 1,
+  parent?: Extract<DesignProgramNode, { type: "container" }>,
+): void {
+  visit(root, depth, parent);
+  if (root.type === "container") root.children.forEach((child) => walkNodes(child, visit, depth + 1, root));
 }
 
 function validateDependencies(program: DesignProgramV1, findings: DesignProgramFinding[]): void {
@@ -184,16 +190,42 @@ function axisInsets(node: Extract<DesignProgramNode, { type: "container" }>, axi
     : node.layout.padding.top + node.layout.padding.bottom;
 }
 
-function minimumNodeExtent(node: DesignProgramNode, axis: LayoutAxisName): number {
+function textAvailableWidth(
+  node: Extract<DesignProgramNode, { type: "text" }>,
+  parent?: Extract<DesignProgramNode, { type: "container" }>,
+): number {
+  if (node.width.mode === "hug") return Number.POSITIVE_INFINITY;
+  let width = node.width.value;
+  if (node.width.mode === "fill" && parent) {
+    width = Math.max(1, parent.width.value - parent.layout.padding.left - parent.layout.padding.right);
+    if (parent.layout.axis === "row") {
+      const fillers = parent.children.filter((child) => child.width.mode === "fill").length;
+      const otherMinimums = parent.children
+        .filter((child) => child.id !== node.id)
+        .reduce((sum, child) => sum + minimumNodeExtent(child, "width", parent), 0);
+      const gaps = Math.max(0, parent.children.length - 1) * parent.layout.gap;
+      width = Math.max(1, (width - otherMinimums - gaps) / Math.max(1, fillers));
+    }
+  }
+  if (node.width.mode === "fixed") width = node.width.value;
+  if (node.width.max !== undefined) width = Math.min(width, node.width.max);
+  return Math.max(1, width);
+}
+
+function minimumNodeExtent(
+  node: DesignProgramNode,
+  axis: LayoutAxisName,
+  parent?: Extract<DesignProgramNode, { type: "container" }>,
+): number {
   const dimension = node[axis];
   const declaredMinimum = dimension.mode === "fixed" ? dimension.value : dimension.min ?? 0;
   if (dimension.mode === "fixed") return declaredMinimum;
-  if (node.type === "text")
-    return Math.max(
-      declaredMinimum,
-      dimension.mode === "hug" ? dimension.value : 0,
-      axis === "height" ? node.fontSize * Math.max(1, node.text.split("\n").length) : 0,
-    );
+  if (node.type === "text") {
+    const contentMinimum = axis === "height"
+      ? estimateProgramTextHeight({ text: node.text, fontSize: node.fontSize, width: textAvailableWidth(node, parent) })
+      : node.width.mode === "hug" && axis === "width" ? estimateProgramTextWidth(node.text, node.fontSize) : 0;
+    return Math.max(declaredMinimum, contentMinimum);
+  }
   if (node.type !== "container") return declaredMinimum;
   return Math.max(declaredMinimum, requiredContainerExtent(node, axis));
 }
@@ -208,8 +240,8 @@ function wrappedRowsHeight(node: Extract<DesignProgramNode, { type: "container" 
   let rowHeight = 0;
   let height = node.layout.padding.top + node.layout.padding.bottom;
   for (const child of node.children) {
-    const width = minimumNodeExtent(child, "width");
-    const childHeight = minimumNodeExtent(child, "height");
+    const width = minimumNodeExtent(child, "width", node);
+    const childHeight = minimumNodeExtent(child, "height", node);
     if (rows > 0 && rowWidth + node.layout.gap + width > availableWidth + GEOMETRY_EPSILON) {
       height += node.layout.gap + rowHeight;
       rows++;
@@ -239,11 +271,11 @@ function requiredContainerExtent(
   }
   if (primary)
     return minimumAxisExtent(
-      node.children.map((child) => ({ mode: "fixed", value: minimumNodeExtent(child, axis) })),
+      node.children.map((child) => ({ mode: "fixed", value: minimumNodeExtent(child, axis, node) })),
       node.layout.gap,
       axisInsets(node, axis),
     );
-  return axisInsets(node, axis) + Math.max(0, ...node.children.map((child) => minimumNodeExtent(child, axis)));
+  return axisInsets(node, axis) + Math.max(0, ...node.children.map((child) => minimumNodeExtent(child, axis, node)));
 }
 
 function layoutOverflowFinding(
@@ -260,7 +292,7 @@ function layoutOverflowFinding(
     ? `${node.layout.padding.left}+${node.layout.padding.right}`
     : `${node.layout.padding.top}+${node.layout.padding.bottom}`;
   const wrapRows = node.layout.wrap && node.layout.axis === "row" && axis === "height";
-  const childSizes = node.children.slice(0, 4).map((child) => `${child.id} ${minimumNodeExtent(child, axis)}`);
+  const childSizes = node.children.slice(0, 4).map((child) => `${child.id} ${minimumNodeExtent(child, axis, node)}`);
   const omitted = node.children.length - childSizes.length;
   const content = wrapRows
     ? `wrapped row heights (${childSizes.join(", ")}${omitted > 0 ? `, +${omitted} more` : ""})`
@@ -278,7 +310,11 @@ function layoutOverflowFinding(
   };
 }
 
-function layoutSizingFindings(node: DesignProgramNode, path: string): DesignProgramFinding[] {
+function layoutSizingFindings(
+  node: DesignProgramNode,
+  path: string,
+  parent?: Extract<DesignProgramNode, { type: "container" }>,
+): DesignProgramFinding[] {
   const findings: DesignProgramFinding[] = [];
   for (const axis of ["width", "height"] as const) {
     if (node[axis].mode === "hug" && node.type !== "container" && node.type !== "text")
@@ -307,43 +343,106 @@ function layoutSizingFindings(node: DesignProgramNode, path: string): DesignProg
       message: "Figma text can hug width only when its height is content-sized too; use HUG on both text axes or a bounded width with HUG height.",
       severity: "error",
     });
+  if (node.type === "text" && node.height.mode === "fill")
+    findings.push({
+      code: "text_height_fill_unsupported",
+      path: `${path}.height`,
+      message: "Universal text height must hug its content; use a HUG text height inside the horizontal or vertical Auto Layout parent.",
+      severity: "error",
+    });
+  if (node.type === "text" && node.height.mode === "fixed")
+    findings.push({
+      code: "text_height_must_hug",
+      path: `${path}.height`,
+      message: "Universal text height must be HUG so the native text box can contain every line; use a bounded width with HUG height for wrapping.",
+      severity: "error",
+    });
+  if (node.type === "text" && node.height.mode === "hug" && node.height.max !== undefined) {
+    const required = estimateProgramTextHeight({ text: node.text, fontSize: node.fontSize, width: textAvailableWidth(node, parent) });
+    if (required > node.height.max + GEOMETRY_EPSILON)
+      findings.push({
+        code: "text_content_exceeds_max_height",
+        path: `${path}.height.max`,
+        message: `Text needs about ${required} px at its declared width but maxHeight is ${node.height.max} px. Increase the explicit bound or keep the screen content in its intentional scroll flow.`,
+        severity: "error",
+      });
+  }
+  if (node.type === "text" && node.width.mode === "hug" && node.width.max !== undefined) {
+    const required = estimateProgramTextWidth(node.text, node.fontSize);
+    if (required > node.width.max + GEOMETRY_EPSILON)
+      findings.push({
+        code: "text_content_exceeds_max_width",
+        path: `${path}.width.max`,
+        message: `Single-line text needs about ${required} px but maxWidth is ${node.width.max} px. Use a bounded width with HUG height to wrap it.`,
+        severity: "error",
+      });
+  }
   return findings;
 }
 
-/** Repairs only measurable fixed-height flow overflow on a screen with an outer vertical scroll viewport. */
+/** Repairs bounded text-height migrations and measurable overflow in vertical scroll content. */
 export function normalizeDesignProgramLayout(program: DesignProgramV1): {
   program: DesignProgramV1;
-  repairs: Array<{ path: string; before: number; after: number; required: number }>;
+  repairs: Array<
+    | { path: string; before: number; after: number; required: number }
+    | { kind: "text-height"; path: string; before: "fixed"; after: "hug"; preservedMinimum: number }
+  >;
 } {
-  const repairs: Array<{ path: string; before: number; after: number; required: number }> = [];
-  const normalizeNode = (node: DesignProgramNode, screenId: string): DesignProgramNode => {
+  const repairs: Array<
+    | { path: string; before: number; after: number; required: number }
+    | { kind: "text-height"; path: string; before: "fixed"; after: "hug"; preservedMinimum: number }
+  > = [];
+  let visited = 0;
+  const normalizeNode = (
+    node: DesignProgramNode,
+    path: string,
+    screenId?: string,
+    allowScrollExpansion = false,
+    parent?: Extract<DesignProgramNode, { type: "container" }>,
+    depth = 1,
+  ): DesignProgramNode => {
+    visited++;
+    if (visited > DESIGN_PROGRAM_LIMITS.nodes || depth > DESIGN_PROGRAM_LIMITS.depth) return node;
+    if (node.type === "text" && node.height.mode === "fixed") {
+      const required = estimateProgramTextHeight({ text: node.text, fontSize: node.fontSize, width: textAvailableWidth(node, parent) });
+      if (node.height.max === undefined || required <= node.height.max + GEOMETRY_EPSILON) {
+        const preservedMinimum = Math.max(node.height.min ?? 1, node.height.value);
+        repairs.push({ kind: "text-height", path: `${path}.height`, before: "fixed", after: "hug", preservedMinimum });
+        return { ...node, height: { ...node.height, mode: "hug", min: preservedMinimum } };
+      }
+      return node;
+    }
     if (node.type !== "container") return node;
-    const children = node.children.map((child) => normalizeNode(child, screenId));
-    const next = children.some((child, index) => child !== node.children[index])
-      ? { ...node, children }
-      : node;
+    const children = node.children.map((child) => normalizeNode(child, `${path}.${child.id}`, screenId, allowScrollExpansion, node, depth + 1));
+    let next = children.some((child, index) => child !== node.children[index]) ? { ...node, children } : node;
     if (next.height.mode !== "fixed") return next;
     const required = requiredContainerExtent(next, "height");
     if (required <= next.height.value + GEOMETRY_EPSILON) return next;
     const after = Math.ceil(required);
     if (after > 20_000 || (next.height.max !== undefined && after > next.height.max)) return next;
-    repairs.push({
-      path: `screens.${screenId}.root.${next.id}.height`,
-      before: next.height.value,
-      after,
-      required,
-    });
-    return { ...next, height: { ...next.height, value: after } };
+    if (!screenId || !allowScrollExpansion) return next;
+    repairs.push({ path: `${path}.height`, before: next.height.value, after, required });
+    next = { ...next, height: { ...next.height, value: after } };
+    return next;
   };
+
   let changed = false;
+  const componentsV1 = program.componentsV1?.map((component) => {
+    const root = normalizeNode(component.root, `componentsV1.${component.id}.${component.root.id}`);
+    if (root === component.root) return component;
+    changed = true;
+    return { ...component, root };
+  });
   const screens = program.screens.map((screen) => {
-    if (screen.scroll !== "vertical" || screen.root.type !== "container") return screen;
-    const root = normalizeNode(screen.root, screen.id);
+    const root = normalizeNode(screen.root, `screens.${screen.id}.root.${screen.root.id}`, screen.id, screen.scroll === "vertical");
     if (root === screen.root) return screen;
     changed = true;
     return { ...screen, root };
   });
-  return { program: changed ? { ...program, screens } : program, repairs };
+  return {
+    program: changed ? { ...program, ...(componentsV1 ? { componentsV1 } : {}), screens } : program,
+    repairs,
+  };
 }
 
 export function parseDesignProgram(value: unknown, options: { allowedBrandAssetIds?: ReadonlySet<string> } = {}): DesignProgramParseResult {
@@ -362,12 +461,12 @@ export function parseDesignProgram(value: unknown, options: { allowedBrandAssetI
     }
     let descendants = -1;
     const ids = new Set<string>();
-    walkNodes(root, (node, depth) => {
+    walkNodes(root, (node, depth, parent) => {
       descendants++;
       if (ids.has(node.id) || node.type === "instance" || node.type === "image" || depth > DESIGN_PROGRAM_LIMITS.depth)
         findings.push({ code: "invalid_local_component_node", path: `componentsV1.${id}.${node.id}`, message: "Use unique bounded native nodes without nested instances or image dependencies.", severity: "error" });
       ids.add(node.id);
-      findings.push(...layoutSizingFindings(node, `componentsV1.${id}.${node.id}`));
+      findings.push(...layoutSizingFindings(node, `componentsV1.${id}.${node.id}`, parent));
       if (node.type === "container")
         for (const axis of ["width", "height"] as const) {
           const finding = layoutOverflowFinding(node, `componentsV1.${id}.${node.id}`, axis);
@@ -385,11 +484,11 @@ export function parseDesignProgram(value: unknown, options: { allowedBrandAssetI
     if (orders.has(screen.order)) findings.push({ code: "duplicate_order", path: `screens.${screenIndex}.order`, message: `Duplicate screen order ${screen.order}.`, severity: "error" });
     orders.add(screen.order);
     const nodeIds = new Set<string>();
-    walkNodes(screen.root, (node, depth) => {
+    walkNodes(screen.root, (node, depth, parent) => {
       nodeCount++;
       if (node.type === "text" && hasUnrenderableProgramText(node.text))
         findings.push({ code: "invalid_native_text", path: `screens.${screen.id}.${node.id}`, message: "Text contains an invalid Unicode character or a directional override.", severity: "error" });
-      findings.push(...layoutSizingFindings(node, `screens.${screen.id}.root.${node.id}`));
+      findings.push(...layoutSizingFindings(node, `screens.${screen.id}.root.${node.id}`, parent));
       if (node.type === "instance") {
         const component = components.get(node.componentId);
         if (!component || node.width.mode !== "fixed" || node.height.mode !== "fixed" ||

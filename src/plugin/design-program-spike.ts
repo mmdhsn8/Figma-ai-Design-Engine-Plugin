@@ -1,9 +1,9 @@
-import { parseDesignProgram } from "../shared/design-program";
+import { DesignProgramV1Schema, normalizeDesignProgramLayout, parseDesignProgram } from "../shared/design-program";
 import { compileDesignProgram } from "../shared/design-program-adapter";
 import type { FigmaToolExecutor, NativeGenerationAdoption } from "./figma-tool-executor";
 import { renderMultiScreenDesign, type RendererFigmaApi } from "./renderer";
 import type { VisualAsset } from "../shared/visual-schema";
-import { convergeProgramLayoutSizing, fitProgramScrollBody, inspectProgramGeometry, verifyProgramInstanceMasters, PROGRAM_FINGERPRINT_KEY, PROGRAM_GEOMETRY_KEY, PROGRAM_TASK_KEY, type ProgramGeometryFinding } from "./design-program-geometry";
+import { convergeProgramLayoutSizing, describeProgramGeometryFindings, fitProgramScrollBody, inspectProgramGeometrySettled, verifyProgramInstanceMasters, PROGRAM_FINGERPRINT_KEY, PROGRAM_GEOMETRY_KEY, PROGRAM_TASK_KEY, type ProgramGeometryFinding, type ProgramGeometryReport } from "./design-program-geometry";
 import { NATIVE_GEOMETRY_VERSION } from "../shared/native-geometry";
 import { CONTEXT_COMPONENT_KEY, NATIVE_MASTER_KEY, type ContextReuseFinding, type prepareContextReuse } from "./design-context-reuse";
 import { FW4_GEOMETRY_ENABLED, FW4_GEOMETRY_FEATURE, projectNativeLayoutExpectations } from "../shared/fw4-geometry";
@@ -22,7 +22,7 @@ function activePageId(api: RendererFigmaApi): string {
 
 export type LocalProgramRenderResult =
   | { success: true; batchId: string; roots: Array<{ screenId: string; nodeId: string; ref: string; freshlyCreated?: boolean }>; nodeCount: number; registeredRefs: number; operationIds: string[]; fingerprint: string; geometryVersion: typeof NATIVE_GEOMETRY_VERSION; fontFallback: boolean; geometryRepairs: number; geometryReadbacks: number; contextFindings?: ContextReuseFinding[]; timingsMs: { parse: number; compile: number; render: number; registration: number; persistence: number; geometry: number } }
-  | { success: false; code: string; nativeRootNodeId?: string; findings: Array<{ code: string; path: string; message: string; severity: "error" | "warning" }> };
+  | { success: false; code: string; nativeRootNodeId?: string; screenId?: string; nativeBatchId?: string; programFingerprint?: string; attachedNodeCount?: number; findings: Array<{ code: string; path: string; message: string; severity: "error" | "warning" }> };
 
 function stableToolRef(logicalRef: string): string {
   let hash = 0x811c9dc5;
@@ -58,11 +58,16 @@ export async function renderDesignProgramLocal(
   const parseStarted = Date.now();
   const assets = scope.assets ?? [];
   const allowedBrandAssetIds = new Set(assets.map(({ id }) => id));
-  const parsedProgram = parseDesignProgram(value, { allowedBrandAssetIds });
+  const schema = DesignProgramV1Schema.safeParse(value);
+  if (!schema.success) return { success: false, code: "invalid_program", findings: schema.error.issues.slice(0, 100).map((issue) => ({
+    code: "invalid_schema", path: issue.path.map(String).join(".") || "program", message: issue.message, severity: "error" as const,
+  })) };
+  const normalizedProgram = normalizeDesignProgramLayout(schema.data).program;
+  const parsedProgram = parseDesignProgram(normalizedProgram, { allowedBrandAssetIds });
   const parseMs = Math.max(0, Date.now() - parseStarted);
   if (!parsedProgram.success) return { success: false, code: "invalid_program", findings: parsedProgram.findings };
   const compileStarted = Date.now();
-  const compiled = compileDesignProgram(value, { assets, allowedBrandAssetIds });
+  const compiled = compileDesignProgram(normalizedProgram, { assets, allowedBrandAssetIds });
   const compileMs = Math.max(0, Date.now() - compileStarted);
   if (!compiled.success) return { success: false, code: "compile_rejected", findings: compiled.findings };
   const semanticRoles = new Map(compiled.semanticRoles.map(({ logicalRef, role }) => [logicalRef, role]));
@@ -72,6 +77,9 @@ export async function renderDesignProgramLocal(
   let geometryMs = 0;
   let geometryRepairs = 0;
   let geometryReadbacks = 0;
+  let confirmedScreenId: string | undefined;
+  let confirmedBatchId: string | undefined;
+  let attachedNodeCount: number | undefined;
   if (activeRenders.has(api))
     return { success: false, code: "native_render_busy", findings: [{ code: "native_render_busy", path: "renderer", message: "Another native program is settling. The saved program can be resumed.", severity: "error" }] };
   activeRenders.add(api);
@@ -94,18 +102,45 @@ export async function renderDesignProgramLocal(
     const nodes = [];
     for (let index = 0; index < queue.length && index < 200; index++) {
       const node = queue[index]!;
-      nodes.push({ nodeId: node.id, parentId: node.parent?.id, plannedRef: node.getPluginData(DESIGN_REF_KEY) });
+      const parent = node.parent;
+      nodes.push({
+        nodeId: node.id, parentId: parent?.id, plannedRef: node.getPluginData(DESIGN_REF_KEY), type: node.type,
+        width: node.width, height: node.height, visible: node.visible,
+        ...(parent && "layoutMode" in parent ? { parentLayoutMode: parent.layoutMode } : {}),
+        ...( "layoutSizingHorizontal" in node ? { layoutSizingHorizontal: node.layoutSizingHorizontal } : {}),
+        ...( "layoutSizingVertical" in node ? { layoutSizingVertical: node.layoutSizingVertical } : {}),
+        ...(node.type === "TEXT" ? { textAutoResize: node.textAutoResize, hasMissingFont: node.hasMissingFont,
+          absoluteRenderBounds: node.absoluteRenderBounds } : {}),
+      });
       if ("children" in node) queue.push(...node.children);
     }
     trace(event, { screenId, nodeId: root.id, parentId: root.parent?.id, visible: root.visible, x: root.x, y: root.y, nodes });
   };
-  const fail = (code: string, message: string): LocalProgramRenderResult => {
-    trace("render_failed", { code, nodeId: confirmedRootId });
-    return { success: false, code, nativeRootNodeId: confirmedRootId,
-      findings: [{ code, path: "screens", message: message.slice(0, 240), severity: "error" }] };
+  const countAttachedNodes = (rootId: string | undefined): number | undefined => {
+    if (!rootId) return;
+    const root = api.currentPage.children.find(({ id }) => id === rootId);
+    if (!root || root.type !== "FRAME") return;
+    const pending: SceneNode[] = [root];
+    let count = 0;
+    while (pending.length && count < 300) {
+      const node = pending.pop()!;
+      count++;
+      if ("children" in node) pending.push(...node.children);
+    }
+    return count;
+  };
+  type RenderFailureFinding = { code: string; path: string; message: string; severity: "error" | "warning" };
+  const fail = (code: string, message: string, details?: RenderFailureFinding[]): LocalProgramRenderResult => {
+    attachedNodeCount ??= countAttachedNodes(confirmedRootId);
+    trace("render_failed", { code, screenId: confirmedScreenId, nativeBatchId: confirmedBatchId ?? compiled.batch.id,
+      nodeId: confirmedRootId, attachedNodeCount });
+    return { success: false, code, nativeRootNodeId: confirmedRootId, screenId: confirmedScreenId,
+      nativeBatchId: confirmedBatchId ?? compiled.batch.id, programFingerprint: compiled.fingerprint, attachedNodeCount,
+      findings: details?.length ? details.slice(0, 12) : [{ code, path: confirmedScreenId ? `screens.${confirmedScreenId}` : "screens", message: message.slice(0, 240), severity: "error" }] };
   };
 
   try {
+    confirmedBatchId = compiled.batch.id;
     const screenIds = new Set(compiled.batch.screens.map(({ id }) => id));
     const existing = api.currentPage.findAll((node) =>
       node.getPluginData("fad.multi-screen.batch-id") === compiled.batch.id &&
@@ -119,6 +154,7 @@ export async function renderDesignProgramLocal(
       return fail("native_root_identity_conflict", "Saved native root identities disagree. Inspect the original screen before resuming.");
     if (expectedRoot && !existing.some(({ id }) => id === expectedRoot)) {
       confirmedRootId = expectedRoot;
+      confirmedScreenId = compiled.batch.screens[0]?.id;
       const node = scope.lookupNode ? await scope.lookupNode(expectedRoot) : undefined;
       verifyScope();
       trace("expected_root_unresolved", { nodeId: expectedRoot, parentId: node && !node.removed ? node.parent?.id : undefined, found: Boolean(node), removed: node?.removed });
@@ -131,14 +167,57 @@ export async function renderDesignProgramLocal(
       const owner = node.getPluginData(TASK_KEY) || node.getPluginData(PROGRAM_TASK_KEY);
       if (owner === taskId && node.parent?.id !== pageId) {
         confirmedRootId = node.id;
+        confirmedScreenId = node.getPluginData("fad.multi-screen.screen-id") || compiled.batch.screens[0]?.id;
         trace("root_parent_changed", { nodeId: node.id, parentId: node.parent?.id });
         return fail("native_root_moved_or_retagged", "The original native root has a different parent and was retained in place.");
       }
       if (node.type !== "FRAME" || owner !== taskId || !hasIdentity(node))
         return fail("ownership_conflict", "The native batch already has a root outside this task's expected ownership or page.");
       confirmedRootId = node.id;
+      confirmedScreenId = node.getPluginData("fad.multi-screen.screen-id") || compiled.batch.screens[0]?.id;
+      attachedNodeCount = countAttachedNodes(node.id);
       if (node.getPluginData("fad.generation.commit") === "pending" && node.getPluginData(BUILT_KEY) !== "1")
         return fail("native_root_partial", "An interrupted native root is still on the page. Inspect it before resuming; no replacement was created.");
+    }
+
+    // Resume must reconcile native work before entering the renderer. This
+    // read is deliberately against the existing root ID; it cannot create or
+    // append any node, and any unresolved tree remains attached for inspection.
+    for (const candidate of existing) {
+      if (candidate.type !== "FRAME") continue;
+      const screenId = candidate.getPluginData("fad.multi-screen.screen-id");
+      const source = parsedProgram.data.screens.find((screen) => screen.id === screenId);
+      const native = compiled.batch.screens.find((screen) => screen.id === screenId);
+      if (!source || !native) continue;
+      confirmedRootId = candidate.id;
+      confirmedScreenId = screenId;
+      attachedNodeCount = countAttachedNodes(candidate.id);
+      const report = await inspectProgramGeometrySettled(candidate, {
+        taskId,
+        pageId,
+        expected: {
+          width: native.width, height: native.height, scroll: source.scroll === "vertical",
+          children: native.children, assets, compareText: candidate.getPluginData("fad.generation.commit") !== "complete",
+          components: compiled.batch.designSystem?.components,
+        },
+        checkReceipt: Boolean(source.compositionV1 && candidate.getPluginData(PROGRAM_GEOMETRY_KEY)),
+        verifyLayoutSizing: true,
+      }, {
+        assertCurrentScope: verifyScope,
+        onAttempt: (attempt, value) => trace("resume_geometry_reconcile", {
+          screenId, rootNodeId: candidate.id, parentId: candidate.parent?.id, attempt,
+          coverage: value.coverage, measuredNodes: value.measuredNodes, attachedNodeCount,
+          findings: describeProgramGeometryFindings(candidate, value.findings, screenId),
+        }),
+      });
+      geometryReadbacks += report.attempts;
+      geometryMs += report.durationMs;
+      if (report.coverage !== "complete")
+        return fail("native_geometry_incomplete", "The original attached root remains in place, but bounded native readback is still incomplete.",
+          describeProgramGeometryFindings(candidate, report.findings, screenId));
+      if (report.findings.length)
+        return fail("native_geometry_failed", "The original attached root was retained; native readback found a structural or geometry mismatch.",
+          describeProgramGeometryFindings(candidate, report.findings, screenId));
     }
     const grounding = !existing.length ? await scope.contextReuse?.() : undefined;
     verifyScope();
@@ -170,6 +249,7 @@ export async function renderDesignProgramLocal(
         root.setPluginData(PROGRAM_TASK_KEY, taskId);
         root.setPluginData(PROGRAM_FINGERPRINT_KEY, compiled.fingerprint);
         confirmedRootId = root.id;
+        confirmedScreenId = screenId;
         scope.rootReceipt?.write(root.id);
         if (root.parent?.id === pageId) {
           fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_root_attached",
@@ -183,11 +263,17 @@ export async function renderDesignProgramLocal(
           root.overflowDirection = "VERTICAL";
         }
         root.setPluginData(BUILT_KEY, "1");
+        confirmedRootId = root.id;
+        confirmedScreenId = screenId;
+        attachedNodeCount = countAttachedNodes(root.id);
         traceTree("root_built", root, screenId);
       },
       canRecoverPendingScreen: (root) => hasIdentity(root) && !root.getPluginData(TASK_KEY) && root.getPluginData(BUILT_KEY) === "1",
-      verifyScreen: (root, screenId, reused, recovering) => {
+      verifyScreen: async (root, screenId, reused, recovering) => {
         verifyScope();
+        confirmedRootId = root.id;
+        confirmedScreenId = screenId;
+        attachedNodeCount = countAttachedNodes(root.id);
         if (!reused && !recovering) freshlyCreatedScreenIds.add(screenId);
         const source = parsedProgram.data.screens.find(({ id }) => id === screenId)!;
         const native = compiled.batch.screens.find(({ id }) => id === screenId)!;
@@ -200,20 +286,29 @@ export async function renderDesignProgramLocal(
         const options = {
           taskId, pageId, expected: { width: native.width, height: native.height, scroll, children: native.children, assets, compareText: !reused, components: compiled.batch.designSystem?.components },
           checkReceipt: (reused || recovering) && Boolean(source.compositionV1 && root.getPluginData(PROGRAM_GEOMETRY_KEY)),
-          ...(FW4_GEOMETRY_ENABLED ? { verifyLayoutSizing: true } : {}),
+          // Universal text sizing is part of the persisted program contract;
+          // verify the actual Figma axes and auto-resize mode on every render.
+          verifyLayoutSizing: true,
         };
         if (FW4_GEOMETRY_ENABLED)
           trace("fw4_layout_expectation", { screenId, rootNodeId: root.id, gate: FW4_GEOMETRY_FEATURE,
             phase: "compiled-program-preflight", expectedNodeCount: native.children.length });
+        const recordGeometryAttempt = (attempt: number, value: Awaited<ReturnType<typeof inspectProgramGeometrySettled>>) => {
+          geometryReadbacks++;
+          geometryMs += value.durationMs;
+          fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_result",
+            stage: "program_geometry_attempt", result: value.coverage === "complete" && value.findings.length === 0 ? "confirmed" : "unverified",
+            rootNodeHash: fw7CorrelationHash(root.id), observedCount: value.measuredNodes, counter: "nativeReadbackOperations" });
+          trace("geometry_readback_attempt", { screenId, rootNodeId: root.id, parentId: root.parent?.id, attempt,
+            coverage: value.coverage, measuredNodes: value.measuredNodes, attachedNodeCount,
+            findings: describeProgramGeometryFindings(root, value.findings, screenId) });
+        };
         fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_started",
           stage: "program_geometry", result: "started", rootNodeHash: fw7CorrelationHash(root.id), counter: "nativeReadbackOperations" });
-        let report = inspectProgramGeometry(root, options);
-        geometryReadbacks++;
-        geometryMs += report.durationMs;
-        fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_result",
-          stage: "program_geometry", result: report.coverage === "complete" && report.findings.length === 0 ? "confirmed" : "unverified",
-          rootNodeHash: fw7CorrelationHash(root.id), observedCount: report.measuredNodes,
-          reasonCode: report.coverage !== "complete" ? "coverage_incomplete" : report.findings.length ? "geometry_findings" : undefined });
+        let report: ProgramGeometryReport & { receipt: string; attempts?: number } = await inspectProgramGeometrySettled(root, options, {
+          assertCurrentScope: verifyScope,
+          onAttempt: recordGeometryAttempt,
+        });
         if (FW4_GEOMETRY_ENABLED)
           trace("fw4_geometry_readback", { screenId, rootNodeId: root.id, gate: FW4_GEOMETRY_FEATURE,
             phase: "native-readback-after-render", coverage: report.coverage,
@@ -225,9 +320,10 @@ export async function renderDesignProgramLocal(
           geometryRepairs++;
           fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_started",
             stage: "program_geometry_recheck", result: "started", rootNodeHash: fw7CorrelationHash(root.id), counter: "nativeReadbackOperations" });
-          report = inspectProgramGeometry(root, options);
-          geometryReadbacks++;
-          geometryMs += report.durationMs;
+          report = await inspectProgramGeometrySettled(root, options, {
+            assertCurrentScope: verifyScope,
+            onAttempt: recordGeometryAttempt,
+          });
           fw7Telemetry.record({ runId: taskId, taskId, screenId, boundary: "figma-api", kind: "native_readback_result",
             stage: "program_geometry_recheck", result: report.coverage === "complete" && report.findings.length === 0 ? "confirmed" : "unverified",
             rootNodeHash: fw7CorrelationHash(root.id), observedCount: report.measuredNodes,
@@ -288,12 +384,24 @@ export async function renderDesignProgramLocal(
     });
     verifyScope();
     const renderMs = Math.max(0, Date.now() - renderStarted);
-    if (incompleteGeometry)
-      return fail("native_geometry_incomplete", "Figma could not measure the complete native screen. Its layers were retained for another read.");
+    if (incompleteGeometry) {
+      const failureRoot = confirmedRootId
+        ? api.currentPage.children.find((node) => node.id === confirmedRootId)
+        : undefined;
+      return fail("native_geometry_incomplete", "The attached native screen remains in place, but bounded reads of the same root could not measure complete geometry.",
+        failureRoot?.type === "FRAME" ? describeProgramGeometryFindings(failureRoot, geometryFindings, confirmedScreenId) : undefined);
+    }
     if (geometryFindings.length)
-      return { success: false, code: "native_geometry_failed", nativeRootNodeId: confirmedRootId, findings: geometryFindings.slice(0, 12).map(({ code, nodeId, parentId }) => ({
-        code, path: parentId ? `native.${parentId}.${nodeId}` : `native.${nodeId}`, message: "Native geometry or ownership differs from the saved program. The renderer retained its layers.", severity: "error",
-      })) };
+      return fail("native_geometry_failed", "Native geometry or ownership differs from the saved program; the attached root was retained.",
+        (() => {
+          const failureRoot = confirmedRootId ? api.currentPage.children.find((node) => node.id === confirmedRootId) : undefined;
+          return failureRoot?.type === "FRAME"
+            ? describeProgramGeometryFindings(failureRoot, geometryFindings, confirmedScreenId)
+            : geometryFindings.slice(0, 12).map(({ code, nodeId, parentId, logicalRef }) => ({
+                code, path: `native.${logicalRef ?? nodeId}`.slice(0, 200),
+                message: `Native geometry or ownership differs at ${nodeId}; parent=${parentId ?? "missing"}.`, severity: "error" as const,
+              }));
+        })());
     if (rendered.failedScreens > 0 || rendered.screens.some((screen) => screen.status !== "generated"))
       return fail("native_render_incomplete", `${rendered.failedScreens} of ${rendered.totalScreens} screens did not render. ${rendered.screens.flatMap((screen) => screen.error ? [`${screen.id}: ${screen.error}`] : []).join(" ")}`);
 
@@ -380,6 +488,15 @@ export async function renderDesignProgramLocal(
       timingsMs: { parse: parseMs, compile: compileMs, render: renderMs, registration: registrationMs, persistence: registration.persistenceMs, geometry: geometryMs },
     };
   } catch (error) {
+    trace("render_exception", {
+      screenId: confirmedScreenId,
+      nodeId: confirmedRootId,
+      attachedNodeCount,
+      errorName: error instanceof Error ? error.name.slice(0, 80) : "unknown",
+      stackFrames: error instanceof Error && error.stack
+        ? error.stack.split("\n").slice(1, 4).map((frame) => frame.trim().slice(0, 160))
+        : [],
+    });
     return fail("native_render_error", error instanceof Error ? error.message : "Native renderer failed.");
   } finally {
     activeRenders.delete(api);

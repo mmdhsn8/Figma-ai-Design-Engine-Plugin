@@ -72,7 +72,7 @@ function screenProgram() {
           name: "Notice copy",
           semanticRole: "body",
           interaction: "none",
-          width: { mode: "hug", value: 230 },
+          width: { mode: "fill", value: 318 },
           height: { mode: "hug", value: 60 },
           text: "ورودی ساختمان تا ساعت ۱۸ باز است · Update 123",
           color: "token:ink",

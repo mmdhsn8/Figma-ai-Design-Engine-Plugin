@@ -6259,7 +6259,18 @@ export async function runChatTask(task: ChatTask, deps: Dependencies): Promise<v
         ? "Universal design paused. Saved plans, programs, and confirmed native screens are retained. Resume this task to continue."
         : sessionEnded
           ? "Universal design paused because the Companion session changed or lost authorization. Reconnect, then resume this saved task."
-          : `Universal design failed safely: ${task.error}. Confirmed native screens are retained; inspect the saved checkpoint before resuming.`.slice(0, 1_000);
+          : (() => {
+              const screens = task.universalScreens ?? [];
+              const attached = screens.filter(({ nativeRootNodeId, nativeAttachmentStatus }) =>
+                Boolean(nativeRootNodeId || nativeAttachmentStatus));
+              const verified = screens.filter(({ status }) => status === "verified");
+              const attachedLayers = attached.reduce((sum, screen) => sum + (screen.attachedNodeCount ?? 0), 0);
+              const progress = `Native progress: ${attached.length}/${screens.length} screen roots attached (${attachedLayers} layers); ${verified.length}/${screens.length} screens geometry-verified.`;
+              const recovery = attached.some(({ status }) => status !== "verified")
+                ? " Attached roots are retained; Resume re-inspects and reuses their saved root IDs."
+                : " Confirmed native screens are retained.";
+              return `Universal design failed safely: ${task.error}. ${progress}${recovery}`.slice(0, 1_000);
+            })();
     if (readOnly() && isCancelled) {
       const checkpoint = readOnlyCheckpoint(task);
       task.inspectionOutcome = "CANCELLED";

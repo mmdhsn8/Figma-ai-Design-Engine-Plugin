@@ -1,5 +1,6 @@
 import type { DesignProgramV1, DesignProgramNode } from "./design-program";
 import { DESIGN_PROGRAM_LIMITS } from "./design-program";
+import { nativeTextAutoResize, programTextAutoResize } from "./program-text-layout";
 import { z } from "zod";
 
 export const FW4_GEOMETRY_FEATURE = "fw4-geometry-v1" as const;
@@ -58,8 +59,8 @@ export function projectNativeLayoutExpectations(
       parentLogicalRef,
       horizontalSizing: nativeSizing(node.width.mode),
       verticalSizing: nativeSizing(node.height.mode),
-      ...(node.type === "text" ? {
-        textAutoResize: node.width.mode === "hug" && node.height.mode === "hug" ? "WIDTH_AND_HEIGHT" : "HEIGHT",
+      ...(node.type === "text" && programTextAutoResize(node.width.mode, node.height.mode) ? {
+        textAutoResize: nativeTextAutoResize(programTextAutoResize(node.width.mode, node.height.mode)!),
       } : {}),
     });
     if (node.type === "container") node.children.forEach((child) => append(child, logicalRef));

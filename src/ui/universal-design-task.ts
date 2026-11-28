@@ -268,7 +268,7 @@ function requestInput(task: ChatTask, purpose: "plan" | "compose" | "repair", sc
   const routeInstruction = purpose === "plan"
     ? "Return only one plan_universal_project tool call. Respect the exact count/device/language constraints in this context. Choose useful distinct screens if the brief did not provide a count. Declare a screen dependency only when the saved content of that screen is required to author another; navigation alone is not a generation dependency. Do not guess private document data."
     : purpose === "compose"
-      ? `Return only one compose_design_program call for currentScreen. Reuse visualLanguageV1 and choose an archetype that makes the screen's main task and entry/exit states clear. Map each planned region to an editable container; use real domain labels, illustrative example values where allowed, and an identifiable primary control when the plan calls for action. Use the shared navigation language across screens and keep sparse states sparse. For RTL, group controls in reading order and write UI copy in the requested language. Use semantic textRole values for typography, the stable variation seed ${compositionVariationSeed(task.id, screen!.screenId)}, and only pinned Brand Kit assets. Prefer useful editable content to large decorative placeholders. Do not force card grids, pad the tree, or add other screens. Layout contract: Figma lays out children in flow, not at authored x/y coordinates. For every FIXED parent axis, budget direct-child minimum sizes + (child count - 1) × gap + axis padding; include wrapped-row height. Use FILL only under a bounded parent axis, never under HUG on that axis. Use HUG for content-driven Auto Layout and HUG text height for variable-length copy; fixed text boxes must be deliberately sized. Screen-level vertical scrolling clips the viewport, not overflowing children inside a fixed content container.`
+      ? `Return only one compose_design_program call for currentScreen. Reuse visualLanguageV1 and choose an archetype that makes the screen's main task and entry/exit states clear. Map each planned region to an editable container; use real domain labels, illustrative example values where allowed, and an identifiable primary control when the plan calls for action. Use the shared navigation language across screens and keep sparse states sparse. For RTL, group controls in reading order and write UI copy in the requested language. Use semantic textRole values for typography, the stable variation seed ${compositionVariationSeed(task.id, screen!.screenId)}, and only pinned Brand Kit assets. Prefer useful editable content to large decorative placeholders. Do not force card grids, pad the tree, or add other screens. Text sizing contract: every text node uses HUG height. Use HUG/HUG for content-sized, no-wrap labels; use FIXED/HUG for bounded wrapping copy; use FILL/HUG only under a bounded Auto Layout parent. Never give text FILL height or fixed height. Keep min/max inside parent bounds and preserve all text. For every FIXED parent axis, budget direct-child minima + (child count - 1) × gap + axis padding; include wrapped-row height. A vertical-scroll screen uses a clipped viewport around a content body that can grow.`
       : "Return only one repair_design_program tool call. Modify only the supplied invalid fields/findings in this saved one-screen program and preserve all other valid content.";
   const payload = {
     contract: purpose === "plan" ? "ProjectPlanDraftV1" : "DesignProgramV1",
@@ -846,6 +846,8 @@ function verifyNativeReadback(
     fail("native_node_count_mismatch", "Native readback did not match the exact adopted subtree node count.");
   if (!response.geometry || response.geometry.coverage !== "complete" || response.geometry.measuredNodes !== subtree.length)
     fail("native_geometry_incomplete", "Figma could not measure the full task-owned screen geometry.");
+  if (!response.geometry.receipt)
+    fail("native_geometry_receipt_missing", "Figma returned geometry without a readback revision; the screen remains unverified.");
   const oneSizingMismatch = response.geometry.findings.length === 1 &&
     response.geometry.findings[0]?.code === "native_layout_sizing_mismatch" &&
     Boolean(response.geometry.findings[0]?.nodeId && response.geometry.findings[0]?.parentId &&
@@ -1806,7 +1808,15 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       task.universalMetrics!.nativeDurationMs += renderDurationMs;
       if (!response.success) {
         fw7Telemetry.record({ runId: task.id, taskId: task.id, screenId: screen.screenId, requestIdHash: fw7CorrelationHash(renderRequestId), rootNodeHash: fw7CorrelationHash(response.nativeRootNodeId), boundary: "task-owner", kind: "native_render_result", stage: "native_render", operation: "design-program-render", result: "failed", durationMs: renderDurationMs, reasonCode: response.errorCode ?? "native_render_failed" });
+        if ((response.screenId && response.screenId !== screen.screenId) ||
+            (response.programFingerprint && response.programFingerprint !== screen.fingerprint))
+          fail("native_acknowledgement_invalid", "The failed render receipt did not match this saved screen and program fingerprint; no root was adopted.");
         screen.nativeRootNodeId ??= response.nativeRootNodeId;
+        if (response.nativeBatchId) screen.nativeBatchId = response.nativeBatchId;
+        if (response.attachedNodeCount && response.nativeRootNodeId) {
+          screen.attachedNodeCount = response.attachedNodeCount;
+          screen.nativeAttachmentStatus = "attached_unverified";
+        }
         screen.errorCode = response.errorCode ?? "native_render_error";
         screen.findings = (response.findings ?? []).slice(0, 12).map(({ code, path, message }) => ({ code, path, message: message.slice(0, 180) }));
         recordTrace({ stageId: screen.screenId, stage: "native_render", event: "request_failed", outcome: "failed", nativeOperationId: renderRequestId, attempt: screen.renderAttempts, durationMs: renderDurationMs, code: screen.errorCode, qaFindingCodes: screen.findings.map(({ code }) => code).slice(0, 8), qaCoverage: "incomplete" });
@@ -1832,6 +1842,8 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       screen.rootRef = response.rootRef;
       screen.nativeRootNodeId = response.nativeRootNodeId;
       screen.nativeBatchId = response.nativeBatchId;
+      screen.nativeAttachmentStatus = "attached_unverified";
+      screen.attachedNodeCount = response.nativeNodeCount;
       screen.adoptionOperationIds = response.adoptionOperationIds;
       screen.nativeNodeCount = response.nativeNodeCount;
       screen.geometryVersion = response.geometryVersion;
@@ -1878,7 +1890,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         taskId: task.id,
         documentId: task.documentId,
         refs: [screen.rootRef],
-        geometry: { programFingerprint: screen.fingerprint, requireReceipt: screen.geometryVersion === 1,
+        geometry: { programFingerprint: screen.fingerprint, requireReceipt: screen.geometryVersion === 1, screenId: screen.screenId,
           expectedRootNodeId: screen.nativeRootNodeId, ...(expectedLayout ? { expectedLayout } : {}) },
         });
       } catch (error) {
@@ -1895,12 +1907,14 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
       task.universalMetrics!.readbackRoundTripMs += readbackDurationMs;
       const readbackFindingCodes = inspection.geometry?.findings.map(({ code }) => code).slice(0, 8) ?? [];
       recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "readback_completed", outcome: inspection.geometry?.coverage === "complete" ? "completed" : "failed", nativeOperationId: inspectRequestId, nativeBatchId: screen.nativeBatchId, durationMs: readbackDurationMs, nodeCount: inspection.geometry?.measuredNodes, qaFindingCodes: readbackFindingCodes, qaCoverage: inspection.geometry?.coverage === "complete" ? "complete" : "incomplete",
+        ...(inspection.geometry?.readAttempts ? { attempt: inspection.geometry.readAttempts } : {}),
         ...(expectedLayout ? { code: FW4_GEOMETRY_FEATURE } : {}) });
       if (inspection.geometry) {
         task.universalMetrics!.nativeReadbackMs = (task.universalMetrics!.nativeReadbackMs ?? 0) + inspection.geometry.durationMs;
         if (inspection.geometry.findings.length) {
-          screen.findings = inspection.geometry.findings.map(({ code, nodeId }) => ({
-            code, path: `native.${nodeId}`, message: "Figma reported a native geometry or ownership discrepancy.",
+          screen.findings = inspection.geometry.findings.map(({ code, nodeId, parentId, logicalRef, observedLayout }) => ({
+            code, path: `native.${logicalRef ?? nodeId}`.slice(0, 200),
+            message: `${code}; nodeId=${nodeId}; parentId=${parentId ?? "missing"}${observedLayout ? `; observedSizing=${observedLayout.horizontalSizing}/${observedLayout.verticalSizing}${observedLayout.textAutoResize ? `/${observedLayout.textAutoResize}` : ""}` : ""}`.slice(0, 180),
           }));
         }
       }
@@ -1919,6 +1933,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         if (previouslyVerified) {
           screen.status = "rendered";
           delete screen.verifiedNodeCount;
+          delete screen.nativeReadbackRevision;
           stage.completed = false;
           stage.verified = false;
         }
@@ -2158,7 +2173,7 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
                   const recheckStarted = monotonicNow();
                   recordTrace({ stageId: screen.screenId, stage: "native_readback", event: "request_started", outcome: "started", nativeOperationId: recheckRequestId, nativeBatchId: screen.nativeBatchId, attempt: 2, code: FW4_GEOMETRY_FEATURE });
                   const recheck = await deps.inspectProgram({ type: "task-native-inspect", requestId: recheckRequestId, taskId: task.id,
-                    documentId: task.documentId, refs: [screen.rootRef!], geometry: { programFingerprint: screen.fingerprint!, requireReceipt: true,
+                    documentId: task.documentId, refs: [screen.rootRef!], geometry: { programFingerprint: screen.fingerprint!, requireReceipt: true, screenId: screen.screenId,
                       expectedRootNodeId: screen.nativeRootNodeId, ...(expectedLayout ? { expectedLayout } : {}) } });
                   check();
                   const durationMs = Math.max(0, Math.round(monotonicNow() - recheckStarted));
@@ -2280,7 +2295,10 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
         }
       }
       screen.status = "verified";
+      screen.nativeAttachmentStatus = "verified";
       screen.verifiedNodeCount = verified.nodeCount;
+      screen.attachedNodeCount = verified.nodeCount;
+      screen.nativeReadbackRevision = inspection.geometry!.receipt!;
       stage.completed = true;
       stage.verified = true;
       stage.logicalRefs = [screen.rootRef];
@@ -2308,7 +2326,9 @@ export async function runUniversalDesignTask(task: ChatTask, deps: UniversalDesi
   }
 
   check();
-  if (!screens.length || screens.length !== task.stages.length || screens.some(({ status }) => status !== "verified") || task.stages.some(({ completed }) => !completed))
+  if (!screens.length || screens.length !== task.stages.length ||
+      screens.some(({ status, nativeRootNodeId, nativeReadbackRevision }) => status !== "verified" || !nativeRootNodeId || !nativeReadbackRevision) ||
+      task.stages.some(({ completed }) => !completed))
     fail("native_verification_incomplete", "Not every planned screen has task-owned native readback; completion was refused.");
   task.universalMetrics!.totalElapsedMs = Math.max(0, Math.round(monotonicNow() - runStartedAt));
   const usedFallback = screens.some(({ findings }) => findings?.some(({ code }) => code === "native_font_fallback"));

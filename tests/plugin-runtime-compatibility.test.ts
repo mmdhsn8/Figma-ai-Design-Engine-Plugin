@@ -11,6 +11,11 @@ import { FW2_FEATURE } from "../src/shared/design-context";
 import { parseProjectPlanDraft, universalJobManifestFingerprint } from "../src/shared/universal-design";
 import { chatHistoryBridge } from "../src/ui/chat-task-bridge";
 import type { chatTaskBridge as chatTaskBridgeType } from "../src/ui/chat-task-bridge";
+import { createMockApi } from "./figma-mock";
+import { designProgramFixtures } from "./fixtures/design-programs";
+import { projectNativeLayoutExpectations } from "../src/shared/fw4-geometry";
+import type { taskNativeBridge as taskNativeBridgeType } from "../src/ui/task-native-bridge";
+import { DesignProgramV1Schema } from "../src/shared/design-program";
 
 const pluginBundle = readFileSync(new URL("../dist/plugin.js", import.meta.url), "utf8");
 const uiHtml = readFileSync(new URL("../dist/ui.html", import.meta.url), "utf8");
@@ -19,6 +24,7 @@ const bundledBuildId = uiHtml.match(/__fadBuildId=["']([^"']{1,100})["']/u)?.[1]
   ?? pluginBundle.match(/git-[A-Za-z0-9._:+-]{1,100}/u)?.[0]
   ?? "source-unknown";
 let compiledUiBridge = "";
+let compiledTaskNativeBridge = "";
 
 beforeAll(async () => {
   const output = await build({
@@ -40,6 +46,26 @@ beforeAll(async () => {
     : "output" in output ? output.output : [];
   compiledUiBridge = chunks.find((chunk) => chunk.type === "chunk")?.code ?? "";
   if (!compiledUiBridge) throw new Error("Vite did not emit the compiled UI bridge harness.");
+
+  const taskOutput = await build({
+    configFile: fileURLToPath(new URL("../vite.ui.config.ts", import.meta.url)),
+    define: { "import.meta.env.VITE_FW7_BUILD_ID": JSON.stringify(bundledBuildId) },
+    build: {
+      write: false,
+      emptyOutDir: false,
+      lib: {
+        entry: fileURLToPath(new URL("../src/ui/task-native-bridge.ts", import.meta.url)),
+        name: "FadCompiledTaskNativeBridge",
+        formats: ["iife"],
+        fileName: () => "task-native-bridge.js",
+      },
+    },
+  });
+  const taskChunks = Array.isArray(taskOutput)
+    ? taskOutput.flatMap((result) => "output" in result ? result.output : [])
+    : "output" in taskOutput ? taskOutput.output : [];
+  compiledTaskNativeBridge = taskChunks.find((chunk) => chunk.type === "chunk")?.code ?? "";
+  if (!compiledTaskNativeBridge) throw new Error("Vite did not emit the compiled native task bridge harness.");
 });
 
 function savedFingerprint(value: unknown): string {
@@ -53,6 +79,123 @@ function savedFingerprint(value: unknown): string {
 }
 
 describe("Figma main sandbox runtime compatibility", () => {
+  it("re-reads the same attached root through the compiled UI/plugin bridge after transient geometry loss", async () => {
+    const mock = createMockApi();
+    const unrelated = mock.api.createFrame();
+    unrelated.name = "Unrelated canvas layer";
+    mock.page.appendChild(unrelated as never);
+    const pageData = new Map<string, string>();
+    Object.assign(mock.page, {
+      getPluginData: (key: string) => pageData.get(key) ?? "",
+      setPluginData: (key: string, value: string) => pageData.set(key, value),
+    });
+    const messages: Array<Record<string, unknown>> = [];
+    const events = new EventTarget();
+    const pluginLog = vi.fn();
+    const figma = mock.api as unknown as {
+      showUI: ReturnType<typeof vi.fn>;
+      ui: { onmessage?: unknown; postMessage: (message: unknown) => void };
+      fileKey: string;
+      currentPage: { id: string };
+    };
+    figma.showUI = vi.fn();
+    figma.ui = {
+      onmessage: undefined,
+      postMessage: (message) => {
+        messages.push(message as Record<string, unknown>);
+        events.dispatchEvent(new MessageEvent("message", { data: { pluginMessage: message } }));
+      },
+    };
+    const context = createContext({
+      figma,
+      __html__: uiHtml,
+      setTimeout,
+      clearTimeout,
+      console: { log: pluginLog, info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    }, { codeGeneration: { strings: false, wasm: false } });
+    runInContext(pluginBundle, context);
+    const pluginRequest = (context as unknown as { figma: { ui: { onmessage: (message: unknown) => Promise<void> } } }).figma.ui.onmessage;
+
+    const source = designProgramFixtures[0]!;
+    const program = DesignProgramV1Schema.parse({
+      ...source,
+      id: "compiled-boundary",
+      screens: source.screens.map((screen) => ({ ...screen, id: "screen-01" })),
+    });
+    const taskId = "compiled-native-task-01";
+    const documentId = `${figma.fileKey}-${figma.currentPage.id.replaceAll(":", "_")}`;
+    await pluginRequest({
+      type: "design-program-render",
+      requestId: "compiled-render-request-01",
+      taskId,
+      documentId,
+      program,
+    });
+    const rendered = messages.find((message) => message.type === "design-program-render-result") as {
+      success?: boolean; nativeRootNodeId?: string; rootRef?: string; screenId?: string; programFingerprint?: string;
+    } | undefined;
+    expect(rendered, JSON.stringify({ rendered, logs: pluginLog.mock.calls })).toMatchObject({ success: true, screenId: "screen-01" });
+    const originalRootId = rendered!.nativeRootNodeId!;
+    const originalNodeIds = mock.nodes.map(({ id }) => id).sort();
+    const textNode = mock.nodes.find((node) => node.type === "TEXT")!;
+    const originalBounds = Object.getOwnPropertyDescriptor(textNode, "absoluteRenderBounds")!;
+    let boundsReads = 0;
+    Object.defineProperty(textNode, "absoluteRenderBounds", {
+      configurable: true,
+      get() {
+        boundsReads++;
+        return boundsReads === 1 ? null : originalBounds.get!.call(textNode);
+      },
+    });
+
+    const uiContext = createContext({
+      window: {
+        addEventListener: events.addEventListener.bind(events),
+        removeEventListener: events.removeEventListener.bind(events),
+        setTimeout: globalThis.setTimeout.bind(globalThis),
+        clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      },
+      parent: {
+        postMessage: ({ pluginMessage }: { pluginMessage: unknown }) => { void pluginRequest(pluginMessage); },
+      },
+      setTimeout,
+      clearTimeout,
+      console: { info: vi.fn(), log: vi.fn() },
+      MessageEvent,
+    });
+    runInContext(compiledTaskNativeBridge, uiContext);
+    const bridge = (uiContext as unknown as {
+      FadCompiledTaskNativeBridge: { taskNativeBridge: typeof taskNativeBridgeType };
+    }).FadCompiledTaskNativeBridge.taskNativeBridge;
+    const readback = await bridge({
+      type: "task-native-inspect",
+      requestId: "compiled-inspect-request-01",
+      documentId,
+      taskId,
+      refs: [rendered!.rootRef!],
+      geometry: {
+        programFingerprint: rendered!.programFingerprint!,
+        requireReceipt: true,
+        screenId: "screen-01",
+        expectedRootNodeId: originalRootId,
+        expectedLayout: projectNativeLayoutExpectations(program, "screen-01"),
+      },
+    });
+
+    expect(readback).toMatchObject({
+      type: "task-native-inspection-result", success: true, expectedRootStatus: "present",
+      geometry: { coverage: "complete", readAttempts: 2 },
+    });
+    expect(boundsReads).toBeGreaterThanOrEqual(2);
+    expect(mock.nodes.find(({ id }) => id === originalRootId)?.parent?.id).toBe(mock.page.id);
+    expect(mock.nodes.map(({ id }) => id).sort()).toEqual(originalNodeIds);
+    expect(mock.page.children.filter((node) => node.getPluginData("fad.multi-screen.batch-id")).map(({ id }) => id))
+      .toEqual([originalRootId]);
+    expect(unrelated.parent?.id).toBe(mock.page.id);
+    expect(messages.filter((message) => message.type === "design-program-render-result")).toHaveLength(1);
+    expect(messages.filter((message) => message.type === "task-native-inspection-result")).toHaveLength(1);
+  });
+
   it("executes the built plugin and verifies checkpoint receipts across a controller reload", async () => {
     const page = {
       id: "page-1",

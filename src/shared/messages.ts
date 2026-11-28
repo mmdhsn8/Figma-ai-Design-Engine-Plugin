@@ -81,6 +81,7 @@ const NativeGeometryReportSchema = z.object({
   coverage: z.enum(["complete", "incomplete"]),
   measuredNodes: z.number().int().min(0).max(300),
   durationMs: z.number().int().nonnegative(),
+  readAttempts: z.number().int().min(1).max(8).optional(),
   receipt: z.string().regex(/^v1-[a-f0-9]{1,8}$/u).optional(),
   findings: z.array(z.object({
     code: z.string().regex(/^[a-z_]{1,80}$/u),
@@ -295,6 +296,7 @@ export const UIToPluginSchema = z.discriminatedUnion("type", [
       geometry: z.object({
         programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u),
         requireReceipt: z.boolean(),
+        screenId: z.string().regex(/^screen-(?:0[1-9]|10)$/u).optional(),
         expectedRootNodeId: z.string().min(1).max(100).optional(),
         expectedLayout: z.array(NativeLayoutExpectationSchema).max(FW4_GEOMETRY_NODE_LIMIT).optional(),
       }).strict().superRefine((geometry, context) => {
@@ -557,8 +559,9 @@ export const PluginToUISchema = z.discriminatedUnion("type", [
       rootRef: z.string().regex(/^[A-Za-z][A-Za-z0-9._-]{0,79}$/u).optional(),
       nativeRootNodeId: z.string().min(1).max(100).optional(),
       nativeBatchId: z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u).optional(),
-      adoptionOperationIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u)).max(200).optional(),
       programFingerprint: z.string().regex(/^dpv1-[a-f0-9]{16}$/u).optional(),
+      attachedNodeCount: z.number().int().min(1).max(300).optional(),
+      adoptionOperationIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{8,100}$/u)).max(200).optional(),
       nativeNodeCount: z.number().int().nonnegative().max(300).optional(),
       visualCaptureEligible: z.boolean().optional(),
       geometryVersion: z.literal(NATIVE_GEOMETRY_VERSION).optional(),

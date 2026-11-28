@@ -94,7 +94,9 @@ export function renderDesignProgramBridge(
         runId: request.taskId, taskId: request.taskId, screenId: parsed.data.screenId ?? request.program.screens[0]?.id,
         requestIdHash: fw7CorrelationHash(request.requestId), boundary: "ui-plugin", kind: "native_render_result",
         stage: "native_render", operation: "design-program-render", result: parsed.data.success ? "applied" : "failed",
-        ...(parsed.data.success ? { observedCount: parsed.data.nativeNodeCount } : { reasonCode: parsed.data.errorCode ?? "native_render_failed" }),
+        ...(parsed.data.success
+          ? { observedCount: parsed.data.nativeNodeCount }
+          : { observedCount: parsed.data.attachedNodeCount, reasonCode: parsed.data.errorCode ?? "native_render_failed" }),
       });
       finish();
       resolve(parsed.data);

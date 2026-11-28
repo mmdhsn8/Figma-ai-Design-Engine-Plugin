@@ -1,5 +1,6 @@
 import { FigmaToolOperationSchema, type FigmaToolOperation } from "./figma-tools";
 import { parseDesignProgram, type DesignProgramFinding, type DesignProgramNode } from "./design-program";
+import { nativeTextAutoResize, programTextAutoResize } from "./program-text-layout";
 
 export type DesignProgramToolCompileResult =
   | { success: true; operations: FigmaToolOperation[]; batches: FigmaToolOperation[][]; fingerprint: string; nodeCount: number }
@@ -56,7 +57,9 @@ export function compileDesignProgramOperations(
       return ref;
     }
     if (node.type === "text") {
-      add(ref, node.name, { tool: "create_text", ref, name: node.name, parent: { kind: "node", ref: parentRef }, text: node.text, size, font: { family: node.weight === "bold" || node.weight === "semibold" ? program.tokens.headingFont : program.tokens.bodyFont, style: node.weight === "bold" ? "Bold" : node.weight === "semibold" ? "Semi Bold" : node.weight === "medium" ? "Medium" : "Regular" }, fontSize: node.fontSize, color: color(node.color, program.tokens.colors), align: (node.align ?? (program.locale.direction === "rtl" ? "right" : "left")).toUpperCase(), direction: program.locale.direction.toUpperCase(), horizontalSizing: node.width.mode.toUpperCase(), verticalSizing: node.height.mode.toUpperCase() });
+      const textAutoResize = programTextAutoResize(node.width.mode, node.height.mode);
+      if (!textAutoResize) throw new Error(`Unsupported Universal text sizing for ${node.id}.`);
+      add(ref, node.name, { tool: "create_text", ref, name: node.name, parent: { kind: "node", ref: parentRef }, text: node.text, size, font: { family: node.weight === "bold" || node.weight === "semibold" ? program.tokens.headingFont : program.tokens.bodyFont, style: node.weight === "bold" ? "Bold" : node.weight === "semibold" ? "Semi Bold" : node.weight === "medium" ? "Medium" : "Regular" }, fontSize: node.fontSize, color: color(node.color, program.tokens.colors), align: (node.align ?? (program.locale.direction === "rtl" ? "right" : "left")).toUpperCase(), direction: program.locale.direction.toUpperCase(), horizontalSizing: node.width.mode.toUpperCase(), verticalSizing: node.height.mode.toUpperCase(), textAutoResize: nativeTextAutoResize(textAutoResize) });
       return ref;
     }
     if (node.type === "rectangle") {
@@ -66,7 +69,7 @@ export function compileDesignProgramOperations(
     if (node.type === "image" && node.asset.source === "placeholder") {
       add(ref, node.name, { tool: "create_frame", ref, name: node.name, parent: { kind: "node", ref: parentRef }, size, fill: "#EEF1F5", autoLayout: { direction: "vertical", gap: 0, padding: { top: 8, right: 8, bottom: 8, left: 8 }, primaryAlign: "CENTER", counterAlign: "CENTER" } });
       const labelRef = safeRef(program.id, screenId, node.id, "label");
-      add(labelRef, "Placeholder disclosure", { tool: "create_text", ref: labelRef, name: "Placeholder disclosure", parent: { kind: "node", ref }, text: `Placeholder · ${node.asset.label}`, size: { width: Math.min(node.width.value, 300), height: 32 }, fontSize: 14, color: "#475569", align: "CENTER", horizontalSizing: "HUG", verticalSizing: "HUG" });
+      add(labelRef, "Placeholder disclosure", { tool: "create_text", ref: labelRef, name: "Placeholder disclosure", parent: { kind: "node", ref }, text: `Placeholder · ${node.asset.label}`, size: { width: Math.min(node.width.value, 300), height: 32 }, fontSize: 14, color: "#475569", align: "CENTER", horizontalSizing: "FIXED", verticalSizing: "HUG", textAutoResize: "HEIGHT" });
       return ref;
     }
     findings.push({ code: "unsupported_tool_primitive", path: `screens.${screenId}.${node.id}`, message: `Candidate B does not implement ${node.type}; no domain-specific substitute was added.`, severity: "error" });

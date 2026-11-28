@@ -222,7 +222,7 @@ function programFor(input: Case, screenIndex: number, regionCount = 3): DesignPr
     semanticRole: index === 0 ? "heading" : index === 1 ? "body-copy" : "primary-action-label",
     interaction: "none" as const,
     width: { mode: "fill" as const, value: width - 32, min: 80 },
-    height: { mode: "fixed" as const, value: 52 },
+    height: { mode: "hug" as const, value: 52, min: 52 },
     text: content[index]!,
     color: index === 0 ? "token:text" : "token:muted",
     fontSize: index === 0 ? 24 : 16,
@@ -410,6 +410,7 @@ function makeHarness(input: Case, options: {
   fw2?: "clean" | "rich" | "denied";
   lowContrast?: boolean;
   generatedAxisOverflow?: boolean;
+  legacySavedNavSizing?: boolean;
   providerDelayMs?: number;
   providerDelayForScreen?: (screenId: string) => number;
   maxConcurrentModelCalls?: 1 | 2;
@@ -510,6 +511,18 @@ function makeHarness(input: Case, options: {
       const program = options.generatedAxisOverflow && screenIndex === 0
         ? generatedOverflowProgram(input, screenIndex)
         : programFor(input, screenIndex, options.sparseConfirmation ? 1 : 3);
+      if (options.legacySavedNavSizing && screenIndex === 0) {
+        const root = program.screens[0]!.root;
+        const region = root.type === "container" ? root.children[0] : undefined;
+        const label = region?.type === "container" ? region.children[0] : undefined;
+        if (region?.type !== "container" || label?.type !== "text") throw new Error("Expected a saved navigation label.");
+        region.layout.axis = "row";
+        label.id = "saved-nav";
+        label.name = "Saved navigation label";
+        label.semanticRole = "navigation-label";
+        label.width = { mode: "hug", value: 120 };
+        label.height = { mode: "fixed", value: 32, max: 32 };
+      }
       if (options.fw2 === "rich") {
         const root = program.screens[0]!.root;
         if (root.type !== "container") throw new Error("Expected fixture container.");
@@ -605,7 +618,10 @@ function makeHarness(input: Case, options: {
         },
       });
       if (!rendered.success)
-        return { type: "design-program-render-result" as const, requestId, taskId: task.id, success: false, errorCode: rendered.code, nativeRootNodeId: rendered.nativeRootNodeId, findings: rendered.findings };
+        return { type: "design-program-render-result" as const, requestId, taskId: task.id, success: false,
+          errorCode: rendered.code, screenId: rendered.screenId, nativeRootNodeId: rendered.nativeRootNodeId,
+          nativeBatchId: rendered.nativeBatchId, programFingerprint: rendered.programFingerprint,
+          attachedNodeCount: rendered.attachedNodeCount, findings: rendered.findings };
       const root = rendered.roots[0]!;
       return {
         type: "design-program-render-result" as const,
@@ -969,9 +985,9 @@ describe("universal design Chat route", () => {
     const region = root.children[0];
     if (region?.type !== "container" || region.children[0]?.type !== "text") throw new Error("Expected fixture region.");
     const label = region.children[0];
-    const fixed = { mode: "fixed" as const, value: 104 };
+    const fixed = { mode: "fixed" as const, value: 320 };
     const master: Extract<DesignProgramNode, { type: "container" }> = {
-      ...region, width: fixed, height: { mode: "fixed", value: 76 }, background: "#111111", children: [{ ...label, id: "master-label", color: "#333333" }],
+      ...region, width: fixed, height: { mode: "fixed", value: 76 }, background: "#111111", children: [{ ...label, id: "master-label", width: { mode: "fill", value: 296 }, color: "#333333" }],
     };
     program.componentsV1 = [{ id: "status-chip", root: master }];
     program.tokens.colors = { page: "#FFFFFF", background: "#FFFFFF", text: "#17202A", muted: "#444444", surface: "#FFFFFF", "raised-surface": "#FFFFFF" };
@@ -2023,6 +2039,62 @@ describe("universal design Chat route", () => {
     expect(persisted.status).toBe("completed");
   });
 
+  it("reports attached versus verified progress and resumes the same incomplete root through screen 02", async () => {
+    const input = { ...onlineShopCase(), brief: "create 2 random screen" };
+    const h = makeHarness(input, { maxConcurrentModelCalls: 1 });
+    const unrelated = h.mock.api.createRectangle();
+    const originalCreateText = h.mock.api.createText.bind(h.mock.api);
+    let geometryAvailable = false;
+    h.mock.api.createText = (() => {
+      const text = originalCreateText();
+      const bounds = Object.getOwnPropertyDescriptor(text, "absoluteRenderBounds")!;
+      Object.defineProperty(text, "absoluteRenderBounds", {
+        configurable: true,
+        get() { return geometryAvailable ? bounds.get!.call(text) : null; },
+      });
+      return text;
+    }) as typeof h.mock.api.createText;
+    const firstRun = h.deps.renderProgram.getMockImplementation()!;
+    let renderCalls = 0;
+    h.deps.renderProgram.mockImplementation(async (...args) => {
+      renderCalls++;
+      return firstRun(...args);
+    });
+
+    await expect(runChatTask(h.task, h.deps)).rejects.toThrow("native_geometry_incomplete");
+    const failed = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    const firstScreen = failed.universalScreens?.find(({ screenId }) => screenId === "screen-01");
+    expect(firstScreen).toMatchObject({
+      status: "rendering", nativeAttachmentStatus: "attached_unverified",
+      nativeRootNodeId: expect.any(String), attachedNodeCount: expect.any(Number),
+    });
+    const originalRootId = firstScreen!.nativeRootNodeId;
+    expect(failed.text).toContain("1/2 screen roots attached");
+    expect(failed.text).toContain("0/2 screens geometry-verified");
+    expect(failed.text).toContain("Resume re-inspects and reuses their saved root IDs.");
+    expect(h.lifecycles).not.toContain("UNIVERSAL_REPAIR");
+    const savedNodeIds = h.mock.nodes.map(({ id }) => id).sort();
+    const providerCalls = h.model.mock.calls.length;
+
+    geometryAvailable = true;
+    await runChatTask(failed, h.deps);
+    expect(failed.status).toBe("completed");
+    expect(h.model).toHaveBeenCalledTimes(providerCalls);
+    expect(renderCalls).toBeGreaterThan(1);
+    const completeScreens = failed.universalScreens!;
+    expect(completeScreens).toHaveLength(2);
+    expect(completeScreens.map(({ status }) => status)).toEqual(["verified", "verified"]);
+    expect(completeScreens.every(({ nativeReadbackRevision }) => /^v1-[a-f0-9]{1,8}$/u.test(nativeReadbackRevision ?? ""))).toBe(true);
+    expect(completeScreens[0]!.nativeRootNodeId).toBe(originalRootId);
+    const roots = h.mock.nodes.filter((node) => node.parent?.type === "PAGE" && node.getPluginData("fad.multi-screen.batch-id"));
+    expect(roots).toHaveLength(2);
+    expect(new Set(roots.map(({ id }) => id)).size).toBe(2);
+    expect(h.mock.nodes.find(({ id }) => id === originalRootId)?.id).toBe(originalRootId);
+    expect(h.mock.page.children).toContain(unrelated);
+    expect(h.mock.nodes.map(({ id }) => id).sort().filter((id) => savedNodeIds.includes(id))).toEqual(savedNodeIds);
+    expect(h.checkpoints.at(-1)?.universalScreens?.every(({ status, nativeReadbackRevision }) => status === "verified" && Boolean(nativeReadbackRevision))).toBe(true);
+  });
+
   it("shares the strict DesignProgramV1 boundary and refuses unverified references and remote assets", () => {
     const input = cases[0]!;
     const program = programFor(input, 0);
@@ -2152,6 +2224,72 @@ describe("universal design Chat route", () => {
     });
   });
 
+  it("repairs the saved-nav HUG/FIXED equivalent before preflight and reaches both native renders without model repair", async () => {
+    const input = onlineShopCase("create 2 random screen");
+    const generated = programFor(input, 0);
+    const root = generated.screens[0]!.root;
+    const region = root.type === "container" ? root.children[0] : undefined;
+    const savedNav = region?.type === "container" ? region.children[0] : undefined;
+    if (region?.type !== "container" || savedNav?.type !== "text") throw new Error("Expected a navigation text node.");
+    region.layout.axis = "row";
+    savedNav.id = "saved-nav";
+    savedNav.width = { mode: "hug", value: 120 };
+    savedNav.height = { mode: "fixed", value: 32, max: 32 };
+
+    const before = parseDesignProgram(generated);
+    expect(before).toMatchObject({ success: false, findings: expect.arrayContaining([expect.objectContaining({
+      code: "text_hug_width_requires_hug_height",
+      path: "screens.screen-01.root.saved-nav.width",
+      message: "Figma text can hug width only when its height is content-sized too; use HUG on both text axes or a bounded width with HUG height.",
+    })]) });
+    const normalized = normalizeDesignProgramLayout(generated);
+    expect(normalized.repairs).toContainEqual({
+      kind: "text-height", path: "screens.screen-01.root.screen-layout.region-1.saved-nav.height",
+      before: "fixed", after: "hug", preservedMinimum: 32,
+    });
+    expect(parseDesignProgram(normalized.program).success).toBe(true);
+    expect(normalizeDesignProgramLayout(normalized.program)).toEqual({ program: normalized.program, repairs: [] });
+    const compiled = compileDesignProgram(normalized.program);
+    expect(compiled.success).toBe(true);
+    if (!compiled.success) throw new Error(JSON.stringify(compiled.findings));
+    const nativeRegion = compiled.batch.screens[0]!.children[0];
+    if (nativeRegion?.type !== "frame") throw new Error("Expected the compiled content frame.");
+    const screenRoot = nativeRegion.children[0];
+    if (screenRoot?.type !== "frame") throw new Error("Expected the screen root frame.");
+    const navRegion = screenRoot.children[0];
+    if (navRegion?.type !== "frame") throw new Error("Expected the navigation region frame.");
+    expect(navRegion.children[0]).toMatchObject({
+      type: "text", sizing: { width: "hug", height: "hug", minHeight: 32 }, textAutoResize: "width-and-height",
+    });
+
+    const h = makeHarness(input, { legacySavedNavSizing: true });
+    await runChatTask(h.task, h.deps);
+    expect(h.task.status).toBe("completed");
+    expect(h.task.universalScreens).toHaveLength(2);
+    expect(h.task.universalScreens?.every(({ status }) => status === "verified")).toBe(true);
+    expect(h.model.mock.calls.filter(([, lifecycle]) => lifecycle === "UNIVERSAL_REPAIR")).toHaveLength(0);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(2);
+    const savedProgramText = h.mock.nodes.find((node) => node.type === "TEXT" && node.getPluginData("fad.design.logical-ref").endsWith(".saved-nav"));
+    expect(savedProgramText).toMatchObject({
+      type: "TEXT", layoutSizingHorizontal: "HUG", layoutSizingVertical: "HUG", textAutoResize: "WIDTH_AND_HEIGHT",
+    });
+    const repairedNav = (() => {
+      const visit = (node: DesignProgramNode): Extract<DesignProgramNode, { type: "text" }> | undefined => {
+        if (node.type === "text") return node.id === "saved-nav" ? node : undefined;
+        if (node.type === "container") {
+          for (const child of node.children) {
+            const found = visit(child);
+            if (found) return found;
+          }
+        }
+        return undefined;
+      };
+      const root = h.task.universalScreens?.[0]?.program?.screens[0]?.root;
+      return root ? visit(root) : undefined;
+    })();
+    expect(repairedNav).toMatchObject({ id: "saved-nav", width: { mode: "hug" }, height: { mode: "hug", min: 32 } });
+  });
+
   it("normalizes a saved pre-render overflow on Resume without repeating composition or dispatching semantic repair", async () => {
     const input = onlineShopCase("create 2 random screen");
     const h = makeHarness(input, { generatedAxisOverflow: true });
@@ -2183,6 +2321,61 @@ describe("universal design Chat route", () => {
       height: { mode: "fixed", value: 440 },
     });
     expect(h.mock.roots.filter((node) => node.getPluginData("fad.generation.commit") === "complete")).toHaveLength(2);
+  });
+
+  it("normalizes a legacy saved text sizing combination on Resume before rendering", async () => {
+    const input = onlineShopCase("create 2 random screen");
+    const h = makeHarness(input);
+    const signal = new AbortController();
+    const originalSave = h.deps.save.getMockImplementation()!;
+    h.deps.save.mockImplementation(async (snapshot) => {
+      await originalSave(snapshot);
+      if (snapshot.universalScreens?.[0]?.status === "program_saved") signal.abort();
+    });
+    await expect(runChatTask(h.task, { ...h.deps, signal: signal.signal })).rejects.toThrow();
+    expect(h.deps.renderProgram).not.toHaveBeenCalled();
+
+    const saved = ChatTaskSchema.parse(JSON.parse(JSON.stringify(h.checkpoints.at(-1))));
+    const first = saved.universalScreens![0]!;
+    const program = first.program;
+    const screenRoot = program?.screens[0]?.root;
+    if (!program || !screenRoot || screenRoot.type !== "container") throw new Error("Expected a saved editable screen.");
+    const navRegion = screenRoot.children[0];
+    if (navRegion?.type !== "container" || navRegion.children[0]?.type !== "text") throw new Error("Expected a saved navigation label.");
+    navRegion.layout.axis = "row";
+    const savedNav = navRegion.children[0];
+    savedNav.id = "saved-nav";
+    savedNav.width = { mode: "hug", value: 120 };
+    savedNav.height = { mode: "fixed", value: 32, max: 32 };
+    expect(parseDesignProgram(program).findings).toContainEqual(expect.objectContaining({
+      code: "text_hug_width_requires_hug_height", path: "screens.screen-01.root.saved-nav.width",
+    }));
+
+    h.deps.save.mockImplementation(originalSave);
+    h.model.mockClear();
+    await runChatTask(saved, h.deps);
+
+    expect(saved.status).toBe("completed");
+    expect(h.model.mock.calls.filter(([, lifecycle]) => lifecycle === "UNIVERSAL_COMPOSING")).toHaveLength(1);
+    expect(h.model.mock.calls.filter(([, lifecycle]) => lifecycle === "UNIVERSAL_REPAIR")).toHaveLength(0);
+    expect(h.deps.renderProgram).toHaveBeenCalledTimes(2);
+    const nativeSavedNav = h.mock.nodes.find((node) => node.type === "TEXT" && node.getPluginData("fad.design.logical-ref").endsWith(".saved-nav"));
+    expect(nativeSavedNav).toMatchObject({ layoutSizingHorizontal: "HUG", layoutSizingVertical: "HUG", textAutoResize: "WIDTH_AND_HEIGHT" });
+    const resumedNav = (() => {
+      const visit = (node: DesignProgramNode): Extract<DesignProgramNode, { type: "text" }> | undefined => {
+        if (node.type === "text") return node.id === "saved-nav" ? node : undefined;
+        if (node.type === "container") {
+          for (const child of node.children) {
+            const found = visit(child);
+            if (found) return found;
+          }
+        }
+        return undefined;
+      };
+      const root = saved.universalScreens?.[0]?.program?.screens[0]?.root;
+      return root ? visit(root) : undefined;
+    })();
+    expect(resumedNav).toMatchObject({ id: "saved-nav", width: { mode: "hug" }, height: { mode: "hug", min: 32 } });
   });
 
   it("renders a hash-verified pinned Brand Kit image as an editable native image fill", async () => {

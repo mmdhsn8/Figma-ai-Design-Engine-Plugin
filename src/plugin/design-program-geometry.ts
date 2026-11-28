@@ -30,8 +30,186 @@ export type ProgramGeometryReport = {
   coverage: "complete" | "incomplete";
   measuredNodes: number;
   durationMs: number;
+  readAttempts?: number;
   findings: ProgramGeometryFinding[];
 };
+
+export type ProgramGeometryInspectionOptions = {
+  taskId: string;
+  pageId: string;
+  expected?: ExpectedScreen;
+  requireOwnership?: boolean;
+  checkReceipt?: boolean;
+  verifyLayoutSizing?: boolean;
+  expectedLayout?: readonly NativeLayoutExpectationV1[];
+};
+
+export type SettledProgramGeometryReport = ProgramGeometryReport & {
+  receipt: string;
+  attempts: number;
+};
+
+export const PROGRAM_GEOMETRY_SETTLE_DELAYS_MS = [16, 48, 96] as const;
+
+type ProgramGeometrySettleOptions = {
+  assertCurrentScope?: () => void;
+  wait?: (milliseconds: number) => Promise<void>;
+  delaysMs?: readonly number[];
+  onAttempt?: (attempt: number, report: SettledProgramGeometryReport) => void;
+};
+
+const TEMPORARY_GEOMETRY_FINDINGS = new Set([
+  "native_measurement_unavailable",
+  "native_transform_unsupported",
+  "native_text_bounds_unavailable",
+  "native_layout_sizing_unavailable",
+  "native_size_mismatch",
+  "native_layout_sizing_mismatch",
+  "native_horizontal_overflow",
+  "native_vertical_overflow",
+  "native_text_render_overflow",
+  "native_viewport_mismatch",
+]);
+
+function snapshotProgramTree(root: FrameNode): Map<string, string> | undefined {
+  const parentById = new Map<string, string>();
+  const pending: SceneNode[] = [root];
+  while (pending.length) {
+    const node = pending.pop()!;
+    if (parentById.size >= 300 || parentById.has(node.id)) return;
+    parentById.set(node.id, node.parent?.id ?? "");
+    if ("children" in node) pending.push(...node.children);
+  }
+  return parentById;
+}
+
+function findProgramTreeMismatch(root: FrameNode, snapshot: Map<string, string>): { nodeId: string; parentId?: string } | undefined {
+  const current = snapshotProgramTree(root);
+  if (!current) return { nodeId: root.id, parentId: root.parent?.id };
+  for (const [nodeId, parentId] of snapshot) {
+    if (!current.has(nodeId)) return { nodeId, ...(parentId ? { parentId } : {}) };
+    if (current.get(nodeId) !== parentId) {
+      const currentParent = current.get(nodeId);
+      return { nodeId, ...(currentParent || parentId ? { parentId: currentParent || parentId } : {}) };
+    }
+  }
+  for (const [nodeId, parentId] of current)
+    if (!snapshot.has(nodeId)) return { nodeId, ...(parentId ? { parentId } : {}) };
+  return;
+}
+
+function failedIdentityReport(
+  root: FrameNode,
+  pageId: string,
+  code: "native_root_removed" | "native_root_moved" | "native_tree_changed",
+  last?: ProgramGeometryReport & { receipt: string },
+  changedNode?: { nodeId: string; parentId?: string },
+): ProgramGeometryReport & { receipt: string } {
+  const nodeId = root.id;
+  const parentId = root.parent?.id;
+  return {
+    version: NATIVE_GEOMETRY_VERSION,
+    coverage: "incomplete",
+    measuredNodes: last?.measuredNodes ?? 0,
+    durationMs: last?.durationMs ?? 0,
+    receipt: last?.receipt ?? "v1-00000000",
+    findings: [changedNode && code === "native_tree_changed" ? { code, ...changedNode } : {
+      code, nodeId, ...(parentId ? { parentId } : code === "native_root_moved" ? { parentId: pageId } : {}),
+    }],
+  };
+}
+
+/**
+ * Read the same attached native root until Figma's post-attachment layout data
+ * settles. Identity and subtree membership are fenced for every pass so a
+ * retry can never turn a moved, removed, or changed tree into a successful read.
+ */
+export async function inspectProgramGeometrySettled(
+  root: FrameNode,
+  options: ProgramGeometryInspectionOptions,
+  settle: ProgramGeometrySettleOptions = {},
+): Promise<SettledProgramGeometryReport> {
+  const started = Date.now();
+  const originalId = root.id;
+  const originalParentId = root.parent?.id;
+  const originalTree = snapshotProgramTree(root);
+  const delays = settle.delaysMs ?? PROGRAM_GEOMETRY_SETTLE_DELAYS_MS;
+  const wait = settle.wait ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  let last: (ProgramGeometryReport & { receipt: string }) | undefined;
+  const totalAttempts = delays.length + 1;
+
+  for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+    if (attempt > 1) await wait(delays[attempt - 2]!);
+    settle.assertCurrentScope?.();
+
+    let identityFailure: "native_root_removed" | "native_root_moved" | "native_tree_changed" | undefined;
+    let changedNode: { nodeId: string; parentId?: string } | undefined;
+    if (("removed" in root && root.removed) || root.id !== originalId)
+      identityFailure = "native_root_removed";
+    else if (root.parent?.id !== originalParentId || root.parent?.id !== options.pageId)
+      identityFailure = "native_root_moved";
+    else if (!originalTree || (changedNode = findProgramTreeMismatch(root, originalTree)) !== undefined)
+      identityFailure = "native_tree_changed";
+
+    if (identityFailure) {
+      const report = failedIdentityReport(root, options.pageId, identityFailure, last, changedNode);
+      const settledReport = { ...report, attempts: attempt, readAttempts: attempt, durationMs: Math.max(report.durationMs, Date.now() - started) };
+      settle.onAttempt?.(attempt, settledReport);
+      return settledReport;
+    }
+
+    last = inspectProgramGeometry(root, options);
+    const settledReport = { ...last, attempts: attempt, readAttempts: attempt, durationMs: Math.max(last.durationMs, Date.now() - started) };
+    settle.onAttempt?.(attempt, settledReport);
+
+    const retryable = (last.coverage === "incomplete" || last.findings.some(({ code }) => TEMPORARY_GEOMETRY_FINDINGS.has(code))) &&
+      !last.findings.some(({ code }) => code === "native_coverage_incomplete" || code === "native_hierarchy_mismatch" ||
+        code === "native_layout_parent_mismatch" || code === "native_layout_expectation_missing");
+    if (!retryable || attempt === totalAttempts) return settledReport;
+  }
+
+  const fallback = last ?? inspectProgramGeometry(root, options);
+  return { ...fallback, attempts: totalAttempts, durationMs: Math.max(fallback.durationMs, Date.now() - started) };
+}
+
+/** Turn native findings into bounded diagnostics with the exact node properties that blocked verification. */
+export function describeProgramGeometryFindings(
+  root: FrameNode,
+  findings: readonly ProgramGeometryFinding[],
+  screenId?: string,
+): Array<{ code: string; path: string; message: string; severity: "error" }> {
+  const byId = new Map<string, SceneNode>();
+  const pending: SceneNode[] = [root];
+  while (pending.length && byId.size < 300) {
+    const node = pending.pop()!;
+    byId.set(node.id, node);
+    if ("children" in node) pending.push(...node.children);
+  }
+  return findings.slice(0, 12).map((finding) => {
+    const node = byId.get(finding.nodeId);
+    const parent = node?.parent;
+    const ref = finding.logicalRef || node?.getPluginData("fad.design.logical-ref") || finding.nodeId;
+    const path = screenId ? `screens.${screenId}.${ref}` : `native.${ref}`;
+    const dimensions = node ? `size=${Number.isFinite(node.width) ? node.width : "unavailable"}x${Number.isFinite(node.height) ? node.height : "unavailable"}` : "node=unavailable";
+    const sizing = node && "layoutSizingHorizontal" in node && "layoutSizingVertical" in node
+      ? `sizing=${String(node.layoutSizingHorizontal)}/${String(node.layoutSizingVertical)}` : "sizing=unavailable";
+    const text = node?.type === "TEXT"
+      ? ` textAutoResize=${node.textAutoResize} visible=${node.visible} font=${typeof node.fontName === "object" ? `${node.fontName.family} ${node.fontName.style}` : "mixed"} missingFont=${node.hasMissingFont}`
+      : "";
+    const parentDetail = parent
+      ? ` parent=${parent.id}${"layoutMode" in parent ? `(${parent.layoutMode})` : `(${parent.type})`}`
+      : " parent=missing";
+    const reported = finding.observedLayout
+      ? ` observedLayout=${finding.observedLayout.horizontalSizing}/${finding.observedLayout.verticalSizing}${finding.observedLayout.textAutoResize ? `/${finding.observedLayout.textAutoResize}` : ""}`
+      : "";
+    return {
+      code: finding.code,
+      path: path.slice(0, 200),
+      message: `${finding.code}; nodeId=${finding.nodeId}; parentId=${finding.parentId ?? "missing"}; ${dimensions}; ${sizing}${text}${parentDetail}${reported}`.slice(0, 240),
+      severity: "error" as const,
+    };
+  });
+}
 
 /** Read native relationships through the async API required by dynamic-page manifests. */
 export async function verifyProgramInstanceMasters(root: FrameNode): Promise<ProgramGeometryFinding[]> {
@@ -94,6 +272,15 @@ function isAutoLayoutParent(node: SceneNode | undefined): node is SceneNode & { 
   return Boolean(node && "layoutMode" in node && node.layoutMode !== "NONE");
 }
 
+function isEffectivelyVisible(node: SceneNode): boolean {
+  let current: BaseNode | null = node;
+  while (current && current.type !== "PAGE" && current.type !== "DOCUMENT") {
+    if ("visible" in current && !current.visible) return false;
+    current = current.parent;
+  }
+  return true;
+}
+
 const align = { start: "MIN", center: "CENTER", end: "MAX", "space-between": "SPACE_BETWEEN", stretch: "MIN", baseline: "BASELINE" } as const;
 
 function nativeType(spec: DesignNode, assets: readonly VisualAsset[]): string {
@@ -103,15 +290,7 @@ function nativeType(spec: DesignNode, assets: readonly VisualAsset[]): string {
 
 export function inspectProgramGeometry(
   root: FrameNode,
-  options: {
-    taskId: string;
-    pageId: string;
-    expected?: ExpectedScreen;
-    requireOwnership?: boolean;
-    checkReceipt?: boolean;
-    verifyLayoutSizing?: boolean;
-    expectedLayout?: readonly NativeLayoutExpectationV1[];
-  },
+  options: ProgramGeometryInspectionOptions,
 ): ProgramGeometryReport & { receipt: string } {
   const started = Date.now();
   const findings: ProgramGeometryFinding[] = [];
@@ -194,7 +373,7 @@ export function inspectProgramGeometry(
         record("native_vertical_overflow", node, parent, { expected: expectedRect, observed: local });
       // An absolute render AABB can be projected exactly only onto axis-aligned parent axes.
       // Text ink can extend past a fixed text box even when its content box passes containment.
-      if (node.type === "TEXT" && !node.effects.some(({ visible }) => visible) &&
+      if (node.type === "TEXT" && isEffectivelyVisible(node) && !node.effects.some(({ visible }) => visible) &&
         parent.absoluteTransform[0][1] === 0 && parent.absoluteTransform[1][0] === 0) {
         const render = node.absoluteRenderBounds;
         if (render) {

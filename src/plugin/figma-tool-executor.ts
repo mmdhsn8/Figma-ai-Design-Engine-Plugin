@@ -29,7 +29,7 @@ import type { PluginToUIMessage, UIToPluginMessage } from "../shared/messages";
 import { utf8Bytes } from "../shared/generation-limits";
 import { planCanvasPlacements } from "./canvas-placement";
 import { placeTopLevelNode, readTopLevelCanvasObstacles } from "./figma-canvas-adapter";
-import { canonicalProgramGeometryReceipt, inspectProgramGeometry, verifyProgramInstanceMasters, PROGRAM_FINGERPRINT_KEY, PROGRAM_GEOMETRY_KEY, PROGRAM_TASK_KEY, type ProgramGeometryFinding, type ProgramGeometryReport } from "./design-program-geometry";
+import { canonicalProgramGeometryReceipt, describeProgramGeometryFindings, inspectProgramGeometry, inspectProgramGeometrySettled, verifyProgramInstanceMasters, PROGRAM_FINGERPRINT_KEY, PROGRAM_GEOMETRY_KEY, PROGRAM_TASK_KEY, type ProgramGeometryFinding, type ProgramGeometryReport } from "./design-program-geometry";
 import { CONTEXT_COMPONENT_KEY, NATIVE_MASTER_KEY } from "./design-context-reuse";
 import { FW5_VISUAL_CAPTURE_LIMITS, VisualCaptureRequestV1Schema, VisualNativeRepairRequestV1Schema, planVisualCaptureScale, pngDimensions, type VisualCaptureReceiptV1, type VisualNativeRepairResultV1 } from "../shared/fw5-visual-qa";
 import { FW5_VISUAL_QA_ENABLED, FW5_VISUAL_REVIEW_MODE } from "../shared/fw5-visual-qa-feature";
@@ -1721,23 +1721,37 @@ export function createFigmaToolExecutor(
         const node = await resolveRef(state, canonicalRef!, pageId);
         if (node.getPluginData(TASK_PLUGIN_KEY) !== message.taskId) {
           unresolvedRefs.push({ ref, status: "unavailable" });
-        } else if (message.geometry && message.refs.length === 1 && node.type === "FRAME") {
+          } else if (message.geometry && message.refs.length === 1 && node.type === "FRAME") {
           assertTaskPageScope(message.documentId, pageId);
+            if (message.geometry.expectedRootNodeId && node.id !== message.geometry.expectedRootNodeId) {
+              unresolvedRefs.push({ ref, status: "stale" });
+              continue;
+            }
           const storedFingerprint = node.getPluginData(PROGRAM_FINGERPRINT_KEY);
           const hasReceipt = Boolean(node.getPluginData(PROGRAM_GEOMETRY_KEY));
           if ((storedFingerprint || message.geometry.requireReceipt) &&
             (storedFingerprint !== message.geometry.programFingerprint || node.getPluginData(PROGRAM_TASK_KEY) !== message.taskId || !hasReceipt)) {
             unresolvedRefs.push({ ref, status: "stale" });
           } else {
-            const report = inspectProgramGeometry(node, {
+            const report = await inspectProgramGeometrySettled(node, {
               taskId: message.taskId, pageId, requireOwnership: true, checkReceipt: hasReceipt,
               ...(message.geometry.expectedLayout ? { expectedLayout: message.geometry.expectedLayout } : {}),
+            }, {
+              assertCurrentScope: () => assertTaskPageScope(message.documentId, pageId),
+              onAttempt: (attempt, value) => console.info("[FAD_NATIVE_PROGRAM] " + JSON.stringify({
+                event: "task_geometry_readback_attempt", atMs: Date.now(), requestId: message.requestId,
+                taskId: message.taskId, screenId: message.geometry?.screenId,
+                programFingerprint: message.geometry?.programFingerprint, rootNodeId: node.id,
+                parentId: node.parent?.id, attempt, coverage: value.coverage,
+                measuredNodes: value.measuredNodes,
+                findings: describeProgramGeometryFindings(node, value.findings, message.geometry?.screenId),
+              })),
             });
             const instanceFindings = await verifyProgramInstanceMasters(node);
             assertTaskPageScope(message.documentId, pageId);
             geometry = {
               version: report.version, coverage: report.coverage, measuredNodes: report.measuredNodes,
-              durationMs: report.durationMs, receipt: report.receipt, findings: [...report.findings, ...instanceFindings].slice(0, 12),
+              durationMs: report.durationMs, readAttempts: report.attempts, receipt: report.receipt, findings: [...report.findings, ...instanceFindings].slice(0, 12),
             };
           }
         }

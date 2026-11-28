@@ -57,7 +57,7 @@ function makeProgram(): DesignProgramV1 {
           semanticRole: "heading",
           interaction: "none",
           width: { mode: "fill", value: 318 },
-          height: { mode: "fixed", value: 28 },
+          height: { mode: "hug", value: 28, min: 28 },
           text: "اطلاعیه ۱۲۳ · Update",
           color: "token:ink",
           fontSize: 18,
@@ -68,7 +68,7 @@ function makeProgram(): DesignProgramV1 {
           name: "Notice copy",
           semanticRole: "body",
           interaction: "none",
-          width: { mode: "hug", value: 230 },
+          width: { mode: "fill", value: 318 },
           height: { mode: "hug", value: 60 },
           text: "ورودی ساختمان تا ساعت ۱۸ باز است.",
           color: "token:ink",
@@ -149,19 +149,18 @@ describe("FW-4 production geometry convergence", () => {
 
     const offFault = await renderWithGate(false, { resetSiblingSizingOnAppend: true });
     const onFault = await renderWithGate(true, { resetSiblingSizingOnAppend: true });
-    expect(offFault.result.success).toBe(true);
+    expect(offFault.result.success).toBe(false);
     expect(onFault.result.success).toBe(true);
-    if (!offFault.result.success || !onFault.result.success || !offFault.root || !onFault.root) return;
+    if (!onFault.result.success || !onFault.root) return;
     const firstExpectedRef = projectNativeLayoutExpectations(makeProgram(), "screen-01").find(({ logicalRef }) => logicalRef.endsWith("notice-title"))?.logicalRef;
     expect(firstExpectedRef).toBeTruthy();
-    const offTitle = offFault.mock.nodes.find((node) => node.getPluginData("fad.design.logical-ref") === firstExpectedRef)!;
     const onTitle = onFault.mock.nodes.find((node) => node.getPluginData("fad.design.logical-ref") === firstExpectedRef)!;
-    expect(offTitle.layoutSizingHorizontal).toBe("FIXED");
-    expect(offTitle.textAutoResize).toBe("WIDTH_AND_HEIGHT");
     expect(onTitle.layoutSizingHorizontal).toBe("FILL");
     expect(onTitle.textAutoResize).toBe("HEIGHT");
     expect(onFault.result.geometryRepairs).toBeGreaterThan(0);
-    expect(onFault.result.geometryReadbacks).toBe(2);
+    // One bounded four-attempt post-attachment inspection is followed by the
+    // convergence readback after the mock's Auto Layout sizing mutation.
+    expect(onFault.result.geometryReadbacks).toBe(5);
   });
 
   it("checks actual native sizing and text auto-resize on the later task-owned readback", async () => {
@@ -171,8 +170,8 @@ describe("FW-4 production geometry convergence", () => {
     const expectations = projectNativeLayoutExpectations(makeProgram(), "screen-01");
     expect(JSON.stringify(expectations)).not.toContain("اطلاعیه");
     expect(expectations).toEqual(expect.arrayContaining([
-      expect.objectContaining({ logicalRef: "fw4-rtl-geometry.screen-01.notice-title", horizontalSizing: "FILL", verticalSizing: "FIXED", textAutoResize: "HEIGHT" }),
-      expect.objectContaining({ logicalRef: "fw4-rtl-geometry.screen-01.notice-copy", horizontalSizing: "HUG", verticalSizing: "HUG", textAutoResize: "WIDTH_AND_HEIGHT" }),
+      expect.objectContaining({ logicalRef: "fw4-rtl-geometry.screen-01.notice-title", horizontalSizing: "FILL", verticalSizing: "HUG", textAutoResize: "HEIGHT" }),
+      expect.objectContaining({ logicalRef: "fw4-rtl-geometry.screen-01.notice-copy", horizontalSizing: "FILL", verticalSizing: "HUG", textAutoResize: "HEIGHT" }),
     ]));
     const title = rendered.mock.nodes.find(({ name }) => name === "Notice title")!;
     title.layoutSizingHorizontal = "FIXED";
@@ -197,7 +196,7 @@ describe("FW-4 production geometry convergence", () => {
     expect(response.geometry?.findings).toContainEqual(expect.objectContaining({
       code: "native_layout_sizing_mismatch",
       nodeId: title.id,
-      expectedLayout: expect.objectContaining({ horizontalSizing: "FILL" }),
+      expectedLayout: expect.objectContaining({ horizontalSizing: "FILL", verticalSizing: "HUG" }),
       observedLayout: expect.objectContaining({ horizontalSizing: "FIXED" }),
     }));
 
@@ -215,7 +214,7 @@ describe("FW-4 production geometry convergence", () => {
           logicalRef: "fw4-rtl-geometry.screen-01.missing-node",
           parentLogicalRef: "fw4-rtl-geometry.screen-01.notice-content",
           horizontalSizing: "FILL",
-          verticalSizing: "FIXED",
+          verticalSizing: "HUG",
         }],
       },
     });
